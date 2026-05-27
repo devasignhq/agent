@@ -2,7 +2,7 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { enqueueReview } from "../queue.js";
+import { enqueueIndex, enqueueReview } from "../queue.js";
 import { getSessionUser } from "../github/oauth.js";
 import { gh } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive } from "../config.js";
@@ -112,7 +112,7 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
           }
           continue;
         }
-        db.insert("repositories", {
+        const inserted = db.insert("repositories", {
           id: uuid(),
           installationId: row!.id,
           owner,
@@ -121,7 +121,9 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
           defaultModel: "claude-opus-4-7",
           modelOverrides: {},
           reviewsEnabled: true,
+          indexState: "queued",
         });
+        enqueueIndex({ repoId: inserted.id, full: true });
       }
     } catch (err) {
       console.warn(`[reconcile] repos for ${inst.id} failed:`, err);
@@ -199,7 +201,7 @@ api.post("/installations/:installationId/link", async (req, res) => {
       }
       continue;
     }
-    db.insert("repositories", {
+    const inserted = db.insert("repositories", {
       id: uuid(),
       installationId: install!.id,
       owner,
@@ -208,7 +210,9 @@ api.post("/installations/:installationId/link", async (req, res) => {
       defaultModel: "claude-opus-4-7",
       modelOverrides: {},
       reviewsEnabled: true,
+      indexState: "queued",
     });
+    enqueueIndex({ repoId: inserted.id, full: true });
   }
 
   res.json({ ok: true, installation: install, repoCount: liveRepos.length });
@@ -231,6 +235,23 @@ api.patch("/repositories/:id", (req, res) => {
   const patch: any = {};
   for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
   res.json(db.update("repositories", (r) => r.id === repo.id, patch));
+});
+
+// Trigger a full repo re-index. Useful when the indexer prompt or allow-list
+// changes, or when QA wants to observe the build without waiting for a webhook.
+api.post("/repositories/:id/reindex", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
+  // Owner-scoped: refuse if the repo doesn't belong to this user's installs.
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  db.update("repositories", (r) => r.id === repo.id, { indexState: "queued", indexError: null });
+  const job = enqueueIndex({ repoId: repo.id, full: true });
+  res.json({ ok: true, jobId: job.id });
 });
 
 // --- PR Reviews (the agent's queue) ---
@@ -299,22 +320,63 @@ api.post("/reviews/sync", async (req, res) => {
     }
     for (const pr of openPRs) {
       discovered++;
+      const newSha: string = pr.head?.sha || "";
       const existing = db.find(
         "prReviews",
         (r) => r.repoId === repo.id && r.prNumber === pr.number
       );
-      if (existing) continue;
+      if (existing) {
+        // Webhook fallback: GitHub may have failed to deliver the
+        // `pull_request.synchronize` event (no tunnel, server restart,
+        // network blip). The PR's head SHA on GitHub no longer matches our
+        // stored one — treat it as a push we missed and re-run the review.
+        // Same shape as the webhook synchronize path so the Agent page log
+        // and queue card behave identically regardless of which source
+        // surfaced the commit first.
+        if (newSha && existing.headSha !== newSha && repo.reviewsEnabled) {
+          db.update("prReviews", (r) => r.id === existing.id, {
+            headSha: newSha,
+            status: "queued",
+            additions: null,
+            deletions: null,
+            changedFiles: null,
+            updatedAt: Date.now(),
+          });
+          db.insert("reviewLogs", {
+            id: uuid(),
+            reviewId: existing.id,
+            kind: "ingest",
+            at: Date.now(),
+            action: "commit.push",
+            target: newSha.slice(0, 7),
+            detail: "New commits detected (sync from GitHub)",
+            meta: {
+              after: newSha,
+              prevHeadSha: existing.headSha,
+              source: "sync",
+            },
+          });
+          enqueueReview(existing.id);
+          enqueued++;
+        }
+        continue;
+      }
       const review = {
         id: uuid(),
         repoId: repo.id,
         prNumber: pr.number,
         prTitle: pr.title,
-        headSha: pr.head?.sha || "",
+        headSha: newSha,
         baseSha: pr.base?.sha || "",
         status: "queued" as const,
         verdict: null,
         criteria: [],
         taskId: null,
+        // Listing endpoint doesn't include diff stats; pipeline will fill these
+        // in on its first run via the full PR fetch in ingestContext.
+        additions: null,
+        deletions: null,
+        changedFiles: null,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };

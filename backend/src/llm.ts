@@ -12,6 +12,7 @@ export async function complete(opts: {
   messages: LLMMessage[];
   maxTokens?: number;
   cacheSystem?: boolean; // hint to use prompt caching when we re-use the system prompt
+  model?: string;        // override the default; e.g. "claude-haiku-4-5" for per-file index summaries
 }): Promise<string> {
   if (!client) return mockComplete(opts);
 
@@ -22,7 +23,7 @@ export async function complete(opts: {
     : undefined;
 
   const resp = await client.messages.create({
-    model: config.llm.model,
+    model: opts.model || config.llm.model,
     max_tokens: opts.maxTokens ?? 2048,
     system: sys as any,
     messages: opts.messages.map((m) => ({ role: m.role, content: m.content })),
@@ -98,6 +99,20 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
   }
 
   if (system?.includes("maintainer-feedback goal refinement")) {
+    // Cheap heuristic for the mock: comments whose body looks like a pure
+    // acknowledgement ("lgtm", "ship it", "looks good") don't actually move
+    // the goal. The production model decides this for itself; here we just
+    // need a deterministic toggle so offline tests can exercise both paths.
+    const lower = last.toLowerCase();
+    const isAck = /\b(lgtm|looks good|ship it|approved|thanks!?|nice)\b/.test(lower);
+    if (isAck) {
+      return JSON.stringify({
+        changed: false,
+        endGoal: "",
+        criteria: [],
+        rationale: "Comment reads as an acknowledgement; no new requirements detected.",
+      });
+    }
     return JSON.stringify({
       changed: true,
       endGoal:
@@ -122,6 +137,35 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
         "Wire it into the existing handler before the db.insert call so we never persist a partial row.",
       code: "const Body = z.object({ name: z.string().min(1) });\nconst parsed = Body.safeParse(req.body);\nif (!parsed.success) return res.status(400).json({ error: parsed.error.flatten() });",
       references: [],
+    });
+  }
+
+  // Per-file index summarisation (Haiku in production). Echo a structurally
+  // valid record so the indexer can run end-to-end without billing.
+  if (system?.includes("file summarisation")) {
+    // Best-effort path extraction so multi-file callers see distinct mocks.
+    const pathMatch = last.match(/^Path:\s*(\S+)/m);
+    const path = pathMatch ? pathMatch[1] : "unknown";
+    return JSON.stringify({
+      summary: `[mock] Summary of ${path}. Real summaries require ANTHROPIC_API_KEY.`,
+      exports: ["mockExport"],
+      imports: ["./db.js"],
+      securityFlags: [],
+    });
+  }
+
+  // Holistic repo-review (Opus in production). Default to no blockers so
+  // mocked offline runs pass cleanly; flip the WARN_FLAKY env to surface a
+  // sample warn-severity item.
+  if (system?.includes("holistic repo-review")) {
+    const includeSample = process.env.WARN_FLAKY === "1";
+    return JSON.stringify({
+      regressions: [],
+      criticalErrors: [],
+      securityFindings: includeSample
+        ? [{ path: "src/handler.ts", concern: "[mock] flagged for visibility", severity: "warn" }]
+        : [],
+      summary: "[mock] No blockers detected by the holistic repo-review step.",
     });
   }
 

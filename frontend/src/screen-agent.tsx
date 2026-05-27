@@ -427,7 +427,7 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
         <div key={pr.id} className={`pr-card ${isPicked ? "picked" : ""}`} onClick={() => onPick(pr.id)}>
             <div className="pr-card-row">
               <span className="mono mute" style={{ fontSize: 11 }}>{pr.repo}</span>
-              <span className="mono" style={{ fontSize: 11, color: "var(--fg-mute)" }}>#{pr.id}</span>
+              <span className="mono" style={{ fontSize: 11, color: "var(--fg-mute)" }}>#{pr.uiId}</span>
             </div>
             <div className="pr-card-title">{pr.title}</div>
             <div className="pr-card-row" style={{ marginTop: 6 }}>
@@ -441,12 +441,6 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
                 <i style={{ width: `${pr.progress * 100}%` }}></i>
               </div>
           }
-            <div className="pr-card-row mono mute" style={{ fontSize: 10, marginTop: 8, gap: 10 }}>
-              <span>+{pr.diff.add}</span>
-              <span>−{pr.diff.del}</span>
-              <span>· {pr.diff.files} files</span>
-              <span style={{ marginLeft: "auto" }}>{pr.model}</span>
-            </div>
           </div>);
 
     })}
@@ -965,7 +959,11 @@ function mapLogEntry(entry) {
     verdict:  { icon: "check",  flavor: "active" },
     error:    { icon: "warn",   flavor: "danger" },
   };
-  const v = map[entry.kind] || { icon: "dot", flavor: "" };
+  let v = map[entry.kind] || { icon: "dot", flavor: "" };
+  // Commit pushes carry kind="ingest" so we don't add a new ReviewLogKind that
+  // would drift across the api.ts ↔ types.ts boundary, but a doc icon reads
+  // wrong for a push. Override on the action — same shape, just a git icon.
+  if (entry.action === "commit.push") v = { icon: "git", flavor: "info" };
   const d = new Date(entry.at);
   const pad = (n) => String(n).padStart(2, "0");
   const sources = entry.meta?.sources;
@@ -1012,11 +1010,18 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       setRepos(repoList);
       setLiveReviews(reviews);
       setError(null);
-      if (!pickedId && reviews.length > 0) setPickedId(reviews[0].id);
     } catch (err) {
       setError(err.message || String(err));
     }
-  }, [pickedId]);
+  }, []);
+
+  // Auto-select the most recent review the first time the queue lands (and
+  // any time the selection gets cleared, e.g. when the picked PR closes).
+  // Lives in its own effect so refreshList can be dependency-free, which
+  // keeps the polling loop below from tearing down on every selection change.
+  React.useEffect(() => {
+    if (!pickedId && liveReviews.length > 0) setPickedId(liveReviews[0].id);
+  }, [pickedId, liveReviews]);
 
   // On mount, pull every open PR from every connected repo into the queue.
   // The endpoint is idempotent — PRs we've already seen are skipped, and only
@@ -1035,27 +1040,124 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   }, [refreshList]);
   React.useEffect(() => { syncOpenPRs(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  React.useEffect(() => { refreshList(); }, [refreshList]);
-  // Poll the list once a review is mid-flight so the queue advances visibly.
+  // Live queue refresh. Poll continuously so PRs that arrive on the backend
+  // via webhook (which inserts a new prReview row) show up in the queue
+  // without a manual reload. Faster cadence (3s) while something is in
+  // flight so visible progress catches up quickly, slower (6s) when idle
+  // so the page doesn't hammer the API forever. Polling pauses while the
+  // tab is hidden and snaps to a fresh fetch the moment the tab becomes
+  // visible again, so the queue is never more than one request behind what
+  // the server knows about.
+  //
+  // We hold liveReviews in a ref so the polling effect doesn't re-create on
+  // every refresh (which would churn the setTimeout chain and the
+  // visibilitychange listener). The ref always reads the latest value when
+  // the timer fires.
+  const liveReviewsRef = React.useRef(liveReviews);
+  React.useEffect(() => { liveReviewsRef.current = liveReviews; }, [liveReviews]);
   React.useEffect(() => {
-    const anyLive = liveReviews.some((r) => r.status === "queued" || r.status === "reviewing");
-    if (!anyLive) return;
-    const id = setInterval(refreshList, 4000);
-    return () => clearInterval(id);
-  }, [liveReviews, refreshList]);
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState === "visible") {
+        await refreshList();
+      }
+      if (cancelled) return;
+      const anyLive = liveReviewsRef.current.some(
+        (r) => r.status === "queued" || r.status === "reviewing"
+      );
+      timer = setTimeout(tick, anyLive ? 3000 : 6000);
+    };
+    // Kick off immediately so the first paint already reflects live data.
+    tick();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") refreshList();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [refreshList]);
 
-  // Fetch the picked review's logs/task when selection changes; poll while it's
-  // still running so the timeline streams in.
+  // Periodic auto-sync from GitHub. Webhook delivery is best-effort —
+  // localhost setups without a tunnel never receive them, and even healthy
+  // tunnels lose events during reconnects or server restarts. Calling the
+  // existing `POST /api/reviews/sync` endpoint on a slow timer closes that
+  // gap: it pulls open PRs directly from every connected repo and inserts
+  // any rows the webhook handler missed. The endpoint is idempotent — PRs
+  // we've already seen are skipped, so this is cheap to run repeatedly.
+  //
+  // 30s is the worst-case discovery latency; the fast queue refresh
+  // (~6s) still picks up any newly-inserted row well before the next
+  // sync tick. Runs silently — does NOT flip the `syncing` flag, so the
+  // "Sync" button and the stat-tile "syncing…" hint stay reserved for
+  // explicit user-initiated syncs.
+  React.useEffect(() => {
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const runSync = async () => {
+      try {
+        const r = await api.syncReviews();
+        if (!cancelled) setSyncStats(r);
+        // The queue refresh effect picks up the new rows on its own
+        // cadence — no need to call refreshList() here.
+      } catch {
+        // Swallow: transient sync errors (rate limit, network blip)
+        // shouldn't take the page down. If the failure is persistent the
+        // queue simply won't grow, and the user can hit "Sync" manually
+        // to surface the error via syncOpenPRs's banner path.
+      }
+    };
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState === "visible") await runSync();
+      if (cancelled) return;
+      timer = setTimeout(tick, 30_000);
+    };
+    // Don't run immediately on mount — the existing syncOpenPRs() already
+    // fires on mount, so we just schedule the first periodic tick.
+    timer = setTimeout(tick, 30_000);
+    const onVisible = () => {
+      if (document.visibilityState === "visible") runSync();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, []);
+
+  // Fetch the picked review's logs/task when selection changes; poll while
+  // the tab is visible so the timeline streams in. Same visibility contract
+  // as the queue poll — pause on hidden tabs, snap fresh on return.
   React.useEffect(() => {
     if (!pickedId) { setDetail(null); return; }
     let cancelled = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
     const fetchOnce = () =>
       api.review(pickedId).then((d) => {
         if (!cancelled) setDetail(d);
       }).catch(() => {});
-    fetchOnce();
-    const id = setInterval(fetchOnce, 2500);
-    return () => { cancelled = true; clearInterval(id); };
+    const tick = async () => {
+      if (cancelled) return;
+      if (document.visibilityState === "visible") await fetchOnce();
+      if (cancelled) return;
+      timer = setTimeout(tick, 2500);
+    };
+    tick();
+    const onVisible = () => {
+      if (document.visibilityState === "visible") fetchOnce();
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
   }, [pickedId]);
 
   // Index helpers
@@ -1076,7 +1178,11 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       repo: repoLabel,
       title: r.prTitle || `PR #${r.prNumber}`,
       branch: r.headSha?.slice(0, 7) || "",
-      diff: { add: 0, del: 0, files: 0 },
+      diff: {
+        add: typeof r.additions === "number" ? r.additions : null,
+        del: typeof r.deletions === "number" ? r.deletions : null,
+        files: typeof r.changedFiles === "number" ? r.changedFiles : null,
+      },
       author: "",
       model: repo?.defaultModel || "—",
       status: mapStatus(r.status),

@@ -5,7 +5,8 @@ import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { config } from "../config.js";
 import { db } from "../db.js";
-import { enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import { gh } from "./app.js";
+import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) return true; // dev mode: skip verification
@@ -36,6 +37,14 @@ export function handleWebhook(req: Request, res: Response) {
     return;
   }
   const type = req.header("X-GitHub-Event") || "";
+
+  // One-line arrival diagnostic. Lets the user verify in stdout whether
+  // GitHub is even delivering a given event type — the most common cause
+  // of "my comment didn't show up" is the GitHub App not being subscribed
+  // to that event on github.com.
+  const repoFullName: string = event?.repository?.full_name || "(no repo)";
+  const action: string = event?.action || "(no action)";
+  console.log(`[webhook] type=${type} action=${action} repo=${repoFullName}`);
 
   switch (type) {
     case "installation":
@@ -83,24 +92,51 @@ function isMaintainerComment(args: {
 // `issue_comment` covers top-level PR conversation comments. GitHub emits the
 // same event for plain issues, so we check `issue.pull_request` to scope.
 function handleIssueComment(event: any) {
-  if (event.action !== "created") return;
-  if (!event.issue?.pull_request) return; // not a PR — skip
   const body: string = event.comment?.body || "";
   const author: string = event.comment?.user?.login || "";
   const authorAssociation: string = event.comment?.author_association || "NONE";
   const senderType: string = event.sender?.type || "User";
-  if (!isMaintainerComment({ body, author, authorAssociation, senderType })) return;
+  const repoFullName: string = event.repository?.full_name || "";
+  const prNumber: number | undefined = event.issue?.number;
 
-  const review = findPRReview(event.repository?.full_name, event.issue.number);
-  if (!review) return;
+  console.log(
+    `[webhook] issue_comment author=${author} assoc=${authorAssociation} senderType=${senderType} bodyLen=${body.length}`
+  );
 
-  enqueueMaintainerFeedback(review.id, {
-    body,
-    author,
-    authorAssociation,
-    sourceUrl: event.comment?.html_url || "",
-    sourceEvent: "issue_comment",
-  });
+  if (event.action !== "created") {
+    console.log(`[webhook] issue_comment: ignored, action=${event.action}`);
+    return;
+  }
+  if (!event.issue?.pull_request) {
+    console.log("[webhook] issue_comment: ignored, not a PR comment");
+    return;
+  }
+  if (!isMaintainerComment({ body, author, authorAssociation, senderType })) {
+    console.log(
+      `[webhook] issue_comment: filtered (assoc=${authorAssociation}, senderType=${senderType}, bodyEmpty=${!body.trim()})`
+    );
+    return;
+  }
+
+  // Async tail: GitHub round-trips can take a beat, so respond 200 immediately
+  // and do the lookup / materialize / enqueue off the request thread.
+  void (async () => {
+    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    if (!review) {
+      console.log(
+        `[webhook] issue_comment: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+      );
+      return;
+    }
+    enqueueMaintainerFeedback(review.id, {
+      body,
+      author,
+      authorAssociation,
+      sourceUrl: event.comment?.html_url || "",
+      sourceEvent: "issue_comment",
+    });
+    console.log(`[webhook] issue_comment: enqueued for review ${review.id}`);
+  })();
 }
 
 // `pull_request_review` fires when a reviewer submits a formal review.
@@ -108,23 +144,45 @@ function handleIssueComment(event: any) {
 // thread events live on a separate `pull_request_review_comment` channel that
 // we intentionally don't listen to (too noisy).
 function handlePullRequestReview(event: any) {
-  if (event.action !== "submitted") return;
   const body: string = event.review?.body || "";
   const author: string = event.review?.user?.login || "";
   const authorAssociation: string = event.review?.author_association || "NONE";
   const senderType: string = event.sender?.type || "User";
-  if (!isMaintainerComment({ body, author, authorAssociation, senderType })) return;
+  const repoFullName: string = event.repository?.full_name || "";
+  const prNumber: number | undefined = event.pull_request?.number;
 
-  const review = findPRReview(event.repository?.full_name, event.pull_request?.number);
-  if (!review) return;
+  console.log(
+    `[webhook] pull_request_review author=${author} assoc=${authorAssociation} senderType=${senderType} bodyLen=${body.length}`
+  );
 
-  enqueueMaintainerFeedback(review.id, {
-    body,
-    author,
-    authorAssociation,
-    sourceUrl: event.review?.html_url || "",
-    sourceEvent: "pull_request_review",
-  });
+  if (event.action !== "submitted") {
+    console.log(`[webhook] pull_request_review: ignored, action=${event.action}`);
+    return;
+  }
+  if (!isMaintainerComment({ body, author, authorAssociation, senderType })) {
+    console.log(
+      `[webhook] pull_request_review: filtered (assoc=${authorAssociation}, senderType=${senderType}, bodyEmpty=${!body.trim()})`
+    );
+    return;
+  }
+
+  void (async () => {
+    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    if (!review) {
+      console.log(
+        `[webhook] pull_request_review: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+      );
+      return;
+    }
+    enqueueMaintainerFeedback(review.id, {
+      body,
+      author,
+      authorAssociation,
+      sourceUrl: event.review?.html_url || "",
+      sourceEvent: "pull_request_review",
+    });
+    console.log(`[webhook] pull_request_review: enqueued for review ${review.id}`);
+  })();
 }
 
 function findPRReview(repoFullName: string | undefined, prNumber: number | undefined) {
@@ -139,6 +197,89 @@ function findPRReview(repoFullName: string | undefined, prNumber: number | undef
     .filter("prReviews", (r) => r.repoId === repo.id && r.prNumber === prNumber)
     .sort((a, b) => b.updatedAt - a.updatedAt);
   return candidates[0] || null;
+}
+
+// Ensure we have a PRReview row for `repoFullName#prNumber`. If one exists,
+// return it. If not, materialize a fresh row by fetching the PR from GitHub
+// using the install token, and enqueue a full review so the criteria pipeline
+// catches up. Returns null when we can't resolve the install or the repo —
+// e.g. the comment is on a repo this server doesn't track.
+async function ensurePRReview(
+  repoFullName: string,
+  prNumber: number | undefined,
+  ghInstallationId: number | undefined
+) {
+  const existing = findPRReview(repoFullName, prNumber);
+  if (existing) return existing;
+
+  if (!prNumber) {
+    console.log("[webhook] ensurePRReview: no PR number on event");
+    return null;
+  }
+  const [owner, name] = repoFullName.split("/");
+  if (!owner || !name) {
+    console.log(`[webhook] ensurePRReview: malformed repo name "${repoFullName}"`);
+    return null;
+  }
+  const repo = db.find("repositories", (r) => r.owner === owner && r.name === name);
+  if (!repo) {
+    console.log(
+      `[webhook] ensurePRReview: repo ${repoFullName} not tracked (no install row)`
+    );
+    return null;
+  }
+  if (!ghInstallationId) {
+    // We could still synthesize a row from the comment-side fields, but
+    // without an install token we can't fetch title/head.sha and the full
+    // review job would fail anyway. Skip with a diagnostic.
+    console.log(
+      `[webhook] ensurePRReview: no installation id on event for ${repoFullName}#${prNumber}`
+    );
+    return null;
+  }
+
+  let pr: any;
+  try {
+    pr = await gh<any>(
+      ghInstallationId,
+      `/repos/${owner}/${name}/pulls/${prNumber}`
+    );
+  } catch (err) {
+    console.warn(
+      `[webhook] ensurePRReview: failed to fetch PR ${repoFullName}#${prNumber}:`,
+      err
+    );
+    return null;
+  }
+
+  const review = {
+    id: uuid(),
+    repoId: repo.id,
+    prNumber,
+    prTitle: pr.title || `PR #${prNumber}`,
+    headSha: pr.head?.sha || "",
+    baseSha: pr.base?.sha || "",
+    status: "queued" as const,
+    verdict: null,
+    criteria: [],
+    taskId: null,
+    additions: typeof pr.additions === "number" ? pr.additions : null,
+    deletions: typeof pr.deletions === "number" ? pr.deletions : null,
+    changedFiles: typeof pr.changed_files === "number" ? pr.changed_files : null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  };
+  db.insert("prReviews", review);
+  // Kick off a full review so the criteria pipeline catches up; the
+  // maintainer-feedback job will be enqueued separately by the caller and
+  // attach onto this same review row.
+  if (repo.reviewsEnabled) {
+    enqueueReview(review.id);
+  }
+  console.log(
+    `[webhook] ensurePRReview: materialized review ${review.id} for ${repoFullName}#${prNumber}`
+  );
+  return review;
 }
 
 function handleInstallation(event: any) {
@@ -248,7 +389,7 @@ function upsertRepoFromInstallEvent(
     }
     return;
   }
-  db.insert("repositories", {
+  const newRepo = db.insert("repositories", {
     id: uuid(),
     installationId: installDbId,
     owner,
@@ -257,13 +398,72 @@ function upsertRepoFromInstallEvent(
     defaultModel: "claude-opus-4-7",
     modelOverrides: {},
     reviewsEnabled: true,
+    indexState: "queued",
   });
+  enqueueIndex({ repoId: newRepo.id, full: true });
 }
 
 function handlePullRequest(event: any) {
-  if (!["opened", "reopened", "synchronize", "ready_for_review"].includes(event.action)) return;
+  if (!["opened", "reopened", "synchronize", "ready_for_review", "closed"].includes(event.action)) return;
   const repoFullName: string = event.repository.full_name;
   const [owner, name] = repoFullName.split("/");
+
+  // Merge-to-prod: when a PR merges into the repo's default branch, refresh
+  // the index incrementally so the post-merge state is what the next review
+  // reasons against. Non-merge closes are ignored.
+  if (event.action === "closed") {
+    const pullReq = event.pull_request;
+    if (!pullReq?.merged) return;
+    const repo = db.find("repositories", (r) => r.owner === owner && r.name === name);
+    if (!repo) return;
+    if (pullReq.base?.ref !== repo.defaultBranch) return;
+    const installId = event.installation?.id;
+    if (!installId) return;
+    void (async () => {
+      try {
+        const files = await gh<Array<{
+          filename: string;
+          previous_filename?: string;
+          status: string;
+        }>>(installId, `/repos/${owner}/${name}/pulls/${pullReq.number}/files?per_page=300`);
+        const added: string[] = [];
+        const modified: string[] = [];
+        const removed: string[] = [];
+        const renamed: Array<{ from: string; to: string }> = [];
+        for (const f of files) {
+          switch (f.status) {
+            case "added":
+              added.push(f.filename);
+              break;
+            case "modified":
+            case "changed":
+              modified.push(f.filename);
+              break;
+            case "removed":
+              removed.push(f.filename);
+              break;
+            case "renamed":
+              if (f.previous_filename) renamed.push({ from: f.previous_filename, to: f.filename });
+              modified.push(f.filename); // re-summarise the new path
+              break;
+            case "copied":
+              added.push(f.filename);
+              break;
+          }
+        }
+        db.update("repositories", (r) => r.id === repo.id, { indexState: "stale" });
+        enqueueIndex({ repoId: repo.id, full: false, changedPaths: { added, modified, removed, renamed } });
+        console.log(
+          `[webhook] merge to ${repo.defaultBranch}: ${owner}/${name}#${pullReq.number} → ` +
+          `${added.length}A ${modified.length}M ${removed.length}D ${renamed.length}R`
+        );
+      } catch (err) {
+        console.warn(`[webhook] merge re-index for ${owner}/${name}#${pullReq.number} failed:`, err);
+      }
+    })();
+    return;
+  }
+
   // Make sure we have a repo row; the user may not have customised settings yet.
   let repo = db.find(
     "repositories",
@@ -283,22 +483,84 @@ function handlePullRequest(event: any) {
       defaultModel: "claude-opus-4-7",
       modelOverrides: {},
       reviewsEnabled: true,
+      indexState: "queued",
     };
     db.insert("repositories", repo);
+    enqueueIndex({ repoId: repo.id, full: true });
   }
   if (!repo.reviewsEnabled) return;
+
+  const pullReq = event.pull_request;
+  const newSha: string = pullReq.head.sha;
+
+  // `synchronize` fires when a contributor pushes new commits to an open PR.
+  // The semantics are "same PR, new state" — we keep ONE prReview row per
+  // PR and update its headSha in place, instead of inserting a duplicate that
+  // would fork the queue card the user is watching. A "commit.push" entry
+  // lands in reviewLogs immediately so the Agent page surfaces the push the
+  // moment GitHub tells us about it, even before the pipeline re-runs and
+  // posts a fresh PR review.
+  if (event.action === "synchronize") {
+    const existing = db.find(
+      "prReviews",
+      (r) => r.repoId === repo!.id && r.prNumber === pullReq.number
+    );
+    if (existing) {
+      const pusher: string = event.sender?.login || "someone";
+      const branch: string = pullReq.head?.ref || "branch";
+      const before: string = event.before || existing.headSha;
+      const count: number | undefined = Array.isArray(event.commits) ? event.commits.length : undefined;
+      const detail =
+        typeof count === "number" && count > 0
+          ? `${pusher} pushed ${count} commit${count === 1 ? "" : "s"} to ${branch}`
+          : `${pusher} pushed new commits to ${branch}`;
+      db.update("prReviews", (r) => r.id === existing.id, {
+        headSha: newSha,
+        status: "queued",
+        additions: null,
+        deletions: null,
+        changedFiles: null,
+        updatedAt: Date.now(),
+      });
+      db.insert("reviewLogs", {
+        id: uuid(),
+        reviewId: existing.id,
+        kind: "ingest",
+        at: Date.now(),
+        action: "commit.push",
+        target: newSha.slice(0, 7),
+        detail,
+        meta: {
+          before,
+          after: newSha,
+          pusher,
+          branch,
+          prevHeadSha: existing.headSha,
+          source: "webhook",
+        },
+      });
+      enqueueReview(existing.id);
+      return;
+    }
+    // No row yet (race: synchronize arrived before opened, or the user only
+    // installed the app after the PR was already open). Fall through to the
+    // insert path so we still pick up the work.
+  }
 
   const review = {
     id: uuid(),
     repoId: repo.id,
-    prNumber: event.pull_request.number,
-    prTitle: event.pull_request.title,
-    headSha: event.pull_request.head.sha,
-    baseSha: event.pull_request.base.sha,
+    prNumber: pullReq.number,
+    prTitle: pullReq.title,
+    headSha: newSha,
+    baseSha: pullReq.base.sha,
     status: "queued" as const,
     verdict: null,
     criteria: [],
     taskId: null,
+    additions: typeof pullReq.additions === "number" ? pullReq.additions : null,
+    deletions: typeof pullReq.deletions === "number" ? pullReq.deletions : null,
+    changedFiles: typeof pullReq.changed_files === "number" ? pullReq.changed_files : null,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };

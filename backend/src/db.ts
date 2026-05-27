@@ -15,6 +15,7 @@ const empty: DB = {
   reviewLogs: [],
   subscriptions: [],
   authAudit: [],
+  repoIndex: [],
 };
 
 function load(): DB {

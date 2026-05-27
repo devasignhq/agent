@@ -14,6 +14,8 @@ import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { handleWebhook } from "./github/webhooks.js";
 import { api } from "./routes/api.js";
 import { startWorker } from "./worker.js";
+import { db } from "./db.js";
+import { enqueueIndex } from "./queue.js";
 
 const app = express();
 
@@ -67,6 +69,31 @@ app.listen(port, () => {
   console.log(`  · Slack:      ${isSlackEnvConfigured() ? `env fallback → ${config.integrations.slackBotChannel}` : "per-user only"}`);
   console.log(`  · Discord:    ${isDiscordEnvConfigured() ? `env fallback → ${config.integrations.discordBotChannelId}` : "per-user only"}`);
   console.log(`  · Web origin: ${config.webOrigin}`);
+  // Spell out which webhook event types the receiver handles. If a comment
+  // posted on GitHub never shows up in stdout (or in the review log), the
+  // first thing to verify is that the matching event here is also subscribed
+  // in the GitHub App's settings on github.com → Permissions & events.
+  console.log(
+    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, ping`
+  );
 });
 
 startWorker();
+backfillRepoIndex();
+
+// Existing repositories may pre-date the indexer. Walk them at boot and
+// enqueue a full build for any that have never been indexed, throttled so a
+// DB with many repos doesn't stampede the LLM in the first minute.
+function backfillRepoIndex() {
+  const repos = db.filter("repositories", (r) => (r.indexState ?? "none") === "none" && r.reviewsEnabled);
+  if (!repos.length) return;
+  console.log(`  · Repo index: backfilling ${repos.length} repo${repos.length === 1 ? "" : "s"}`);
+  let i = 0;
+  for (const r of repos) {
+    setTimeout(() => {
+      db.update("repositories", (x) => x.id === r.id, { indexState: "queued" });
+      enqueueIndex({ repoId: r.id, full: true });
+    }, i * 5_000);
+    i++;
+  }
+}
