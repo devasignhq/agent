@@ -11,7 +11,7 @@ import { complete, detectVideoProvider, summarizeVideo, type VideoSummary } from
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { config } from "../config.js";
 import type { MaintainerComment } from "../queue.js";
-import type { Criterion, PRReview, PRReviewStatus, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
+import type { Criterion, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -68,6 +68,24 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       });
     }
 
+    // a.5 Pull the repo index slice relevant to this PR. Touched files +
+    // anything that imports from them + a short manifest of the rest of the
+    // repo. The holistic Opus call below uses this so the verdict reflects
+    // whole-repo impact, not just the diff.
+    const holistic = gatherHolisticContext(repo, context.diff);
+    if (holistic.entries.length || holistic.manifest.length) {
+      log(review.id, "holistic", "Repo index retrieved", {
+        detail: `${holistic.entries.length} entries (${holistic.touchedCount} touched, ${holistic.dependentCount} dependents)`,
+        meta: {
+          indexedCommit: repo.indexedCommit,
+          touched: holistic.entries.slice(0, holistic.touchedCount).map((e) => e.path),
+          dependents: holistic.entries.slice(holistic.touchedCount).map((e) => e.path),
+        },
+      });
+    } else if ((repo.indexState ?? "none") === "none") {
+      log(review.id, "holistic", "Repo index not yet built — skipping whole-repo check");
+    }
+
     // b. Criteria synthesis (with task linkage if there's a matching task)
     const task = findOrCreateTask(review);
     let endGoal = task.endGoal;
@@ -121,15 +139,51 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
     });
     const allMet = filledCriteria.every((c) => c.met === true);
-    const status: PRReviewStatus = allMet ? "passed" : "changes_requested";
+
+    // c.1 Whole-repo review: ask Opus to check the diff against the repo index
+    // for regressions, critical errors, and security flaws. Skipped when the
+    // index hasn't been built yet (e.g. a PR landed before the initial walk
+    // finished); in that case we fall back to the criteria-only verdict.
+    let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
+    let hasBlocker = false;
+    if (holistic.entries.length || holistic.manifest.length) {
+      holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic });
+      hasBlocker = [
+        ...holisticVerdict.regressions,
+        ...holisticVerdict.criticalErrors,
+        ...holisticVerdict.securityFindings,
+      ].some((f) => f.severity === "blocker");
+      log(
+        review.id,
+        "holistic",
+        hasBlocker ? "Holistic review found blockers" : "Holistic review clean",
+        {
+          detail: holisticVerdict.summary,
+          meta: {
+            regressions: holisticVerdict.regressions.length,
+            criticalErrors: holisticVerdict.criticalErrors.length,
+            securityFindings: holisticVerdict.securityFindings.length,
+          },
+        }
+      );
+    }
+
+    const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
     setStatus(review.id, {
       criteria: filledCriteria,
       verdict: verdict.summary,
       status,
     });
-    log(review.id, "verdict", allMet ? "All criteria met" : "Changes requested", {
+    log(review.id, "verdict", status === "passed" ? "All checks met" : "Changes requested", {
       detail: verdict.summary,
-      meta: { criteriaCount: filledCriteria.length },
+      meta: {
+        criteriaCount: filledCriteria.length,
+        holisticBlockers: hasBlocker,
+        holisticFindings:
+          holisticVerdict.regressions.length +
+          holisticVerdict.criticalErrors.length +
+          holisticVerdict.securityFindings.length,
+      },
     });
 
     // d. Output: GitHub Check Run + PR review + broadcast
@@ -140,6 +194,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       suggestions: verdict.suggestions,
       comments: verdict.comments,
       diff: context.diff,
+      holistic: holisticVerdict,
     });
     await broadcastVerdict(review, repo, status, verdict.summary);
     log(review.id, "comment", "Posted Check Run and PR review", {
@@ -194,6 +249,26 @@ async function ingestContext(
         ref: `${repo.owner}/${repo.name}#${review.prNumber}`,
         text: `${pr.title}\n\n${pr.body || ""}`,
       });
+      // Persist real diff stats from the full PR object so the queue card
+      // shows accurate counts instead of zeros.
+      const nextAdditions = typeof pr.additions === "number" ? pr.additions : review.additions;
+      const nextDeletions = typeof pr.deletions === "number" ? pr.deletions : review.deletions;
+      const nextChangedFiles = typeof pr.changed_files === "number" ? pr.changed_files : review.changedFiles;
+      if (
+        nextAdditions !== review.additions ||
+        nextDeletions !== review.deletions ||
+        nextChangedFiles !== review.changedFiles
+      ) {
+        db.update("prReviews", (r) => r.id === review.id, {
+          additions: nextAdditions,
+          deletions: nextDeletions,
+          changedFiles: nextChangedFiles,
+        });
+        // Keep the local reference in sync for downstream logic in this call.
+        review.additions = nextAdditions;
+        review.deletions = nextDeletions;
+        review.changedFiles = nextChangedFiles;
+      }
       // Fetch unified diff
       diff = await ghText(
         install.installationId,
@@ -559,7 +634,8 @@ function formatReviewBody(
   endGoal: string,
   filledCriteria: Criterion[],
   suggestions: ReviewSuggestion[],
-  summary: string
+  summary: string,
+  holistic: HolisticVerdict = EMPTY_HOLISTIC
 ): string {
   const lines: string[] = [];
   if (endGoal) {
@@ -588,10 +664,35 @@ function formatReviewBody(
       lines.push("");
     }
   }
+  const holisticItems =
+    holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
+  if (holisticItems) {
+    lines.push("## Repo-wide concerns");
+    if (holistic.summary) lines.push(holistic.summary, "");
+    appendHolisticGroup(lines, "Regressions", holistic.regressions);
+    appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
+    appendHolisticGroup(lines, "Security findings", holistic.securityFindings);
+    lines.push("");
+  }
   if (summary) {
     lines.push("---", summary);
   }
   return lines.join("\n").trim() || "DevAsign review.";
+}
+
+function appendHolisticGroup(
+  lines: string[],
+  label: string,
+  findings: HolisticFinding[]
+) {
+  if (!findings.length) return;
+  lines.push(`### ${label}`);
+  for (const f of findings) {
+    const sev = f.severity === "blocker" ? "🚫 **Blocker**" : "⚠️ Warn";
+    const where = f.path ? `\`${f.path}\` — ` : "";
+    lines.push(`- ${sev} — ${where}${f.concern}`);
+  }
+  lines.push("");
 }
 
 // GitHub rejects an entire review batch if any inline comment references a
@@ -622,11 +723,12 @@ async function postGithubOutput(
     suggestions: ReviewSuggestion[];
     comments: Array<{ path: string; line: number; body: string }>;
     diff: string;
+    holistic: HolisticVerdict;
   }
 ) {
   if (!install) return; // dev: nothing to post to
   const conclusion = status === "passed" ? "success" : "action_required";
-  const body = formatReviewBody(args.endGoal, args.criteria, args.suggestions, args.summary);
+  const body = formatReviewBody(args.endGoal, args.criteria, args.suggestions, args.summary, args.holistic);
 
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
@@ -1129,6 +1231,10 @@ export async function runMaintainerFeedbackJob(
     log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
       detail: refined.rationale || "No actionable change inferred from the comment.",
     });
+    // No goal movement → no PR reply. The "Maintainer feedback received" +
+    // this "reviewed; unchanged" pair in the review log is the agent's
+    // observable acknowledgement that it saw and considered the comment.
+    return;
   }
 
   // Pull the latest diff so the implementation guide can be anchored in the
@@ -1217,4 +1323,178 @@ function tryParseJSON<T>(raw: string, fallback: T): T {
   } catch {
     return fallback;
   }
+}
+
+// ─── Whole-repo (holistic) review ─────────────────────────────────────────
+// Uses the per-file repo index to answer: does this diff break anything, miss
+// a critical edge, or introduce a security flaw? Runs in addition to the
+// acceptance-criteria check; a blocker-severity finding flips status to
+// changes_requested even when every criterion is otherwise met.
+
+type HolisticFinding = {
+  path?: string;
+  concern: string;
+  severity: "blocker" | "warn";
+};
+
+type HolisticVerdict = {
+  regressions: HolisticFinding[];
+  criticalErrors: HolisticFinding[];
+  securityFindings: HolisticFinding[];
+  summary: string;
+};
+
+const EMPTY_HOLISTIC: HolisticVerdict = {
+  regressions: [],
+  criticalErrors: [],
+  securityFindings: [],
+  summary: "",
+};
+
+type HolisticContext = {
+  entries: RepoIndexEntry[];      // [...touched, ...dependents]
+  touchedCount: number;
+  dependentCount: number;
+  manifest: Array<{ path: string; summary: string }>;
+};
+
+const HOLISTIC_TOUCHED_CAP = 25;
+const HOLISTIC_DEPENDENT_CAP = 25;
+const HOLISTIC_MANIFEST_CAP = 20;
+
+function gatherHolisticContext(repo: Repository, diff: string): HolisticContext {
+  const state = repo.indexState ?? "none";
+  if (state !== "ready" && state !== "stale") {
+    return { entries: [], touchedCount: 0, dependentCount: 0, manifest: [] };
+  }
+  const touchedPaths = diffFilePaths(diff);
+  const allEntries = db.filter("repoIndex", (e) => e.repoId === repo.id);
+  if (!allEntries.length) {
+    return { entries: [], touchedCount: 0, dependentCount: 0, manifest: [] };
+  }
+  const byPath = new Map(allEntries.map((e) => [e.path, e]));
+  const touched: RepoIndexEntry[] = [];
+  for (const p of touchedPaths) {
+    const e = byPath.get(p);
+    if (e) touched.push(e);
+  }
+
+  // Dependents heuristic: match imports against touched basenames + exported
+  // symbols. Misses aliased re-exports and barrel files, but catches the
+  // common case without a language-specific resolver.
+  const touchedSymbols = new Set<string>();
+  for (const t of touched) {
+    const base = (t.path.split("/").pop() || t.path).replace(/\.[^.]+$/, "");
+    touchedSymbols.add(base);
+    for (const ex of t.exports) touchedSymbols.add(ex);
+  }
+  const touchedIds = new Set(touched.map((t) => t.id));
+  const dependents: RepoIndexEntry[] = [];
+  for (const e of allEntries) {
+    if (touchedIds.has(e.id)) continue;
+    const matches = e.imports.some((imp) => {
+      const tail = (imp.split("/").pop() || imp).replace(/\.[^.]+$/, "");
+      return touchedSymbols.has(tail);
+    });
+    if (matches) dependents.push(e);
+  }
+
+  const cappedTouched = touched.slice(0, HOLISTIC_TOUCHED_CAP);
+  const cappedDependents = dependents.slice(0, HOLISTIC_DEPENDENT_CAP);
+
+  // Manifest: a short tour of the rest of the repo so the LLM has a mental
+  // model beyond the touched slice. Largest code files by size is a crude
+  // but cheap importance proxy.
+  const manifest = allEntries
+    .filter((e) => /\.(ts|tsx|js|jsx|py|go|rs|rb|java|kt|swift|cs|cc|cpp)$/i.test(e.path))
+    .sort((a, b) => b.size - a.size)
+    .slice(0, HOLISTIC_MANIFEST_CAP)
+    .map((e) => ({ path: e.path, summary: e.summary }));
+
+  return {
+    entries: [...cappedTouched, ...cappedDependents],
+    touchedCount: cappedTouched.length,
+    dependentCount: cappedDependents.length,
+    manifest,
+  };
+}
+
+async function reviewAgainstRepo(args: {
+  review: PRReview;
+  diff: string;
+  holistic: HolisticContext;
+}): Promise<HolisticVerdict> {
+  const { holistic } = args;
+  if (!holistic.entries.length && !holistic.manifest.length) return EMPTY_HOLISTIC;
+
+  const system =
+    "You are DevAsign's holistic repo-review step. Given (1) a PR diff, (2) summaries of the files the PR touches, " +
+    "(3) summaries of files that depend on the touched files, and (4) a manifest of the rest of the repo, decide " +
+    "whether the PR introduces regressions, critical errors, or security flaws beyond what the acceptance criteria covered. " +
+    'Emit ONLY JSON: {"regressions": [{"path": string, "concern": string, "severity": "blocker"|"warn"}], ' +
+    '"criticalErrors": [{"path": string?, "concern": string, "severity": "blocker"|"warn"}], ' +
+    '"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn"}], ' +
+    '"summary": string}. ' +
+    'Use severity="blocker" only when an issue would clearly break a feature, corrupt state, or expose data. ' +
+    'Use severity="warn" for plausible concerns that need human eyes. ' +
+    "Never invent risks the diff doesn't actually create. Quote symbol names or paths from the provided summaries when you cite a concern. " +
+    "When nothing material surfaces, return empty arrays — do not pad.";
+
+  const touchedBlock = holistic.entries.slice(0, holistic.touchedCount)
+    .map((e) =>
+      `### ${e.path}\n` +
+      `Exports: ${e.exports.join(", ") || "(none)"}\n` +
+      `Imports: ${e.imports.join(", ") || "(none)"}\n` +
+      `Flags: ${e.securityFlags.join(", ") || "(none)"}\n` +
+      `Summary: ${e.summary}`
+    )
+    .join("\n\n");
+  const dependentsBlock = holistic.entries.slice(holistic.touchedCount)
+    .map((e) =>
+      `### ${e.path}\n` +
+      `Imports: ${e.imports.join(", ") || "(none)"}\n` +
+      `Summary: ${e.summary}`
+    )
+    .join("\n\n");
+  const manifestBlock = holistic.manifest
+    .map((m) => `- ${m.path}: ${m.summary}`)
+    .join("\n");
+
+  const userText =
+    `# Diff\n\`\`\`diff\n${args.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    `# Touched files (repo index summaries)\n${touchedBlock || "(none indexed)"}\n\n` +
+    `# Dependent files\n${dependentsBlock || "(none)"}\n\n` +
+    `# Repo manifest (top-level tour)\n${manifestBlock || "(none)"}`;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1500,
+  });
+  const parsed = tryParseJSON<Partial<HolisticVerdict>>(raw, EMPTY_HOLISTIC);
+  return {
+    regressions: normaliseFindings(parsed.regressions),
+    criticalErrors: normaliseFindings(parsed.criticalErrors),
+    securityFindings: normaliseFindings(parsed.securityFindings),
+    summary: String(parsed.summary || ""),
+  };
+}
+
+function normaliseFindings(input: unknown): HolisticFinding[] {
+  if (!Array.isArray(input)) return [];
+  const out: HolisticFinding[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    const concern = String((item as any).concern || "").trim();
+    if (!concern) continue;
+    const sev = (item as any).severity === "blocker" ? "blocker" : "warn";
+    const path = (item as any).path;
+    out.push({
+      concern,
+      severity: sev,
+      ...(typeof path === "string" && path ? { path } : {}),
+    });
+  }
+  return out;
 }

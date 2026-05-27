@@ -28,6 +28,36 @@ export type Repository = {
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
+  // Repo-index state. Optional so DB rows written before the indexer existed
+  // still load — treat undefined as "none" at every branch site.
+  indexState?: RepoIndexState;
+  indexedAt?: number;
+  indexedCommit?: string;
+  indexedFileCount?: number;
+  indexError?: string | null;
+};
+
+export type RepoIndexState =
+  | "none"      // never indexed (legacy / pre-migration rows)
+  | "queued"    // build job sitting on the index queue
+  | "indexing"  // worker is actively walking the tree
+  | "ready"     // index is up-to-date as of indexedAt
+  | "stale"     // PR merged; awaiting incremental refresh
+  | "errored";
+
+export type RepoIndexEntry = {
+  id: string;
+  repoId: string;            // FK -> Repository.id
+  path: string;              // "backend/src/review/pipeline.ts"
+  sha: string;               // blob SHA from git tree — sha-keyed cache
+  size: number;
+  language: string;          // derived from extension ("ts", "tsx", "py", ...)
+  summary: string;           // 2-4 sentence Haiku summary
+  exports: string[];         // top-level symbol names (function/class/const)
+  imports: string[];         // module specifiers as written
+  securityFlags: string[];   // free-form tags ("reads-env", "raw-sql", ...)
+  indexedAt: number;
+  model: string;             // model that produced this entry
 };
 
 export type IntegrationType = "slack" | "linear" | "discord";
@@ -83,6 +113,11 @@ export type PRReview = {
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;
+  // Diff stats from GitHub. Populated on review materialization and refreshed
+  // by the pipeline; may be null until we've fetched the full PR object.
+  additions: number | null;
+  deletions: number | null;
+  changedFiles: number | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -94,7 +129,8 @@ export type ReviewLogKind =
   | "tool"
   | "comment"
   | "verdict"
-  | "error";
+  | "error"
+  | "holistic";
 
 export type ReviewLogEntry = {
   id: string;
@@ -140,4 +176,5 @@ export type DB = {
   reviewLogs: ReviewLogEntry[];
   subscriptions: Subscription[];
   authAudit: AuthAuditEntry[];
+  repoIndex: RepoIndexEntry[];
 };

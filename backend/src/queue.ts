@@ -1,5 +1,7 @@
 // In-memory job queue. Stand-in for Cloud Tasks / Pub-Sub in dev.
-// One worker drains it sequentially; that's enough for local dev.
+// Two parallel pending lists (reviews + index) drained round-robin so a long
+// initial repo-index build can't starve PR reviews. The shape survives a
+// future move to two real queues backed by separate topics.
 
 import { v4 as uuid } from "uuid";
 
@@ -27,9 +29,28 @@ export type MaintainerFeedbackJob = {
   attempts: number;
 };
 
-export type Job = ReviewJob | MaintainerFeedbackJob;
+export type IndexJobPayload = {
+  repoId: string;
+  full: boolean;
+  changedPaths?: {
+    added: string[];
+    modified: string[];
+    removed: string[];
+    renamed: Array<{ from: string; to: string }>;
+  };
+};
 
-const pending: Job[] = [];
+export type IndexJob = {
+  id: string;
+  type: "index";
+  payload: IndexJobPayload;
+  enqueuedAt: number;
+  attempts: number;
+};
+
+export type Job = ReviewJob | MaintainerFeedbackJob | IndexJob;
+
+const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
 
 export function enqueueReview(reviewId: string): ReviewJob {
@@ -40,8 +61,7 @@ export function enqueueReview(reviewId: string): ReviewJob {
     enqueuedAt: Date.now(),
     attempts: 0,
   };
-  pending.push(job);
-  // Notify the worker on next tick so the producer's response can return first.
+  pending.reviews.push(job);
   process.nextTick(notify);
   return job;
 }
@@ -57,7 +77,20 @@ export function enqueueMaintainerFeedback(
     enqueuedAt: Date.now(),
     attempts: 0,
   };
-  pending.push(job);
+  pending.reviews.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueIndex(payload: IndexJobPayload): IndexJob {
+  const job: IndexJob = {
+    id: uuid(),
+    type: "index",
+    payload,
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.index.push(job);
   process.nextTick(notify);
   return job;
 }
@@ -71,15 +104,34 @@ let draining = false;
 async function notify() {
   if (draining || subscribers.length === 0) return;
   draining = true;
+  // Round-robin: take one review-bucket job, then one index-bucket job,
+  // repeat until both empty. Reviews come first inside a round so a freshly
+  // enqueued review never sits behind an index batch.
   try {
-    while (pending.length > 0) {
-      const job = pending.shift()!;
+    while (pending.reviews.length > 0 || pending.index.length > 0) {
+      const job = pending.reviews.shift() || pending.index.shift();
+      if (!job) break;
       job.attempts += 1;
       for (const sub of subscribers) {
         try {
           await sub(job);
         } catch (err) {
           console.error("[queue] subscriber error", err);
+        }
+      }
+      // If both buckets have work, alternate by also draining one from the
+      // other side this round before looping.
+      if (pending.reviews.length > 0 && pending.index.length > 0) {
+        const partner = job.type === "index" ? pending.reviews.shift() : pending.index.shift();
+        if (partner) {
+          partner.attempts += 1;
+          for (const sub of subscribers) {
+            try {
+              await sub(partner);
+            } catch (err) {
+              console.error("[queue] subscriber error", err);
+            }
+          }
         }
       }
     }
@@ -89,5 +141,10 @@ async function notify() {
 }
 
 export function queueSnapshot() {
-  return { pending: pending.length, subscribers: subscribers.length };
+  return {
+    pending: pending.reviews.length + pending.index.length,
+    reviews: pending.reviews.length,
+    index: pending.index.length,
+    subscribers: subscribers.length,
+  };
 }
