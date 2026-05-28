@@ -130,7 +130,8 @@ export type ReviewLogKind =
   | "comment"
   | "verdict"
   | "error"
-  | "holistic";
+  | "holistic"
+  | "finding";
 
 export type ReviewLogEntry = {
   id: string;

@@ -10,7 +10,7 @@ import { gh } from "../github/app.js";
 import { complete, detectVideoProvider, summarizeVideo, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { config } from "../config.js";
-import type { MaintainerComment } from "../queue.js";
+import { enqueueReview, type MaintainerComment } from "../queue.js";
 import type { Criterion, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
@@ -30,6 +30,51 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
   return db.update("prReviews", (r) => r.id === reviewId, {
     ...patch,
     updatedAt: Date.now(),
+  });
+}
+
+// Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
+// on kind === "finding") and avoids extending the PRReview shape.
+type FindingCategory = "regression" | "criticalError" | "security" | "suggestion";
+
+function emitFindingLog(
+  reviewId: string,
+  category: Exclude<FindingCategory, "suggestion">,
+  finding: { path?: string; concern: string; severity: "blocker" | "warn"; fixPrompt?: string }
+) {
+  const titleByCategory: Record<typeof category, string> = {
+    regression: "Possible regression",
+    criticalError: "Critical error",
+    security: "Security finding",
+  };
+  log(reviewId, "finding", titleByCategory[category], {
+    detail: finding.concern,
+    meta: {
+      category,
+      severity: finding.severity,
+      ...(finding.path ? { path: finding.path } : {}),
+      title: titleByCategory[category],
+      body: finding.concern,
+      ...(finding.fixPrompt ? { fixPrompt: finding.fixPrompt } : {}),
+    },
+  });
+}
+
+function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
+  // Compose a body that includes rationale and (optionally) the codeExample so
+  // the timeline shows the same information the GitHub PR body does.
+  const bodyParts = [s.rationale];
+  if (s.codeExample) bodyParts.push("```\n" + s.codeExample + "\n```");
+  log(reviewId, "finding", s.title || "Suggested change", {
+    detail: s.rationale,
+    meta: {
+      category: "suggestion" as FindingCategory,
+      severity: "warn" as const,
+      criterionId: s.criterionId,
+      title: s.title,
+      body: bodyParts.join("\n\n"),
+      ...(s.fixPrompt ? { fixPrompt: s.fixPrompt } : {}),
+    },
   });
 }
 
@@ -166,7 +211,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
           },
         }
       );
+      // Emit one log row per finding so the frontend can render a copyable
+      // fix prompt next to each item. Categories let the timeline branch on
+      // severity styling without re-parsing the holistic JSON.
+      for (const f of holisticVerdict.regressions) emitFindingLog(review.id, "regression", f);
+      for (const f of holisticVerdict.criticalErrors) emitFindingLog(review.id, "criticalError", f);
+      for (const f of holisticVerdict.securityFindings) emitFindingLog(review.id, "security", f);
     }
+    // Per-criterion suggestions land as findings too — same UI affordance, so
+    // a user with one unmet criterion gets a copyable prompt to fix it.
+    for (const s of verdict.suggestions) emitSuggestionLog(review.id, s);
 
     const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
     setStatus(review.id, {
@@ -569,6 +623,10 @@ type ReviewSuggestion = {
   title: string;
   rationale: string;
   codeExample?: string;
+  // Self-contained prompt the user can paste into an external AI coding agent
+  // (Cursor / Claude Code / Codex) to land the fix. Includes the relevant
+  // diff hunk inline so the prompt is actionable without repo access.
+  fixPrompt?: string;
 };
 
 async function reviewDiff(
@@ -586,12 +644,25 @@ async function reviewDiff(
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
     "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string}], " +
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
-    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string}]}. " +
+    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
     "For every unmet criterion, include one suggestion describing the smallest practical patch the developer " +
     "could ship in a follow-up commit; prefer best-practice idioms already used in the diff. " +
     "`codeExample` is optional and must be a minimal snippet, never a full file. " +
-    "Inline `comments` annotate specific diff lines; only emit them when the comment ties to a concrete line.";
+    "Inline `comments` annotate specific diff lines; only emit them when the comment ties to a concrete line. " +
+    // fixPrompt: a copy-pasteable prompt for an external AI coding agent
+    // (Cursor / Claude Code / Codex). Self-contained — must include the
+    // relevant diff hunk verbatim so the user's agent can act without repo
+    // access. Strict template:
+    "Each suggestion MUST include a `fixPrompt` string the user can paste into another AI coding agent. " +
+    "Use this exact template (preserve newlines and the inner ```diff fence):\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Suggested approach:\n<concrete steps to fix>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk.";
   const userText =
     `# Criteria\n${criteria.map((c) => `- ${c.id}: ${c.text}`).join("\n")}\n\n` +
     `# Diff\n\`\`\`diff\n${context.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
@@ -622,6 +693,7 @@ async function reviewDiff(
       title: String(s.title || ""),
       rationale: String(s.rationale || ""),
       codeExample: s.codeExample ? String(s.codeExample) : undefined,
+      fixPrompt: s.fixPrompt ? String(s.fixPrompt) : undefined,
     })),
   };
 }
@@ -635,21 +707,39 @@ function formatReviewBody(
   filledCriteria: Criterion[],
   suggestions: ReviewSuggestion[],
   summary: string,
-  holistic: HolisticVerdict = EMPTY_HOLISTIC
+  holistic: HolisticVerdict = EMPTY_HOLISTIC,
+  context?: { prTitle: string; repoFullName: string }
 ): string {
   const lines: string[] = [];
   if (endGoal) {
     lines.push("## End goal", endGoal, "");
   }
-  if (filledCriteria.length) {
-    lines.push("## Acceptance criteria");
-    for (const c of filledCriteria) {
-      const box = c.met === true ? "[x]" : "[ ]";
-      lines.push(`- ${box} **${c.id}** — ${c.text}`);
-      if (c.evidence) lines.push(`  _Evidence:_ ${c.evidence}`);
+
+  // Split the criteria into two labeled sections instead of one mixed
+  // task list. The single `[x]`/`[ ]` list reads as "status"; the split
+  // makes failures the dominant signal at the top of the comment so the
+  // developer sees what they have to fix at a glance.
+  const unmet = filledCriteria.filter((c) => c.met !== true);
+  const met = filledCriteria.filter((c) => c.met === true);
+  if (unmet.length) {
+    lines.push("## ❌ Acceptance criteria not met");
+    for (const c of unmet) {
+      lines.push(`- **${c.id}** — ${c.text}`);
+      if (c.evidence) lines.push(`  _Why it failed:_ ${c.evidence}`);
     }
     lines.push("");
   }
+  if (met.length) {
+    const header = unmet.length === 0
+      ? `## ✅ Acceptance criteria met (all ${met.length} met)`
+      : `## ✅ Acceptance criteria met (${met.length} / ${filledCriteria.length})`;
+    lines.push(header);
+    for (const c of met) {
+      lines.push(`- **${c.id}** — ${c.text}`);
+    }
+    lines.push("");
+  }
+
   if (suggestions.length) {
     lines.push("## Suggested changes");
     for (const s of suggestions) {
@@ -661,6 +751,7 @@ function formatReviewBody(
       if (s.codeExample) {
         lines.push("", "```", s.codeExample, "```");
       }
+      appendFixPrompt(lines, s.fixPrompt);
       lines.push("");
     }
   }
@@ -677,7 +768,122 @@ function formatReviewBody(
   if (summary) {
     lines.push("---", summary);
   }
+
+  // Consolidated "fix everything in one paste" prompt for an external AI
+  // coding agent (Claude Code, Cursor, Aider, Codex). Only included when
+  // there's anything to fix — at least one unmet criterion or one
+  // blocker-severity holistic finding. The per-suggestion fixPrompts above
+  // stay too, for users who want to fix one item at a time.
+  //
+  // The outer fence uses 6 backticks so per-suggestion fixPrompts (which
+  // themselves contain ```diff fences) don't accidentally close it. GitHub
+  // renders 4+-backtick fences as code blocks with a copy button, so the
+  // user gets one-click copy of the whole prompt.
+  const blockerHolistic = [
+    ...holistic.regressions,
+    ...holistic.criticalErrors,
+    ...holistic.securityFindings,
+  ].filter((f) => f.severity === "blocker");
+  if (context && (unmet.length > 0 || blockerHolistic.length > 0)) {
+    const prompt = buildConsolidatedFixPrompt({
+      prTitle: context.prTitle,
+      repoFullName: context.repoFullName,
+      endGoal,
+      unmetCriteria: unmet,
+      suggestions,
+      blockerHolistic,
+    });
+    lines.push("");
+    lines.push("---");
+    lines.push("");
+    lines.push("<details>");
+    lines.push("<summary>📋 One prompt to fix all of this — paste into your AI coding agent</summary>");
+    lines.push("");
+    lines.push("``````");
+    lines.push(prompt);
+    lines.push("``````");
+    lines.push("");
+    lines.push("</details>");
+  }
+
   return lines.join("\n").trim() || "DevAsign review.";
+}
+
+// Compose a single self-contained prompt the developer can paste once into
+// an external AI coding agent to fix the whole PR. Reuses the per-suggestion
+// `fixPrompt`s the LLM already produces (each carries File / Symbol / Issue
+// / Suggested approach / Relevant diff) so we incur no extra LLM cost; this
+// is pure string composition.
+function buildConsolidatedFixPrompt(args: {
+  prTitle: string;
+  repoFullName: string;
+  endGoal: string;
+  unmetCriteria: Criterion[];
+  suggestions: ReviewSuggestion[];
+  blockerHolistic: HolisticFinding[];
+}): string {
+  const { prTitle, repoFullName, endGoal, unmetCriteria, suggestions, blockerHolistic } = args;
+  const lines: string[] = [];
+  lines.push(`You are helping fix PR "${prTitle}" in ${repoFullName}. Automated review flagged the items below as blocking approval. Apply the changes so each one passes — don't introduce changes beyond what's listed.`);
+  lines.push("");
+  if (endGoal) {
+    lines.push("## End goal");
+    lines.push(endGoal);
+    lines.push("");
+  }
+  if (unmetCriteria.length) {
+    lines.push("## Failed acceptance criteria");
+    lines.push("");
+    unmetCriteria.forEach((c, i) => {
+      lines.push(`### ${i + 1}. ${c.text} (${c.id})`);
+      if (c.evidence) {
+        lines.push(`_Why it failed:_ ${c.evidence}`);
+      }
+      lines.push("");
+      const relevant = suggestions.filter((s) => s.criterionId === c.id);
+      if (relevant.length === 0) {
+        lines.push("_(No specific patch was suggested for this criterion — use the criterion text and evidence above to plan the fix.)_");
+        lines.push("");
+      } else {
+        for (const s of relevant) {
+          if (s.fixPrompt) {
+            // The per-suggestion fixPrompt is already a complete block
+            // (File / Symbol / Issue / Suggested approach / Relevant diff).
+            // Drop it in verbatim — nothing to reformat.
+            lines.push(s.fixPrompt);
+          } else {
+            // Older suggestions without a fixPrompt: synthesise something
+            // usable from the fields we do have.
+            lines.push(`**${s.title}**`);
+            if (s.rationale) lines.push(s.rationale);
+            if (s.codeExample) {
+              lines.push("");
+              lines.push("```");
+              lines.push(s.codeExample);
+              lines.push("```");
+            }
+          }
+          lines.push("");
+        }
+      }
+    });
+  }
+  if (blockerHolistic.length) {
+    lines.push("## Repo-wide blockers (must also be addressed)");
+    lines.push("");
+    blockerHolistic.forEach((f, i) => {
+      const where = f.path ? `\`${f.path}\` — ` : "";
+      lines.push(`### ${i + 1}. ${where}${f.concern}`);
+      lines.push("");
+      if (f.fixPrompt) {
+        lines.push(f.fixPrompt);
+      }
+      lines.push("");
+    });
+  }
+  lines.push("## Your task");
+  lines.push("For each failed criterion and blocker above, apply the suggested fix. Use the `Relevant diff` hunks as the anchor for where to make the change. After each change, re-verify it satisfies the criterion or addresses the blocker it's tied to.");
+  return lines.join("\n").trimEnd();
 }
 
 function appendHolisticGroup(
@@ -691,8 +897,24 @@ function appendHolisticGroup(
     const sev = f.severity === "blocker" ? "🚫 **Blocker**" : "⚠️ Warn";
     const where = f.path ? `\`${f.path}\` — ` : "";
     lines.push(`- ${sev} — ${where}${f.concern}`);
+    appendFixPrompt(lines, f.fixPrompt, /* indented */ true);
   }
   lines.push("");
+}
+
+// Renders the per-finding "prompt for your AI agent" block. The prompt sits in
+// a top-level ``` fence so GitHub's built-in code-block copy button picks it
+// up — no client-side wiring needed for the GitHub surface. The optional
+// indent variant keeps list-rendered findings (holistic) readable.
+function appendFixPrompt(lines: string[], fixPrompt: string | undefined, indented = false) {
+  if (!fixPrompt) return;
+  const pad = indented ? "  " : "";
+  lines.push("");
+  lines.push(`${pad}**Prompt for your AI agent:**`);
+  lines.push("");
+  lines.push(`${pad}\`\`\``);
+  for (const ln of fixPrompt.split("\n")) lines.push(`${pad}${ln}`);
+  lines.push(`${pad}\`\`\``);
 }
 
 // GitHub rejects an entire review batch if any inline comment references a
@@ -728,7 +950,14 @@ async function postGithubOutput(
 ) {
   if (!install) return; // dev: nothing to post to
   const conclusion = status === "passed" ? "success" : "action_required";
-  const body = formatReviewBody(args.endGoal, args.criteria, args.suggestions, args.summary, args.holistic);
+  const body = formatReviewBody(
+    args.endGoal,
+    args.criteria,
+    args.suggestions,
+    args.summary,
+    args.holistic,
+    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}` }
+  );
 
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
@@ -1154,7 +1383,11 @@ export async function runMaintainerFeedbackJob(
   if (!repo) return;
   const install = db.find("installations", (i) => i.id === repo.installationId);
 
-  log(review.id, "ingest", "Maintainer feedback received", {
+  // The "comment arrived" log is written synchronously by the webhook
+  // handler so the Agent page surfaces the comment before this job even
+  // dequeues. Here we mark the start of the analysis phase — the brain
+  // icon on `criteria` reads as "the agent is thinking" in the timeline.
+  log(review.id, "criteria", "Analyzing maintainer comment for product-aligned changes", {
     target: comment.sourceUrl,
     detail: `${comment.author} (${comment.authorAssociation}): ${comment.body.slice(0, 240)}`,
     meta: { sourceEvent: comment.sourceEvent },
@@ -1222,10 +1455,20 @@ export async function runMaintainerFeedbackJob(
     if (task) {
       db.update("tasks", (t) => t.id === task.id, { endGoal: refined.endGoal });
     }
-    setStatus(review.id, { criteria: refined.criteria });
+    // The bar moved: new criteria came in from the maintainer's comment.
+    // Flip the visible status to `changes_requested` so a PR that read as
+    // "passed" no longer reads as approved while the developer hasn't had
+    // a chance to implement the new requirement yet. Re-enqueue a full
+    // review so the diff is re-checked against the updated criteria and a
+    // fresh REQUEST_CHANGES review lands on the GitHub PR.
+    setStatus(review.id, {
+      criteria: refined.criteria,
+      status: "changes_requested",
+    });
+    enqueueReview(review.id);
     log(review.id, "criteria", "End goal updated from maintainer feedback", {
       detail: refined.rationale || refined.endGoal,
-      meta: { count: refined.criteria.length },
+      meta: { count: refined.criteria.length, statusGated: true },
     });
   } else {
     log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
@@ -1335,6 +1578,9 @@ type HolisticFinding = {
   path?: string;
   concern: string;
   severity: "blocker" | "warn";
+  // Self-contained prompt the user can paste into an external AI coding agent
+  // to land the fix. Includes the relevant diff hunk inline.
+  fixPrompt?: string;
 };
 
 type HolisticVerdict = {
@@ -1431,14 +1677,26 @@ async function reviewAgainstRepo(args: {
     "You are DevAsign's holistic repo-review step. Given (1) a PR diff, (2) summaries of the files the PR touches, " +
     "(3) summaries of files that depend on the touched files, and (4) a manifest of the rest of the repo, decide " +
     "whether the PR introduces regressions, critical errors, or security flaws beyond what the acceptance criteria covered. " +
-    'Emit ONLY JSON: {"regressions": [{"path": string, "concern": string, "severity": "blocker"|"warn"}], ' +
-    '"criticalErrors": [{"path": string?, "concern": string, "severity": "blocker"|"warn"}], ' +
-    '"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn"}], ' +
+    'Emit ONLY JSON: {"regressions": [{"path": string, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
+    '"criticalErrors": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
+    '"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
     '"summary": string}. ' +
     'Use severity="blocker" only when an issue would clearly break a feature, corrupt state, or expose data. ' +
     'Use severity="warn" for plausible concerns that need human eyes. ' +
     "Never invent risks the diff doesn't actually create. Quote symbol names or paths from the provided summaries when you cite a concern. " +
-    "When nothing material surfaces, return empty arrays — do not pad.";
+    "When nothing material surfaces, return empty arrays — do not pad. " +
+    // Every finding must carry a copy-pasteable fixPrompt for the user's
+    // external AI coding agent. Use this exact template (preserve newlines
+    // and the inner ```diff fence):
+    "Each finding MUST include a `fixPrompt` string the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
+    "Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Suggested approach:\n<concrete steps to fix>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding genuinely doesn't map to a hunk in the PR diff.";
 
   const touchedBlock = holistic.entries.slice(0, holistic.touchedCount)
     .map((e) =>
@@ -1490,10 +1748,12 @@ function normaliseFindings(input: unknown): HolisticFinding[] {
     if (!concern) continue;
     const sev = (item as any).severity === "blocker" ? "blocker" : "warn";
     const path = (item as any).path;
+    const fixPrompt = (item as any).fixPrompt;
     out.push({
       concern,
       severity: sev,
       ...(typeof path === "string" && path ? { path } : {}),
+      ...(typeof fixPrompt === "string" && fixPrompt ? { fixPrompt } : {}),
     });
   }
   return out;

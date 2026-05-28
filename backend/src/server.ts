@@ -74,12 +74,60 @@ app.listen(port, () => {
   // first thing to verify is that the matching event here is also subscribed
   // in the GitHub App's settings on github.com → Permissions & events.
   console.log(
-    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, ping`
+    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, ping`
   );
+  // Self-diagnose: ask GitHub which events the App is actually configured to
+  // deliver. A common failure mode is the handler being ready while the App
+  // is missing a subscription — comments then vanish silently. Loud-warn on
+  // any gap so the user fixes it before it bites them.
+  void verifyAppEventSubscriptions();
 });
 
 startWorker();
 backfillRepoIndex();
+
+// Cross-check the App's actual webhook event subscriptions against what we
+// need to handle the full review surface. Soft-fail on network errors so a
+// transient GitHub blip can't take startup down.
+const REQUIRED_APP_EVENTS = [
+  "pull_request",
+  "issue_comment",
+  "pull_request_review",
+  "pull_request_review_comment",
+];
+async function verifyAppEventSubscriptions(): Promise<void> {
+  const name = config.github.appName;
+  if (!name) return;
+  try {
+    const resp = await fetch(`https://api.github.com/apps/${name}`, {
+      headers: {
+        Accept: "application/vnd.github+json",
+        "User-Agent": "devasign-app",
+      },
+    });
+    if (!resp.ok) {
+      console.warn(`[startup] couldn't query App "${name}" subscriptions: HTTP ${resp.status}`);
+      return;
+    }
+    const data = (await resp.json()) as { events?: string[] };
+    const events = Array.isArray(data.events) ? data.events : [];
+    const missing = REQUIRED_APP_EVENTS.filter((e) => !events.includes(e));
+    if (missing.length === 0) {
+      console.log(`  · App events: ${events.join(", ")} (all required ✓)`);
+      return;
+    }
+    console.warn("");
+    console.warn(`⚠  GitHub App "${name}" is missing webhook event subscriptions:`);
+    for (const e of missing) console.warn(`     · ${e}`);
+    console.warn(`   Without these, the matching webhooks never reach this server`);
+    console.warn(`   (the handlers will look correct but never fire). Visit:`);
+    console.warn(`     https://github.com/settings/apps/${name}/permissions`);
+    console.warn(`   and check the boxes under "Subscribe to events".`);
+    console.warn("");
+  } catch (err) {
+    console.warn(`[startup] couldn't query App "${name}" subscriptions:`, err);
+  }
+}
 
 // Existing repositories may pre-date the indexer. Walk them at boot and
 // enqueue a full build for any that have never been indexed, throttled so a
