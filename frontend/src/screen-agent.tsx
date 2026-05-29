@@ -498,6 +498,8 @@ const FINDING_LABEL = {
   regression: "Regression",
   criticalError: "Critical error",
   security: "Security finding",
+  consistency: "Consistency",
+  deferral: "Deferred work",
   suggestion: "Suggested change",
 };
 

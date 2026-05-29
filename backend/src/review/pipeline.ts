@@ -36,7 +36,7 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
 
 // Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
 // on kind === "finding") and avoids extending the PRReview shape.
-type FindingCategory = "regression" | "criticalError" | "security" | "suggestion";
+type FindingCategory = "regression" | "criticalError" | "security" | "consistency" | "deferral" | "suggestion";
 
 function emitFindingLog(
   reviewId: string,
@@ -47,6 +47,8 @@ function emitFindingLog(
     regression: "Possible regression",
     criticalError: "Critical error",
     security: "Security finding",
+    consistency: "Consistency deviation",
+    deferral: "Deferred / incomplete work",
   };
   log(reviewId, "finding", titleByCategory[category], {
     detail: finding.concern,
@@ -243,6 +245,41 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // Per-criterion suggestions land as findings too — same UI affordance, so
     // a user with one unmet criterion gets a copyable prompt to fix it.
     for (const s of verdict.suggestions) emitSuggestionLog(review.id, s);
+
+    // c.2 Deferred-work detection (advisory). Mine the diff's own added comments
+    // for self-admitted punts the coding agent buried instead of surfacing —
+    // TODOs, stubs, "deferred to a follow-up", NotImplemented. A cheap regex
+    // pre-scan gates the LLM call so a clean diff costs nothing. These findings
+    // never gate the merge (forced "warn"); they exist so the author sees the
+    // punt on time. Runs after both the spec'd and spec-less review paths since
+    // an agent can quietly defer work regardless of whether the PR had a spec.
+    const deferralCandidates = scanDeferralCandidates(context.diff);
+    if (deferralCandidates.length) {
+      const promise = buildPromiseText(endGoal || "", filledCriteria, context);
+      const deferrals = await detectDeferredWork({
+        diff: context.diff,
+        promise,
+        candidates: deferralCandidates,
+      });
+      // Spread into a fresh object — holisticVerdict may still be the shared
+      // EMPTY_HOLISTIC const (spec'd PR with no repo index), which must not be
+      // mutated. formatReviewBody reads deferrals off the verdict below.
+      holisticVerdict = { ...holisticVerdict, deferrals };
+      for (const f of deferrals) emitFindingLog(review.id, "deferral", f);
+      log(
+        review.id,
+        "holistic",
+        deferrals.length
+          ? `Found ${deferrals.length} self-admitted deferral(s)`
+          : "Scanned for deferred/incomplete work — none material",
+        {
+          detail: deferrals.length
+            ? "The diff concedes work was deferred or stubbed — see findings."
+            : `${deferralCandidates.length} marker(s) scanned; none was a real scope cut.`,
+          meta: { candidates: deferralCandidates.length, deferrals: deferrals.length },
+        }
+      );
+    }
 
     const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
     setStatus(review.id, {
@@ -884,6 +921,22 @@ function formatReviewBody(
     for (const c of met) {
       lines.push(`- **${c.id}** — ${c.text}`);
     }
+    lines.push("");
+  }
+
+  // Self-admitted deferred / incomplete work the diff's own comments concede.
+  // Advisory (never blocks the merge) but surfaced prominently right under the
+  // criteria — this is the "the agent quietly punted part of the design" signal
+  // the author needs to see before merging. Rendered for both spec'd and
+  // spec-less PRs; each item carries its own copyable fix prompt.
+  if (holistic.deferrals.length) {
+    lines.push("## 🕓 Deferred / incomplete work");
+    lines.push(
+      "The diff's own comments concede that parts were deferred, stubbed, or only partially implemented. " +
+        "These don't block the merge — confirm each was intentional, or use the prompt to finish it:",
+      ""
+    );
+    appendHolisticGroup(lines, "Deferred", holistic.deferrals);
     lines.push("");
   }
 
@@ -1802,6 +1855,16 @@ type HolisticVerdict = {
   regressions: HolisticFinding[];
   criticalErrors: HolisticFinding[];
   securityFindings: HolisticFinding[];
+  // Populated only by the spec-less pass (reviewSpeclessPR): concrete
+  // deviations from how the rest of the codebase / recent merged PRs are
+  // written. Advisory — never blocks a merge. Empty for spec'd reviews.
+  consistencyFindings: HolisticFinding[];
+  // Self-admitted "deferred / incomplete work" the diff's own comments concede
+  // — TODOs, stubs, "for now", "deferred to a follow-up", NotImplemented, etc.
+  // Detected by a separate regex-gated pass (detectDeferredWork) on both the
+  // spec'd and spec-less paths. Advisory — surfaced prominently but never
+  // blocks a merge (forced severity "warn"), like consistencyFindings.
+  deferrals: HolisticFinding[];
   summary: string;
 };
 
@@ -1809,6 +1872,8 @@ const EMPTY_HOLISTIC: HolisticVerdict = {
   regressions: [],
   criticalErrors: [],
   securityFindings: [],
+  consistencyFindings: [],
+  deferrals: [],
   summary: "",
 };
 
@@ -1973,4 +2038,299 @@ function normaliseFindings(input: unknown): HolisticFinding[] {
     });
   }
   return out;
+}
+
+// ─── Deferred / incomplete-work detection ──────────────────────────────────
+//
+// The complaint this addresses: a coding agent agrees to a design, then during
+// implementation quietly punts part of it and buries the admission in a code
+// comment ("deferred to a follow-up", a TODO, a stub) instead of telling the
+// author. We mine the diff's own *added* lines for those self-admissions, then
+// — only if any surface — ask the model which ones are a real gap against what
+// the PR promised. Advisory: findings never gate the merge; they just need to
+// be seen on time.
+
+type DeferralCandidate = { path: string; lineText: string; marker: string };
+
+// Case-insensitive markers that betray a self-admitted punt in added code.
+// Tuned for recall on the agent's own words; detectDeferredWork is the
+// precision filter that drops benign matches (an unrelated pre-existing TODO, a
+// marker inside a logging string, a stray "pending" in prose).
+const DEFERRAL_MARKERS: RegExp[] = [
+  /\bTODO\b/i,
+  /\bFIXME\b/i,
+  /\bHACK\b/i,
+  /\bXXX\b/,
+  /not[\s_-]?implemented/i,
+  /\bunimplemented\b/i,
+  /NotImplemented(?:Error|Exception)?/,
+  /\bfor now\b/i,
+  /\bfor the (?:time being|moment)\b/i,
+  /\bin the future\b/i,
+  /\bfuture work\b/i,
+  /\bfollow[\s-]?up\b/i,
+  /\bdefer(?:red|ring|s)?\b/i,
+  /\bplaceholder\b/i,
+  /\bstub(?:bed|s)?\b/i,
+  /\btemporar(?:y|ily)\b/i,
+  /\bout of scope\b/i,
+  /\brevisit\b/i,
+  /(?:won['’]t|will not|doesn['’]t|does not|can['’]t|cannot)\s+(?:yet\s+)?(?:support|handle|implement)/i,
+  /\bcurrently (?:only|does not|doesn['’]t)\b/i,
+  /\bwill (?:be )?(?:add|implement|support|handl)/i,
+  /\bleft as (?:an )?exercise\b/i,
+  /\bpending\b/i,
+  /\bpartial(?:ly)?\s+(?:implement|support)/i,
+  /\bnot (?:yet )?(?:done|handled|supported|implemented)\b/i,
+];
+
+const DEFERRAL_CANDIDATE_CAP = 40;
+
+// Pure pre-scan: walk the unified diff's *added* lines (tracking the file each
+// hunk belongs to) and collect the ones that trip a deferral marker. Exported
+// so it can be unit-tested without an LLM round-trip.
+export function scanDeferralCandidates(diff: string): DeferralCandidate[] {
+  const out: DeferralCandidate[] = [];
+  let currentPath = "";
+  for (const raw of diff.split("\n")) {
+    // "+++ b/path" is the post-image path for the following hunk; "+++ /dev/null"
+    // marks a deletion (currentPath stays whatever it was — we skip its lines
+    // below since deletions have no added content).
+    const header = raw.match(/^\+\+\+ b\/(.+)$/);
+    if (header) {
+      currentPath = header[1].trim();
+      continue;
+    }
+    // Added lines only: a single leading "+", not the "+++" file header.
+    if (raw[0] !== "+" || raw.startsWith("+++")) continue;
+    const added = raw.slice(1);
+    const hit = DEFERRAL_MARKERS.find((re) => re.test(added));
+    if (!hit) continue;
+    out.push({
+      path: currentPath,
+      lineText: added.trim().slice(0, 200),
+      marker: (added.match(hit)?.[0] || "").trim(),
+    });
+    if (out.length >= DEFERRAL_CANDIDATE_CAP) break;
+  }
+  return out;
+}
+
+// Assemble "what the PR promised" — the yardstick each self-admitted deferral is
+// measured against: the end goal, the acceptance criteria, and the PR/issue
+// description text already ingested into the context.
+function buildPromiseText(endGoal: string, criteria: Criterion[], context: Context): string {
+  const parts: string[] = [];
+  if (endGoal && endGoal !== NEUTRAL_ENDGOAL) parts.push(`## End goal\n${endGoal}`);
+  if (criteria.length) {
+    parts.push(`## Acceptance criteria\n${criteria.map((c) => `- ${c.id}: ${c.text}`).join("\n")}`);
+  }
+  const promiseSources = context.sources.filter(
+    (s) => s.kind === "github_pr" || s.kind === "github_issue_primary" || s.kind === "github_issue"
+  );
+  for (const s of promiseSources.slice(0, 4)) {
+    parts.push(`## ${s.kind} (${s.ref})\n${s.text.slice(0, 2000)}`);
+  }
+  return parts.join("\n\n");
+}
+
+// Regex-gated LLM pass. Given what the PR promised and the candidate marker
+// lines from the pre-scan, decide which candidates are genuine self-admitted
+// deferrals/scope-cuts and whether each contradicts the promise. Returns
+// advisory findings (severity forced to "warn" so they never gate the merge,
+// mirroring how reviewSpeclessPR treats consistencyFindings). Exported for
+// testing alongside scanDeferralCandidates.
+export async function detectDeferredWork(args: {
+  diff: string;
+  promise: string;
+  candidates: DeferralCandidate[];
+}): Promise<HolisticFinding[]> {
+  const { diff, promise, candidates } = args;
+  if (!candidates.length) return [];
+
+  const system =
+    "You are DevAsign's deferred-work detection step. A coding agent often agrees to a design, then during " +
+    "implementation quietly punts part of it — leaving the admission in a code comment (a TODO, a stub, " +
+    '"for now", "deferred to a follow-up", NotImplemented) instead of telling the author. Your job is to catch ' +
+    "those self-admissions in the PR's OWN added lines and surface them.\n" +
+    "You are given: (1) what the PR promised (end goal, acceptance criteria, and PR/issue description); (2) the " +
+    "diff; (3) candidate marker lines the pre-scan flagged in the added code. For each candidate, decide whether " +
+    "it genuinely concedes that something was deferred, stubbed, only partially implemented, or left unhandled. " +
+    "Keep only the real ones — drop benign matches (an unrelated pre-existing TODO, a marker inside a logging " +
+    'string or test fixture, a word like "pending" used in normal prose). Never invent a deferral the diff does ' +
+    "not actually state.\n" +
+    "In each finding's `concern`, START with either `Contradicts <the criterion id / 'end goal' / 'PR " +
+    "description'>` when the punt undercuts something the PR promised, or `Incidental` when it does not — then a " +
+    "colon, a short explanation, and the offending comment quoted verbatim.\n" +
+    'Emit ONLY JSON: {"deferrals": [{"path": string?, "concern": string, "fixPrompt": string}], "summary": string}. ' +
+    "Return an empty array when none of the candidates is a real, material deferral — prefer empty over padding. " +
+    "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
+    "Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentences: what was deferred and what it undercuts>\n\n" +
+    "Suggested approach:\n<concrete steps to actually implement the deferred part>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.";
+
+  const candidateBlock = candidates
+    .map((c, i) => `${i + 1}. ${c.path || "(unknown file)"} — \`${c.lineText}\``)
+    .join("\n");
+
+  const userText =
+    `# What this PR promised\n${promise || "(no explicit promise on record — compare against the PR's apparent intent)"}\n\n` +
+    `# Candidate self-admissions found in the added code\n${candidateBlock}\n\n` +
+    `# Diff\n\`\`\`diff\n${diff.slice(0, 40_000)}\n\`\`\``;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1500,
+  });
+  const parsed = tryParseJSON<{ deferrals?: unknown }>(raw, { deferrals: [] });
+  // Advisory: force "warn" so a deferral never flips the merge status. The
+  // model's contradiction judgment is preserved in the `concern` prefix.
+  return normaliseFindings(parsed.deferrals).map((f) => ({ ...f, severity: "warn" as const }));
+}
+
+// --- Spec-less review (security + consistency) ---
+//
+// When a PR has no linked issue / spec / attachment there are no acceptance
+// criteria to check. Rather than inventing some or rubber-stamping the PR, we
+// do two concrete things the diff alone supports: (1) a focused security
+// review, and (2) a consistency check against how the rest of the team's code
+// is written. The conventions baseline prefers the repo index; when the index
+// isn't built yet it falls back to a sample of recent merged PRs.
+
+type MergedPRSample = { number: number; title: string; diff: string };
+
+// Pull the diffs of the most recent merged PRs as a convention baseline.
+// Best-effort: returns [] when there's no install or GitHub is unreachable.
+async function listRecentMergedPRDiffs(
+  install: { installationId: number } | null,
+  repo: { owner: string; name: string },
+  opts: { count?: number; excludePr?: number; maxBytes?: number } = {}
+): Promise<MergedPRSample[]> {
+  if (!install) return [];
+  const count = opts.count ?? 5;
+  const maxBytes = opts.maxBytes ?? 6000;
+  let list: any[] = [];
+  try {
+    list = await gh<any[]>(
+      install.installationId,
+      `/repos/${repo.owner}/${repo.name}/pulls?state=closed&sort=updated&direction=desc&per_page=20`
+    );
+  } catch (err) {
+    console.warn("[specless] listing merged PRs failed:", err);
+    return [];
+  }
+  const merged = list
+    .filter((p) => p && p.merged_at && p.number !== opts.excludePr)
+    .slice(0, count);
+  // Fetch each merged PR's diff in parallel — they're independent network
+  // round-trips and we'd otherwise pay 5× the latency for what is the longest
+  // step on the spec-less path.
+  const results = await Promise.all(
+    merged.map(async (pr): Promise<MergedPRSample | null> => {
+      try {
+        const diff = await ghText(
+          install.installationId,
+          `/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
+          { Accept: "application/vnd.github.v3.diff" }
+        );
+        return { number: pr.number, title: String(pr.title || ""), diff: diff.slice(0, maxBytes) };
+      } catch (err) {
+        console.warn(`[specless] diff for merged PR #${pr.number} failed:`, err);
+        return null;
+      }
+    })
+  );
+  return results.filter((r): r is MergedPRSample => r !== null);
+}
+
+async function reviewSpeclessPR(args: {
+  review: PRReview;
+  diff: string;
+  holistic: HolisticContext;
+  priorPRs: MergedPRSample[];
+}): Promise<HolisticVerdict> {
+  const { holistic, priorPRs } = args;
+
+  // Convention baseline: index summaries when available, else merged-PR diffs.
+  const usingIndex = holistic.entries.length > 0 || holistic.manifest.length > 0;
+  const conventionsBlock = usingIndex
+    ? [
+        ...holistic.entries.map(
+          (e) =>
+            `### ${e.path}\n` +
+            `Exports: ${e.exports.join(", ") || "(none)"}\n` +
+            `Imports: ${e.imports.join(", ") || "(none)"}\n` +
+            `Flags: ${e.securityFlags.join(", ") || "(none)"}\n` +
+            `Summary: ${e.summary}`
+        ),
+        ...holistic.manifest.map((m) => `- ${m.path}: ${m.summary}`),
+      ].join("\n\n")
+    : priorPRs
+        .map((p) => `## Merged PR #${p.number} — ${p.title}\n\`\`\`diff\n${p.diff}\n\`\`\``)
+        .join("\n\n");
+  const conventionsLabel = usingIndex
+    ? "how the merged-in codebase is written (repo index summaries)"
+    : "how recent merged PRs in this repo are written (their diffs)";
+
+  const system =
+    "You are DevAsign's spec-less PR review step. This PR has NO linked issue, spec, or attachment, so there are no " +
+    "acceptance criteria. Do two concrete jobs instead, grounded ONLY in the diff:\n" +
+    "1. SECURITY: find real vulnerabilities the diff introduces — injection (SQL/command/template), missing authz/authn, " +
+    "secrets or credentials committed, unsafe deserialization, SSRF, path traversal, XSS, weak crypto, unvalidated input " +
+    "reaching a sink. Only flag issues the diff actually creates; never speculate.\n" +
+    "2. CONSISTENCY: compare the PR against the provided examples of " + conventionsLabel + ". Flag concrete deviations " +
+    "(naming, error handling, logging, module/import structure, test patterns, API shape) where this PR diverges from the " +
+    "established convention. Cite the specific convention you're comparing against. Never invent a rule the examples don't " +
+    "demonstrate, and never flag subjective style.\n" +
+    "Also report any regressions or critical errors the diff plainly introduces.\n" +
+    'Emit ONLY JSON: {"securityFindings": [Finding], "consistencyFindings": [Finding], "regressions": [Finding], ' +
+    '"criticalErrors": [Finding], "summary": string}. ' +
+    'A Finding is {"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}. ' +
+    'severity="blocker" only when an issue would expose data, break a feature, or corrupt state; otherwise "warn". ' +
+    "Consistency findings are advisory — always severity=\"warn\". " +
+    "Return empty arrays when nothing material surfaces — prefer empty over padding. " +
+    "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent. Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Suggested approach:\n<concrete steps to fix>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.";
+
+  const userText =
+    `# PR ${args.review.prTitle}\n\n` +
+    `# Diff under review\n\`\`\`diff\n${args.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    `# Conventions baseline — ${conventionsLabel}\n${conventionsBlock || "(none available)"}`;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1800,
+  });
+  const parsed = tryParseJSON<Partial<HolisticVerdict>>(raw, EMPTY_HOLISTIC);
+  // Force consistency findings to advisory severity regardless of model output.
+  const consistencyFindings = normaliseFindings(parsed.consistencyFindings).map((f) => ({
+    ...f,
+    severity: "warn" as const,
+  }));
+  // Spread EMPTY_HOLISTIC so fields this pass doesn't populate (e.g. deferrals,
+  // which are produced by the separate detectDeferredWork pass) get their
+  // canonical default automatically.
+  return {
+    ...EMPTY_HOLISTIC,
+    regressions: normaliseFindings(parsed.regressions),
+    criticalErrors: normaliseFindings(parsed.criticalErrors),
+    securityFindings: normaliseFindings(parsed.securityFindings),
+    consistencyFindings,
+    summary: String(parsed.summary || ""),
+  };
 }
