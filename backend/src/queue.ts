@@ -10,7 +10,11 @@ export type MaintainerComment = {
   author: string;
   authorAssociation: string;
   sourceUrl: string;
-  sourceEvent: "issue_comment" | "pull_request_review" | "pull_request_review_comment";
+  sourceEvent:
+    | "issue_comment"
+    | "pull_request_review"
+    | "pull_request_review_comment"
+    | "in_app_message";
 };
 
 export type ReviewJob = {

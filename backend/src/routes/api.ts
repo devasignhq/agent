@@ -2,12 +2,18 @@
 import { Router } from "express";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { enqueueIndex, enqueueReview } from "../queue.js";
+import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { getSessionUser } from "../github/oauth.js";
 import { gh } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { detectVideoProvider } from "../llm.js";
+import {
+  markAllRead,
+  notificationsForUser,
+  notifyForReview,
+  unreadCountForUser,
+} from "../notifications.js";
 
 export const api = Router();
 
@@ -385,6 +391,15 @@ api.post("/reviews/sync", async (req, res) => {
         enqueueReview(review.id);
         enqueued++;
       }
+      // App notification: this PR was discovered via a sync (e.g. opened
+      // before the App was installed, or webhook delivery missed). Same
+      // copy as the webhook path so the user sees one consistent message.
+      notifyForReview(
+        review.id,
+        "review",
+        `PR #${pr.number} added to review queue`,
+        `${repo.owner}/${repo.name} — ${pr.title}`
+      );
     }
   }
 
@@ -406,11 +421,15 @@ api.post("/tasks/:id/attachments", (req, res) => {
   if (!task) return void res.status(404).json({ error: "task_not_found" });
   const { kind, url, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
-  const att = { kind, url, note };
-  db.update("tasks", (t) => t.id === task.id, {
-    attachments: [...task.attachments, att],
-    endGoal: null, // invalidate so the next review re-synthesises
-  });
+  const att = { id: uuid(), kind, url, note, createdAt: Date.now() };
+  // Non-text kinds (videos, docs, images, PDFs) genuinely reshape the brief
+  // and warrant a fresh criteria synthesis. Plain text messages from the
+  // composer go through the lighter maintainer-feedback path below, which
+  // decides for itself whether `endGoal` should change.
+  const patch: any = { attachments: [...task.attachments, att] };
+  if (kind !== "text") patch.endGoal = null;
+  db.update("tasks", (t) => t.id === task.id, patch);
+
   // When the user drops a Loom (or any other recognised video link) on a
   // PR-bound task mid-review, post a discrete bug-fix comment to the PR so
   // the developer can act on it immediately, without waiting for the next
@@ -422,7 +441,117 @@ api.post("/tasks/:id/attachments", (req, res) => {
       console.warn("[bugfix] post failed:", err)
     );
   }
+
+  // Text messages from the agent-page composer should re-evaluate the end
+  // goal & acceptance criteria. Reuse the maintainer-feedback flow: same
+  // Opus refinement step, same persistence, same GitHub-comment behaviour.
+  // The only differentiator is `sourceEvent: "in_app_message"` so downstream
+  // logs can tell where the comment originated.
+  if (kind === "text" && typeof note === "string" && note.trim()) {
+    // One task is 1:1 with a review in practice; if the PR was closed and
+    // reopened we may have several, in which case refine the most recently
+    // updated one (the one the user is looking at in the agent page).
+    const reviews = db
+      .filter("prReviews", (r) => r.taskId === task.id)
+      .sort((a, b) => b.updatedAt - a.updatedAt);
+    const review = reviews[0];
+    if (review) {
+      const user = getSessionUser(req);
+      const comment = {
+        body: note.trim(),
+        author: user?.githubLogin || "user",
+        authorAssociation: "OWNER",
+        sourceUrl: "",
+        sourceEvent: "in_app_message" as const,
+      };
+      // Immediate timeline entry so the user sees their message land before
+      // the Opus round-trip resolves. Mirrors the webhook path that logs
+      // `comment.received` on every maintainer-comment ingest.
+      db.insert("reviewLogs", {
+        id: uuid(),
+        reviewId: review.id,
+        kind: "ingest",
+        at: Date.now(),
+        action: "comment.received",
+        target: comment.author,
+        detail: comment.body.slice(0, 240),
+        meta: { sourceEvent: comment.sourceEvent },
+      });
+      enqueueMaintainerFeedback(review.id, comment);
+    }
+  }
+
   res.json({ ok: true, attachment: att });
+});
+
+// Removes an attachment from a task's end-goal. We do more than just splice
+// the array: we also invalidate `task.endGoal` and clear `review.criteria`
+// on any linked PR review, then re-queue the review. That undoes the context
+// (synthesised end goal + per-criterion checks) that this attachment seeded.
+api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const task = db.find("tasks", (t) => t.id === req.params.taskId);
+  if (!task) return void res.status(404).json({ error: "task_not_found" });
+  const removed = task.attachments.find((a) => a.id === req.params.attachmentId);
+  if (!removed) return void res.status(404).json({ error: "attachment_not_found" });
+  const remaining = task.attachments.filter((a) => a.id !== req.params.attachmentId);
+  db.update("tasks", (t) => t.id === task.id, {
+    attachments: remaining,
+    endGoal: null, // force resynthesis without this constraint's context
+  });
+  // Scrub the removed attachment out of persistent video-summary logs so the
+  // frontend's "sources analyzed" list doesn't keep showing a Loom (or other
+  // video link) that the user just dropped. Video logs survive across review
+  // re-runs — the pipeline only summarises newly-seen URLs — so without this
+  // pass the URL would stick around in `meta.videos` forever.
+  const removedUrls = new Set<string>(
+    [removed.url, removed.contentRef].filter((s): s is string => typeof s === "string" && s.length > 0)
+  );
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  if (removedUrls.size > 0) {
+    const linkedReviewIds = new Set(linkedReviews.map((r) => r.id));
+    const videoLogs = db.filter("reviewLogs", (l) =>
+      linkedReviewIds.has(l.reviewId) &&
+      (l.action === "Videos summarized by Gemini" ||
+        l.action === "Videos in maintainer feedback summarized") &&
+      Array.isArray((l.meta as any)?.videos)
+    );
+    for (const entry of videoLogs) {
+      const videos = ((entry.meta as any).videos as Array<{ url?: string }>) || [];
+      const remainingVideos = videos.filter((v) => !v?.url || !removedUrls.has(v.url));
+      if (remainingVideos.length === 0) {
+        db.remove("reviewLogs", (l) => l.id === entry.id);
+      } else if (remainingVideos.length !== videos.length) {
+        db.update("reviewLogs", (l) => l.id === entry.id, {
+          meta: { ...(entry.meta as object), videos: remainingVideos } as any,
+        });
+      }
+    }
+  }
+  // For each linked review: log the removal, wipe criteria, requeue.
+  for (const rev of linkedReviews) {
+    db.insert("reviewLogs", {
+      id: uuid(),
+      reviewId: rev.id,
+      kind: "ingest",
+      at: Date.now(),
+      action: "constraint.removed",
+      target: removed.kind,
+      detail:
+        `Removed ${removed.kind} attachment` +
+        (removed.url ? ` (${removed.url})` : removed.note ? ` — "${String(removed.note).slice(0, 80)}"` : "") +
+        "; re-synthesising end goal.",
+      meta: { attachmentId: removed.id, kind: removed.kind, by: user.githubLogin },
+    });
+    db.update("prReviews", (r) => r.id === rev.id, {
+      criteria: [],
+      status: "queued",
+      verdict: null,
+    });
+    enqueueReview(rev.id);
+  }
+  res.json({ ok: true, removed });
 });
 
 // --- Integrations ---
@@ -494,4 +623,25 @@ api.get("/audit", (req, res) => {
       .sort((a, b) => b.at - a.at)
       .slice(0, 100)
   );
+});
+
+// --- Notifications (bell + popover) ---
+
+// Frontend polls this every ~10s (visibility-aware) to refresh the bell.
+api.get("/notifications", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  res.json({
+    items: notificationsForUser(user.id, 50),
+    unreadCount: unreadCountForUser(user.id),
+  });
+});
+
+// "Mark all read" button. Returns how many rows were actually flipped — the
+// frontend uses that to optimistically zero the badge.
+api.post("/notifications/read", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const marked = markAllRead(user.id);
+  res.json({ ok: true, marked });
 });

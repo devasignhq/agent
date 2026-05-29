@@ -18,6 +18,16 @@
   --warn: #f5a524;
   --info: #4aa8ff;
   --purple: #a48cff;
+  /* Extra source-kind colors. Each is distinct enough from the existing
+     palette to read instantly when 6+ source cards stack in the End-goal
+     panel. Same lightness range so they sit cohesively next to --info /
+     --purple / --warn. */
+  --green: #3ddc97;
+  --cyan: #22d3ee;
+  --pink: #ff5fc5;
+  /* Lemon-green for the "approved" review pill — a clear positive signal
+     that reads distinctly against both --green (mint) and --warn (amber). */
+  --lemon: #c7ea46;
 
   --mono: "Geist Mono", ui-monospace, "JetBrains Mono", Menlo, monospace;
   --sans: "Geist", ui-sans-serif, system-ui, -apple-system, sans-serif;
@@ -275,11 +285,15 @@ input, textarea, select { font-family: inherit; color: inherit; }
   height: 18px;
   border-radius: 0;
 }
-.pill.ok { color: var(--accent); border-color: rgba(255, 122, 61,0.3); background: rgba(255, 122, 61,0.06); }
+.pill.ok { color: var(--lemon); border-color: rgba(199,234,70,0.35); background: rgba(199,234,70,0.08); }
+.pill.running { color: var(--accent); border-color: rgba(255, 122, 61,0.3); background: rgba(255, 122, 61,0.06); }
 .pill.warn { color: var(--warn); border-color: rgba(245,165,36,0.3); background: rgba(245,165,36,0.06); }
 .pill.danger { color: var(--danger); border-color: rgba(255,90,95,0.3); background: rgba(255,90,95,0.06); }
 .pill.info { color: var(--info); border-color: rgba(74,168,255,0.3); background: rgba(74,168,255,0.06); }
 .pill.purple { color: var(--purple); border-color: rgba(164,140,255,0.3); background: rgba(164,140,255,0.06); }
+.pill.green { color: var(--green); border-color: rgba(61,220,151,0.3); background: rgba(61,220,151,0.06); }
+.pill.cyan { color: var(--cyan); border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.06); }
+.pill.pink { color: var(--pink); border-color: rgba(255,95,197,0.3); background: rgba(255,95,197,0.06); }
 .pill .dot { width: 5px; height: 5px; background: currentColor; }
 
 /* Inputs */

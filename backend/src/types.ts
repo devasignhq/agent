@@ -82,10 +82,12 @@ export type Task = {
 };
 
 export type TaskAttachment = {
+  id: string;
   kind: "loom" | "figma" | "image" | "pdf" | "link" | "text";
   url?: string;
   contentRef?: string; // Cloud Storage path
   note?: string;
+  createdAt?: number;
 };
 
 export type PRReviewStatus =
@@ -167,6 +169,24 @@ export type AuthAuditEntry = {
   meta?: Record<string, unknown>;
 };
 
+// App-level notifications that feed the bell + popover in the dashboard.
+// Mirrors the existing UI shape (kind drives dot color via NOTIF_DOT in
+// frontend/src/app.tsx); `createdAt` is a number so the frontend can render
+// relative time itself.
+export type NotificationKind = "review" | "blocker" | "system";
+
+export type Notification = {
+  id: string;
+  userId: string;
+  kind: NotificationKind;
+  title: string;
+  meta: string;
+  link?: string;       // app path to navigate on click, e.g. "/reviews/{id}"
+  reviewId?: string;   // FK back to a PRReview row for dedup / navigation
+  createdAt: number;
+  readAt: number | null;
+};
+
 export type DB = {
   users: User[];
   installations: Installation[];
@@ -178,4 +198,5 @@ export type DB = {
   subscriptions: Subscription[];
   authAudit: AuthAuditEntry[];
   repoIndex: RepoIndexEntry[];
+  notifications: Notification[];
 };

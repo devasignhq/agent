@@ -84,23 +84,93 @@ const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
   );
 };
 
-const NOTIFICATIONS = [
-  { id: 1, kind: "review", title: "PR #482 ready for review", meta: "acme/pay · agent", time: "2m", unread: true },
-  { id: 4, kind: "blocker", title: "Agent flagged a blocker", meta: "acme/admin#1142",        time: "3h", unread: false },
-  { id: 6, kind: "review", title: "PR #471 merged into main",  meta: "acme/pay · @maya",       time: "yesterday", unread: false },
-  { id: 8, kind: "system", title: "Slack workspace connected", meta: "integrations",            time: "2d", unread: false },
-  { id: 9, kind: "review", title: "Comment from @jules on PR #468", meta: "acme/admin · 1 reply", time: "3d", unread: false },
-  { id: 11, kind: "blocker", title: "CI failed on acme/infra#313", meta: "build · timeout",    time: "5d", unread: false },
-  { id: 12, kind: "system", title: "New device signed in",      meta: "Chrome · macOS",         time: "1w", unread: false },
-];
-
 const NOTIF_DOT = {
   review:  "var(--info)",
   blocker: "var(--danger)",
   system:  "var(--fg-mute)",
 };
 
-const NotificationsPopover = ({ onClose }) => {
+// Compact relative-time formatter for the notification row. Mirrors the
+// pre-formatted strings the mock data used ("2m", "3h", "yesterday", "1w").
+function ago(ms) {
+  const s = Math.max(0, Math.floor((Date.now() - ms) / 1000));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);  if (h < 24) return `${h}h`;
+  const d = Math.floor(h / 24);
+  if (d === 1) return "yesterday";
+  if (d < 7)  return `${d}d`;
+  const w = Math.floor(d / 7);
+  return `${w}w`;
+}
+
+// Polls /api/notifications. Visibility-aware: 10s while focused, 60s when the
+// tab is hidden (matches the cadence the agent screen already uses). The
+// returned `markAllRead` flips every unread row server-side and updates local
+// state optimistically so the badge clears without waiting for the next poll.
+function useNotifications(enabled) {
+  const [items, setItems] = React.useState([]);
+  const [unreadCount, setUnreadCount] = React.useState(0);
+  const refresh = React.useCallback(async () => {
+    if (!enabled) return;
+    try {
+      const data = await api.notifications();
+      setItems(data.items);
+      setUnreadCount(data.unreadCount);
+    } catch (err) {
+      // 401 is normal on the auth screen; everything else is worth a console.
+      if (!(err && (err.status === 401))) {
+        console.warn("[notifications] poll failed:", err);
+      }
+    }
+  }, [enabled]);
+  React.useEffect(() => {
+    if (!enabled) {
+      setItems([]);
+      setUnreadCount(0);
+      return;
+    }
+    let alive = true;
+    let timer = null;
+    const tick = async () => {
+      if (!alive) return;
+      await refresh();
+      if (!alive) return;
+      const delay = document.visibilityState === "visible" ? 10_000 : 60_000;
+      timer = setTimeout(tick, delay);
+    };
+    tick();
+    const onVis = () => {
+      if (document.visibilityState === "visible") {
+        // Refresh immediately on tab focus and reset the timer.
+        if (timer) clearTimeout(timer);
+        tick();
+      }
+    };
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      alive = false;
+      if (timer) clearTimeout(timer);
+      document.removeEventListener("visibilitychange", onVis);
+    };
+  }, [enabled, refresh]);
+  const markAllRead = React.useCallback(async () => {
+    // Optimistic: clear the badge + flip each row, then confirm server-side.
+    const now = Date.now();
+    setItems((prev) => prev.map((n) => (n.readAt === null ? { ...n, readAt: now } : n)));
+    setUnreadCount(0);
+    try {
+      await api.markNotificationsRead();
+    } catch (err) {
+      console.warn("[notifications] markAllRead failed:", err);
+      // Roll back by re-fetching; next poll will fix it anyway.
+      refresh();
+    }
+  }, [refresh]);
+  return { items, unreadCount, refresh, markAllRead };
+}
+
+const NotificationsPopover = ({ onClose, items, unreadCount, onMarkAllRead, onNavigate }) => {
   const ref = React.useRef(null);
   const [expanded, setExpanded] = React.useState(false);
   React.useEffect(() => {
@@ -111,27 +181,49 @@ const NotificationsPopover = ({ onClose }) => {
     document.addEventListener("keydown", onKey);
     return () => { clearTimeout(t); document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onKey); };
   }, [onClose]);
-  const unread = NOTIFICATIONS.filter(n => n.unread).length;
+  const handleRowClick = (n) => {
+    // Clicks navigate to the agent page for now; review-level deep-link is
+    // a follow-up. We always close the popover so the user lands on content.
+    if (onNavigate) onNavigate("agent");
+    onClose();
+  };
   return (
     <div ref={ref} className={`notif-pop ${expanded ? "expanded" : ""}`} role="dialog" aria-label="Notifications">
       <div className="notif-pop-head">
         <span className="notif-pop-title">notifications</span>
-        <span className="notif-pop-count">{unread} new</span>
+        <span className="notif-pop-count">{unreadCount} new</span>
       </div>
       <div className="notif-pop-list">
-        {NOTIFICATIONS.map(n => (
-          <div key={n.id} className={`notif-row ${n.unread ? "unread" : ""}`}>
-            <i className="notif-dot" style={{ background: NOTIF_DOT[n.kind] }}></i>
+        {items.length === 0 && (
+          <div className="notif-row" style={{ opacity: 0.6 }}>
+            <i className="notif-dot" style={{ background: "var(--fg-mute)" }}></i>
             <div className="notif-body">
-              <div className="notif-title">{n.title}</div>
-              <div className="notif-meta">{n.meta}</div>
+              <div className="notif-title">No notifications yet</div>
+              <div className="notif-meta">New PRs and completed reviews will appear here.</div>
             </div>
-            <div className="notif-time">{n.time}</div>
           </div>
-        ))}
+        )}
+        {items.map(n => {
+          const unread = n.readAt === null;
+          return (
+            <div
+              key={n.id}
+              className={`notif-row ${unread ? "unread" : ""}`}
+              onClick={() => handleRowClick(n)}
+              style={{ cursor: "pointer" }}
+            >
+              <i className="notif-dot" style={{ background: NOTIF_DOT[n.kind] || NOTIF_DOT.system }}></i>
+              <div className="notif-body">
+                <div className="notif-title">{n.title}</div>
+                <div className="notif-meta">{n.meta}</div>
+              </div>
+              <div className="notif-time">{ago(n.createdAt)}</div>
+            </div>
+          );
+        })}
       </div>
       <div className="notif-pop-foot">
-        <button className="notif-foot-btn">Mark all read</button>
+        <button className="notif-foot-btn" onClick={onMarkAllRead}>Mark all read</button>
         <button className="notif-foot-btn primary" onClick={() => setExpanded(e => !e)}>
           {expanded ? "Show less" : "View all"}
         </button>
@@ -232,12 +324,13 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
   );
 };
 
-const TopBar = ({ current, onOpenCC, isMobile, onSignOut, onNavigate, user }) => {
+const TopBar = ({ current, onOpenCC, isMobile, onSignOut, onNavigate, user, notifications }) => {
   const labels = {
     agent: "Agents", settings: "Settings"
   };
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
+  const unread = notifications?.unreadCount ?? 0;
   return (
     <div className="topbar">
       {isMobile && (
@@ -260,9 +353,22 @@ const TopBar = ({ current, onOpenCC, isMobile, onSignOut, onNavigate, user }) =>
                   onClick={() => setNotifOpen(o => !o)}
                   aria-label="Notifications">
             <Icon name="bell" size={13}/>
-            <i style={{ position: "absolute", top: 5, right: 6, width: 6, height: 6, background: "var(--accent)", borderRadius: "50%" }}></i>
+            {unread > 0 && (
+              <i
+                aria-label={`${unread} unread notification${unread === 1 ? "" : "s"}`}
+                style={{ position: "absolute", top: 5, right: 6, width: 6, height: 6, background: "var(--accent)", borderRadius: "50%" }}
+              ></i>
+            )}
           </button>
-          {notifOpen && <NotificationsPopover onClose={() => setNotifOpen(false)} />}
+          {notifOpen && (
+            <NotificationsPopover
+              onClose={() => setNotifOpen(false)}
+              items={notifications?.items || []}
+              unreadCount={unread}
+              onMarkAllRead={notifications?.markAllRead}
+              onNavigate={onNavigate}
+            />
+          )}
         </div>
         <div style={{ position: "relative" }}>
           <button
@@ -339,6 +445,7 @@ const App = () => {
   const [ccOpen, setCCOpen] = React.useState(false);
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
+  const notifications = useNotifications(auth.status === "signed_in");
 
   // Top-level fallback for the install round-trip: if popups were blocked and
   // we did a full-page nav, GitHub will have redirected back to the main tab
@@ -548,6 +655,7 @@ const App = () => {
           }}
           onNavigate={(k) => setCurrent(k)}
           user={auth.user}
+          notifications={notifications}
         />
         <div className="content" style={current === "agent" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}

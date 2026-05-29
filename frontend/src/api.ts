@@ -101,10 +101,12 @@ export type IntegrationView = {
 };
 
 export type TaskAttachment = {
+  id: string;
   kind: "loom" | "figma" | "image" | "pdf" | "link" | "text";
   url?: string;
   contentRef?: string;
   note?: string;
+  createdAt?: number;
 };
 
 export type Task = {
@@ -174,6 +176,20 @@ export type AuthAuditEntry = {
   meta?: Record<string, unknown>;
 };
 
+export type NotificationKind = "review" | "blocker" | "system";
+
+export type Notification = {
+  id: string;
+  userId: string;
+  kind: NotificationKind;
+  title: string;
+  meta: string;
+  link?: string;
+  reviewId?: string;
+  createdAt: number;
+  readAt: number | null;
+};
+
 export type Health = {
   ok: boolean;
   llm: "live" | "mock";
@@ -235,6 +251,11 @@ export const api = {
       `/api/tasks/${taskId}/attachments`,
       { method: "POST", body: JSON.stringify(att) }
     ),
+  deleteAttachment: (taskId: string, attachmentId: string) =>
+    request<{ ok: true; removed: TaskAttachment }>(
+      `/api/tasks/${taskId}/attachments/${attachmentId}`,
+      { method: "DELETE" }
+    ),
 
   // integrations
   integrations: () => request<IntegrationView[]>("/api/integrations"),
@@ -260,4 +281,13 @@ export const api = {
 
   // audit
   audit: () => request<AuthAuditEntry[]>("/api/audit"),
+
+  // notifications
+  notifications: () =>
+    request<{ items: Notification[]; unreadCount: number }>("/api/notifications"),
+  markNotificationsRead: () =>
+    request<{ ok: true; marked: number }>("/api/notifications/read", {
+      method: "POST",
+      body: "{}",
+    }),
 };

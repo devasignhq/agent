@@ -9,6 +9,7 @@ import { db } from "../db.js";
 import { gh } from "../github/app.js";
 import { complete, detectVideoProvider, summarizeVideo, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
+import { notifyForReview } from "../notifications.js";
 import { config } from "../config.js";
 import { enqueueReview, type MaintainerComment } from "../queue.js";
 import type { Criterion, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
@@ -64,7 +65,10 @@ function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
   // Compose a body that includes rationale and (optionally) the codeExample so
   // the timeline shows the same information the GitHub PR body does.
   const bodyParts = [s.rationale];
-  if (s.codeExample) bodyParts.push("```\n" + s.codeExample + "\n```");
+  if (s.codeExample) {
+    const fence = codeFence(s.codeExample);
+    bodyParts.push(`${fence}\n${s.codeExample}\n${fence}`);
+  }
   log(reviewId, "finding", s.title || "Suggested change", {
     detail: s.rationale,
     meta: {
@@ -239,6 +243,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
           holisticVerdict.securityFindings.length,
       },
     });
+    // App notification: analysis is complete. `review` → "passed" (blue dot),
+    // `blocker` → "changes_requested" (red dot). Click navigates to detail.
+    notifyForReview(
+      review.id,
+      status === "passed" ? "review" : "blocker",
+      status === "passed"
+        ? `PR #${review.prNumber} — All criteria met`
+        : `PR #${review.prNumber} — Changes requested`,
+      `${repo.owner}/${repo.name} — ${review.prTitle}`
+    );
 
     // d. Output: GitHub Check Run + PR review + broadcast
     await postGithubOutput(review, repo, install, status, {
@@ -260,9 +274,18 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   } catch (err) {
     console.error(`[review] ${review.id} failed:`, err);
     setStatus(review.id, { status: "errored" });
+    const errMsg = err instanceof Error ? err.message : String(err);
     log(review.id, "error", "Pipeline errored", {
-      detail: err instanceof Error ? err.message : String(err),
+      detail: errMsg,
     });
+    // App notification: the analysis failed. `blocker` kind so the bell shows
+    // a red dot — same visual weight as "changes_requested".
+    notifyForReview(
+      review.id,
+      "blocker",
+      `PR #${review.prNumber} — Review failed`,
+      `${repo.owner}/${repo.name} — ${errMsg.slice(0, 140)}`
+    );
   }
 }
 
@@ -749,7 +772,8 @@ function formatReviewBody(
       lines.push(heading);
       if (s.rationale) lines.push(s.rationale);
       if (s.codeExample) {
-        lines.push("", "```", s.codeExample, "```");
+        const fence = codeFence(s.codeExample);
+        lines.push("", fence, s.codeExample, fence);
       }
       appendFixPrompt(lines, s.fixPrompt);
       lines.push("");
@@ -775,10 +799,12 @@ function formatReviewBody(
   // blocker-severity holistic finding. The per-suggestion fixPrompts above
   // stay too, for users who want to fix one item at a time.
   //
-  // The outer fence uses 6 backticks so per-suggestion fixPrompts (which
-  // themselves contain ```diff fences) don't accidentally close it. GitHub
-  // renders 4+-backtick fences as code blocks with a copy button, so the
-  // user gets one-click copy of the whole prompt.
+  // The outer fence adapts to the content (codeFence) so per-suggestion
+  // fixPrompts — which themselves contain ```diff fences — can't accidentally
+  // close it. GitHub renders 4+-backtick fences as code blocks with a copy
+  // button, so the user gets one-click copy of the whole prompt. A blank line
+  // separates the </summary> from the fence so GitHub renders the markdown
+  // inside <details> instead of treating it as raw HTML.
   const blockerHolistic = [
     ...holistic.regressions,
     ...holistic.criticalErrors,
@@ -793,15 +819,16 @@ function formatReviewBody(
       suggestions,
       blockerHolistic,
     });
+    const fence = codeFence(prompt);
     lines.push("");
     lines.push("---");
     lines.push("");
     lines.push("<details>");
     lines.push("<summary>📋 One prompt to fix all of this — paste into your AI coding agent</summary>");
     lines.push("");
-    lines.push("``````");
+    lines.push(fence);
     lines.push(prompt);
-    lines.push("``````");
+    lines.push(fence);
     lines.push("");
     lines.push("</details>");
   }
@@ -857,10 +884,11 @@ function buildConsolidatedFixPrompt(args: {
             lines.push(`**${s.title}**`);
             if (s.rationale) lines.push(s.rationale);
             if (s.codeExample) {
+              const fence = codeFence(s.codeExample);
               lines.push("");
-              lines.push("```");
+              lines.push(fence);
               lines.push(s.codeExample);
-              lines.push("```");
+              lines.push(fence);
             }
           }
           lines.push("");
@@ -902,19 +930,36 @@ function appendHolisticGroup(
   lines.push("");
 }
 
+// Pick a code-fence backtick run strictly longer than the longest run of
+// backticks already inside `content`. The fixPrompt template mandates an
+// inner ```diff fence (see reviewDiff's system prompt), so a naive 3-backtick
+// wrapper would be closed early by that inner fence — leaking the rest of the
+// comment out as broken markdown. GitHub renders any fence of 3+ backticks;
+// 4+ also keeps the one-click copy button. Minimum 3 so empty content still
+// fences cleanly.
+function codeFence(content: string): string {
+  let longest = 0;
+  for (const run of content.match(/`+/g) || []) longest = Math.max(longest, run.length);
+  return "`".repeat(Math.max(3, longest + 1));
+}
+
 // Renders the per-finding "prompt for your AI agent" block. The prompt sits in
-// a top-level ``` fence so GitHub's built-in code-block copy button picks it
-// up — no client-side wiring needed for the GitHub surface. The optional
-// indent variant keeps list-rendered findings (holistic) readable.
+// a fenced code block so GitHub's built-in copy button picks it up — no
+// client-side wiring needed for the GitHub surface. The fence length adapts
+// to the content (codeFence) so the fixPrompt's own ```diff hunk can't close
+// the wrapper. The optional indent variant keeps list-rendered findings
+// (holistic) readable; the 2-space pad aligns the block with the list item's
+// content column so GitHub still parses it as belonging to the bullet.
 function appendFixPrompt(lines: string[], fixPrompt: string | undefined, indented = false) {
   if (!fixPrompt) return;
   const pad = indented ? "  " : "";
+  const fence = codeFence(fixPrompt);
   lines.push("");
   lines.push(`${pad}**Prompt for your AI agent:**`);
   lines.push("");
-  lines.push(`${pad}\`\`\``);
+  lines.push(`${pad}${fence}`);
   for (const ln of fixPrompt.split("\n")) lines.push(`${pad}${ln}`);
-  lines.push(`${pad}\`\`\``);
+  lines.push(`${pad}${fence}`);
 }
 
 // GitHub rejects an entire review batch if any inline comment references a
@@ -1084,7 +1129,10 @@ function formatBugFixComment(bug: BugFixSynthesis, videoUrl: string): string {
   if (bug.broken) lines.push("**What's broken**", bug.broken, "");
   if (bug.expected) lines.push("**Expected**", bug.expected, "");
   if (bug.fix) lines.push("**Suggested fix**", bug.fix, "");
-  if (bug.code) lines.push("```", bug.code, "```", "");
+  if (bug.code) {
+    const fence = codeFence(bug.code);
+    lines.push(fence, bug.code, fence, "");
+  }
   lines.push(`_Source: ${videoUrl}_`);
   return lines.join("\n");
 }
@@ -1358,7 +1406,10 @@ function formatImplementationGuide(
   ];
   if (guide.ask) lines.push("**What they asked**", guide.ask, "");
   if (guide.approach) lines.push("**Suggested approach**", guide.approach, "");
-  if (guide.code) lines.push("```", guide.code, "```", "");
+  if (guide.code) {
+    const fence = codeFence(guide.code);
+    lines.push(fence, guide.code, fence, "");
+  }
   if (guide.references.length) {
     lines.push("**References**");
     for (const r of guide.references) lines.push(`- ${r}`);
@@ -1413,9 +1464,11 @@ export async function runMaintainerFeedbackJob(
   if (task && videoUrls.length) {
     const known = new Set(task.attachments.map((a) => a.url || ""));
     const fresh = videoUrls.filter((u) => !known.has(u)).map((u) => ({
+      id: uuid(),
       kind: "loom" as const,
       url: u,
       note: `from maintainer ${comment.author}`,
+      createdAt: Date.now(),
     }));
     if (fresh.length) {
       db.update("tasks", (t) => t.id === task.id, {
