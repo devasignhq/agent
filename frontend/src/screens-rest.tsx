@@ -11,6 +11,7 @@ import { registerPopup } from "./popup-registry";
 const SET_SECTIONS = [
 { key: "account", name: "Account" },
 { key: "install", name: "Installation" },
+{ key: "models", name: "Models" },
 { key: "integrations", name: "Integrations" },
 { key: "usage", name: "Usage" },
 { key: "billing", name: "Plans & billing" },
@@ -42,6 +43,7 @@ const SettingsPage = ({ initialSection }) => {
 
         <div>
           {sec === "install" && <SetInstall />}
+          {sec === "models" && <SetModels />}
           {sec === "integrations" && <SetIntegrations />}
           {sec === "billing" && <SetBilling />}
           {sec === "usage" && <SetUsage />}
@@ -534,6 +536,114 @@ const SetInstall = () => {
               </div>
             }
           </div>
+        </div>
+      </div>
+    </div>);
+
+};
+
+// ─── Models · per-repo review model + reviews toggle ──────────────────────
+// Wired to live backend endpoints: GET /api/repositories (list) and
+// PATCH /api/repositories/:id via api.updateRepository — the only consumer
+// of that endpoint in the frontend.
+const REVIEW_MODELS = [
+{ key: "claude-opus-4-7",   name: "Opus 4.7",   blurb: "Deepest reasoning · best for large or subtle diffs" },
+{ key: "claude-sonnet-4-5", name: "Sonnet 4.5", blurb: "Balanced speed and quality" },
+{ key: "claude-haiku-4-5",  name: "Haiku 4.5",  blurb: "Fastest · low cost for small PRs" }];
+
+const SetModels = () => {
+  const [repos, setRepos] = React.useState([]);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState(null);
+  const [savingId, setSavingId] = React.useState(null);
+
+  // Live load. Same call SetInstall uses; repos with zero open PRs still show.
+  React.useEffect(() => {
+    api.repositories()
+      .then((rs) => setRepos(rs))
+      .catch((e) => setError(e.message || String(e)))
+      .finally(() => setLoading(false));
+  }, []);
+
+  // Optimistic patch → PATCH /api/repositories/:id; rolls back on failure and
+  // reconciles from the row the backend returns.
+  const patchRepo = async (id, patch) => {
+    const prev = repos;
+    setRepos((list) => list.map((r) => (r.id === id ? { ...r, ...patch } : r)));
+    setSavingId(id);
+    try {
+      const updated = await api.updateRepository(id, patch);
+      if (updated) setRepos((list) => list.map((r) => (r.id === id ? { ...r, ...updated } : r)));
+      setError(null);
+    } catch (e) {
+      setRepos(prev);
+      setError(e.message || String(e));
+    } finally {
+      setSavingId(null);
+    }
+  };
+
+  // Always offer the repo's persisted model, even if it predates this list,
+  // so a saved value never disappears from the choices.
+  const optionsFor = (current) =>
+    !current || REVIEW_MODELS.some((m) => m.key === current)
+      ? REVIEW_MODELS
+      : [{ key: current, name: current, blurb: "current setting" }, ...REVIEW_MODELS];
+
+  return (
+    <div className="col gap-5">
+      <div className="card">
+        <div className="card-head">
+          <h3 className="card-title">Review models</h3>
+          <span className="mono mute" style={{ fontSize: 11 }}>per repository</span>
+        </div>
+        <div className="card-body">
+          <div className="mute" style={{ fontSize: 12, marginBottom: 14 }}>
+            Choose which model reviews PRs in each connected repository, and turn reviews on or off.
+            Changes apply to the next queued review.
+          </div>
+
+          {loading &&
+          <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>Loading repositories…</div>}
+          {error &&
+          <div className="mono" style={{ fontSize: 12, color: "var(--danger)", marginBottom: 12 }}>{error}</div>}
+          {!loading && !error && repos.length === 0 &&
+          <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>
+              No repositories granted yet — install the GitHub App and pick repos on GitHub.
+            </div>}
+
+          {repos.map((r, i) => {
+            const saving = savingId === r.id;
+            return (
+              <div key={r.id} style={{ padding: "14px 0", borderTop: i === 0 ? "none" : "1px solid var(--line)" }}>
+                <div className="flex items-center gap-2" style={{ marginBottom: 10 }}>
+                  <Icon name="git" size={12} color="var(--fg-faint)" />
+                  <span className="mono" style={{ fontSize: 13 }}>{r.owner}/{r.name}</span>
+                  <span className="flex-1"></span>
+                  <button
+                    className={`btn sm ${r.reviewsEnabled ? "ghost" : ""}`}
+                    onClick={() => patchRepo(r.id, { reviewsEnabled: !r.reviewsEnabled })}
+                    disabled={saving}
+                    title={r.reviewsEnabled ? "Reviews are on — click to pause" : "Reviews are off — click to enable"}
+                  >
+                    {r.reviewsEnabled ? <><Icon name="check" size={11} /> reviews on</> : "reviews off"}
+                  </button>
+                </div>
+                <div className="llm-row" style={{ opacity: r.reviewsEnabled ? 1 : 0.45 }}>
+                  {optionsFor(r.defaultModel).map((m) => (
+                    <div
+                      key={m.key}
+                      className={`llm-chip ${r.defaultModel === m.key ? "picked" : ""}`}
+                      title={m.blurb}
+                      onClick={() => !saving && r.defaultModel !== m.key && patchRepo(r.id, { defaultModel: m.key })}
+                    >
+                      <Icon name="spark" size={11} /> {m.name}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            );
+          })}
         </div>
       </div>
     </div>);
