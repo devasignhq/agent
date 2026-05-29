@@ -62,6 +62,9 @@ export function handleWebhook(req: Request, res: Response) {
     case "pull_request_review":
       handlePullRequestReview(event);
       break;
+    case "pull_request_review_comment":
+      handlePullRequestReviewComment(event);
+      break;
     case "ping":
       // GitHub sends this when the webhook is created. Nothing to do.
       break;
@@ -128,6 +131,26 @@ function handleIssueComment(event: any) {
       );
       return;
     }
+    // Immediate log so the Agent page surfaces the comment within ~3s of
+    // arrival, independent of how many jobs the worker has queued ahead of
+    // the maintainer-feedback analysis. The status of the underlying review
+    // is irrelevant here — even a "passed" PR should reflect that a
+    // maintainer commented.
+    db.insert("reviewLogs", {
+      id: uuid(),
+      reviewId: review.id,
+      kind: "ingest",
+      at: Date.now(),
+      action: "comment.received",
+      target: author,
+      detail: body.length > 200 ? body.slice(0, 200) + "…" : body,
+      meta: {
+        author,
+        authorAssociation,
+        sourceEvent: "issue_comment",
+        sourceUrl: event.comment?.html_url || "",
+      },
+    });
     enqueueMaintainerFeedback(review.id, {
       body,
       author,
@@ -139,10 +162,10 @@ function handleIssueComment(event: any) {
   })();
 }
 
-// `pull_request_review` fires when a reviewer submits a formal review.
-// We only care about `submitted` with a non-empty body; the per-line inline
-// thread events live on a separate `pull_request_review_comment` channel that
-// we intentionally don't listen to (too noisy).
+// `pull_request_review` fires when a reviewer submits a formal review. We
+// only care about `submitted` with a non-empty body. The per-line inline
+// thread events live on a separate `pull_request_review_comment` channel —
+// handled below in `handlePullRequestReviewComment`.
 function handlePullRequestReview(event: any) {
   const body: string = event.review?.body || "";
   const author: string = event.review?.user?.login || "";
@@ -174,6 +197,24 @@ function handlePullRequestReview(event: any) {
       );
       return;
     }
+    // Same immediate-log pattern as issue_comment: surface the review
+    // submission on the Agent page before the worker dequeues the analysis
+    // job.
+    db.insert("reviewLogs", {
+      id: uuid(),
+      reviewId: review.id,
+      kind: "ingest",
+      at: Date.now(),
+      action: "comment.received",
+      target: author,
+      detail: body.length > 200 ? body.slice(0, 200) + "…" : body,
+      meta: {
+        author,
+        authorAssociation,
+        sourceEvent: "pull_request_review",
+        sourceUrl: event.review?.html_url || "",
+      },
+    });
     enqueueMaintainerFeedback(review.id, {
       body,
       author,
@@ -182,6 +223,85 @@ function handlePullRequestReview(event: any) {
       sourceEvent: "pull_request_review",
     });
     console.log(`[webhook] pull_request_review: enqueued for review ${review.id}`);
+  })();
+}
+
+// `pull_request_review_comment` fires for inline comments on specific code
+// lines — the most common reviewer interaction (clicking `+` next to a line
+// in the Files-changed tab). Same maintainer filter as the top-level
+// handlers; we record path:line so the timeline reads like
+// `comment.received · @owner · src/foo.ts:42 — "..."` instead of a context-
+// free body preview.
+function handlePullRequestReviewComment(event: any) {
+  const body: string = event.comment?.body || "";
+  const author: string = event.comment?.user?.login || "";
+  const authorAssociation: string = event.comment?.author_association || "NONE";
+  const senderType: string = event.sender?.type || "User";
+  const repoFullName: string = event.repository?.full_name || "";
+  const prNumber: number | undefined = event.pull_request?.number;
+  const path: string = event.comment?.path || "";
+  // GitHub gives us multiple line fields; `line` is the post-image line we
+  // want for the user-facing label. Fall back to `original_line` so an
+  // outdated diff still produces a readable timestamp string.
+  const line: number | null =
+    typeof event.comment?.line === "number"
+      ? event.comment.line
+      : typeof event.comment?.original_line === "number"
+      ? event.comment.original_line
+      : null;
+
+  console.log(
+    `[webhook] pull_request_review_comment author=${author} assoc=${authorAssociation} senderType=${senderType} bodyLen=${body.length} where=${path}:${line ?? "?"}`
+  );
+
+  if (event.action !== "created") {
+    console.log(`[webhook] pull_request_review_comment: ignored, action=${event.action}`);
+    return;
+  }
+  if (!isMaintainerComment({ body, author, authorAssociation, senderType })) {
+    console.log(
+      `[webhook] pull_request_review_comment: filtered (assoc=${authorAssociation}, senderType=${senderType}, bodyEmpty=${!body.trim()})`
+    );
+    return;
+  }
+
+  void (async () => {
+    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    if (!review) {
+      console.log(
+        `[webhook] pull_request_review_comment: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+      );
+      return;
+    }
+    const where = path ? `${path}${line !== null ? `:${line}` : ""}` : "(unknown location)";
+    const bodyPreview = body.length > 160 ? body.slice(0, 160) + "…" : body;
+    db.insert("reviewLogs", {
+      id: uuid(),
+      reviewId: review.id,
+      kind: "ingest",
+      at: Date.now(),
+      action: "comment.received",
+      target: author,
+      detail: `${where} — ${bodyPreview}`,
+      meta: {
+        author,
+        authorAssociation,
+        path,
+        line,
+        sourceEvent: "pull_request_review_comment",
+        sourceUrl: event.comment?.html_url || "",
+      },
+    });
+    // Inline comments are most useful when prefixed with their location so
+    // the LLM analysis knows the comment is anchored to a specific line.
+    enqueueMaintainerFeedback(review.id, {
+      body: `On ${where}:\n${body}`,
+      author,
+      authorAssociation,
+      sourceUrl: event.comment?.html_url || "",
+      sourceEvent: "pull_request_review_comment",
+    });
+    console.log(`[webhook] pull_request_review_comment: enqueued for review ${review.id}`);
   })();
 }
 

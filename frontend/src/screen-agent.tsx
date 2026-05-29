@@ -455,6 +455,52 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
 // ────────────────────────────────────────────────────────────────────────────
 // Timeline (per-PR)
 // ────────────────────────────────────────────────────────────────────────────
+
+// One-click copy of a prompt body. Uses navigator.clipboard with a synchronous
+// textarea fallback for environments where clipboard access is blocked.
+const CopyPromptBlock = ({ prompt }) => {
+  const [copied, setCopied] = React.useState(false);
+  const onCopy = React.useCallback(async () => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(prompt);
+      } else {
+        const ta = document.createElement("textarea");
+        ta.value = prompt;
+        ta.style.position = "fixed";
+        ta.style.opacity = "0";
+        document.body.appendChild(ta);
+        ta.select();
+        document.execCommand("copy");
+        document.body.removeChild(ta);
+      }
+      setCopied(true);
+      setTimeout(() => setCopied(false), 1500);
+    } catch (err) {
+      console.warn("[copy-prompt] failed", err);
+    }
+  }, [prompt]);
+  return (
+    <div className="copy-prompt-block">
+      <div className="copy-prompt-head">
+        <span className="copy-prompt-label">Prompt for your AI agent</span>
+        <button type="button" className="copy-prompt-btn" onClick={onCopy} title="Copy prompt to clipboard">
+          <Icon name={copied ? "check" : "copy"} size={11} />
+          <span>{copied ? "Copied" : "Copy"}</span>
+        </button>
+      </div>
+      <pre className="copy-prompt-pre">{prompt}</pre>
+    </div>
+  );
+};
+
+const FINDING_LABEL = {
+  regression: "Regression",
+  criticalError: "Critical error",
+  security: "Security finding",
+  suggestion: "Suggested change",
+};
+
 const TimelineFor = ({ events, runningStageIdx }) =>
 <div className="timeline">
     {events.map((e, i) => {
@@ -494,6 +540,24 @@ const TimelineFor = ({ events, runningStageIdx }) =>
           <div className={`pr-comment ${e.inline.sev}`}>
                 <div className="head">{e.inline.title}</div>
                 <div style={{ color: "var(--fg)" }}>{e.inline.body}</div>
+              </div>
+          }
+            {e.finding &&
+          <div className={`finding-card sev-${e.finding.severity}`}>
+                <div className="finding-head">
+                  <span className={`pill ${e.finding.severity === "blocker" ? "danger" : "warn"}`}>
+                    <i className="dot"></i> {e.finding.severity === "blocker" ? "Blocker" : "Warn"}
+                  </span>
+                  <span className="finding-cat">{FINDING_LABEL[e.finding.category] || "Finding"}</span>
+                  {e.finding.path && (
+                    <span className="mono mute finding-path">{e.finding.path}</span>
+                  )}
+                </div>
+                {e.finding.title && e.finding.title !== e.finding.body && (
+                  <div className="finding-title">{e.finding.title}</div>
+                )}
+                <div className="finding-body">{e.finding.body}</div>
+                {e.finding.fixPrompt && <CopyPromptBlock prompt={e.finding.fixPrompt} />}
               </div>
           }
           </div>
@@ -958,12 +1022,20 @@ function mapLogEntry(entry) {
     comment:  { icon: "message",flavor: "active" },
     verdict:  { icon: "check",  flavor: "active" },
     error:    { icon: "warn",   flavor: "danger" },
+    holistic: { icon: "brain",  flavor: "info"   },
+    finding:  { icon: "warn",   flavor: "warn"   },
   };
   let v = map[entry.kind] || { icon: "dot", flavor: "" };
-  // Commit pushes carry kind="ingest" so we don't add a new ReviewLogKind that
-  // would drift across the api.ts ↔ types.ts boundary, but a doc icon reads
-  // wrong for a push. Override on the action — same shape, just a git icon.
+  // Commit pushes and maintainer-comment arrivals both carry kind="ingest"
+  // so we don't add new ReviewLogKinds that would drift across the
+  // api.ts ↔ types.ts boundary. Pick the icon off the action instead so
+  // each one reads correctly in the timeline.
   if (entry.action === "commit.push") v = { icon: "git", flavor: "info" };
+  if (entry.action === "comment.received") v = { icon: "message", flavor: "info" };
+  // Findings flip to danger-flavored when the agent marked them blocker.
+  if (entry.kind === "finding" && entry.meta?.severity === "blocker") {
+    v = { icon: "warn", flavor: "danger" };
+  }
   const d = new Date(entry.at);
   const pad = (n) => String(n).padStart(2, "0");
   const sources = entry.meta?.sources;
@@ -973,6 +1045,19 @@ function mapLogEntry(entry) {
       : entry.meta?.count
       ? ` · ${entry.meta.count} item(s)`
       : "";
+  // Findings carry structured meta (category, severity, path, body, fixPrompt)
+  // — surface them via the `finding` slot so <TimelineFor> can render the
+  // copyable prompt block next to the issue text.
+  const finding = entry.kind === "finding"
+    ? {
+        category: entry.meta?.category || "suggestion",
+        severity: entry.meta?.severity === "blocker" ? "blocker" : "warn",
+        path: typeof entry.meta?.path === "string" ? entry.meta.path : undefined,
+        title: typeof entry.meta?.title === "string" ? entry.meta.title : entry.action,
+        body: typeof entry.meta?.body === "string" ? entry.meta.body : (entry.detail || ""),
+        fixPrompt: typeof entry.meta?.fixPrompt === "string" ? entry.meta.fixPrompt : undefined,
+      }
+    : undefined;
   return {
     t: `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`,
     action: entry.action,
@@ -980,6 +1065,7 @@ function mapLogEntry(entry) {
     icon: v.icon,
     flavor: v.flavor,
     detail: <>{entry.detail || entry.action}{detailExtra}</>,
+    finding,
   };
 }
 

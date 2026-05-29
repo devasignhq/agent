@@ -3202,6 +3202,88 @@ input, textarea, select { font-family: inherit; color: inherit; }
 .pr-comment.warn { border-left-color: var(--warn); }
 .pr-comment .head { font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute); margin-bottom: 4px; }
 
+/* Finding card — one row per regression / critical error / security finding /
+ * suggestion. Carries the copy-prompt block so users can hand the fix to
+ * their own AI coding agent. */
+.finding-card {
+  margin-top: 10px;
+  background: var(--bg);
+  border: 1px solid var(--line);
+  border-left: 3px solid var(--warn);
+  padding: 10px 12px;
+  font-size: 12px;
+  color: var(--fg-dim);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.finding-card.sev-blocker { border-left-color: var(--danger); }
+.finding-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.finding-cat {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.finding-path { font-size: 11px; }
+.finding-title { font-size: 13px; color: var(--fg); font-weight: 500; }
+.finding-body { color: var(--fg-dim); white-space: pre-wrap; }
+
+/* Copy-prompt block — fenced, monospace, single-click clipboard. */
+.copy-prompt-block {
+  margin-top: 4px;
+  border: 1px solid var(--line);
+  background: var(--bg-2);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.copy-prompt-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg-1, var(--bg));
+}
+.copy-prompt-label {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--fg-mute);
+}
+.copy-prompt-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 8px;
+  font: inherit;
+  font-size: 11px;
+  background: transparent;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  transition: border-color 120ms, color 120ms;
+}
+.copy-prompt-btn:hover { color: var(--fg); border-color: var(--line-2); }
+.copy-prompt-btn:active { transform: translateY(1px); }
+.copy-prompt-pre {
+  margin: 0;
+  padding: 10px 12px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--fg-dim);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 360px;
+  overflow: auto;
+}
+
 /* Notifications popover (anchored under bell button) */
 .btn.is-active { background: var(--bg-3); border-color: var(--line-2); }
 

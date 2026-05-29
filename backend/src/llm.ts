@@ -77,12 +77,43 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
           title: "Rename the submit button label",
           rationale: "The ticket specifies 'Send for review' as the user-facing copy; update the JSX label.",
           codeExample: "<button>Send for review</button>",
+          fixPrompt:
+            "Fix: Rename submit button label to 'Send for review'\n\n" +
+            "File: src/handler.ts\n" +
+            "Symbol: SubmitButton (JSX)\n\n" +
+            "Issue:\n" +
+            "The submit button still reads 'Submit' but the ticket specifies the user-facing copy as 'Send for review'. " +
+            "Update the JSX label to match.\n\n" +
+            "Suggested approach:\n" +
+            "Open src/handler.ts, locate the submit button JSX, and replace the inner text with 'Send for review'. " +
+            "If a translation key is used, update the en-US copy as well.\n\n" +
+            "Relevant diff:\n" +
+            "```diff\n" +
+            "- <button>Submit</button>\n" +
+            "+ <button>Send for review</button>\n" +
+            "```",
         },
         {
           criterionId: "c4",
           title: "Handle the empty-state branch",
           rationale: "Return early with the empty payload before the main path so the new branch matches the ticket.",
           codeExample: "if (!items.length) return { items: [] };",
+          fixPrompt:
+            "Fix: Handle the empty-state branch in src/handler.ts\n\n" +
+            "File: src/handler.ts\n" +
+            "Symbol: handler\n\n" +
+            "Issue:\n" +
+            "The empty-state path described in the ticket is not handled in the new branch. " +
+            "When items is empty, the handler currently falls through to the main path and may throw.\n\n" +
+            "Suggested approach:\n" +
+            "Return early with the empty payload before the main path runs, so the empty branch matches the ticket's contract.\n\n" +
+            "Relevant diff:\n" +
+            "```diff\n" +
+            "  function handler(items) {\n" +
+            "+   if (!items?.length) return { items: [] };\n" +
+            "    // main path…\n" +
+            "  }\n" +
+            "```",
         },
       ],
     });
@@ -163,7 +194,26 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       regressions: [],
       criticalErrors: [],
       securityFindings: includeSample
-        ? [{ path: "src/handler.ts", concern: "[mock] flagged for visibility", severity: "warn" }]
+        ? [
+            {
+              path: "src/handler.ts",
+              concern: "[mock] flagged for visibility",
+              severity: "warn",
+              fixPrompt:
+                "Fix: Sanity-check src/handler.ts (mock finding)\n\n" +
+                "File: src/handler.ts\n" +
+                "Symbol: n/a\n\n" +
+                "Issue:\n" +
+                "This is a deterministic mock finding emitted because WARN_FLAKY=1 was set. " +
+                "Treat as a no-op example of the copy-prompt UI.\n\n" +
+                "Suggested approach:\n" +
+                "No action required — disable WARN_FLAKY to silence.\n\n" +
+                "Relevant diff:\n" +
+                "```diff\n" +
+                "// mock\n" +
+                "```",
+            },
+          ]
         : [],
       summary: "[mock] No blockers detected by the holistic repo-review step.",
     });
