@@ -79,6 +79,10 @@ export type Task = {
   endGoal: string | null;
   attachments: TaskAttachment[];
   createdAt: number;
+  // Set when we've already asked for an end goal on a spec-less PR (no linked
+  // issue/attachments). Keeps the "provide an end goal" PR comment idempotent
+  // so re-reviews on later pushes don't re-spam the conversation.
+  endGoalRequestedAt?: number | null;
 };
 
 export type TaskAttachment = {
