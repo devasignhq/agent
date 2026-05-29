@@ -63,18 +63,6 @@ function emitFindingLog(
   });
 }
 
-// Emit one log row per finding across every category in a HolisticVerdict.
-// Centralising this means a future finding category added to HolisticVerdict
-// only needs one new line here to start surfacing in the timeline — neither
-// the spec-less nor the criteria-based branch in runReviewJob has to be
-// updated separately.
-function emitHolisticFindings(reviewId: string, v: HolisticVerdict) {
-  for (const f of v.securityFindings) emitFindingLog(reviewId, "security", f);
-  for (const f of v.consistencyFindings) emitFindingLog(reviewId, "consistency", f);
-  for (const f of v.regressions) emitFindingLog(reviewId, "regression", f);
-  for (const f of v.criticalErrors) emitFindingLog(reviewId, "criticalError", f);
-}
-
 function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
   // Compose a body that includes rationale and (optionally) the codeExample so
   // the timeline shows the same information the GitHub PR body does.
@@ -213,103 +201,50 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     setStatus(review.id, { taskId: task.id, criteria });
 
-    const specless = criteria.length === 0;
-    let verdict: {
-      summary: string;
-      criteria: Array<{ id: string; met: boolean; evidence: string }>;
-      comments: Array<{ path: string; line: number; body: string }>;
-      suggestions: ReviewSuggestion[];
-    };
-    let filledCriteria: Criterion[];
-    let allMet: boolean;
+    // c. Review the diff against the criteria
+    const verdict = await reviewDiff(review, context, criteria);
+    const filledCriteria: Criterion[] = criteria.map((c) => {
+      const m = verdict.criteria.find((vc) => vc.id === c.id);
+      return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
+    });
+    const allMet = filledCriteria.every((c) => c.met === true);
+
+    // c.1 Whole-repo review: ask Opus to check the diff against the repo index
+    // for regressions, critical errors, and security flaws. Skipped when the
+    // index hasn't been built yet (e.g. a PR landed before the initial walk
+    // finished); in that case we fall back to the criteria-only verdict.
     let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
     let hasBlocker = false;
-
-    if (specless) {
-      // No acceptance criteria to verify. Instead of inventing some or
-      // rubber-stamping the PR, run a focused security review + a consistency
-      // check against how the rest of the codebase / recent merged PRs are
-      // written. This single pass subsumes the holistic call for spec-less PRs.
-      log(review.id, "review", "No spec — running security + consistency review");
-      // Convention baseline: prefer the repo index when it's built; fall back
-      // to sampling recent merged PRs only when there's no index to read.
-      const useMergedPRBaseline = !holistic.entries.length && !holistic.manifest.length;
-      const priorPRs = useMergedPRBaseline
-        ? await listRecentMergedPRDiffs(install, repo, { excludePr: review.prNumber })
-        : [];
-      if (useMergedPRBaseline) {
-        log(review.id, "holistic", "Comparing against recent merged PRs", {
-          detail: priorPRs.length ? `${priorPRs.length} merged PR(s) sampled` : "no prior PRs available",
-          meta: { sampled: priorPRs.map((p) => p.number) },
-        });
-      }
-      holisticVerdict = await reviewSpeclessPR({ review, diff: context.diff, holistic, priorPRs });
+    if (holistic.entries.length || holistic.manifest.length) {
+      holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic });
       hasBlocker = [
         ...holisticVerdict.regressions,
         ...holisticVerdict.criticalErrors,
         ...holisticVerdict.securityFindings,
       ].some((f) => f.severity === "blocker");
-      const securityCount = holisticVerdict.securityFindings.length;
       log(
         review.id,
         "holistic",
-        securityCount === 0 ? "No security vulnerabilities found" : `Security review: ${securityCount} finding(s)`,
+        hasBlocker ? "Holistic review found blockers" : "Holistic review clean",
         {
           detail: holisticVerdict.summary,
           meta: {
-            securityFindings: securityCount,
-            consistencyFindings: holisticVerdict.consistencyFindings.length,
             regressions: holisticVerdict.regressions.length,
             criticalErrors: holisticVerdict.criticalErrors.length,
+            securityFindings: holisticVerdict.securityFindings.length,
           },
         }
       );
-      emitHolisticFindings(review.id, holisticVerdict);
-      verdict = { summary: holisticVerdict.summary, criteria: [], comments: [], suggestions: [] };
-      filledCriteria = [];
-      allMet = true; // no criteria to fail; blocker gating below decides status
-    } else {
-      // c. Review the diff against the criteria
-      verdict = await reviewDiff(review, context, criteria);
-      filledCriteria = criteria.map((c) => {
-        const m = verdict.criteria.find((vc) => vc.id === c.id);
-        return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
-      });
-      allMet = filledCriteria.every((c) => c.met === true);
-
-      // c.1 Whole-repo review: ask Opus to check the diff against the repo index
-      // for regressions, critical errors, and security flaws. Skipped when the
-      // index hasn't been built yet (e.g. a PR landed before the initial walk
-      // finished); in that case we fall back to the criteria-only verdict.
-      if (holistic.entries.length || holistic.manifest.length) {
-        holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic });
-        hasBlocker = [
-          ...holisticVerdict.regressions,
-          ...holisticVerdict.criticalErrors,
-          ...holisticVerdict.securityFindings,
-        ].some((f) => f.severity === "blocker");
-        log(
-          review.id,
-          "holistic",
-          hasBlocker ? "Holistic review found blockers" : "Holistic review clean",
-          {
-            detail: holisticVerdict.summary,
-            meta: {
-              regressions: holisticVerdict.regressions.length,
-              criticalErrors: holisticVerdict.criticalErrors.length,
-              securityFindings: holisticVerdict.securityFindings.length,
-            },
-          }
-        );
-        // Emit one log row per finding so the frontend can render a copyable
-        // fix prompt next to each item. Categories let the timeline branch on
-        // severity styling without re-parsing the holistic JSON.
-        emitHolisticFindings(review.id, holisticVerdict);
-      }
-      // Per-criterion suggestions land as findings too — same UI affordance, so
-      // a user with one unmet criterion gets a copyable prompt to fix it.
-      for (const s of verdict.suggestions) emitSuggestionLog(review.id, s);
+      // Emit one log row per finding so the frontend can render a copyable
+      // fix prompt next to each item. Categories let the timeline branch on
+      // severity styling without re-parsing the holistic JSON.
+      for (const f of holisticVerdict.regressions) emitFindingLog(review.id, "regression", f);
+      for (const f of holisticVerdict.criticalErrors) emitFindingLog(review.id, "criticalError", f);
+      for (const f of holisticVerdict.securityFindings) emitFindingLog(review.id, "security", f);
     }
+    // Per-criterion suggestions land as findings too — same UI affordance, so
+    // a user with one unmet criterion gets a copyable prompt to fix it.
+    for (const s of verdict.suggestions) emitSuggestionLog(review.id, s);
 
     // c.2 Deferred-work detection (advisory). Mine the diff's own added comments
     // for self-admitted punts the coding agent buried instead of surfacing —
@@ -356,8 +291,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // Route the verdict to a GitHub review action. We never auto-APPROVE a PR
     // we had no acceptance criteria to verify against: a clean spec-less pass
     // posts a neutral COMMENT and (exactly once) invites the maintainer to
-    // supply an end goal so a real criteria-based review can run. (`specless`
-    // was decided above when we chose the review path.)
+    // supply an end goal so a real criteria-based review can run.
+    const specless = filledCriteria.length === 0;
     let reviewEvent: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
     let postConversationReview = true;
     let includeEndGoalCTA = false;
@@ -915,10 +850,9 @@ async function reviewDiff(
 // the maintainer-feedback path ingests it, synthesizes acceptance criteria, and
 // re-runs the review automatically.
 function buildEndGoalRequestCTA(): string {
-  // No leading H2 — the caller wraps this in a <details><summary> that already
-  // carries the "Want a deeper, goal-based review?" heading.
   return [
-    'This PR isn\'t linked to an issue, so DevAsign reviewed it for security and codebase consistency. To also have it checked against a concrete **end goal**, reply on this PR with what "done" looks like — DevAsign will turn it into acceptance criteria and re-review automatically.',
+    "## 🎯 Want a deeper, goal-based review?",
+    'This PR isn\'t linked to an issue, so DevAsign reviewed it for correctness only. To have it checked against a concrete **end goal**, reply on this PR with what "done" looks like — DevAsign will turn it into acceptance criteria and re-review automatically.',
     "",
     "You can provide it as:",
     "- **Text** — a short description of the intended behaviour and acceptance conditions",
@@ -945,49 +879,21 @@ function formatReviewBody(
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
+  const holisticItemCount =
+    holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
   if (specless) {
-    // No acceptance criteria — lead with the security verdict, then a
-    // consistency section, then any regressions/critical errors the security
-    // pass surfaced. (The generic "Repo-wide concerns" block below is skipped
-    // for spec-less PRs since we render those groups explicitly here.)
-    const sec = holistic.securityFindings;
-    if (sec.length === 0) {
+    if (holisticItemCount === 0) {
       lines.push(
-        "## ✅ Your PR is good to me — no security vulnerability found",
-        "This PR has no linked issue or spec, so there were no acceptance criteria to verify. I reviewed the diff for security vulnerabilities and found none.",
+        "## ✅ No issues found",
+        "No blocking bugs, regressions, or security concerns surfaced in this diff. This PR has no linked issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
         ""
       );
     } else {
       lines.push(
-        "## 🔒 Security review",
-        `I reviewed the diff for vulnerabilities and found ${sec.length} issue${sec.length === 1 ? "" : "s"} to address. This PR has no linked issue or spec, so no acceptance criteria were checked.`,
+        "## Reviewed for correctness",
+        "This PR has no linked issue or spec, so no acceptance criteria were checked. The concerns below come from a whole-repo correctness pass.",
         ""
       );
-      appendHolisticGroup(lines, "Security findings", sec);
-      lines.push("");
-    }
-
-    // Consistency check — always shown so the developer sees it ran.
-    lines.push("## 🧭 Consistency with the codebase");
-    if (holistic.consistencyFindings.length === 0) {
-      lines.push(
-        "This PR matches the conventions in the rest of the codebase / recent merged PRs — no deviations worth flagging.",
-        ""
-      );
-    } else {
-      lines.push(
-        "Compared against how the rest of the team's code is written, these spots diverge from the established convention:",
-        ""
-      );
-      appendHolisticGroup(lines, "Deviations", holistic.consistencyFindings);
-      lines.push("");
-    }
-
-    if (holistic.regressions.length || holistic.criticalErrors.length) {
-      lines.push("## Other concerns from the diff");
-      appendHolisticGroup(lines, "Regressions", holistic.regressions);
-      appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
-      lines.push("");
     }
   } else if (endGoal) {
     lines.push("## End goal", endGoal, "");
@@ -1050,12 +956,9 @@ function formatReviewBody(
       lines.push("");
     }
   }
-  // Generic whole-repo concerns block for spec'd PRs. Spec-less PRs render
-  // their security/consistency/other groups explicitly above, so skip it here
-  // to avoid double-listing the same findings.
   const holisticItems =
     holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
-  if (!specless && holisticItems) {
+  if (holisticItems) {
     lines.push("## Repo-wide concerns");
     if (holistic.summary) lines.push(holistic.summary, "");
     appendHolisticGroup(lines, "Regressions", holistic.regressions);
@@ -1108,18 +1011,9 @@ function formatReviewBody(
   }
 
   // Spec-less PRs: invite an end goal (posted once; gated in runReviewJob).
-  // Demoted to a collapsed footer so it never overshadows the security +
-  // consistency verdict above.
   if (context?.endGoalCTA) {
     lines.push("");
-    lines.push("---");
-    lines.push("");
-    lines.push("<details>");
-    lines.push("<summary>🎯 Want a deeper, goal-based review?</summary>");
-    lines.push("");
     lines.push(buildEndGoalRequestCTA());
-    lines.push("");
-    lines.push("</details>");
   }
 
   return lines.join("\n").trim() || "DevAsign review.";
@@ -1309,9 +1203,7 @@ async function postGithubOutput(
           title:
             status === "passed"
               ? specless
-                ? args.holistic.securityFindings.length === 0
-                  ? "No security vulnerability found"
-                  : "Security reviewed — see comment"
+                ? "No issues found — add an end goal for acceptance-criteria review"
                 : "All acceptance criteria met"
               : "Changes requested",
           summary: args.summary || "",
@@ -1770,12 +1662,6 @@ export async function runMaintainerFeedbackJob(
   const docUrls = extractDocUrls(comment.body);
 
   const videoSummaries: VideoSummary[] = [];
-  if (videoUrls.length) {
-    log(review.id, "ingest", "Summarizing videos referenced in feedback", {
-      detail: `${videoUrls.length} video(s)`,
-      meta: { urls: videoUrls },
-    });
-  }
   for (const url of videoUrls) {
     try {
       videoSummaries.push(await summarizeVideo({ url, note: `maintainer comment by ${comment.author}` }));
@@ -1816,9 +1702,6 @@ export async function runMaintainerFeedbackJob(
     });
   }
 
-  log(review.id, "criteria", "Checking whether this feedback changes acceptance criteria", {
-    detail: `against ${review.criteria.length} existing criterion${review.criteria.length === 1 ? "" : "s"}`,
-  });
   const refined = await refineGoalFromFeedback({
     review,
     // When the PR is spec-less (no criteria yet), the stored endGoal is just
@@ -1881,9 +1764,6 @@ export async function runMaintainerFeedbackJob(
     }
   }
 
-  log(review.id, "criteria", "Synthesizing implementation guide for the developer", {
-    detail: diffSlice ? "anchored in the current diff" : "from feedback + criteria alone",
-  });
   const guide = await synthesizeImplementationGuide({
     feedback: {
       author: comment.author,
@@ -1900,10 +1780,6 @@ export async function runMaintainerFeedbackJob(
   if (!install) return; // dev: nothing to post to
 
   const body = formatImplementationGuide(guide, comment);
-  log(review.id, "comment", "Posting implementation guide to PR", {
-    target: `${repo.owner}/${repo.name}#${review.prNumber}`,
-    detail: guide.title,
-  });
   try {
     await gh(
       install.installationId,
@@ -2136,11 +2012,7 @@ async function reviewAgainstRepo(args: {
     maxTokens: 1500,
   });
   const parsed = tryParseJSON<Partial<HolisticVerdict>>(raw, EMPTY_HOLISTIC);
-  // Spread EMPTY_HOLISTIC so any future HolisticVerdict field that the
-  // criteria-path doesn't populate (e.g. consistencyFindings) gets its
-  // canonical default automatically.
   return {
-    ...EMPTY_HOLISTIC,
     regressions: normaliseFindings(parsed.regressions),
     criticalErrors: normaliseFindings(parsed.criticalErrors),
     securityFindings: normaliseFindings(parsed.securityFindings),

@@ -800,9 +800,9 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
             <div className="ac-row" style={{ opacity: 0.85 }}>
                 <div className="ac-check"><Icon name="check" size={11} /></div>
                 <div>
-                  <div style={{ fontSize: 13 }}>No linked spec — reviewed for security &amp; codebase consistency.</div>
+                  <div style={{ fontSize: 13 }}>No acceptance criteria — reviewed for correctness only.</div>
                   <div className="mute mono" style={{ fontSize: 11, marginTop: 3 }}>
-                    Add an end goal on the PR (description, Loom, or screenshot + notes) to also enable acceptance-criteria checks.
+                    Add an end goal on the PR (description, Loom, or screenshot + notes) to enable criteria checks.
                   </div>
                 </div>
               </div>
@@ -1561,16 +1561,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     };
   }, []);
 
-  // Refresh the picked review's logs/task on demand. Exposed at component
-  // scope (not buried inside the polling effect) so handleComposerSend can
-  // trigger an immediate refresh after a message lands — that way the
-  // backend's comment.received + "Analyzing…" entries appear within ~250ms
-  // instead of waiting up to one poll interval.
-  const refreshDetail = React.useCallback(async () => {
-    if (!pickedId) return;
-    try { setDetail(await api.review(pickedId)); } catch {}
-  }, [pickedId]);
-
   // Fetch the picked review's logs/task when selection changes; poll while
   // the tab is visible so the timeline streams in. Same visibility contract
   // as the queue poll — pause on hidden tabs, snap fresh on return.
@@ -1578,15 +1568,19 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     if (!pickedId) { setDetail(null); return; }
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
+    const fetchOnce = () =>
+      api.review(pickedId).then((d) => {
+        if (!cancelled) setDetail(d);
+      }).catch(() => {});
     const tick = async () => {
       if (cancelled) return;
-      if (document.visibilityState === "visible") await refreshDetail();
+      if (document.visibilityState === "visible") await fetchOnce();
       if (cancelled) return;
       timer = setTimeout(tick, 2500);
     };
     tick();
     const onVisible = () => {
-      if (document.visibilityState === "visible") refreshDetail();
+      if (document.visibilityState === "visible") fetchOnce();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
@@ -1594,7 +1588,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [pickedId, refreshDetail]);
+  }, [pickedId]);
 
   // Index helpers
   const repoById = React.useMemo(
@@ -1788,17 +1782,14 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         updateUserEvent(id, key, { loading: false, flavor: "danger", detail: <>Attach failed: {String(err.message || err)}</> });
       }
     } else {
-      // No optimistic event for text: the backend writes a `comment.received`
-      // log synchronously inside POST /tasks/:id/attachments, and the
-      // refreshDetail() call below surfaces it within ~250ms. Showing an
-      // optimistic `user.input` row alongside would duplicate the message
-      // with different styling (user icon vs message icon, "you" vs author
-      // login), which reads as two separate things.
+      appendUserEvent(id, {
+        _key: key, t: nowHMS(),
+        action: "user.input", icon: "user", flavor: "active",
+        target: <span className="mono mute" style={{ fontSize: 11 }}>you</span>,
+        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: html || escapeHtml(text) }} />,
+      });
       try {
         await api.addAttachment(taskId, { kind: "text", note: text });
-        // Surface the backend's comment.received + "Analyzing…" entries on
-        // the next tick instead of waiting up to one 2.5s poll interval.
-        await refreshDetail();
       } catch (err) {
         console.warn("[agent] attach text failed", err);
       }
