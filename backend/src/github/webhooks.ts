@@ -7,6 +7,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import { gh } from "./app.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import { notifyForReview } from "../notifications.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) return true; // dev mode: skip verification
@@ -396,6 +397,14 @@ async function ensurePRReview(
   if (repo.reviewsEnabled) {
     enqueueReview(review.id);
   }
+  // App notification: a PR we didn't already know about just became visible
+  // via a maintainer comment. The install owner gets a "added to queue" row.
+  notifyForReview(
+    review.id,
+    "review",
+    `PR #${prNumber} added to review queue`,
+    `${repo.owner}/${repo.name} — ${review.prTitle}`
+  );
   console.log(
     `[webhook] ensurePRReview: materialized review ${review.id} for ${repoFullName}#${prNumber}`
   );
@@ -686,4 +695,12 @@ function handlePullRequest(event: any) {
   };
   db.insert("prReviews", review);
   enqueueReview(review.id);
+  // App notification: a PR was opened (or re-opened) on a tracked repo and
+  // we've queued it for review.
+  notifyForReview(
+    review.id,
+    "review",
+    `PR #${pullReq.number} added to review queue`,
+    `${repo.owner}/${repo.name} — ${pullReq.title}`
+  );
 }

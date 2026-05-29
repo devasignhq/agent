@@ -394,7 +394,7 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
       <div className="flex justify-between items-center">
         <h3 className="card-title">Review queue</h3>
         <div className="flex gap-2 items-center">
-          <span className="pill ok"><i className="dot pulse"></i> {active} running</span>
+          <span className="pill running"><i className="dot pulse"></i> {active} running</span>
           {onSync && (
             <button
               className="btn sm ghost"
@@ -597,21 +597,86 @@ const TerminalFor = ({ pr, lines }) =>
 // ────────────────────────────────────────────────────────────────────────────
 // Goal panel (right column) — same layout as the previous pop-up
 // ────────────────────────────────────────────────────────────────────────────
-const GoalPanel = ({ pr, live }) => {
+const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
+  // Local-only hide set for constraints without a backend attachment id
+  // (legacy attachments persisted before we added `id`, or static demo
+  // strings). Click → fade out, no network round-trip.
+  const [hiddenLocal, setHiddenLocal] = React.useState<Set<string>>(new Set());
+  // Mirror set of URLs / content refs whose corresponding entries in
+  // "sources analyzed" should also disappear when their constraint is hidden.
+  // Backend-delete path adds to this too, so the source row drops in the
+  // same render as the constraint — the polling refetch will then reconcile.
+  const [hiddenSourceUrls, setHiddenSourceUrls] = React.useState<Set<string>>(new Set());
+  const hideLocally = React.useCallback((key: string, urls: Array<string | undefined>) => {
+    setHiddenLocal((s) => {
+      const next = new Set(s);
+      next.add(key);
+      return next;
+    });
+    const liveUrls = urls.filter((u): u is string => typeof u === "string" && u.length > 0);
+    if (liveUrls.length > 0) {
+      setHiddenSourceUrls((s) => {
+        const next = new Set(s);
+        for (const u of liveUrls) next.add(u);
+        return next;
+      });
+    }
+  }, []);
+  const hideSourceUrl = React.useCallback((urls: Array<string | undefined>) => {
+    const liveUrls = urls.filter((u): u is string => typeof u === "string" && u.length > 0);
+    if (liveUrls.length === 0) return;
+    setHiddenSourceUrls((s) => {
+      const next = new Set(s);
+      for (const u of liveUrls) next.add(u);
+      return next;
+    });
+  }, []);
+  // Inline confirmation: the row key currently in "are you sure?" state. Only
+  // backend-id constraints enter this — client-side hides for static/legacy
+  // rows skip it because they're reversible (page reload restores them).
+  const [pendingDelete, setPendingDelete] = React.useState<string | null>(null);
+  React.useEffect(() => {
+    if (!pendingDelete) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") setPendingDelete(null); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [pendingDelete]);
   // Prefer live data (task.endGoal + review.criteria) when available; fall
   // back to the static `goal` blob for any legacy PRs.
+  const liveMode = !!(live && (live.endGoal || (live.criteria && live.criteria.length)));
   const goal =
-    (live && (live.endGoal || (live.criteria && live.criteria.length)))
+    liveMode
       ? {
           title: live.title,
-          ticket: { id: live.taskId || "—", url: "", source: "github", summary: live.endGoal || "(no end-goal synthesised yet)", assignee: "—", reporter: "—" },
-          loom: null,
-          images: [],
-          docs: [],
+          ticket: { id: live.prNumber ? `#${live.prNumber}` : "—", url: "", source: "github", summary: live.endGoal || "(no end-goal synthesised yet)", assignee: "—", reporter: "—" },
           acceptance: live.criteria.map((c, i) => ({ id: i + 1, text: c.text, met: c.met === true, note: c.evidence || undefined })),
-          constraints: live.attachments?.map((a) => `${a.kind} · ${a.url || a.note || a.contentRef || ""}`) || [],
+          // Constraint rows in live mode carry the attachment id + the URL /
+          // contentRef so the X click can match the corresponding source
+          // entry in "sources analyzed" and hide it in lockstep.
+          constraints: (live.attachments || []).map((a) => ({
+            id: a.id as string | undefined,
+            kind: a.kind,
+            url: a.url,
+            contentRef: a.contentRef,
+            note: a.note,
+            label: `${a.kind} · ${a.url || a.note || a.contentRef || ""}`,
+          })),
         }
       : pr?.goal;
+  // Source manifest — what the agent actually ingested while synthesising
+  // the end goal. Live path uses the structured list extracted from
+  // `detail.logs` + `task.attachments`; static demo path projects the old
+  // loom/images/docs shape into the same generic descriptor.
+  // After the user removes a constraint, also drop the matching source row
+  // from this view (matched by URL) until the backend re-render reconciles.
+  const rawSources = liveMode ? (live.sources || []) : staticGoalSources(pr?.goal);
+  const sources = React.useMemo(() => {
+    if (hiddenSourceUrls.size === 0) return rawSources;
+    return rawSources.filter((s) => {
+      const u = s?.url;
+      return !(typeof u === "string" && hiddenSourceUrls.has(u));
+    });
+  }, [rawSources, hiddenSourceUrls]);
 
   if (!goal) {
     return (
@@ -642,10 +707,11 @@ const GoalPanel = ({ pr, live }) => {
       <div className="agent-pane-head">
         <div className="flex gap-3 items-center">
           <h3 className="card-title">End-goal</h3>
-          <span className="pill ok"><i className="dot"></i> ingested</span>
         </div>
         <div className="flex gap-2 items-center">
-          <span className="mono mute" style={{ fontSize: 11 }}>3 sources</span>
+          <span className="mono mute" style={{ fontSize: 11 }}>
+            {sources.length} source{sources.length === 1 ? "" : "s"}
+          </span>
           <button className="btn sm ghost"><Icon name="download" size={11} /></button>
           <button className="btn sm ghost"><Icon name="spark" size={11} /> Re-ingest</button>
         </div>
@@ -666,51 +732,58 @@ const GoalPanel = ({ pr, live }) => {
 
         <div className="drawer-section">
           <div className="drawer-label">sources analyzed</div>
-          {goal.loom && <div className="source-card">
-            <div className="source-head">
-              <Icon name="loom" size={14} color="var(--purple)" />
-              <span className="mono" style={{ fontSize: 12 }}>{goal.loom.url}</span>
-              <span className="mono mute" style={{ fontSize: 11 }}>{goal.loom.duration}</span>
-              <span className="pill purple" style={{ marginLeft: "auto" }}><i className="dot"></i> transcribed</span>
+          {sources.length === 0 && (
+            <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>
+              {liveMode
+                ? "(sources still being ingested…)"
+                : "(no sources recorded)"}
             </div>
-            <div className="source-body">
-              <div style={{ fontSize: 12, color: "var(--fg-dim)", lineHeight: 1.6, marginBottom: 10 }}>
-                {goal.loom.transcript}
-              </div>
-              <div className="key-moments">
-                {goal.loom.keyMoments.map((m, i) =>
-                <div key={i} className="key-moment">
-                    <span className="mono txt-accent" style={{ fontSize: 11, minWidth: 36 }}>{m.t}</span>
-                    <span style={{ fontSize: 12 }}>{m.note}</span>
+          )}
+          {sources.map((s, i) => {
+            const flavorVar =
+              s.flavor === "green" ? "var(--green)"
+              : s.flavor === "cyan" ? "var(--cyan)"
+              : s.flavor === "pink" ? "var(--pink)"
+              : s.flavor === "purple" ? "var(--purple)"
+              : s.flavor === "warn" ? "var(--warn)"
+              : s.flavor === "danger" ? "var(--danger)"
+              : s.flavor === "info" ? "var(--info)"
+              : s.flavor === "active" ? "var(--accent)"
+              : "var(--fg-mute)";
+            return (
+              <div key={i} className="source-card">
+                <div className="source-head">
+                  <Icon name={s.icon} size={14} color={flavorVar} />
+                  <span className="mono" style={{ fontSize: 12 }}>{s.label}</span>
+                  {s.url && (
+                    <a
+                      href={s.url}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="mono mute"
+                      style={{ fontSize: 11, textDecoration: "underline" }}
+                      title={s.url}
+                    >
+                      {s.url.length > 40 ? s.url.slice(0, 38) + "…" : s.url}
+                    </a>
+                  )}
+                  {s.unreliable && (
+                    <span className="pill warn" style={{ marginLeft: 6 }}>
+                      <i className="dot"></i> unreliable
+                    </span>
+                  )}
+                  <span className={`pill ${s.flavor || ""}`} style={{ marginLeft: "auto" }}>
+                    <i className="dot"></i> {s.state}
+                  </span>
+                </div>
+                {s.note && (
+                  <div className="source-body mono" style={{ fontSize: 11, color: "var(--fg-dim)" }}>
+                    {s.note}
                   </div>
                 )}
               </div>
-            </div>
-          </div>}
-
-          {goal.images.map((img, i) =>
-          <div key={i} className="source-card">
-              <div className="source-head">
-                <Icon name="image" size={14} color="var(--warn)" />
-                <span className="mono" style={{ fontSize: 12 }}>{img.name}</span>
-                <span className="pill warn" style={{ marginLeft: "auto" }}><i className="dot"></i> ocr'd</span>
-              </div>
-              <div className="source-body mono" style={{ fontSize: 11, color: "var(--fg-dim)" }}>
-                <div><span className="mute">strings extracted:</span> {img.strings}</div>
-                <div><span className="mute">spec:</span> {img.spec}</div>
-              </div>
-            </div>
-          )}
-
-          {goal.docs.map((d, i) =>
-          <div key={i} className="source-card">
-              <div className="source-head">
-                <Icon name="doc" size={14} color="var(--info)" />
-                <span className="mono" style={{ fontSize: 12 }}>{d.path}</span>
-                <span className="pill info" style={{ marginLeft: "auto" }}><i className="dot"></i> {d.sections} sections</span>
-              </div>
-            </div>
-          )}
+            );
+          })}
         </div>
 
         <div className="drawer-section">
@@ -739,11 +812,97 @@ const GoalPanel = ({ pr, live }) => {
         <div className="drawer-section">
           <div className="drawer-label">constraints</div>
           <ul className="constraint-list">
-            {goal.constraints.map((c, i) =>
-            <li key={i}>
-                <span className="mono txt-accent">▸</span> {c}
-              </li>
-            )}
+            {(() => {
+              const rows = goal.constraints.map((c, i) => {
+                // Live-mode constraints are { id, label, kind, url, ... };
+                // demo/static constraints are bare strings.
+                const isObj = c && typeof c === "object" && "label" in c;
+                const label: string = isObj ? c.label : c;
+                const attId: string | undefined = isObj ? c.id : undefined;
+                const url: string | undefined = isObj ? c.url : undefined;
+                const contentRef: string | undefined = isObj ? c.contentRef : undefined;
+                // Stable per-row key for client-side hide tracking.
+                const key = attId || `static:${i}:${label}`;
+                return { label, attId, key, url, contentRef };
+              }).filter((r) => !hiddenLocal.has(r.key));
+              if (rows.length === 0) {
+                return (
+                  <li className="mute mono" style={{ fontSize: 11, listStyle: "none", padding: 0 }}>
+                    No constraints. Drop a Loom, doc link, or note into the message agent to add one.
+                  </li>
+                );
+              }
+              return rows.map((r) => {
+                const isPending = pendingDelete === r.key;
+                return (
+                <li
+                  key={r.key}
+                  style={{ display: "flex", alignItems: "flex-start", gap: 8, flexWrap: "wrap" }}
+                >
+                  <span className="mono txt-accent" style={{ paddingTop: 2 }}>▸</span>
+                  <span style={{ flex: 1, minWidth: 0, wordBreak: "break-word", opacity: isPending ? 0.5 : 1 }}>{r.label}</span>
+                  <button
+                    className="icon-btn"
+                    title="Remove this constraint — re-synthesises the end goal and re-runs the review"
+                    aria-label="Remove constraint"
+                    onClick={() => setPendingDelete(r.key)}
+                    style={{ flex: "0 0 auto", width: 22, height: 22 }}
+                  >
+                    <Icon name="x" size={11} />
+                  </button>
+                  {isPending && (
+                    <div
+                      role="alertdialog"
+                      aria-label="Confirm removal"
+                      // Spans the whole row so the prompt is unmissable. Uses
+                      // the danger-tinted background from the existing
+                      // user-confirm sign-out flow for visual continuity.
+                      style={{
+                        flex: "1 0 100%",
+                        marginTop: 6,
+                        padding: 10,
+                        border: "1px solid color-mix(in oklch, var(--danger) 35%, var(--line))",
+                        background: "color-mix(in oklch, var(--danger) 6%, transparent)",
+                        display: "flex",
+                        alignItems: "center",
+                        gap: 10,
+                        flexWrap: "wrap",
+                      }}
+                    >
+                      <span style={{ flex: 1, minWidth: 0, fontSize: 12, color: "var(--fg)" }}>
+                        Remove this constraint? The agent will re-synthesise the end goal without it and re-run the review.
+                      </span>
+                      <button
+                        className="btn sm ghost"
+                        onClick={() => setPendingDelete(null)}
+                        autoFocus
+                      >Cancel</button>
+                      <button
+                        className="btn sm danger"
+                        onClick={() => {
+                          // Source list drops in lockstep regardless of path
+                          // — backend-delete also gets durable cleanup via the
+                          // video-log scrub server-side. `hideLocally` stays
+                          // as a silent fallback for the rare case where a
+                          // row somehow lacks an attachment id, so the click
+                          // is never a no-op.
+                          hideSourceUrl([r.url, r.contentRef]);
+                          if (r.attId && onDeleteConstraint) {
+                            onDeleteConstraint(r.attId);
+                          } else {
+                            hideLocally(r.key, [r.url, r.contentRef]);
+                          }
+                          setPendingDelete(null);
+                        }}
+                      >
+                        <Icon name="x" size={11}/> Remove
+                      </button>
+                    </div>
+                  )}
+                </li>
+                );
+              });
+            })()}
           </ul>
         </div>
       </div>
@@ -1067,6 +1226,178 @@ function mapLogEntry(entry) {
     detail: <>{entry.detail || entry.action}{detailExtra}</>,
     finding,
   };
+}
+
+// Walk the backend log stream + task attachments and build a structured list
+// of everything the agent ingested while synthesising the end goal. The data
+// is already on the wire via GET /api/reviews/:id; this just folds it into
+// the shape the GoalPanel renders. Returns an empty array when nothing has
+// been ingested yet (transient pre-pipeline state).
+//
+// Source-kind icons/flavors mirror the existing review-log timeline mapping
+// so the same source reads the same way in both surfaces.
+function extractIngestedSources(logs, attachments = []) {
+  const sources = [];
+  const ingestLog = (logs || []).find((l) => l.action === "Context ingested");
+  if (ingestLog?.meta) {
+    const kinds = Array.isArray(ingestLog.meta.sources) ? ingestLog.meta.sources : [];
+    const primary = Array.isArray(ingestLog.meta.primaryIssues) ? ingestLog.meta.primaryIssues : [];
+    const secondary = Array.isArray(ingestLog.meta.secondaryIssues) ? ingestLog.meta.secondaryIssues : [];
+    if (kinds.includes("github_pr")) {
+      sources.push({
+        kind: "pr",
+        icon: "git",
+        flavor: "green",
+        label: "PR description",
+        state: "ingested",
+      });
+    }
+    if (kinds.includes("diff")) {
+      sources.push({
+        kind: "diff",
+        icon: "code",
+        flavor: "cyan",
+        label: "Unified diff",
+        state: "ingested",
+      });
+    }
+    for (const num of primary) {
+      sources.push({
+        kind: "issue",
+        icon: "doc",
+        flavor: "warn",
+        label: `Issue #${num}`,
+        state: "primary",
+        note: "closes/fixes-linked — authoritative job-to-be-done",
+      });
+    }
+    for (const num of secondary) {
+      sources.push({
+        kind: "issue",
+        icon: "doc",
+        flavor: "info",
+        label: `Issue #${num}`,
+        state: "secondary",
+      });
+    }
+  }
+
+  // Videos can appear in two log lines: the main ingest summarisation pass
+  // and a follow-up pass that summarises videos found in maintainer
+  // comments. De-dupe by URL so the same Loom doesn't show twice.
+  const videoLogs = (logs || []).filter(
+    (l) =>
+      (l.action === "Videos summarized by Gemini" ||
+        l.action === "Videos in maintainer feedback summarized") &&
+      Array.isArray(l.meta?.videos)
+  );
+  const seenVideoUrls = new Set();
+  for (const log of videoLogs) {
+    for (const v of log.meta.videos) {
+      if (!v?.url || seenVideoUrls.has(v.url)) continue;
+      seenVideoUrls.add(v.url);
+      const provider = String(v.provider || "video");
+      const isLoom = provider.toLowerCase() === "loom";
+      sources.push({
+        kind: "video",
+        icon: isLoom ? "loom" : "play",
+        // Loom keeps its purple convention; other providers (YouTube /
+        // Vimeo / Wistia / Twitch) get pink so they don't all collapse
+        // into the same color when a PR has both.
+        flavor: isLoom ? "purple" : "pink",
+        label: `${provider.charAt(0).toUpperCase() + provider.slice(1)} video`,
+        url: v.url,
+        state: v.model ? `transcribed (${v.model})` : "transcribed",
+        unreliable: v.unreliable === true,
+      });
+    }
+  }
+
+  const indexLog = (logs || []).find((l) => l.action === "Repo index retrieved");
+  if (indexLog?.meta) {
+    const touched = Array.isArray(indexLog.meta.touched) ? indexLog.meta.touched.length : 0;
+    const dependents = Array.isArray(indexLog.meta.dependents) ? indexLog.meta.dependents.length : 0;
+    const sha = typeof indexLog.meta.indexedCommit === "string" ? indexLog.meta.indexedCommit.slice(0, 7) : null;
+    sources.push({
+      kind: "repoIndex",
+      icon: "brain",
+      flavor: "cyan",
+      label: "Repo index",
+      state: "retrieved",
+      note: `${touched + dependents} entries · ${touched} touched, ${dependents} dependents${sha ? ` · indexed @ ${sha}` : ""}`,
+    });
+  }
+
+  for (const a of attachments || []) {
+    const kind = String(a?.kind || "link");
+    const icon =
+      kind === "loom" ? "loom"
+      : kind === "figma" ? "image"
+      : kind === "image" ? "image"
+      : kind === "pdf" ? "doc"
+      : kind === "text" ? "doc"
+      : "link";
+    // Per-kind color so attachments visibly differ from each other and
+    // from the ingest sources above. text falls through to the default
+    // (muted) so plain-text notes don't shout.
+    const flavor =
+      kind === "loom" ? "purple"
+      : kind === "figma" ? "pink"
+      : kind === "image" ? "warn"
+      : kind === "pdf" ? "danger"
+      : kind === "link" ? "info"
+      : "";
+    sources.push({
+      kind,
+      icon,
+      flavor,
+      label: `${kind.charAt(0).toUpperCase() + kind.slice(1)} attachment`,
+      url: a.url || a.contentRef || undefined,
+      note: a.note || undefined,
+      state: "attached",
+    });
+  }
+
+  return sources;
+}
+
+// Build a `sources` array for the static demo `pr.goal` blob (Loom +
+// Figma frames + docs) so the legacy mock data still renders through the
+// same generic loop the live path uses.
+function staticGoalSources(goal) {
+  if (!goal) return [];
+  const out = [];
+  if (goal.loom) {
+    out.push({
+      kind: "video",
+      icon: "loom",
+      flavor: "purple",
+      label: "Loom video",
+      url: goal.loom.url,
+      state: "transcribed",
+      note: goal.loom.duration ? `${goal.loom.duration} · ${goal.loom.frames || 0} key frames` : undefined,
+    });
+  }
+  for (const img of goal.images || []) {
+    out.push({
+      kind: "image",
+      icon: "image",
+      flavor: "warn",
+      label: img.name || "Image",
+      state: "ocr'd",
+      note: img.spec ? `${img.strings || 0} strings · ${img.spec}` : undefined,
+    });
+  }
+  for (const d of goal.docs || []) {
+    out.push({
+      kind: "doc",
+      icon: "doc",
+      flavor: "info",
+      label: d.path || "Doc",
+      state: `${d.sections || 0} sections`,
+    });
+  }
+  return out;
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -1602,7 +1933,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
               {pr?.status === "running" && <span className="pill info"><i className="dot pulse"></i> live</span>}
             </div>
             <div className="flex gap-2 items-center">
-              <span className="mono mute" style={{ fontSize: 11 }}>model · {pr?.model || "—"}</span>
               <button
                 className="btn sm ghost"
                 onClick={() => pickedId && api.rerunReview(pickedId).then(refreshList).catch((e) => alert(`Re-run failed: ${e.message || e}`))}
@@ -1633,8 +1963,26 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
             endGoal: detail.task?.endGoal,
             criteria: detail.review.criteria,
             taskId: detail.task?.id,
+            prNumber: detail.review.prNumber,
             attachments: detail.task?.attachments,
+            sources: extractIngestedSources(detail.logs, detail.task?.attachments || []),
           } : null}
+          onDeleteConstraint={async (attachmentId) => {
+            if (!detail?.task?.id) return;
+            try {
+              await api.deleteAttachment(detail.task.id, attachmentId);
+              // Optimistic: drop it from the locally cached detail so the row
+              // disappears immediately. The polling refetch will reconcile.
+              setDetail((d) => d && d.task ? {
+                ...d,
+                task: { ...d.task, attachments: (d.task.attachments || []).filter((a) => a.id !== attachmentId), endGoal: null },
+                review: { ...d.review, criteria: [], status: "queued", verdict: null },
+              } : d);
+              refreshList();
+            } catch (err) {
+              alert(`Could not remove constraint: ${err.message || err}`);
+            }
+          }}
         />
       </div>
     </div>);

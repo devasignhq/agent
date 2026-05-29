@@ -2,6 +2,7 @@
 // (debounced) so the server can restart without losing state.
 import fs from "node:fs";
 import path from "node:path";
+import { v4 as uuid } from "uuid";
 import { config } from "./config.js";
 import type { DB } from "./types.js";
 
@@ -16,14 +17,51 @@ const empty: DB = {
   subscriptions: [],
   authAudit: [],
   repoIndex: [],
+  notifications: [],
 };
+
+// One-shot migration on load: assign an id (and createdAt) to any
+// TaskAttachment that was persisted before the `id` field existed. Without
+// this, the frontend's constraint X-click can't address the attachment by
+// id and falls back to a client-only hide path. Idempotent — rows that
+// already have an id are untouched. Returns true when something changed.
+function backfillAttachmentIds(state: DB): boolean {
+  let mutated = false;
+  for (const task of state.tasks || []) {
+    const attachments = task.attachments || [];
+    for (let i = 0; i < attachments.length; i++) {
+      const a = attachments[i];
+      if (!a) continue;
+      if (!a.id) {
+        attachments[i] = { ...a, id: uuid(), createdAt: a.createdAt ?? Date.now() };
+        mutated = true;
+      } else if (!a.createdAt) {
+        attachments[i] = { ...a, createdAt: Date.now() };
+        mutated = true;
+      }
+    }
+  }
+  return mutated;
+}
 
 function load(): DB {
   if (!config.dbPath) return structuredClone(empty);
   try {
     const raw = fs.readFileSync(config.dbPath, "utf8");
     const parsed = JSON.parse(raw);
-    return { ...empty, ...parsed };
+    const merged = { ...empty, ...parsed } as DB;
+    if (backfillAttachmentIds(merged)) {
+      // Persist the migrated snapshot synchronously so re-reads (or another
+      // process) see the rewritten ids without waiting on the debounced flush.
+      try {
+        fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
+        fs.writeFileSync(config.dbPath, JSON.stringify(merged, null, 2));
+        console.log("[db] migrated attachment ids");
+      } catch (err) {
+        console.warn("[db] could not write back attachment-id migration:", err);
+      }
+    }
+    return merged;
   } catch {
     return structuredClone(empty);
   }
