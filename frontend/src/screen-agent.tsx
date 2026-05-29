@@ -794,6 +794,17 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
             </span>
           </div>
           <div className="ac-list">
+            {goal.acceptance.length === 0 &&
+            <div className="ac-row" style={{ opacity: 0.85 }}>
+                <div className="ac-check"><Icon name="check" size={11} /></div>
+                <div>
+                  <div style={{ fontSize: 13 }}>No acceptance criteria — reviewed for correctness only.</div>
+                  <div className="mute mono" style={{ fontSize: 11, marginTop: 3 }}>
+                    Add an end goal on the PR (description, Loom, or screenshot + notes) to enable criteria checks.
+                  </div>
+                </div>
+              </div>
+            }
             {goal.acceptance.map((a) =>
             <div key={a.id} className={`ac-row ${a.met ? "met" : "unmet"}`}>
                 <div className="ac-check">

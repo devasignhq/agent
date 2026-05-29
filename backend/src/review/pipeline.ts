@@ -137,17 +137,35 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     // b. Criteria synthesis (with task linkage if there's a matching task)
     const task = findOrCreateTask(review);
+    // Whether we have any authoritative source of "done" beyond the diff: a
+    // linked issue, an attached video, or a task attachment. When we don't,
+    // synthesis is told it may legitimately produce zero criteria instead of
+    // inventing a spec from a thin PR description.
+    const hasAuthoritativeSpec = !!(
+      context.primaryIssues.length ||
+      context.secondaryIssues.length ||
+      context.videos.length ||
+      task.attachments.length
+    );
     let endGoal = task.endGoal;
     let criteria: Criterion[] = [];
     if (!endGoal || review.criteria.length === 0) {
-      const synth = await synthesizeCriteria(review, context);
-      endGoal = synth.endGoal;
+      const synth = await synthesizeCriteria(review, context, hasAuthoritativeSpec);
       criteria = synth.criteria;
+      // Spec-less PR with no checkable claims: keep a neutral end goal so the
+      // task still reads as "reviewed" (and the frontend renders it) rather
+      // than "not synthesized".
+      endGoal = synth.endGoal || (criteria.length === 0 ? NEUTRAL_ENDGOAL : "");
       db.update("tasks", (t) => t.id === task.id, { endGoal });
-      log(review.id, "criteria", "End goal synthesized", {
-        detail: endGoal,
-        meta: { count: criteria.length },
-      });
+      log(
+        review.id,
+        "criteria",
+        criteria.length ? "End goal synthesized" : "No spec — reviewing for correctness only",
+        {
+          detail: endGoal,
+          meta: { count: criteria.length, hasAuthoritativeSpec },
+        }
+      );
     } else {
       criteria = review.criteria;
     }
@@ -232,10 +250,39 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       verdict: verdict.summary,
       status,
     });
-    log(review.id, "verdict", status === "passed" ? "All checks met" : "Changes requested", {
+
+    // Route the verdict to a GitHub review action. We never auto-APPROVE a PR
+    // we had no acceptance criteria to verify against: a clean spec-less pass
+    // posts a neutral COMMENT and (exactly once) invites the maintainer to
+    // supply an end goal so a real criteria-based review can run.
+    const specless = filledCriteria.length === 0;
+    let reviewEvent: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+    let postConversationReview = true;
+    let includeEndGoalCTA = false;
+    if (status !== "passed") {
+      reviewEvent = "REQUEST_CHANGES";
+    } else if (!specless) {
+      reviewEvent = "APPROVE";
+    } else {
+      reviewEvent = "COMMENT";
+      if (!task.endGoalRequestedAt) {
+        includeEndGoalCTA = true; // ask once
+      } else {
+        postConversationReview = false; // already asked → refresh Check Run only
+      }
+    }
+
+    const verdictAction =
+      status !== "passed"
+        ? "Changes requested"
+        : specless
+        ? "No issues found (no linked spec)"
+        : "All checks met";
+    log(review.id, "verdict", verdictAction, {
       detail: verdict.summary,
       meta: {
         criteriaCount: filledCriteria.length,
+        specless,
         holisticBlockers: hasBlocker,
         holisticFindings:
           holisticVerdict.regressions.length +
@@ -245,17 +292,21 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     });
     // App notification: analysis is complete. `review` → "passed" (blue dot),
     // `blocker` → "changes_requested" (red dot). Click navigates to detail.
+    const notifyTitle =
+      status !== "passed"
+        ? `PR #${review.prNumber} — Changes requested`
+        : specless
+        ? `PR #${review.prNumber} — No issues found${includeEndGoalCTA ? "; end goal requested" : ""}`
+        : `PR #${review.prNumber} — All criteria met`;
     notifyForReview(
       review.id,
       status === "passed" ? "review" : "blocker",
-      status === "passed"
-        ? `PR #${review.prNumber} — All criteria met`
-        : `PR #${review.prNumber} — Changes requested`,
+      notifyTitle,
       `${repo.owner}/${repo.name} — ${review.prTitle}`
     );
 
     // d. Output: GitHub Check Run + PR review + broadcast
-    await postGithubOutput(review, repo, install, status, {
+    const { reviewPosted } = await postGithubOutput(review, repo, install, status, {
       endGoal: endGoal || "",
       criteria: filledCriteria,
       summary: verdict.summary,
@@ -263,14 +314,29 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       comments: verdict.comments,
       diff: context.diff,
       holistic: holisticVerdict,
+      event: reviewEvent,
+      postConversationReview,
+      endGoalCTA: includeEndGoalCTA,
     });
+    // Mark the end-goal request as sent so re-reviews on later pushes don't
+    // re-spam the PR conversation.
+    if (includeEndGoalCTA && reviewPosted) {
+      db.update("tasks", (t) => t.id === task.id, { endGoalRequestedAt: Date.now() });
+      log(review.id, "comment", "Requested an end goal on spec-less PR");
+    }
     await broadcastVerdict(review, repo, status, verdict.summary);
-    log(review.id, "comment", "Posted Check Run and PR review", {
-      meta: {
-        inlineComments: verdict.comments.length,
-        suggestions: verdict.suggestions.length,
-      },
-    });
+    log(
+      review.id,
+      "comment",
+      postConversationReview ? "Posted Check Run and PR review" : "Refreshed Check Run",
+      {
+        meta: {
+          inlineComments: verdict.comments.length,
+          suggestions: verdict.suggestions.length,
+          event: reviewEvent,
+        },
+      }
+    );
   } catch (err) {
     console.error(`[review] ${review.id} failed:`, err);
     setStatus(review.id, { status: "errored" });
@@ -529,7 +595,18 @@ async function ghText(installationId: number, path: string, headers: Record<stri
 
 // --- Criteria synthesis ---
 
-async function synthesizeCriteria(review: PRReview, context: Context): Promise<{
+// End goal placeholder for a PR with no authoritative spec (no linked issue,
+// no attachments, no checkable claims in the description). Kept non-empty so
+// the task still reads as "reviewed" in the UI rather than "not synthesized",
+// while signalling that acceptance criteria were intentionally not invented.
+const NEUTRAL_ENDGOAL =
+  "No linked issue or spec — reviewed for correctness only. Provide an end goal on the PR to enable acceptance-criteria checks.";
+
+async function synthesizeCriteria(
+  review: PRReview,
+  context: Context,
+  hasAuthoritativeSpec: boolean
+): Promise<{
   endGoal: string;
   criteria: Criterion[];
 }> {
@@ -539,7 +616,14 @@ async function synthesizeCriteria(review: PRReview, context: Context): Promise<{
     "The endGoal is one sentence summarising what success looks like. Each criterion is independently checkable. " +
     "Sources labelled `github_issue_primary` are the canonical job-to-be-done (the issue the PR closes/fixes); " +
     "treat their description as authoritative. `github_issue` rows are secondary background. " +
-    "`video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague.";
+    "`video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague." +
+    (hasAuthoritativeSpec
+      ? ""
+      : " IMPORTANT: This PR has NO linked issue and NO attached specification. Derive acceptance criteria ONLY from " +
+        "explicit, checkable claims the PR's own title and description actually make (e.g. \"fixes flaky uploads\", " +
+        "\"adds retry on 5xx\"). If the description makes no verifiable promise, return an EMPTY `criteria` array and a " +
+        "brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent acceptance criteria " +
+        "just to have something to check, and never turn vague phrasing into a hard requirement.");
   const userText =
     `# PR ${review.prTitle}\n\n## Context\n` +
     context.sources
@@ -669,6 +753,9 @@ async function reviewDiff(
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
     "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
+    "If the criteria list is empty, do NOT invent criteria or acceptance checks — review only for concrete, " +
+    "evidence-backed defects in the diff, and if it is sound return empty `comments` and `suggestions` with a brief, " +
+    "positive `summary`. Never manufacture issues to appear thorough. " +
     "For every unmet criterion, include one suggestion describing the smallest practical patch the developer " +
     "could ship in a follow-up commit; prefer best-practice idioms already used in the diff. " +
     "`codeExample` is optional and must be a minimal snippet, never a full file. " +
@@ -721,20 +808,57 @@ async function reviewDiff(
   };
 }
 
+// Markdown block inviting the maintainer to provide an end goal on a spec-less
+// PR. When they reply (text, a Loom/video link, or a screenshot + description),
+// the maintainer-feedback path ingests it, synthesizes acceptance criteria, and
+// re-runs the review automatically.
+function buildEndGoalRequestCTA(): string {
+  return [
+    "## 🎯 Want a deeper, goal-based review?",
+    'This PR isn\'t linked to an issue, so DevAsign reviewed it for correctness only. To have it checked against a concrete **end goal**, reply on this PR with what "done" looks like — DevAsign will turn it into acceptance criteria and re-review automatically.',
+    "",
+    "You can provide it as:",
+    "- **Text** — a short description of the intended behaviour and acceptance conditions",
+    "- **A Loom / YouTube / Vimeo link** — DevAsign will watch it and extract acceptance signals",
+    "- **A screenshot + description** — show the expected result and describe it in the comment",
+    "",
+    "_Just comment on this PR — no special command needed._",
+  ].join("\n");
+}
+
 // Build the markdown body that lands as the GitHub PR Review body. The shape
 // is intentionally scannable: end goal, then a checked/unchecked criteria
 // list with per-criterion evidence, then concrete suggestions the developer
-// can apply in a follow-up commit.
+// can apply in a follow-up commit. For a spec-less PR (no acceptance criteria)
+// it leads with a neutral status instead of a synthesised end goal so we never
+// present invented requirements.
 function formatReviewBody(
   endGoal: string,
   filledCriteria: Criterion[],
   suggestions: ReviewSuggestion[],
   summary: string,
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
-  context?: { prTitle: string; repoFullName: string }
+  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean }
 ): string {
   const lines: string[] = [];
-  if (endGoal) {
+  const specless = filledCriteria.length === 0;
+  const holisticItemCount =
+    holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
+  if (specless) {
+    if (holisticItemCount === 0) {
+      lines.push(
+        "## ✅ No issues found",
+        "No blocking bugs, regressions, or security concerns surfaced in this diff. This PR has no linked issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
+        ""
+      );
+    } else {
+      lines.push(
+        "## Reviewed for correctness",
+        "This PR has no linked issue or spec, so no acceptance criteria were checked. The concerns below come from a whole-repo correctness pass.",
+        ""
+      );
+    }
+  } else if (endGoal) {
     lines.push("## End goal", endGoal, "");
   }
 
@@ -831,6 +955,12 @@ function formatReviewBody(
     lines.push(fence);
     lines.push("");
     lines.push("</details>");
+  }
+
+  // Spec-less PRs: invite an end goal (posted once; gated in runReviewJob).
+  if (context?.endGoalCTA) {
+    lines.push("");
+    lines.push(buildEndGoalRequestCTA());
   }
 
   return lines.join("\n").trim() || "DevAsign review.";
@@ -991,19 +1121,23 @@ async function postGithubOutput(
     comments: Array<{ path: string; line: number; body: string }>;
     diff: string;
     holistic: HolisticVerdict;
+    // GitHub review action. COMMENT (no APPROVE/REQUEST_CHANGES) is used for a
+    // clean spec-less pass so the bot doesn't formally approve a PR it had no
+    // criteria to verify against.
+    event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+    // When false, only the Check Run is (re)posted — used on repeat reviews of
+    // a still-spec-less PR where we've already asked for an end goal.
+    postConversationReview: boolean;
+    // Append the "provide an end goal" call-to-action to the review body.
+    endGoalCTA: boolean;
   }
-) {
-  if (!install) return; // dev: nothing to post to
+): Promise<{ reviewPosted: boolean }> {
+  if (!install) return { reviewPosted: false }; // dev: nothing to post to
   const conclusion = status === "passed" ? "success" : "action_required";
-  const body = formatReviewBody(
-    args.endGoal,
-    args.criteria,
-    args.suggestions,
-    args.summary,
-    args.holistic,
-    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}` }
-  );
+  const specless = args.criteria.length === 0;
 
+  // Check Run is keyed to head_sha, so it's always (re)posted — it updates the
+  // commit status without adding conversation noise.
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
       method: "POST",
@@ -1013,7 +1147,12 @@ async function postGithubOutput(
         status: "completed",
         conclusion,
         output: {
-          title: status === "passed" ? "All acceptance criteria met" : "Changes requested",
+          title:
+            status === "passed"
+              ? specless
+                ? "No issues found — add an end goal for acceptance-criteria review"
+                : "All acceptance criteria met"
+              : "Changes requested",
           summary: args.summary || "",
         },
       }),
@@ -1022,6 +1161,18 @@ async function postGithubOutput(
   } catch (err) {
     console.warn("[review] failed to post check run:", err);
   }
+
+  // Already asked for an end goal on a prior pass: refresh only the Check Run.
+  if (!args.postConversationReview) return { reviewPosted: false };
+
+  const body = formatReviewBody(
+    args.endGoal,
+    args.criteria,
+    args.suggestions,
+    args.summary,
+    args.holistic,
+    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA }
+  );
 
   // Translate the LLM's inline annotations into GitHub's review-comment shape.
   // Pre-filter against the file paths actually present in the diff so a bad
@@ -1033,16 +1184,18 @@ async function postGithubOutput(
     .map((c) => ({ path: c.path, line: c.line, side: "RIGHT" as const, body: c.body }));
 
   // PR review (single grouped comment so the conversation doesn't get spammy)
+  let reviewPosted = false;
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
       method: "POST",
       body: JSON.stringify({
-        event: status === "passed" ? "APPROVE" : "REQUEST_CHANGES",
+        event: args.event,
         body,
         ...(inline.length ? { comments: inline } : {}),
       }),
       headers: { "Content-Type": "application/json" },
     });
+    reviewPosted = true;
   } catch (err) {
     // The inline batch is the usual culprit when the review POST fails (bad
     // line numbers, deleted files, etc). Fall back to posting just the body
@@ -1053,16 +1206,18 @@ async function postGithubOutput(
         await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
           method: "POST",
           body: JSON.stringify({
-            event: status === "passed" ? "APPROVE" : "REQUEST_CHANGES",
+            event: args.event,
             body,
           }),
           headers: { "Content-Type": "application/json" },
         });
+        reviewPosted = true;
       } catch (err2) {
         console.warn("[review] verdict-only fallback also failed:", err2);
       }
     }
   }
+  return { reviewPosted };
 }
 
 // --- Mid-review bug-fix comments ---
@@ -1276,6 +1431,10 @@ async function refineGoalFromFeedback(args: {
     "meaningfully changes what 'done' means for the PR. Only update the goal/criteria when the feedback adds " +
     "something concrete and clearly aligned with the product being built. Never invent requirements the " +
     "feedback didn't actually state. " +
+    "If there are NO existing acceptance criteria (the criteria list below is empty — the PR had no linked spec) and " +
+    "the comment supplies goal or acceptance information, treat the comment as the authoritative specification: set " +
+    "`changed` to true and synthesize the end goal and acceptance criteria directly from it (its text plus any video " +
+    "summaries or referenced docs provided). " +
     'Emit ONLY JSON: {"changed": boolean, "endGoal": string, "criteria": [{"id": string, "text": string}], "rationale": string}. ' +
     "When `changed` is false, echo back the original endGoal and criteria.";
 
@@ -1492,7 +1651,10 @@ export async function runMaintainerFeedbackJob(
 
   const refined = await refineGoalFromFeedback({
     review,
-    endGoal: task?.endGoal || "",
+    // When the PR is spec-less (no criteria yet), the stored endGoal is just
+    // the neutral placeholder — pass "" so the model treats this comment as the
+    // authoritative spec and bootstraps criteria from it.
+    endGoal: review.criteria.length === 0 ? "" : task?.endGoal || "",
     criteria: review.criteria,
     feedback: {
       author: comment.author,
@@ -1738,6 +1900,7 @@ async function reviewAgainstRepo(args: {
     'Use severity="warn" for plausible concerns that need human eyes. ' +
     "Never invent risks the diff doesn't actually create. Quote symbol names or paths from the provided summaries when you cite a concern. " +
     "When nothing material surfaces, return empty arrays — do not pad. " +
+    "This applies to `warn` findings as much as `blocker` findings: a `warn` is still a claim that must point to something concrete in the diff. Prefer empty arrays over speculative concerns. " +
     // Every finding must carry a copy-pasteable fixPrompt for the user's
     // external AI coding agent. Use this exact template (preserve newlines
     // and the inner ```diff fence):
