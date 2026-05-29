@@ -499,6 +499,7 @@ const FINDING_LABEL = {
   criticalError: "Critical error",
   security: "Security finding",
   consistency: "Consistency",
+  deferral: "Deferred work",
   suggestion: "Suggested change",
 };
 

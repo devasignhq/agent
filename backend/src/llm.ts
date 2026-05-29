@@ -185,6 +185,38 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     });
   }
 
+  // Deferred-work detection (Opus in production). Echo one deterministic
+  // advisory deferral so the offline path exercises the finding card + the new
+  // "Deferred / incomplete work" section end-to-end. The `concern` leads with
+  // the "Contradicts …" prefix the real prompt asks for.
+  if (system?.includes("deferred-work detection")) {
+    return JSON.stringify({
+      deferrals: [
+        {
+          path: "src/handler.ts",
+          concern:
+            "Contradicts criterion c1 — the added code defers part of the requested API: " +
+            '"// TODO: pagination (limit/offset) deferred to a follow-up PR". The end goal asked for the full query API.',
+          fixPrompt:
+            "Fix: Implement the deferred pagination params in src/handler.ts\n\n" +
+            "File: src/handler.ts\n" +
+            "Symbol: listHandler\n\n" +
+            "Issue:\n" +
+            "A code comment concedes pagination was deferred to a follow-up, but the end goal required the full " +
+            "query API including limit/offset. The PR ships without it.\n\n" +
+            "Suggested approach:\n" +
+            "Parse `limit` and `offset` from the query string, validate them, and apply them to the query before " +
+            "returning so the API matches what was agreed.\n\n" +
+            "Relevant diff:\n" +
+            "```diff\n" +
+            "+ // TODO: pagination (limit/offset) deferred to a follow-up PR\n" +
+            "```",
+        },
+      ],
+      summary: "[mock] 1 self-admitted deferral detected.",
+    });
+  }
+
   // Holistic repo-review (Opus in production). Default to no blockers so
   // mocked offline runs pass cleanly; flip the WARN_FLAKY env to surface a
   // sample warn-severity item.
