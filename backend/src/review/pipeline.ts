@@ -2013,6 +2013,7 @@ async function reviewAgainstRepo(args: {
   });
   const parsed = tryParseJSON<Partial<HolisticVerdict>>(raw, EMPTY_HOLISTIC);
   return {
+    ...EMPTY_HOLISTIC,
     regressions: normaliseFindings(parsed.regressions),
     criticalErrors: normaliseFindings(parsed.criticalErrors),
     securityFindings: normaliseFindings(parsed.securityFindings),
