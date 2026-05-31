@@ -208,20 +208,17 @@ export const api = {
 
   // installations & repos
   installations: () => request<Installation[]>("/api/installations"),
+  // Fast variant: backend returns the DB snapshot immediately and runs the
+  // GitHub reconcile in the background. Used by Settings → Installation for
+  // instant first paint; the slower `installations()` call is fired right
+  // after to pick up any rows the reconcile materialised.
+  installationsFast: () => request<Installation[]>("/api/installations?fast=1"),
   linkInstallation: (installationId: number) =>
     request<{ ok: true }>(`/api/installations/${installationId}/link`, {
       method: "POST",
       body: "{}",
     }),
   repositories: () => request<Repository[]>("/api/repositories"),
-  updateRepository: (
-    id: string,
-    patch: Partial<Pick<Repository, "defaultModel" | "modelOverrides" | "reviewsEnabled">>
-  ) =>
-    request<Repository>(`/api/repositories/${id}`, {
-      method: "PATCH",
-      body: JSON.stringify(patch),
-    }),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>

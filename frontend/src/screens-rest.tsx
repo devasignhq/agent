@@ -4,17 +4,14 @@ import React from "react";
 import { Icon } from "./icons";
 import { api, installRedirectUrl } from "./api";
 import { useAuth } from "./auth-context";
-import { IDE_OPTIONS, CLI_OPTIONS, HOW_IT_WORKS } from "./onboarding-data";
 import { registerPopup } from "./popup-registry";
 
 // ─── Settings ───────────────────────────────────────────────────────────────
 const SET_SECTIONS = [
 { key: "account", name: "Account" },
 { key: "install", name: "Installation" },
-{ key: "models", name: "Models" },
 { key: "integrations", name: "Integrations" },
-{ key: "usage", name: "Usage" },
-{ key: "billing", name: "Plans & billing" },
+{ key: "billing", name: "Billing" },
 { key: "support", name: "Support" }];
 
 
@@ -43,10 +40,8 @@ const SettingsPage = ({ initialSection }) => {
 
         <div>
           {sec === "install" && <SetInstall />}
-          {sec === "models" && <SetModels />}
           {sec === "integrations" && <SetIntegrations />}
           {sec === "billing" && <SetBilling />}
-          {sec === "usage" && <SetUsage />}
           {sec === "support" && <SetSupport />}
           {sec === "account" && <SetAccount />}
         </div>
@@ -321,21 +316,33 @@ const SetIntegrations = () => {
 };
 
 const SetInstall = () => {
-  const [ide, setIde] = React.useState("cursor");
-  const [cli, setCli] = React.useState("claude-code");
-  const [cliOpen, setCliOpen] = React.useState(true);
-  const [howOpen, setHowOpen] = React.useState(false);
-  const [installed, setInstalled] = React.useState<Record<string, boolean>>({});
-
   // Live installs + repos. Refreshes on mount, when an install message arrives
   // from the popup-handshake, and once after the user opens a popup so we
   // catch the round-trip even if the user dismisses the popup themselves.
   const [installs, setInstalls] = React.useState<any[]>([]);
   const [repos, setRepos] = React.useState<any[]>([]);
-  const refresh = React.useCallback(() => {
-    Promise.all([api.installations(), api.repositories()])
-      .then(([is, rs]) => { setInstalls(is); setRepos(rs); })
-      .catch(() => {});
+  // Two-phase load: phase 1 paints the local DB snapshot in one LAN round-
+  // trip (the `?fast=1` variant skips awaiting the GitHub reconcile); phase 2
+  // calls the default endpoint to pick up anything the background reconcile
+  // turned up (missed webhooks, popup-handshake races, etc). The page never
+  // shows an empty repo list while a network round-trip to GitHub is pending.
+  const refresh = React.useCallback(async () => {
+    try {
+      const [is, rs] = await Promise.all([api.installationsFast(), api.repositories()]);
+      setInstalls(is);
+      setRepos(rs);
+    } catch {
+      /* phase 2 will retry */
+    }
+    try {
+      const reconciled = await api.installations();
+      setInstalls(reconciled);
+      // Reconcile may have inserted new Repository rows via
+      // /installation/repositories; refresh the repos slice too.
+      setRepos(await api.repositories());
+    } catch {
+      /* keep phase-1 data on screen */
+    }
   }, []);
   React.useEffect(() => { refresh(); }, [refresh]);
 
@@ -371,9 +378,6 @@ const SetInstall = () => {
       if (popup.closed) { clearInterval(watch); refresh(); }
     }, 500);
   };
-
-  const currentIde = IDE_OPTIONS.find((o) => o.key === ide)!;
-  const currentCli = CLI_OPTIONS.find((o) => o.key === cli)!;
 
   // Group repos under their installation for the connected-repos list.
   const installRows = React.useMemo(() => {
@@ -447,234 +451,60 @@ const SetInstall = () => {
         </div>
       </div>
 
-      <div className="card">
-        <div className="card-head"><h3 className="card-title">IDE plugin</h3>
-          <span className="mono mute" style={{ fontSize: 11 }}>routes you to the IDE's marketplace</span></div>
-        <div className="card-body">
-          <div className="llm-row" style={{ marginBottom: 12 }}>
-            {IDE_OPTIONS.map((o) =>
-            <div key={o.key} className={`llm-chip ${ide === o.key ? "picked" : ""}`} onClick={() => setIde(o.key)}>
-                <Icon name="code" size={11} /> {o.name}
-                {installed[o.key] && <Icon name="check" size={11} color="var(--accent)" />}
-              </div>
-            )}
-          </div>
-          <div className="ide-install">
-            <div className="ide-install-meta">
-              <div className="mono" style={{ fontSize: 13 }}>{currentIde.name}</div>
-              <div className="mute mono" style={{ fontSize: 11, marginTop: 2 }}>
-                Opens {currentIde.store} · grants <span className="dim">repo:read</span> + <span className="dim">pr:write</span>
-              </div>
-            </div>
-            <button
-              className={`btn ${installed[ide] ? "ghost" : "primary"}`}
-              onClick={() => setInstalled({ ...installed, [ide]: !installed[ide] })}>
-
-              {installed[ide] ?
-              <><Icon name="check" size={12} /> Installed</> :
-              <><Icon name="external" size={12} /> Install on {currentIde.name}</>}
-            </button>
-          </div>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-head"><h3 className="card-title">CLI agent</h3>
-          <span className="mono mute" style={{ fontSize: 11 }}>local install · runs review off your machine</span></div>
-        <div className="card-body">
-          <div className="llm-row" style={{ marginBottom: 12 }}>
-            {CLI_OPTIONS.map((o) =>
-            <div key={o.key} className={`llm-chip ${cli === o.key ? "picked" : ""}`} onClick={() => setCli(o.key)}>
-                <Icon name="terminal" size={11} /> {o.name}
-              </div>
-            )}
-          </div>
-          <div className="code-block">
-            <code>$ {currentCli.install}</code>
-            <button className="btn sm ghost"><Icon name="copy" size={11} /> Copy</button>
-          </div>
-
-          <div className="collapse" style={{ marginTop: 14 }}>
-            <button className="collapse-head" onClick={() => setCliOpen(!cliOpen)}>
-              <Icon name="terminal" size={13} />
-              <span className="mono" style={{ fontSize: 12 }}>Core commands · {currentCli.name}</span>
-              <span className="flex-1"></span>
-              <span className="mute mono" style={{ fontSize: 11 }}>{currentCli.commands.length}</span>
-              <span className={`chev ${cliOpen ? "open" : ""}`}><Icon name="chevron-d" size={12} /></span>
-            </button>
-            {cliOpen &&
-            <div className="collapse-body">
-                {currentCli.commands.map((cmd) =>
-              <div key={cmd.c} className="cmd-row">
-                    <code className="cmd-c">$ {cmd.c}</code>
-                    <span className="cmd-d">{cmd.d}</span>
-                  </div>
-              )}
-              </div>
-            }
-          </div>
-
-          <div className="collapse" style={{ marginTop: 10 }}>
-            <button className="collapse-head" onClick={() => setHowOpen(!howOpen)}>
-              <Icon name="brain" size={13} />
-              <span className="mono" style={{ fontSize: 12 }}>How the review agent works</span>
-              <span className="flex-1"></span>
-              <span className="mute mono" style={{ fontSize: 11 }}>4 steps</span>
-              <span className={`chev ${howOpen ? "open" : ""}`}><Icon name="chevron-d" size={12} /></span>
-            </button>
-            {howOpen &&
-            <div className="collapse-body">
-                <div className="how-grid">
-                  {HOW_IT_WORKS.map((s) =>
-                <div key={s.title} className="how-step" style={{ opacity: "1", backgroundColor: "rgba(10, 11, 13, 0)", borderStyle: "none", padding: "12px 14px" }}>
-                      <div className="how-icon"><Icon name={s.icon} size={14} /></div>
-                      <div className="mono" style={{ fontSize: 12 }}>{s.title}</div>
-                      <div className="mute" style={{ fontSize: 12, marginTop: 4, lineHeight: 1.55 }}>{s.body}</div>
-                    </div>
-                )}
-                </div>
-              </div>
-            }
-          </div>
-        </div>
-      </div>
     </div>);
 
 };
 
-// ─── Models · per-repo review model + reviews toggle ──────────────────────
-// Wired to live backend endpoints: GET /api/repositories (list) and
-// PATCH /api/repositories/:id via api.updateRepository — the only consumer
-// of that endpoint in the frontend.
-const REVIEW_MODELS = [
-{ key: "claude-opus-4-7",   name: "Opus 4.7",   blurb: "Deepest reasoning · best for large or subtle diffs" },
-{ key: "claude-sonnet-4-5", name: "Sonnet 4.5", blurb: "Balanced speed and quality" },
-{ key: "claude-haiku-4-5",  name: "Haiku 4.5",  blurb: "Fastest · low cost for small PRs" }];
+const PLANS = [
+{ id: "free", name: "Free", tagline: "For maintainers of public repos", price: "$0", cadence: "/ free forever", features: "Public repos only" },
+{ id: "pro", name: "Pro", tagline: "For private repos & small teams", price: "$25", cadence: "/ month", features: "Private repos · Limited PR review", cta: "Get Pro Plan" },
+{ id: "max", name: "Max", tagline: "For shipping teams that review at velocity", price: "$100", cadence: "/ month", features: "Unlimited PR reviews · Priority queue", cta: "Get Max Plan" }];
 
-const SetModels = () => {
-  const [repos, setRepos] = React.useState([]);
-  const [loading, setLoading] = React.useState(true);
-  const [error, setError] = React.useState(null);
-  const [savingId, setSavingId] = React.useState(null);
+const INVOICES = [
+{ id: "inv-2026-05", date: "May 14, 2026", amount: "$25.00", status: "paid" },
+{ id: "inv-2026-04", date: "Apr 14, 2026", amount: "$25.00", status: "paid" },
+{ id: "inv-2026-03", date: "Mar 14, 2026", amount: "$25.00", status: "paid" }];
 
-  // Live load. Same call SetInstall uses; repos with zero open PRs still show.
-  React.useEffect(() => {
-    api.repositories()
-      .then((rs) => setRepos(rs))
-      .catch((e) => setError(e.message || String(e)))
-      .finally(() => setLoading(false));
-  }, []);
-
-  // Optimistic patch → PATCH /api/repositories/:id; rolls back on failure and
-  // reconciles from the row the backend returns.
-  const patchRepo = async (id, patch) => {
-    const prev = repos;
-    setRepos((list) => list.map((r) => (r.id === id ? { ...r, ...patch } : r)));
-    setSavingId(id);
-    try {
-      const updated = await api.updateRepository(id, patch);
-      if (updated) setRepos((list) => list.map((r) => (r.id === id ? { ...r, ...updated } : r)));
-      setError(null);
-    } catch (e) {
-      setRepos(prev);
-      setError(e.message || String(e));
-    } finally {
-      setSavingId(null);
-    }
-  };
-
-  // Always offer the repo's persisted model, even if it predates this list,
-  // so a saved value never disappears from the choices.
-  const optionsFor = (current) =>
-    !current || REVIEW_MODELS.some((m) => m.key === current)
-      ? REVIEW_MODELS
-      : [{ key: current, name: current, blurb: "current setting" }, ...REVIEW_MODELS];
-
-  return (
-    <div className="col gap-5">
-      <div className="card">
-        <div className="card-head">
-          <h3 className="card-title">Review models</h3>
-          <span className="mono mute" style={{ fontSize: 11 }}>per repository</span>
-        </div>
-        <div className="card-body">
-          <div className="mute" style={{ fontSize: 12, marginBottom: 14 }}>
-            Choose which model reviews PRs in each connected repository, and turn reviews on or off.
-            Changes apply to the next queued review.
-          </div>
-
-          {loading &&
-          <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>Loading repositories…</div>}
-          {error &&
-          <div className="mono" style={{ fontSize: 12, color: "var(--danger)", marginBottom: 12 }}>{error}</div>}
-          {!loading && !error && repos.length === 0 &&
-          <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>
-              No repositories granted yet — install the GitHub App and pick repos on GitHub.
-            </div>}
-
-          {repos.map((r, i) => {
-            const saving = savingId === r.id;
-            return (
-              <div key={r.id} style={{ padding: "14px 0", borderTop: i === 0 ? "none" : "1px solid var(--line)" }}>
-                <div className="flex items-center gap-2" style={{ marginBottom: 10 }}>
-                  <Icon name="git" size={12} color="var(--fg-faint)" />
-                  <span className="mono" style={{ fontSize: 13 }}>{r.owner}/{r.name}</span>
-                  <span className="flex-1"></span>
-                  <button
-                    className={`btn sm ${r.reviewsEnabled ? "ghost" : ""}`}
-                    onClick={() => patchRepo(r.id, { reviewsEnabled: !r.reviewsEnabled })}
-                    disabled={saving}
-                    title={r.reviewsEnabled ? "Reviews are on — click to pause" : "Reviews are off — click to enable"}
-                  >
-                    {r.reviewsEnabled ? <><Icon name="check" size={11} /> reviews on</> : "reviews off"}
-                  </button>
-                </div>
-                <div className="llm-row" style={{ opacity: r.reviewsEnabled ? 1 : 0.45 }}>
-                  {optionsFor(r.defaultModel).map((m) => (
-                    <div
-                      key={m.key}
-                      className={`llm-chip ${r.defaultModel === m.key ? "picked" : ""}`}
-                      title={m.blurb}
-                      onClick={() => !saving && r.defaultModel !== m.key && patchRepo(r.id, { defaultModel: m.key })}
-                    >
-                      <Icon name="spark" size={11} /> {m.name}
-                    </div>
-                  ))}
-                </div>
-              </div>
-            );
-          })}
-        </div>
-      </div>
-    </div>);
-
-};
 
 const SetBilling = () => {
+  const { user } = useAuth();
   const [cancelStep, setCancelStep] = React.useState("idle"); // idle | confirm | done
   const [reason, setReason] = React.useState("");
+
+  // Map backend `plan` enum to plan card id. Backend's "team" is now "max".
+  const currentPlanId = user?.plan === "team" ? "max" : user?.plan || "pro";
 
   return (
     <div className="col gap-5">
       <div className="card">
         <div className="card-head"><h3 className="card-title">Current plan</h3>
-          <span className="pill purple"><i className="dot"></i> team</span></div>
+          <span className="pill purple"><i className="dot"></i> {currentPlanId}</span></div>
         <div className="card-body">
           <div className="grid-3">
-            {[
-            { name: "Solo", price: "$0", desc: "1 repo · 50 reviews / mo" },
-            { name: "Team", price: "$49", desc: "10 repos · unlimited reviews", current: true },
-            { name: "Org", price: "$199", desc: "Unlimited repos · SSO · audit" }].
-            map((p) =>
-            <div key={p.name} className="card" style={{ padding: 14, borderColor: p.current ? "var(--accent)" : "var(--line)" }}>
-                <div className="flex justify-between items-center">
-                  <div className="mono">{p.name}</div>
-                  {p.current && <span className="pill ok"><i className="dot"></i> current</span>}
-                </div>
-                <div className="mono" style={{ fontSize: 24, marginTop: 8 }}>{p.price}<span className="mute" style={{ fontSize: 12 }}>/mo</span></div>
-                <div className="mute mono" style={{ fontSize: 11, marginTop: 6 }}>{p.desc}</div>
-              </div>
-            )}
+            {PLANS.map((p) => {
+              const isCurrent = p.id === currentPlanId;
+              return (
+                <div key={p.id} className="card flex items-center justify-between" style={{
+                  padding: 12,
+                  gap: 12,
+                  borderColor: isCurrent ? "var(--accent)" : "var(--line)"
+                }}>
+                  <div style={{ minWidth: 0, flex: 1 }}>
+                    <div className="flex items-center" style={{ gap: 8 }}>
+                      <div className="mono" style={{ fontSize: 15 }}>{p.name}</div>
+                      {isCurrent && <span className="pill ok"><i className="dot"></i> current</span>}
+                    </div>
+                    <div className="mono" style={{ fontSize: 22, marginTop: 6, lineHeight: 1 }}>
+                      {p.price}<span style={{ fontSize: 10, marginLeft: 4, opacity: 0.55 }}>{p.cadence}</span>
+                    </div>
+                    <div className="mute mono" style={{ fontSize: 11, marginTop: 8 }}>{p.features}</div>
+                  </div>
+                  {p.cta && !isCurrent &&
+                  <button className="btn sm" style={{ whiteSpace: "nowrap" }}>{p.cta}</button>
+                  }
+                </div>);
+
+            })}
           </div>
         </div>
       </div>
@@ -683,15 +513,15 @@ const SetBilling = () => {
       <div className="card">
         <div className="card-head">
           <h3 className="card-title">Subscription</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>renews Jun 14 · $49.00</span>
+          <span className="mute mono" style={{ fontSize: 11 }}>renews Jun 14 · $25.00</span>
         </div>
         <div className="card-body">
           {cancelStep === "idle" &&
           <div className="flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
             <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="mono" style={{ fontSize: 13 }}>Team plan · billed monthly</div>
+              <div className="mono" style={{ fontSize: 13 }}>Pro plan · billed monthly</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                Cancel anytime. Your plan stays active until the end of the current period, then drops to Solo.
+                Cancel anytime. Your plan stays active until the end of the current period, then drops to Free.
               </div>
             </div>
             <div className="flex gap-2">
@@ -704,10 +534,10 @@ const SetBilling = () => {
           {cancelStep === "confirm" &&
           <div className="col gap-3">
             <div>
-              <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>Cancel Team plan?</div>
+              <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>Cancel Pro plan?</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                You'll keep Team features until <span className="mono" style={{ color: "var(--fg-dim)" }}>Jun 14, 2026</span>.
-                After that, your org reverts to Solo (1 repo · 50 reviews / mo).
+                You'll keep Pro features until <span className="mono" style={{ color: "var(--fg-dim)" }}>Jun 14, 2026</span>.
+                After that, your org reverts to Free (public repos only).
               </div>
             </div>
             <div>
@@ -740,7 +570,7 @@ const SetBilling = () => {
               <span className="mono" style={{ fontSize: 13 }}>Subscription cancelled</span>
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
-              You'll keep Team features until Jun 14, 2026. Changed your mind?
+              You'll keep Pro features until Jun 14, 2026. Changed your mind?
               <button className="btn sm ghost" style={{ marginLeft: 10 }} onClick={() => setCancelStep("idle")}>
                 Reactivate
               </button>
@@ -749,176 +579,31 @@ const SetBilling = () => {
           }
         </div>
       </div>
-    </div>);
-};
 
-
-// ─── Usage · activity + agent credits ───────────────────────────────────
-const CREDIT_PACKS = [
-{ key: "starter", credits: 5000, price: 19, blurb: "≈ 70 reviews on Sonnet 4.5" },
-{ key: "growth", credits: 25000, price: 79, blurb: "≈ 360 reviews · best for active teams", popular: true },
-{ key: "pro", credits: 100000, price: 249, blurb: "≈ 1.5k reviews · saves 22%" }];
-
-const SetUsage = () => {
-  const [balance, setBalance] = React.useState(0);
-  const [autoRefill, setAutoRefill] = React.useState(false);
-  const [refillAt, setRefillAt] = React.useState(1000);
-  const [refillPack, setRefillPack] = React.useState("growth");
-  const [pendingPack, setPendingPack] = React.useState(null); // pack key during purchase
-  const [bought, setBought] = React.useState(null); // pack key after purchase
-  const burnRate = 142; // credits / day mock
-
-  // Pull live subscription once. POST /api/billing/credits adds credits (the
-  // backend stub mimics what a Stripe webhook would do post-checkout).
-  React.useEffect(() => {
-    api.subscription().then((sub) => {
-      if (sub) {
-        setBalance(sub.credits);
-        setAutoRefill(sub.autoRefill);
-      }
-    }).catch(() => {});
-  }, []);
-
-  const buy = async (pack) => {
-    setPendingPack(pack.key);
-    try {
-      await api.addCredits(pack.credits);
-      const sub = await api.subscription();
-      setBalance(sub?.credits ?? balance + pack.credits);
-      setBought(pack.key);
-      setTimeout(() => setBought(null), 2400);
-    } catch (err) {
-      alert(`Top-up failed: ${err.message || err}`);
-    } finally {
-      setPendingPack(null);
-    }
-  };
-
-  return (
-    <div className="col gap-5">
+      {/* Invoices */}
       <div className="card">
         <div className="card-head">
-          <h3 className="card-title">Activity · May 2026</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>billing period · resets Jun 14</span>
+          <h3 className="card-title">Invoices</h3>
+          <span className="mute mono" style={{ fontSize: 11 }}>last 12 months</span>
         </div>
         <div className="card-body">
-          {[
-          { l: "Reviews", v: "412 / ∞", p: 0.4 },
-          { l: "Goal ingests (Loom / image)", v: "188", p: 0.6 }].
-          map((u) =>
-          <div key={u.l} style={{ marginBottom: 14 }}>
-              <div className="flex justify-between" style={{ marginBottom: 6, fontSize: 12 }}>
-                <span className="mono mute">{u.l}</span><span className="mono">{u.v}</span>
-              </div>
-              <div className="progress"><i style={{ width: `${u.p * 100}%` }}></i></div>
-            </div>
+          {INVOICES.map((inv, i) =>
+          <div
+          key={inv.id}
+          className="flex items-center justify-between"
+          style={{
+            gap: 12,
+            padding: "10px 0",
+            borderTop: i === 0 ? "none" : "1px solid var(--line)"
+          }}>
+            <div className="mono" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>{inv.date}</div>
+            <div className="mono" style={{ fontSize: 13, width: 80, textAlign: "right" }}>{inv.amount}</div>
+            <span className="pill ok"><i className="dot"></i> {inv.status}</span>
+            <button className="btn sm ghost" style={{ whiteSpace: "nowrap" }}>
+              <Icon name="eye" size={11} /> View
+            </button>
+          </div>
           )}
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <h3 className="card-title">Credit balance</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>{burnRate}/day burn · ~{Math.floor(balance / burnRate)}d left</span>
-        </div>
-        <div className="card-body">
-          <div className="flex items-baseline gap-3" style={{ flexWrap: "wrap" }}>
-            <div className="mono" style={{ fontSize: 36, fontVariantNumeric: "tabular-nums", color: "var(--fg)" }}>
-              {balance.toLocaleString()}
-            </div>
-            <div className="mute mono" style={{ fontSize: 12 }}>credits remaining</div>
-          </div>
-          <div className="mute" style={{ fontSize: 12, marginTop: 8 }}>
-            1 credit ≈ 1k tokens · used by every agent review, goal ingest, and chat. Credits never expire.
-          </div>
-          <div className="progress" style={{ marginTop: 14 }}>
-            <i style={{ width: `${Math.min(100, balance / 250)}%`, background: balance < 1500 ? "var(--warn)" : "var(--accent)" }}></i>
-          </div>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-head">
-          <h3 className="card-title">Buy credits</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>charged to card on file · ····4242</span>
-        </div>
-        <div className="card-body">
-          <div className="grid-3">
-            {CREDIT_PACKS.map((p) =>
-            <div
-            key={p.key}
-            className="card"
-            style={{
-              padding: 16,
-              borderColor: p.popular ? "var(--accent)" : "var(--line)",
-              position: "relative"
-            }}>
-                {p.popular &&
-              <span className="pill ok" style={{ position: "absolute", top: 12, right: 12 }}>
-                  <i className="dot"></i> most popular
-                </span>
-              }
-                <div className="mono" style={{ fontSize: 22, fontVariantNumeric: "tabular-nums" }}>
-                  {p.credits.toLocaleString()}
-                </div>
-                <div className="mute mono" style={{ fontSize: 11, letterSpacing: "0.06em", textTransform: "uppercase" }}>
-                  credits
-                </div>
-                <div className="mono" style={{ fontSize: 15, marginTop: 12 }}>
-                  ${p.price}<span className="mute" style={{ fontSize: 11 }}> · one-time</span>
-                </div>
-                <div className="mute" style={{ fontSize: 12, marginTop: 6, minHeight: 32 }}>{p.blurb}</div>
-                <button
-                className={`btn ${p.popular ? "primary" : ""}`}
-                style={{ width: "100%", marginTop: 14 }}
-                disabled={pendingPack === p.key}
-                onClick={() => buy(p)}>
-                  {pendingPack === p.key ? "Processing…" :
-                bought === p.key ? <><Icon name="check" size={11} /> Added</> :
-                <>Buy {p.credits.toLocaleString()} credits</>}
-                </button>
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      <div className="card">
-        <div className="card-head"><h3 className="card-title">Auto-refill</h3></div>
-        <div className="card-body">
-          <div className="flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="mono" style={{ fontSize: 13 }}>Top up automatically</div>
-              <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                When your balance drops below {refillAt.toLocaleString()} credits, we'll buy
-                another <span className="mono" style={{ color: "var(--fg-dim)" }}>
-                  {CREDIT_PACKS.find((p) => p.key === refillPack)?.credits.toLocaleString()}
-                </span> pack and charge your card.
-              </div>
-            </div>
-            <div className={`tog ${autoRefill ? "on" : ""}`} onClick={() => setAutoRefill(!autoRefill)}></div>
-          </div>
-          {autoRefill &&
-          <div className="flex gap-3" style={{ marginTop: 14, flexWrap: "wrap" }}>
-            <label className="col gap-1" style={{ flex: 1, minWidth: 140 }}>
-              <span className="mute mono" style={{ fontSize: 11 }}>Refill threshold</span>
-              <select className="input" value={refillAt} onChange={(e) => setRefillAt(+e.target.value)}>
-                <option value={500}>500 credits</option>
-                <option value={1000}>1,000 credits</option>
-                <option value={2500}>2,500 credits</option>
-                <option value={5000}>5,000 credits</option>
-              </select>
-            </label>
-            <label className="col gap-1" style={{ flex: 1, minWidth: 140 }}>
-              <span className="mute mono" style={{ fontSize: 11 }}>Refill pack</span>
-              <select className="input" value={refillPack} onChange={(e) => setRefillPack(e.target.value)}>
-                {CREDIT_PACKS.map((p) =>
-                <option key={p.key} value={p.key}>{p.credits.toLocaleString()} · ${p.price}</option>
-                )}
-              </select>
-            </label>
-          </div>
-          }
         </div>
       </div>
     </div>);
