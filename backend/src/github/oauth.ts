@@ -14,6 +14,23 @@ function pruneState() {
   for (const [k, exp] of pendingState) if (exp < now) pendingState.delete(k);
 }
 
+// Session cookie attributes. In prod the dashboard (www.devasign.ai) and API
+// (api.devasign.ai) are different hosts, so the cookie must be SameSite=None;
+// Secure to ride along on the cross-origin XHR — both share devasign.ai, so it
+// stays first-party. Locally we're on http://localhost where None/Secure is
+// invalid, so fall back to Lax. Setting and clearing must use identical
+// attributes or the browser won't overwrite the existing cookie.
+function sessionCookieOptions() {
+  const secure = config.secureCookies;
+  return {
+    httpOnly: true,
+    sameSite: (secure ? "none" : "lax") as "none" | "lax",
+    secure,
+    path: "/",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  };
+}
+
 export function startOAuth(req: Request, res: Response) {
   if (!isGithubOAuthConfigured()) {
     res.status(503).json({
@@ -104,11 +121,7 @@ export async function finishOAuth(req: Request, res: Response) {
 
   // Trivial session cookie (signed in dev; replace with real session store in prod)
   const session = Buffer.from(`${user.id}:${Date.now()}`).toString("base64url");
-  res.cookie("devasign_session", session, {
-    httpOnly: true,
-    sameSite: "lax",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
-  });
+  res.cookie("devasign_session", session, sessionCookieOptions());
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
   // navigation the frontend just strips the query and renders normally.
@@ -127,6 +140,9 @@ export function getSessionUser(req: Request): User | null {
 }
 
 export function signOut(_req: Request, res: Response) {
-  res.clearCookie("devasign_session");
+  // clearCookie only overwrites the cookie when path/sameSite/secure match how
+  // it was set; reuse the same attributes (maxAge is irrelevant when clearing).
+  const { maxAge: _ignored, ...clearOpts } = sessionCookieOptions();
+  res.clearCookie("devasign_session", clearOpts);
   res.json({ ok: true });
 }

@@ -14,10 +14,16 @@ import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { handleWebhook } from "./github/webhooks.js";
 import { api } from "./routes/api.js";
 import { startWorker } from "./worker.js";
-import { db } from "./db.js";
+import { db, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
 
 const app = express();
+
+// Render (and most PaaS) terminate TLS at a proxy and forward over http with
+// X-Forwarded-* headers. Trusting the proxy makes req.protocol/req.secure report
+// https, so the OAuth redirect_uri is built as https and Secure cookies are
+// emitted correctly.
+app.set("trust proxy", true);
 
 app.use(morgan("dev"));
 app.use(cors({ origin: config.webOrigin, credentials: true }));
@@ -61,6 +67,16 @@ app.use((err: any, _req: any, res: any, _next: any) => {
   res.status(500).json({ error: "internal_error", message: err?.message || String(err) });
 });
 
+// Load persisted state from Postgres before we serve requests or run the
+// worker/backfill — all of which read synchronously from the in-memory
+// snapshot that initDb() populates.
+try {
+  await initDb();
+} catch (err) {
+  console.error("[server] fatal: could not initialize the database\n", err);
+  process.exit(1);
+}
+
 const port = config.port;
 app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
@@ -85,6 +101,20 @@ app.listen(port, () => {
 
 startWorker();
 backfillRepoIndex();
+
+// Flush staged writes to Postgres on a clean exit so mutations still inside
+// the debounce window aren't lost.
+for (const signal of ["SIGINT", "SIGTERM"] as const) {
+  process.on(signal, async () => {
+    console.log(`\n[server] ${signal} received — flushing pending writes…`);
+    try {
+      await shutdownDb();
+    } catch (err) {
+      console.error("[server] error during shutdown", err);
+    }
+    process.exit(0);
+  });
+}
 
 // Cross-check the App's actual webhook event subscriptions against what we
 // need to handle the full review surface. Soft-fail on network errors so a

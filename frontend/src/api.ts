@@ -2,10 +2,14 @@
 // In dev the frontend (Vite, :3001) talks to the backend (:8787) directly with
 // credentials. localhost:3001 ↔ localhost:8787 is same-site (eTLD+1 = localhost),
 // so the SameSite=Lax session cookie set on /api/auth/github/callback flows on
-// XHR. In prod, set VITE_API_BASE to your API origin (same-site preferred).
+// XHR. In prod the API is deployed at https://api.devasign.ai so it stays
+// same-site with https://www.devasign.ai and the session cookie remains
+// first-party. Set VITE_API_BASE to override; the PROD fallback below encodes
+// that origin so a missing build-time env var can't silently ship localhost.
 
 const API_BASE =
-  (import.meta as any).env?.VITE_API_BASE ?? "http://localhost:8787";
+  (import.meta as any).env?.VITE_API_BASE ??
+  ((import.meta as any).env?.PROD ? "https://api.devasign.ai" : "http://localhost:8787");
 
 export const apiBase = API_BASE;
 export const oauthStartUrl = `${API_BASE}/api/auth/github`;
