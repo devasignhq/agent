@@ -47,6 +47,9 @@ desktop.ini
 # Claude Code local settings
 .claude/settings.local.json
 
+# Project memory (local-only working doc)
+memory.md
+
 # Coverage / test artifacts
 coverage/
 .nyc_output/
