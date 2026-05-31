@@ -1,10 +1,22 @@
-// Tiny JSON store. Stand-in for Firestore in dev. Writes are flushed to disk
-// (debounced) so the server can restart without losing state.
-import fs from "node:fs";
-import path from "node:path";
+// Postgres-backed document store (Neon in dev/prod).
+//
+// Shape-compatible drop-in for the old JSON-file store: the whole dataset is
+// held in memory and read synchronously through the same predicate API, while
+// mutations write through to Postgres. Each collection maps to a table of
+// `(id text primary key, data jsonb)` — one JSONB document per row — so the
+// in-memory object shapes round-trip without a per-field column mapping.
+//
+// Reads are synchronous against the in-memory snapshot (populated by initDb()
+// at boot). Writes mutate the snapshot synchronously and are flushed to
+// Postgres in a debounced, ordered batch — mirroring the old file store's
+// write-through-cache behaviour, just durably and off-box.
 import { v4 as uuid } from "uuid";
+import pg from "pg";
 import { config } from "./config.js";
 import type { DB } from "./types.js";
+
+const { Pool } = pg;
+type PgPool = InstanceType<typeof Pool>;
 
 const empty: DB = {
   users: [],
@@ -20,14 +32,35 @@ const empty: DB = {
   notifications: [],
 };
 
+// Collection key -> Postgres table name. Unquoted identifiers fold to
+// lowercase in Postgres, so camelCase keys get an explicit snake_case table.
+const TABLES: Record<keyof DB, string> = {
+  users: "users",
+  installations: "installations",
+  repositories: "repositories",
+  integrations: "integrations",
+  tasks: "tasks",
+  prReviews: "pr_reviews",
+  reviewLogs: "review_logs",
+  subscriptions: "subscriptions",
+  authAudit: "auth_audit",
+  repoIndex: "repo_index",
+  notifications: "notifications",
+};
+
+const COLLECTIONS = Object.keys(TABLES) as (keyof DB)[];
+
+let state: DB = structuredClone(empty);
+let pool: PgPool | null = null;
+
 // One-shot migration on load: assign an id (and createdAt) to any
 // TaskAttachment that was persisted before the `id` field existed. Without
 // this, the frontend's constraint X-click can't address the attachment by
 // id and falls back to a client-only hide path. Idempotent — rows that
 // already have an id are untouched. Returns true when something changed.
-function backfillAttachmentIds(state: DB): boolean {
+function backfillAttachmentIds(snapshot: DB): boolean {
   let mutated = false;
-  for (const task of state.tasks || []) {
+  for (const task of snapshot.tasks || []) {
     const attachments = task.attachments || [];
     for (let i = 0; i < attachments.length; i++) {
       const a = attachments[i];
@@ -44,39 +77,226 @@ function backfillAttachmentIds(state: DB): boolean {
   return mutated;
 }
 
-function load(): DB {
-  if (!config.dbPath) return structuredClone(empty);
+// ---------------------------------------------------------------------------
+// Write-through batching
+//
+// Mutations stage their net effect in `dirty` (upserts) / `deleted` (removes),
+// keyed by collection. `dirty` and `deleted` are mutually exclusive per id —
+// staging one clears the other — so the last write to an id within a batch
+// wins, matching the in-memory snapshot. A debounced flush drains both into a
+// single transaction.
+// ---------------------------------------------------------------------------
+const dirty = new Map<keyof DB, Map<string, unknown>>();
+const deleted = new Map<keyof DB, Set<string>>();
+let flushTimer: NodeJS.Timeout | null = null;
+let flushing: Promise<void> | null = null;
+
+function rowId(row: unknown): string | null {
+  const id = (row as { id?: unknown } | null)?.id;
+  return typeof id === "string" ? id : null;
+}
+
+function stageUpsert(name: keyof DB, row: unknown): void {
+  if (!pool) return; // ephemeral mode — nothing to persist
+  const id = rowId(row);
+  if (!id) return;
+  let d = dirty.get(name);
+  if (!d) dirty.set(name, (d = new Map()));
+  d.set(id, row);
+  deleted.get(name)?.delete(id);
+  schedule();
+}
+
+function stageDelete(name: keyof DB, id: string): void {
+  if (!pool) return;
+  let s = deleted.get(name);
+  if (!s) deleted.set(name, (s = new Set()));
+  s.add(id);
+  dirty.get(name)?.delete(id);
+  schedule();
+}
+
+function hasPending(): boolean {
+  for (const m of dirty.values()) if (m.size) return true;
+  for (const s of deleted.values()) if (s.size) return true;
+  return false;
+}
+
+function schedule(): void {
+  if (!pool || flushTimer) return;
+  flushTimer = setTimeout(() => {
+    flushTimer = null;
+    void runFlush();
+  }, 50);
+}
+
+async function persistBatch(
+  upserts: Array<[keyof DB, unknown[]]>,
+  deletes: Array<[keyof DB, string[]]>
+): Promise<void> {
+  const client = await pool!.connect();
   try {
-    const raw = fs.readFileSync(config.dbPath, "utf8");
-    const parsed = JSON.parse(raw);
-    const merged = { ...empty, ...parsed } as DB;
-    if (backfillAttachmentIds(merged)) {
-      // Persist the migrated snapshot synchronously so re-reads (or another
-      // process) see the rewritten ids without waiting on the debounced flush.
-      try {
-        fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
-        fs.writeFileSync(config.dbPath, JSON.stringify(merged, null, 2));
-        console.log("[db] migrated attachment ids");
-      } catch (err) {
-        console.warn("[db] could not write back attachment-id migration:", err);
+    await client.query("begin");
+    for (const [name, rows] of upserts) {
+      const t = TABLES[name];
+      // Chunk so the parameter count per statement stays well bounded.
+      const CHUNK = 500;
+      for (let i = 0; i < rows.length; i += CHUNK) {
+        const slice = rows.slice(i, i + CHUNK);
+        const params: unknown[] = [];
+        const tuples = slice.map((row, j) => {
+          params.push(rowId(row), row);
+          return `($${j * 2 + 1}, $${j * 2 + 2})`;
+        });
+        await client.query(
+          `insert into "${t}" (id, data) values ${tuples.join(", ")} ` +
+            `on conflict (id) do update set data = excluded.data`,
+          params
+        );
       }
     }
-    return merged;
-  } catch {
-    return structuredClone(empty);
+    for (const [name, ids] of deletes) {
+      if (!ids.length) continue;
+      await client.query(`delete from "${TABLES[name]}" where id = any($1::text[])`, [ids]);
+    }
+    await client.query("commit");
+  } catch (err) {
+    await client.query("rollback").catch(() => {});
+    throw err;
+  } finally {
+    client.release();
   }
 }
 
-const state: DB = load();
+async function runFlush(): Promise<void> {
+  if (flushing) return flushing;
+  flushing = (async () => {
+    try {
+      while (pool && hasPending()) {
+        // Snapshot and clear the shared maps so mutations arriving mid-flush
+        // accumulate into the next batch instead of being lost.
+        const upserts: Array<[keyof DB, unknown[]]> = [];
+        for (const [name, m] of dirty) {
+          if (m.size) {
+            upserts.push([name, [...m.values()]]);
+            m.clear();
+          }
+        }
+        const deletes: Array<[keyof DB, string[]]> = [];
+        for (const [name, s] of deleted) {
+          if (s.size) {
+            deletes.push([name, [...s]]);
+            s.clear();
+          }
+        }
+        try {
+          await persistBatch(upserts, deletes);
+        } catch (err) {
+          // Re-stage the failed batch (without clobbering newer writes) and
+          // back off before the loop retries.
+          for (const [name, rows] of upserts) {
+            const d = dirty.get(name) ?? (dirty.set(name, new Map()), dirty.get(name)!);
+            for (const row of rows) {
+              const id = rowId(row);
+              if (id && !d.has(id) && !deleted.get(name)?.has(id)) d.set(id, row);
+            }
+          }
+          for (const [name, ids] of deletes) {
+            const s = deleted.get(name) ?? (deleted.set(name, new Set()), deleted.get(name)!);
+            for (const id of ids) if (!dirty.get(name)?.has(id)) s.add(id);
+          }
+          console.error("[db] flush failed — will retry:", (err as Error).message);
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    } finally {
+      flushing = null;
+    }
+  })();
+  return flushing;
+}
 
-let saveTimer: NodeJS.Timeout | null = null;
-function flush() {
-  if (!config.dbPath) return;
-  if (saveTimer) clearTimeout(saveTimer);
-  saveTimer = setTimeout(() => {
-    fs.mkdirSync(path.dirname(config.dbPath), { recursive: true });
-    fs.writeFileSync(config.dbPath, JSON.stringify(state, null, 2));
-  }, 150);
+/** Block until all staged writes are durable in Postgres. */
+export async function flushPending(): Promise<void> {
+  if (!pool) return;
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  // Loop in case writes land between draining and the await resolving.
+  do {
+    await runFlush();
+  } while (hasPending());
+}
+
+// node-postgres reads `ssl` straight from the config below, so the libpq-style
+// query params in the URL are redundant; strip them to silence pg's
+// sslmode-deprecation warning. TLS verification still happens via `ssl` below.
+function sanitizeUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    for (const p of ["sslmode", "channel_binding", "uselibpqcompat"]) u.searchParams.delete(p);
+    return u.toString();
+  } catch {
+    return url;
+  }
+}
+
+async function ensureSchema(): Promise<void> {
+  for (const name of COLLECTIONS) {
+    await pool!.query(
+      `create table if not exists "${TABLES[name]}" (id text primary key, data jsonb not null)`
+    );
+  }
+}
+
+async function loadAll(): Promise<void> {
+  const fresh = structuredClone(empty);
+  for (const name of COLLECTIONS) {
+    const { rows } = await pool!.query<{ data: unknown }>(`select data from "${TABLES[name]}"`);
+    (fresh[name] as unknown[]) = rows.map((r) => r.data);
+  }
+  state = fresh;
+}
+
+/**
+ * Connect to Postgres, ensure the schema, and load the full dataset into the
+ * in-memory snapshot. Must be awaited before the server starts serving so the
+ * synchronous read API has data. With no DATABASE_URL configured, falls back
+ * to an ephemeral in-memory store (no persistence) so the server can still boot.
+ */
+export async function initDb(): Promise<void> {
+  if (!config.databaseUrl) {
+    console.warn("[db] DATABASE_URL not set — using ephemeral in-memory store (no persistence)");
+    state = structuredClone(empty);
+    pool = null;
+    return;
+  }
+  pool = new Pool({
+    connectionString: sanitizeUrl(config.databaseUrl),
+    ssl: { rejectUnauthorized: true },
+    max: 5,
+  });
+  await ensureSchema();
+  await loadAll();
+
+  if (backfillAttachmentIds(state)) {
+    for (const task of state.tasks) stageUpsert("tasks", task);
+    await flushPending();
+    console.log("[db] migrated attachment ids");
+  }
+
+  const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);
+  console.log(`[db] connected to Postgres — loaded ${total} rows across ${COLLECTIONS.length} tables`);
+}
+
+/** Flush pending writes and close the pool. Call on graceful shutdown. */
+export async function shutdownDb(): Promise<void> {
+  await flushPending();
+  if (pool) {
+    await pool.end();
+    pool = null;
+  }
 }
 
 export const db = {
@@ -87,7 +307,7 @@ export const db = {
 
   insert<K extends keyof DB>(name: K, row: DB[K][number]) {
     (state[name] as DB[K][number][]).push(row);
-    flush();
+    stageUpsert(name, row);
     return row;
   },
 
@@ -100,17 +320,22 @@ export const db = {
     const idx = list.findIndex(predicate);
     if (idx === -1) return null;
     list[idx] = { ...list[idx], ...patch };
-    flush();
+    stageUpsert(name, list[idx]);
     return list[idx];
   },
 
   remove<K extends keyof DB>(name: K, predicate: (row: DB[K][number]) => boolean) {
     const list = state[name] as DB[K][number][];
-    const before = list.length;
-    const kept = list.filter((r) => !predicate(r));
-    state[name] = kept as any;
-    flush();
-    return before - kept.length;
+    const kept: DB[K][number][] = [];
+    const removed: DB[K][number][] = [];
+    for (const row of list) (predicate(row) ? removed : kept).push(row);
+    if (removed.length === 0) return 0;
+    state[name] = kept as DB[K];
+    for (const row of removed) {
+      const id = rowId(row);
+      if (id) stageDelete(name, id);
+    }
+    return removed.length;
   },
 
   find<K extends keyof DB>(name: K, predicate: (row: DB[K][number]) => boolean) {

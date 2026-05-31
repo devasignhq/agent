@@ -14,6 +14,10 @@ function loadPrivateKey(): string {
 export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
+  // Cross-site session cookies need SameSite=None; Secure, which is only valid
+  // (and only wanted) once the dashboard is served over https — i.e. prod. In
+  // local dev WEB_ORIGIN is http://localhost, so cookies stay SameSite=Lax.
+  secureCookies: (process.env.WEB_ORIGIN || "").startsWith("https://"),
   sessionSecret: process.env.SESSION_SECRET || "dev-secret-replace-me",
   github: {
     oauthClientId: process.env.GITHUB_OAUTH_CLIENT_ID || "",
@@ -42,9 +46,11 @@ export const config = {
     discordBotToken: process.env.DISCORD_BOT_TOKEN || "",
     discordBotChannelId: process.env.DISCORD_BOT_CHANNEL_ID || "",
   },
-  dbPath: process.env.DB_PATH || "",
+  // Neon/Postgres connection string. Source of truth for all persisted state.
+  databaseUrl: process.env.DATABASE_URL || "",
 };
 
+export const isDbConfigured = () => Boolean(config.databaseUrl);
 export const isLLMLive = () => Boolean(config.llm.apiKey);
 export const isGeminiLive = () => Boolean(config.gemini.apiKey);
 export const isGithubOAuthConfigured = () =>

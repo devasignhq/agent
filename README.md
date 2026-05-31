@@ -5,7 +5,7 @@ Multimodal AI agent that reviews PRs against the actual ticket — pulling conte
 This repo has two halves:
 
 - [`frontend/`](frontend) — Vite + React + TypeScript dashboard, ported pixel-for-pixel from the Claude Design handoff (terminal/CLI dark theme, Geist + Geist Mono, orange accent `#ff7a3d`).
-- [`backend/`](backend) — Node + Express API that implements the spine described in [`devasign.md`](devasign.md): GitHub OAuth + GitHub App, webhook receiver, in-memory job queue, review worker, Anthropic LLM client, JSON-backed store.
+- [`backend/`](backend) — Node + Express API that implements the spine described in [`devasign.md`](devasign.md): GitHub OAuth + GitHub App, webhook receiver, in-memory job queue, review worker, Anthropic LLM client, Postgres-backed store (Neon).
 
 ## Quickstart
 
@@ -63,7 +63,7 @@ Per [`devasign.md`](devasign.md):
 | Review pipeline | ✅ ingest → criteria → review → output → log; multimodal context shape is in place |
 | LLM (Claude) | ✅ live when key set, deterministic mock otherwise |
 | Job queue | ✅ in-memory (stand-in for Cloud Tasks); one worker drains it |
-| Persistence | ✅ JSON file (stand-in for Firestore); write-through cache |
+| Persistence | ✅ Postgres (Neon); in-memory snapshot loaded at boot, write-through on mutation |
 | Integrations | Slack & Discord broadcast wired; Linear ingestion helper present |
 | Billing (Stripe) | Subscription row + credit grant endpoint; no real Stripe wiring yet |
 | Eval harness | Spec'd in `devasign.md` §5.e but out-of-band — not in the request path |
@@ -80,6 +80,6 @@ curl -s -X POST http://localhost:8787/api/webhooks/github \
 ```
 
 You should see the job hit the queue, the worker run ingest → criteria → review,
-and the resulting record appear in `backend/data/db.json` along with five log
+and the resulting record persist to Postgres (Neon) along with five log
 entries on the timeline (`Pipeline started`, `Context ingested`, `End goal
 synthesized`, `Changes requested`, `Posted Check Run and PR review`).
