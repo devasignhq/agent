@@ -4,7 +4,6 @@ import React from "react";
 import { Icon } from "./icons";
 import { api, installRedirectUrl } from "./api";
 import { registerPopup } from "./popup-registry";
-import { IDE_OPTIONS, CLI_OPTIONS, HOW_IT_WORKS } from "./onboarding-data";
 
 const Auth = ({ onSignIn }) => (
   <div className="auth-shell">
@@ -16,8 +15,8 @@ const Auth = ({ onSignIn }) => (
         <div className="ob-eyebrow">code review · multimodal</div>
         <h1 className="auth-h1">Ship code that <span className="accent">matches the goal.</span></h1>
         <p className="auth-p">
-          DevAsign ingests the ticket, Loom or screenshot first — then reviews PRs against
-          that goal, right inside your IDE or CLI.
+          DevAsign ingests the ticket, Loom or screenshot first — then reviews every PR
+          against that goal.
         </p>
         <button className="gh-btn" onClick={onSignIn}>
           <Icon name="github" size={18} />
@@ -80,9 +79,8 @@ export { Auth };
 // ─── Onboarding ──────────────────────────────────────────────────────────────
 
 const OB_STEPS = [
-  { key: "github",  title: "Install GitHub App",  sub: "1 of 3 · required" },
-  { key: "integ",   title: "Connect integrations", sub: "2 of 3 · optional" },
-  { key: "devtool", title: "Setup IDE & CLI",      sub: "3 of 3 · pick at least one" },
+  { key: "github",  title: "Install GitHub App",  sub: "1 of 2 · required" },
+  { key: "integ",   title: "Connect integrations", sub: "2 of 2 · optional" },
 ];
 
 const Onboarding = ({ onDone }) => {
@@ -198,8 +196,6 @@ const Onboarding = ({ onDone }) => {
   }, [ghInstall.status]);
 
   const [integ, setInteg] = React.useState({ slack: false, linear: false, discord: false });
-  const [ide, setIde] = React.useState("cursor");
-  const [cli, setCli] = React.useState("claude-code");
 
   const ghReady = ghInstall.status === "installed";
   const canAdvance = step !== 0 || ghReady;
@@ -222,7 +218,7 @@ const Onboarding = ({ onDone }) => {
 
   const next = () => {
     if (!canAdvance) return;
-    step < 2 ? setStep(step + 1) : onDone();
+    step < 1 ? setStep(step + 1) : onDone();
   };
   const back = () => step > 0 && setStep(step - 1);
 
@@ -249,7 +245,6 @@ const Onboarding = ({ onDone }) => {
       <div className="ob-main">
         {step === 0 && <OBGitHub install={ghInstall} setInstall={setGhInstall} refreshInstalls={refreshInstalls} />}
         {step === 1 && <OBInteg integ={integ} setInteg={setInteg} />}
-        {step === 2 && <OBDevtool ide={ide} setIde={setIde} cli={cli} setCli={setCli} />}
 
         <div className="ob-foot">
           <button className="btn ghost" onClick={back} disabled={step === 0} style={step === 0 ? { opacity: 0.4 } : {}}>
@@ -257,7 +252,7 @@ const Onboarding = ({ onDone }) => {
           </button>
           <div className="flex gap-3 items-center">
             <span className="mono" style={{ fontSize: 11, color: "var(--fg-mute)" }}>
-              step {step + 1} / 3
+              step {step + 1} / 2
             </span>
             {step === 0 && !ghReady && (
               <span className="mono" style={{ fontSize: 11, color: "var(--warn)" }}>
@@ -273,7 +268,7 @@ const Onboarding = ({ onDone }) => {
               disabled={!canAdvance}
               style={!canAdvance ? { opacity: 0.4, cursor: "not-allowed" } : {}}
             >
-              {step === 2 ? "Finish setup" : "Continue"} <Icon name="chevron-r" size={14}/>
+              {step === 1 ? "Finish setup" : "Continue"} <Icon name="chevron-r" size={14}/>
             </button>
           </div>
         </div>
@@ -585,117 +580,6 @@ const OBInteg = ({ integ, setInteg }) => {
             </button>
           </div>
         ))}
-      </div>
-    </>
-  );
-};
-
-const OBDevtool = ({ ide, setIde, cli, setCli }) => {
-  const [howOpen, setHowOpen] = React.useState(false);
-  const [cliOpen, setCliOpen] = React.useState(true);
-  const [installed, setInstalled] = React.useState({});
-  const currentIde = IDE_OPTIONS.find(o => o.key === ide);
-  const currentCli = CLI_OPTIONS.find(o => o.key === cli);
-
-  return (
-    <>
-      <div className="ob-eyebrow">step 03 / devtools</div>
-      <h1 className="ob-title">Where should DevAsign live?</h1>
-      <p className="ob-desc">
-        Install the review agent in your IDE so it can drop inline comments on the diff
-        view, and / or in your CLI vibe-coding workflow.
-      </p>
-
-      <label className="label">IDE plugin</label>
-      <div className="llm-row" style={{ marginBottom: 12 }}>
-        {IDE_OPTIONS.map(o => (
-          <div key={o.key} className={`llm-chip ${ide === o.key ? "picked" : ""}`} onClick={() => setIde(o.key)}>
-            <Icon name="code" size={11}/> {o.name}
-            {installed[o.key] && <Icon name="check" size={11} color="var(--accent)"/>}
-          </div>
-        ))}
-      </div>
-
-      <div className="ide-install" style={{ marginBottom: 24 }}>
-        <div className="ide-install-meta">
-          <div className="mono" style={{ fontSize: 13 }}>{currentIde.name}</div>
-          <div className="mute mono" style={{ fontSize: 11, marginTop: 2 }}>
-            Opens {currentIde.store} · grants <span className="dim">repo:read</span> + <span className="dim">pr:write</span>
-          </div>
-        </div>
-        <button
-          className={`btn ${installed[ide] ? "ghost" : "primary"}`}
-          onClick={() => setInstalled({ ...installed, [ide]: !installed[ide] })}
-        >
-          {installed[ide]
-            ? <><Icon name="check" size={12}/> Installed</>
-            : <><Icon name="external" size={12}/> Install on {currentIde.name}</>}
-        </button>
-      </div>
-
-      <label className="label">CLI agent</label>
-      <div className="llm-row" style={{ marginBottom: 12 }}>
-        {CLI_OPTIONS.map(o => (
-          <div key={o.key} className={`llm-chip ${cli === o.key ? "picked" : ""}`} onClick={() => setCli(o.key)}>
-            <Icon name="terminal" size={11}/> {o.name}
-          </div>
-        ))}
-      </div>
-      <div className="code-block">
-        <code>$ {currentCli.install}</code>
-        <button className="btn sm ghost"><Icon name="copy" size={11}/> Copy</button>
-      </div>
-
-      {/* Collapsible: CLI commands for selected agent */}
-      <div className="collapse" style={{ marginTop: 14 }}>
-        <button className="collapse-head" onClick={() => setCliOpen(!cliOpen)}>
-          <Icon name="terminal" size={13}/>
-          <span className="mono" style={{ fontSize: 12 }}>Core commands · {currentCli.name}</span>
-          <span className="flex-1"></span>
-          <span className="mute mono" style={{ fontSize: 11 }}>{currentCli.commands.length}</span>
-          <span className={`chev ${cliOpen ? "open" : ""}`}><Icon name="chevron-d" size={12}/></span>
-        </button>
-        {cliOpen && (
-          <div className="collapse-body">
-            {currentCli.commands.map(cmd => (
-              <div key={cmd.c} className="cmd-row">
-                <code className="cmd-c">$ {cmd.c}</code>
-                <span className="cmd-d">{cmd.d}</span>
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-
-      {/* Collapsible: How the review agent works */}
-      <div className="collapse" style={{ marginTop: 10 }}>
-        <button className="collapse-head" onClick={() => setHowOpen(!howOpen)}>
-          <Icon name="brain" size={13}/>
-          <span className="mono" style={{ fontSize: 12 }}>How the review agent works</span>
-          <span className="flex-1"></span>
-          <span className="mute mono" style={{ fontSize: 11 }}>4 steps</span>
-          <span className={`chev ${howOpen ? "open" : ""}`}><Icon name="chevron-d" size={12}/></span>
-        </button>
-        {howOpen && (
-          <div className="collapse-body">
-            <div className="how-grid">
-              {HOW_IT_WORKS.map(s => (
-                <div key={s.title} className="how-step">
-                  <div className="how-icon"><Icon name={s.icon} size={14}/></div>
-                  <div className="mono" style={{ fontSize: 12 }}>{s.title}</div>
-                  <div className="mute" style={{ fontSize: 12, marginTop: 4, lineHeight: 1.55 }}>{s.body}</div>
-                </div>
-              ))}
-            </div>
-          </div>
-        )}
-      </div>
-
-      <div className="card" style={{ marginTop: 16, padding: 14, display: "flex", gap: 12, alignItems: "center" }}>
-        <Icon name="shield" size={16} color="var(--accent)"/>
-        <div className="mute" style={{ fontSize: 12 }}>
-          Plugins run review locally and never upload your source. Only diffs + goal context are sent to your chosen LLM.
-        </div>
       </div>
     </>
   );

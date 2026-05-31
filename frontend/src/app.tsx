@@ -6,7 +6,6 @@ import { useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio, TweakSele
 import { Auth, Onboarding } from "./screens-onboarding";
 import { AgentPage } from "./screen-agent";
 import { SettingsPage } from "./screens-rest";
-import { CommandCenter } from "./command-center";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
 import { registerPopup, closePopup } from "./popup-registry";
@@ -324,7 +323,7 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
   );
 };
 
-const TopBar = ({ current, onOpenCC, isMobile, onSignOut, onNavigate, user, notifications }) => {
+const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications }) => {
   const labels = {
     agent: "Agents", settings: "Settings"
   };
@@ -342,11 +341,6 @@ const TopBar = ({ current, onOpenCC, isMobile, onSignOut, onNavigate, user, noti
       </div>
       <div className="topbar-spacer"></div>
       <div className="topbar-actions">
-        <button className="btn ghost sm topbar-search" onClick={onOpenCC} aria-label="Search">
-          <Icon name="search" size={12}/>
-          <span className="topbar-search-label"> Search </span>
-          <span className="kbd-hint">⌘K</span>
-        </button>
         <div style={{ position: "relative" }}>
           <button className={`btn ghost sm ${notifOpen ? "is-active" : ""}`}
                   style={{ position: "relative" }}
@@ -442,7 +436,6 @@ const App = () => {
   const [forceStage, setForceStage] = React.useState<null | "onboarding" | "app">(null);
   const [hasInstall, setHasInstall] = React.useState<null | boolean>(null);
   const [current, setCurrent] = React.useState("agent");
-  const [ccOpen, setCCOpen] = React.useState(false);
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
@@ -590,19 +583,6 @@ const App = () => {
     return () => window.removeEventListener("keydown", onKey);
   }, [stage]);
 
-  // ⌘K / Ctrl+K to toggle Command Center
-  React.useEffect(() => {
-    const onKey = (e) => {
-      if (stage !== "app") return;
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setCCOpen(o => !o);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [stage]);
-
   if (stage === "loading") {
     return (
       <div className="auth-shell" style={{ display: "grid", placeItems: "center" }}>
@@ -646,7 +626,6 @@ const App = () => {
       <div className="main">
         <TopBar
           current={current}
-          onOpenCC={() => setCCOpen(true)}
           isMobile={isMobile}
           onSignOut={async () => {
             await auth.signOut();
@@ -664,11 +643,6 @@ const App = () => {
       </div>
       {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} />}
       <TweaksUI t={t} setTweak={setTweak} />
-      <CommandCenter
-        open={ccOpen}
-        onClose={() => setCCOpen(false)}
-        onNavigate={(k) => setCurrent(k)}
-      />
     </div>
   );
 };

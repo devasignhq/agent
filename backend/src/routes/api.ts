@@ -4,7 +4,7 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { getSessionUser } from "../github/oauth.js";
-import { gh } from "../github/app.js";
+import { appJWT, gh } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { detectVideoProvider } from "../llm.js";
@@ -47,9 +47,21 @@ api.get("/installations", async (req, res) => {
   // owned by accounts the current user can access. This recovers installs
   // that were missed (e.g. webhook delivery failure, JWT broken at the time,
   // or popup never made it back to our origin).
-  await reconcileInstallsForUser(user).catch((err) =>
-    console.warn("[installations] reconcile failed:", err)
-  );
+  //
+  // `?fast=1` lets the Settings → Installation page paint immediately from
+  // the local DB: the reconcile still runs but as a background side-effect
+  // so the request returns in a single LAN round-trip. The frontend triggers
+  // a second (non-fast) call once mounted to pick up whatever the background
+  // reconcile turned up.
+  if (req.query.fast === "1") {
+    void reconcileInstallsForUser(user).catch((err) =>
+      console.warn("[installations] background reconcile failed:", err)
+    );
+  } else {
+    await reconcileInstallsForUser(user).catch((err) =>
+      console.warn("[installations] reconcile failed:", err)
+    );
+  }
   res.json(db.filter("installations", (i) => i.userId === user.id));
 });
 
@@ -62,7 +74,6 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
   if (!user.githubId) return;
   let apps: Array<any> = [];
   try {
-    const { appJWT } = await import("../github/app.js");
     const resp = await fetch("https://api.github.com/app/installations", {
       headers: {
         Authorization: `Bearer ${appJWT()}`,
@@ -80,11 +91,16 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
     console.warn("[reconcile] fetch failed:", err);
     return;
   }
-  for (const inst of apps) {
-    // Only auto-claim installs on the user's personal account; org installs
-    // require explicit linking via the popup-handshake (to avoid claiming
-    // someone else's org).
-    if (inst?.account?.id !== user.githubId) continue;
+
+  // Only auto-claim installs on the user's personal account; org installs
+  // require explicit linking via the popup-handshake (to avoid claiming
+  // someone else's org).
+  const owned = apps.filter((inst) => inst?.account?.id === user.githubId);
+
+  // Up-front DB writes for each owned install — single-threaded reads/writes
+  // against the in-memory DB stay deterministic this way. The slow part —
+  // /installation/repositories — runs in parallel below.
+  const rows = owned.map((inst) => {
     let row = db.find("installations", (i) => i.installationId === inst.id);
     if (!row) {
       row = {
@@ -99,42 +115,50 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
     } else if (!row.userId) {
       db.update("installations", (i) => i.id === row!.id, { userId: user.id });
     }
-    // Materialise repos for this install.
-    try {
-      const reposResp = await gh<any>(inst.id, "/installation/repositories?per_page=100");
-      const repos = reposResp?.repositories || [];
-      const ids = repos.map((r: any) => r.id);
-      db.update("installations", (i) => i.id === row!.id, { repoIds: ids });
-      for (const r of repos) {
-        const [owner, name] = String(r.full_name || "").split("/");
-        if (!owner || !name) continue;
-        const existing = db.find(
-          "repositories",
-          (x) => x.owner === owner && x.name === name
-        );
-        if (existing) {
-          if (existing.installationId !== row!.id) {
-            db.update("repositories", (x) => x.id === existing.id, { installationId: row!.id });
+    return { inst, row };
+  });
+
+  // Fan out the per-install repo fetches. Each round-trip is independent;
+  // running them in parallel cuts reconcile time from sum-of-latencies to
+  // max(latencies) for multi-install users.
+  await Promise.all(
+    rows.map(async ({ inst, row }) => {
+      try {
+        const reposResp = await gh<any>(inst.id, "/installation/repositories?per_page=100");
+        const repos = reposResp?.repositories || [];
+        const ids = repos.map((r: any) => r.id);
+        db.update("installations", (i) => i.id === row.id, { repoIds: ids });
+        for (const r of repos) {
+          const [owner, name] = String(r.full_name || "").split("/");
+          if (!owner || !name) continue;
+          const existing = db.find(
+            "repositories",
+            (x) => x.owner === owner && x.name === name
+          );
+          if (existing) {
+            if (existing.installationId !== row.id) {
+              db.update("repositories", (x) => x.id === existing.id, { installationId: row.id });
+            }
+            continue;
           }
-          continue;
+          const inserted = db.insert("repositories", {
+            id: uuid(),
+            installationId: row.id,
+            owner,
+            name,
+            defaultBranch: r.default_branch || "main",
+            defaultModel: "claude-opus-4-7",
+            modelOverrides: {},
+            reviewsEnabled: true,
+            indexState: "queued",
+          });
+          enqueueIndex({ repoId: inserted.id, full: true });
         }
-        const inserted = db.insert("repositories", {
-          id: uuid(),
-          installationId: row!.id,
-          owner,
-          name,
-          defaultBranch: r.default_branch || "main",
-          defaultModel: "claude-opus-4-7",
-          modelOverrides: {},
-          reviewsEnabled: true,
-          indexState: "queued",
-        });
-        enqueueIndex({ repoId: inserted.id, full: true });
+      } catch (err) {
+        console.warn(`[reconcile] repos for ${inst.id} failed:`, err);
       }
-    } catch (err) {
-      console.warn(`[reconcile] repos for ${inst.id} failed:`, err);
-    }
-  }
+    })
+  );
 }
 
 // Used by the onboarding GitHub-install screen to link a pending install to
@@ -230,17 +254,6 @@ api.get("/repositories", (req, res) => {
   const installs = db.filter("installations", (i) => i.userId === user.id);
   const installIds = new Set(installs.map((i) => i.id));
   res.json(db.filter("repositories", (r) => installIds.has(r.installationId)));
-});
-
-api.patch("/repositories/:id", (req, res) => {
-  const user = getSessionUser(req);
-  if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  const repo = db.find("repositories", (r) => r.id === req.params.id);
-  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
-  const allowed = ["defaultModel", "modelOverrides", "reviewsEnabled"] as const;
-  const patch: any = {};
-  for (const k of allowed) if (k in req.body) patch[k] = req.body[k];
-  res.json(db.update("repositories", (r) => r.id === repo.id, patch));
 });
 
 // Trigger a full repo re-index. Useful when the indexer prompt or allow-list
