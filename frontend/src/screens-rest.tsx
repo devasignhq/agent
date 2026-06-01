@@ -9,7 +9,7 @@ import { registerPopup, closePopup } from "./popup-registry";
 // ─── Settings ───────────────────────────────────────────────────────────────
 const SET_SECTIONS = [
 { key: "account", name: "Account" },
-{ key: "install", name: "Installation" },
+{ key: "install", name: "Repository" },
 { key: "integrations", name: "Integrations" },
 { key: "billing", name: "Billing" },
 { key: "support", name: "Support" }];
@@ -443,7 +443,10 @@ const SetInstall = () => {
       const e = byInstall.get(r.installationId);
       if (e) e.repos.push(r);
     }
-    return [...byInstall.values()];
+    // Only surface installs that actually have ≥1 installed repo. An install
+    // with no repos is just an authorized account (the "user authentication"
+    // case), not a repo installation — don't show or count it here.
+    return [...byInstall.values()].filter(({ repos }) => repos.length > 0);
   }, [installs, repos]);
 
   return (
@@ -451,14 +454,14 @@ const SetInstall = () => {
       <div className="card">
         <div className="card-head">
           <h3 className="card-title">GitHub App</h3>
-          {installs.length > 0
-            ? <span className="pill ok"><i className="dot"></i> {installs.length} install{installs.length === 1 ? "" : "s"}</span>
+          {installRows.length > 0
+            ? <span className="pill ok"><i className="dot"></i> {installRows.length} install{installRows.length === 1 ? "" : "s"}</span>
             : <span className="pill"><i className="dot"></i> not installed</span>}
         </div>
         <div className="card-body">
           <div className="mute" style={{ fontSize: 12, marginBottom: 12 }}>
-            {installs.length > 0
-              ? `Connected to ${installs.map((i) => i.accountLogin).join(", ")}. Manage repos and permissions on GitHub — changes sync back instantly.`
+            {installRows.length > 0
+              ? "Manage Repos and Permissions on GitHub"
               : "Install the DevAsign GitHub App on at least one account or org to start reviewing PRs."}
           </div>
 
@@ -476,11 +479,6 @@ const SetInstall = () => {
                     <span className="mono gh-account-count">{rs.length} repo{rs.length === 1 ? "" : "s"}</span>
                   </div>
                   <ul className="gh-repo-list">
-                    {rs.length === 0 && (
-                      <li className="gh-repo-row mute mono" style={{ fontSize: 11 }}>
-                        No repositories granted yet — pick repos on GitHub.
-                      </li>
-                    )}
                     {rs.map((r) => (
                       <li key={r.id} className="gh-repo-row">
                         <Icon name="git" size={11} color="var(--fg-faint)" />
