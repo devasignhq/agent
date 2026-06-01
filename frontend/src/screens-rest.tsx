@@ -2,9 +2,9 @@
 // Settings page (and its sub-sections)
 import React from "react";
 import { Icon } from "./icons";
-import { api, installRedirectUrl } from "./api";
+import { api, installRedirectUrl, linearConnectUrl } from "./api";
 import { useAuth } from "./auth-context";
-import { registerPopup } from "./popup-registry";
+import { registerPopup, closePopup } from "./popup-registry";
 
 // ─── Settings ───────────────────────────────────────────────────────────────
 const SET_SECTIONS = [
@@ -117,18 +117,40 @@ const SetIntegrations = () => {
     }]))
   );
 
-  React.useEffect(() => {
-    api.integrations().then((list) => {
+  const refresh = React.useCallback(async () => {
+    try {
+      const list = await api.integrations();
       setRows(list);
       setState((s) => {
         const next = { ...s };
-        for (const r of list) {
-          if (next[r.type]) next[r.type] = { ...next[r.type], connected: true, expanded: true };
+        // Reflect exactly what the backend reports: connected for each present
+        // row, not-connected for the rest (so a disconnect clears the card).
+        const present = new Set(list.map((r) => r.type));
+        for (const key of Object.keys(next)) {
+          next[key] = { ...next[key], connected: present.has(key) };
         }
         return next;
       });
-    }).catch(() => {});
+    } catch {
+      /* leave current state on a transient failure */
+    }
   }, []);
+  React.useEffect(() => { refresh(); }, [refresh]);
+
+  // Linear connects via an OAuth popup; main.tsx posts devasign_linear_done when
+  // the callback lands back on our origin. Close the popup and refresh to pick
+  // up the new integration row.
+  React.useEffect(() => {
+    const onMsg = (e: MessageEvent) => {
+      if (e.origin !== window.location.origin) return;
+      if (e.data && (e.data as any).type === "devasign_linear_done") {
+        closePopup("linear");
+        setTimeout(refresh, 400);
+      }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [refresh]);
 
   const toggle = (intKey, evKey) => setState(s => ({
     ...s,
@@ -137,10 +159,28 @@ const SetIntegrations = () => {
   const setExpanded = (intKey, v) => setState(s => ({ ...s, [intKey]: { ...s[intKey], expanded: v } }));
   const setConnected = async (intKey, v) => {
     if (v) {
+      // Linear connects the whole workspace via OAuth, not a pasted token. Open
+      // the backend authorize endpoint in a popup; on return main.tsx posts
+      // devasign_linear_done and the listener above refreshes.
+      if (intKey === "linear") {
+        const popup = window.open(
+          linearConnectUrl,
+          "devasign_linear",
+          "width=920,height=780,menubar=no,toolbar=no,location=yes"
+        );
+        if (!popup) { window.location.href = linearConnectUrl; return; }
+        registerPopup("linear", popup);
+        popup.focus();
+        // Fallback: if the user closes the popup before the message lands,
+        // refresh anyway when it closes.
+        const watch = setInterval(() => {
+          if (popup.closed) { clearInterval(watch); refresh(); }
+        }, 500);
+        return;
+      }
+      // Slack / Discord: paste a bot token (+ channel).
       const token = prompt(
-        intKey === "slack"   ? "Slack bot token (xoxb-…)" :
-        intKey === "linear"  ? "Linear API key (lin_api_…)" :
-                               "Discord bot token"
+        intKey === "slack" ? "Slack bot token (xoxb-…)" : "Discord bot token"
       );
       if (!token) return;
       const channel =
@@ -150,7 +190,7 @@ const SetIntegrations = () => {
       try {
         const created = await api.addIntegration({
           type: intKey,
-          tokens: intKey === "linear" ? { apiKey: token } : { botToken: token },
+          tokens: { botToken: token },
           workspaceMeta: channel
             ? (intKey === "slack" ? { channel } : { channelId: channel })
             : {},
@@ -176,6 +216,22 @@ const SetIntegrations = () => {
   };
 
   const connectedCount = Object.values(state).filter(s => s.connected).length;
+
+  // Show the real connected workspace for Linear (from the backend row) instead
+  // of the placeholder meta baked into INTEGRATIONS.
+  const metaFor = (i) => {
+    if (i.key === "linear") {
+      const r = rows.find((x) => x.type === "linear");
+      const name = r?.workspaceMeta?.workspaceName || r?.workspaceMeta?.urlKey;
+      if (name) {
+        return [
+          { label: "workspace", value: name },
+          ...(r.workspaceMeta.urlKey ? [{ label: "url key", value: r.workspaceMeta.urlKey }] : []),
+        ];
+      }
+    }
+    return i.meta;
+  };
 
   return (
     <div className="col gap-5">
@@ -248,7 +304,7 @@ const SetIntegrations = () => {
               <div className="card-body int-body">
                 {/* Connection meta — single inline strip */}
                 <div className="int-meta-strip">
-                  {i.meta.map(m => (
+                  {metaFor(i).map(m => (
                     <span key={m.label} className="int-meta-chip">
                       <span className="int-meta-label">{m.label}</span>
                       <span className="int-meta-value">{m.value}</span>

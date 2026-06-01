@@ -37,6 +37,18 @@ export const config = {
     apiKey: process.env.GEMINI_API_KEY || "",
     model: process.env.GEMINI_MODEL || "gemini-2.5-pro",
   },
+  // Linear OAuth — lets a user connect their whole Linear workspace so DevAsign
+  // can ingest tickets (acceptance criteria) and post notification comments.
+  // Distinct from the per-user `integrations.linearApiKey` env fallback below,
+  // which is a single workspace-wide key for dev.
+  linear: {
+    oauthClientId: process.env.LINEAR_OAUTH_CLIENT_ID || "",
+    oauthClientSecret: process.env.LINEAR_OAUTH_CLIENT_SECRET || "",
+    // Public OAuth apps use a single app-level webhook (configured in the Linear
+    // app settings, not per-connect): Linear delivers every install's events to
+    // one URL signed with this one secret. Verify all inbound webhooks against it.
+    webhookSigningSecret: process.env.LINEAR_WEBHOOK_SIGNING_SECRET || "",
+  },
   integrations: {
     // Workspace-wide fallback. Used by broadcastVerdict() only when no
     // per-user Slack integration is configured in the DB.
@@ -57,6 +69,9 @@ export const isGithubOAuthConfigured = () =>
   Boolean(config.github.oauthClientId && config.github.oauthClientSecret);
 export const isGithubAppConfigured = () =>
   Boolean(config.github.appId && config.github.privateKey);
+export const isLinearOAuthConfigured = () =>
+  Boolean(config.linear.oauthClientId && config.linear.oauthClientSecret);
+export const isLinearWebhookConfigured = () => Boolean(config.linear.webhookSigningSecret);
 export const isSlackEnvConfigured = () =>
   Boolean(config.integrations.slackBotToken && config.integrations.slackBotChannel);
 export const isDiscordEnvConfigured = () =>

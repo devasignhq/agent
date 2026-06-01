@@ -7,11 +7,12 @@
 // opener calling `popup.close()` is always allowed because the opener holds
 // the Window reference from `window.open()`.
 
-export type PopupKind = "install" | "auth";
+export type PopupKind = "install" | "auth" | "linear";
 
 const popups: Record<PopupKind, Window | null> = {
   install: null,
   auth: null,
+  linear: null,
 };
 
 export function registerPopup(kind: PopupKind, win: Window | null) {

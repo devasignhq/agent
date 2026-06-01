@@ -169,6 +169,8 @@ The "Message agent" screen feeds straight into this — links, screenshots, and 
 
 **c. Review** — a multimodal LLM evaluates the PR diff against each criterion → produces a verdict (pass / changes-requested), a per-criterion checklist, and inline comments.
 
+**c.1 DEVASIGN.md guidance** — teams commit `DEVASIGN.md` files into their repo to encode their own conventions (the way they'd use `AGENTS.md` / `CLAUDE.md`). The agent reads every `DEVASIGN.md` on the path of each changed file — root → leaf, so a subdirectory's doc governs only files under it — and checks the diff against the rules that govern it. Violations the diff *newly introduces* surface as **nit-level** findings; and bidirectionally, if the diff makes a `DEVASIGN.md` statement outdated, it flags the docs for updating. Both are advisory nits — they never gate the merge. Skipped entirely (no LLM call) when no `DEVASIGN.md` governs a changed file.
+
 **d. Output** — post a GitHub Check Run + PR review, write to `reviewLogs`, broadcast the verdict to the connected Slack/Discord channel. The verdict is advisory — the human still decides to merge.
 
 **e. Eval** — run your LLM-as-judge harness (the evals platform you've already specced) over a sample of reviews to track quality regressions as you change prompts/models.

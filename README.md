@@ -83,3 +83,45 @@ You should see the job hit the queue, the worker run ingest → criteria → rev
 and the resulting record persist to Postgres (Neon) along with five log
 entries on the timeline (`Pipeline started`, `Context ingested`, `End goal
 synthesized`, `Changes requested`, `Posted Check Run and PR review`).
+
+## Guiding the review with `DEVASIGN.md`
+
+Drop a `DEVASIGN.md` file into your repository to teach the review agent your
+team's own conventions — the same way you'd use `AGENTS.md` or `CLAUDE.md`.
+There is **no setup in the dashboard**: commit the file and the agent picks it
+up on the next review.
+
+How it behaves:
+
+- **Hierarchical scope.** The agent reads a `DEVASIGN.md` at *every* level of
+  your directory tree. The repo-root file governs everything; a
+  `frontend/DEVASIGN.md` governs only files under `frontend/`. A file obeys
+  every `DEVASIGN.md` on its path, root → leaf.
+- **Violations are nits.** When a PR *newly* introduces a violation of a rule
+  that governs a changed file, the agent posts it as a **nit-level** finding —
+  surfaced with a copyable fix prompt, but it never blocks the merge.
+  Pre-existing code is left alone; the agent flags only what the diff adds.
+- **Docs stay honest (bidirectional).** If the diff changes code such that a
+  `DEVASIGN.md` statement is now outdated, the agent flags that the docs need
+  updating too.
+
+### Starter template
+
+```markdown
+# DEVASIGN.md
+
+Conventions for this directory and everything under it. Newly introduced
+violations are flagged as nits; they don't block the merge.
+
+## Conventions
+- State each rule as a single, checkable sentence.
+- Prefer concrete, observable rules ("API calls go through `src/api.ts`") over
+  subjective taste ("write clean code").
+
+## Examples
+- Error handling: wrap external calls and surface a typed error, never throw raw.
+- Naming: React components are PascalCase; hooks start with `use`.
+```
+
+Put broad rules in the root `DEVASIGN.md` and narrow, area-specific rules in a
+`DEVASIGN.md` inside the relevant subdirectory.

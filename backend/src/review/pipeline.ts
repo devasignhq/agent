@@ -7,12 +7,25 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { gh } from "../github/app.js";
-import { complete, detectVideoProvider, summarizeVideo, type VideoSummary } from "../llm.js";
+import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
 import { config } from "../config.js";
 import { enqueueReview, type MaintainerComment } from "../queue.js";
-import type { Criterion, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
+import {
+  downloadLinearFile,
+  fetchLinearIssueContext,
+  searchLinearIssues,
+  type LinearIssueContext,
+  type LinearIssueCandidate,
+} from "../linear/client.js";
+import {
+  devasignDocsForChangedFiles,
+  fetchDevasignDocs,
+  type DevasignDoc,
+  type DevasignScope,
+} from "./devasign.js";
+import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -36,12 +49,22 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
 
 // Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
 // on kind === "finding") and avoids extending the PRReview shape.
-type FindingCategory = "regression" | "criticalError" | "security" | "consistency" | "deferral" | "suggestion";
+type FindingCategory =
+  | "regression"
+  | "criticalError"
+  | "security"
+  | "consistency"
+  | "deferral"
+  // DEVASIGN.md findings: a convention the diff newly violates, and a
+  // DEVASIGN.md statement the diff makes outdated (docs need updating).
+  | "convention"
+  | "docDrift"
+  | "suggestion";
 
 function emitFindingLog(
   reviewId: string,
   category: Exclude<FindingCategory, "suggestion">,
-  finding: { path?: string; concern: string; severity: "blocker" | "warn"; fixPrompt?: string }
+  finding: { path?: string; concern: string; severity: "blocker" | "warn" | "nit"; fixPrompt?: string }
 ) {
   const titleByCategory: Record<typeof category, string> = {
     regression: "Possible regression",
@@ -49,6 +72,8 @@ function emitFindingLog(
     security: "Security finding",
     consistency: "Consistency deviation",
     deferral: "Deferred / incomplete work",
+    convention: "DEVASIGN.md violation",
+    docDrift: "DEVASIGN.md needs updating",
   };
   log(reviewId, "finding", titleByCategory[category], {
     detail: finding.concern,
@@ -139,19 +164,46 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     // b. Criteria synthesis (with task linkage if there's a matching task)
     const task = findOrCreateTask(review);
+    // If the PR resolved to a Linear ticket (explicit ref or fuzzy match),
+    // record the linkage on the task so the verdict step can post a Linear
+    // notification, and surface it on the timeline.
+    if (context.linkedLinearIssue) {
+      db.update("tasks", (t) => t.id === task.id, { linkedLinearIssue: context.linkedLinearIssue });
+      log(review.id, "ingest", `Linked to Linear ${context.linkedLinearIssue.identifier}`, {
+        target: context.linkedLinearIssue.identifier,
+        detail: context.linkedLinearIssue.url,
+        meta: { linearIssueId: context.linkedLinearIssue.id },
+      });
+    }
     // Whether we have any authoritative source of "done" beyond the diff: a
-    // linked issue, an attached video, or a task attachment. When we don't,
-    // synthesis is told it may legitimately produce zero criteria instead of
-    // inventing a spec from a thin PR description.
+    // linked issue (GitHub or Linear), an attached video, or a task attachment.
+    // When we don't, synthesis is told it may legitimately produce zero criteria
+    // instead of inventing a spec from a thin PR description.
     const hasAuthoritativeSpec = !!(
       context.primaryIssues.length ||
       context.secondaryIssues.length ||
+      context.linkedLinearIssue ||
       context.videos.length ||
       task.attachments.length
     );
     let endGoal = task.endGoal;
     let criteria: Criterion[] = [];
-    if (!endGoal || review.criteria.length === 0) {
+    if (context.linearSeedCriteria.length && review.criteria.length === 0) {
+      // Reuse the criteria DevAsign synthesized when the Linear ticket was
+      // opened — keeps the PR review consistent with what the team saw on the
+      // ticket and skips a redundant synthesis call.
+      criteria = context.linearSeedCriteria.map((c) => ({ ...c, met: null, evidence: null }));
+      endGoal = context.linearSeedEndGoal || endGoal || "";
+      db.update("tasks", (t) => t.id === task.id, { endGoal });
+      log(review.id, "criteria", "Criteria seeded from linked Linear ticket", {
+        detail: endGoal,
+        meta: {
+          count: criteria.length,
+          source: "linear_cache",
+          linear: context.linkedLinearIssue?.identifier,
+        },
+      });
+    } else if (!endGoal || review.criteria.length === 0) {
       const synth = await synthesizeCriteria(review, context, hasAuthoritativeSpec);
       criteria = synth.criteria;
       // Spec-less PR with no checkable claims: keep a neutral end goal so the
@@ -281,6 +333,59 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       );
     }
 
+    // c.3 DEVASIGN.md guidance (advisory). Read the repo's DEVASIGN.md files at
+    // every directory level and check the diff against the rules that govern the
+    // files it touches: newly introduced violations surface as nit-level
+    // findings, and statements the diff makes outdated surface as "docs need
+    // updating". Both are nits — they never gate the merge. Skipped entirely (no
+    // LLM call) when no DEVASIGN.md governs a changed file, so most repos pay
+    // nothing. Wrapped so an advisory pass never fails the whole review.
+    if (install) {
+      try {
+        const changedPaths = [...diffFilePaths(context.diff)];
+        const docs = await fetchDevasignDocs(repo, install, review.headSha);
+        const scopes = devasignDocsForChangedFiles(
+          docs.map((d) => d.path),
+          changedPaths
+        );
+        if (scopes.length) {
+          const devasign = await reviewAgainstDevasignDocs({
+            review,
+            diff: context.diff,
+            docs,
+            scopes,
+          });
+          holisticVerdict = {
+            ...holisticVerdict,
+            conventionFindings: devasign.conventionFindings,
+            docDriftFindings: devasign.docDriftFindings,
+          };
+          for (const f of devasign.conventionFindings) emitFindingLog(review.id, "convention", f);
+          for (const f of devasign.docDriftFindings) emitFindingLog(review.id, "docDrift", f);
+          const nitCount = devasign.conventionFindings.length;
+          const driftCount = devasign.docDriftFindings.length;
+          log(
+            review.id,
+            "holistic",
+            nitCount + driftCount
+              ? `DEVASIGN.md: ${nitCount} nit(s), ${driftCount} doc update(s)`
+              : "Checked against DEVASIGN.md — nothing new",
+            {
+              detail:
+                nitCount + driftCount
+                  ? "Newly introduced convention nits / outdated docs — see findings."
+                  : `${scopes.length} DEVASIGN.md scope(s) checked; no new violations.`,
+              meta: { docs: docs.length, scopes: scopes.length, nits: nitCount, docDrift: driftCount },
+            }
+          );
+        }
+      } catch (err) {
+        log(review.id, "holistic", "DEVASIGN.md guidance skipped", {
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
     const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
     setStatus(review.id, {
       criteria: filledCriteria,
@@ -361,7 +466,29 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       db.update("tasks", (t) => t.id === task.id, { endGoalRequestedAt: Date.now() });
       log(review.id, "comment", "Requested an end goal on spec-less PR");
     }
-    await broadcastVerdict(review, repo, status, verdict.summary);
+    // Linear notification: a short "we reviewed PR #N for this issue" comment on
+    // the linked ticket (the full verdict stays on the PR). Idempotent per head
+    // SHA so re-reviews on later pushes don't repeat it.
+    const linearInt = context.linkedLinearIssue ? linearIntegrationForUser(install?.userId) : null;
+    const notifyLinear = Boolean(
+      context.linkedLinearIssue && linearInt && task.linearNotifiedSha !== review.headSha
+    );
+    await broadcastVerdict(
+      review,
+      repo,
+      status,
+      verdict.summary,
+      notifyLinear && linearInt
+        ? {
+            linkedLinearIssue: context.linkedLinearIssue,
+            linearToken: linearInt.tokens.accessToken || linearInt.tokens.apiKey || "",
+            linearBearer: Boolean(linearInt.tokens.accessToken),
+          }
+        : {}
+    );
+    if (notifyLinear) {
+      db.update("tasks", (t) => t.id === task.id, { linearNotifiedSha: review.headSha });
+    }
     log(
       review.id,
       "comment",
@@ -401,15 +528,26 @@ type Context = {
   videos: VideoSummary[];
   primaryIssues: number[];
   secondaryIssues: number[];
+  // Linear ticket resolved for this PR (explicit ref or fuzzy match), if any.
+  linkedLinearIssue: { id: string; identifier: string; url: string } | null;
+  // Acceptance criteria cached on the resolved Linear ticket's Task — seeds the
+  // review without re-synthesizing. Empty when nothing was cached.
+  linearSeedCriteria: Criterion[];
+  linearSeedEndGoal: string | null;
 };
 
 async function ingestContext(
   review: PRReview,
-  repo: { owner: string; name: string },
-  install: { installationId: number } | null
+  repo: Repository,
+  install: Installation | null
 ): Promise<Context> {
   const sources: IngestedSource[] = [];
   let diff = "";
+  let prBody = "";
+  let prBranch = "";
+  let linkedLinearIssue: { id: string; identifier: string; url: string } | null = null;
+  let linearSeedCriteria: Criterion[] = [];
+  let linearSeedEndGoal: string | null = null;
   // Collect videos referenced anywhere — PR body, issue bodies, attachments.
   // `source` lets the log distinguish what surfaced the URL; de-duped by URL
   // before Gemini runs so a Loom embedded in both the PR and the issue is
@@ -424,10 +562,12 @@ async function ingestContext(
         install.installationId,
         `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}`
       );
+      prBody = pr.body || "";
+      prBranch = pr.head?.ref || "";
       sources.push({
         kind: "github_pr",
         ref: `${repo.owner}/${repo.name}#${review.prNumber}`,
-        text: `${pr.title}\n\n${pr.body || ""}`,
+        text: `${pr.title}\n\n${prBody}`,
       });
       // Persist real diff stats from the full PR object so the queue card
       // shows accurate counts instead of zeros.
@@ -518,6 +658,56 @@ async function ingestContext(
     }
   }
 
+  // ── Linear ticket resolution ──────────────────────────────────────────────
+  // If this repo's owner connected Linear, tie the PR to a Linear issue. First
+  // by an explicit identifier in the PR body/branch (the "Fixes ENG-123" magic
+  // words Linear's GitHub integration injects, and its `user/eng-123-slug`
+  // branch names). Otherwise — whenever there's no explicit Linear ref — by a
+  // conservative fuzzy search over the workspace's open issues, so an unlinked
+  // PR still gets matched to its ticket. The resolved issue is the authoritative
+  // spec; criteria cached when the ticket was opened seed the review so we don't
+  // re-synthesize. The matcher returns null unless a candidate clearly
+  // corresponds, and search failures degrade to "no match".
+  const linearIntegration = linearIntegrationForUser(install?.userId);
+  if (linearIntegration) {
+    const token = linearIntegration.tokens.accessToken || linearIntegration.tokens.apiKey || "";
+    const bearer = Boolean(linearIntegration.tokens.accessToken);
+    if (token) {
+      try {
+        let issue: LinearIssueContext | null = null;
+        const explicit = extractLinkedLinearIssues(prBody, prBranch);
+        if (explicit.length) {
+          issue = await fetchLinearIssueContext(token, explicit[0], { bearer });
+        } else {
+          const candidates = await searchLinearIssues(token, `${review.prTitle} ${prBody}`, { bearer });
+          const matchId = await matchPrToLinearIssue({ prTitle: review.prTitle, prBody, candidates });
+          if (matchId) issue = await fetchLinearIssueContext(token, matchId, { bearer });
+        }
+        if (issue) {
+          linkedLinearIssue = { id: issue.id, identifier: issue.identifier, url: issue.url };
+          for (const s of linearSourcesFromIssue(issue)) sources.push(s);
+          // A Loom/YouTube/Vimeo in the Linear description gets the same Gemini
+          // treatment as one embedded in a GitHub issue.
+          for (const url of extractVideoUrls(issue.description)) {
+            videoTargets.push({ url, note: `embedded in ${issue.identifier}`, source: "linear_issue" });
+          }
+          const cached = db.find("tasks", (t) => t.externalId === `linear:${issue!.id}`);
+          if (cached?.criteria?.length) {
+            // Cache hit: the criteria already reflect the ticket's files, so we
+            // don't re-download/summarize them here.
+            linearSeedCriteria = cached.criteria;
+            linearSeedEndGoal = cached.endGoal;
+          } else {
+            // No cache → we'll synthesize fresh, so read any attached files now.
+            for (const s of await summarizeLinearFiles(issue, token, bearer)) sources.push(s);
+          }
+        }
+      } catch (err) {
+        console.warn("[ingest] linear resolution failed:", err);
+      }
+    }
+  }
+
   // De-dupe by URL so a Loom appearing in both PR body and issue body or in
   // attachments doesn't get summarised multiple times.
   const seenUrls = new Set<string>();
@@ -556,7 +746,16 @@ async function ingestContext(
     }
   }
 
-  return { sources, diff, videos, primaryIssues, secondaryIssues };
+  return {
+    sources,
+    diff,
+    videos,
+    primaryIssues,
+    secondaryIssues,
+    linkedLinearIssue,
+    linearSeedCriteria,
+    linearSeedEndGoal,
+  };
 }
 
 // Pull issues referenced from a PR body. GitHub treats the canonical
@@ -586,6 +785,66 @@ function extractLinkedIssues(body: string): { primary: number[]; secondary: numb
     primary: Array.from(primary).slice(0, 3),
     secondary: Array.from(secondary).slice(0, 2),
   };
+}
+
+// Pull Linear issue identifiers (e.g. "ENG-123") from PR text and branch names.
+// Linear's GitHub integration injects "Fixes ENG-123" into PR bodies and names
+// branches `user/eng-123-slug`, so we scan both. The body match is case-
+// sensitive uppercase (the canonical form) to avoid false hits like "utf-8";
+// the branch match keys off the `/<key>-<n>` segment Linear produces.
+export function extractLinkedLinearIssues(body: string, branch?: string): string[] {
+  const seen = new Set<string>();
+  const bodyRe = /\b([A-Z][A-Z0-9]{1,9})-(\d+)\b/g;
+  let m: RegExpExecArray | null;
+  while ((m = bodyRe.exec(body || "")) !== null) {
+    seen.add(`${m[1]}-${m[2]}`);
+  }
+  if (branch) {
+    const branchRe = /\/([A-Za-z][A-Za-z0-9]{1,9})-(\d+)/g;
+    while ((m = branchRe.exec(branch)) !== null) {
+      seen.add(`${m[1].toUpperCase()}-${m[2]}`);
+    }
+  }
+  return Array.from(seen).slice(0, 3);
+}
+
+// The Linear integration for the repo owner (repo -> installation -> user ->
+// integration). Returns null when the owner hasn't connected Linear.
+function linearIntegrationForUser(userId: string | undefined): Integration | null {
+  if (!userId) return null;
+  return db.find("integrations", (i) => i.userId === userId && i.type === "linear");
+}
+
+// Conservative LLM match of a PR to one of a set of candidate Linear issues.
+// Returns the matching issue id, or null when nothing clearly corresponds —
+// guarding against both an empty candidate list and a hallucinated id. Keep the
+// "Linear issue matching" marker in the prompt; the offline mock keys off it.
+async function matchPrToLinearIssue(args: {
+  prTitle: string;
+  prBody: string;
+  candidates: LinearIssueCandidate[];
+}): Promise<string | null> {
+  const { prTitle, prBody, candidates } = args;
+  if (!candidates.length) return null;
+  const system =
+    "You are DevAsign's Linear issue matching step. Given a pull request and candidate Linear issues, decide which " +
+    "single issue the PR is implementing. Be conservative: match only when the PR clearly corresponds to a candidate's " +
+    "described work. Emit ONLY JSON: {\"id\": string | null}. Set id to the matching candidate's id, or null if none " +
+    "clearly matches. Never guess.";
+  const list = candidates
+    .map((c, i) => `${i + 1}. id=${c.id} [${c.identifier}] ${c.title}\n${(c.description || "").slice(0, 500)}`)
+    .join("\n\n");
+  const userText =
+    `# Pull request\n${prTitle}\n\n${(prBody || "").slice(0, 2000)}\n\n# Candidate Linear issues\n${list}`;
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+  });
+  const parsed = tryParseJSON<{ id: string | null }>(raw, { id: null });
+  const id = parsed?.id || null;
+  // Guard against a hallucinated id — must be one of the candidates we offered.
+  return id && candidates.some((c) => c.id === id) ? id : null;
 }
 
 // Pull every URL out of a chunk of text and keep only the ones whose host the
@@ -647,13 +906,34 @@ async function synthesizeCriteria(
   endGoal: string;
   criteria: Criterion[];
 }> {
+  return synthesizeCriteriaCore({
+    title: `PR ${review.prTitle}`,
+    sources: context.sources,
+    hasAuthoritativeSpec,
+  });
+}
+
+// Source-agnostic core of criteria synthesis. Shared by the PR pipeline (above)
+// and the Linear ticket-ingestion job (runLinearIngestJob), so an opened Linear
+// issue and a PR that fixes it run through identical logic. Keep the literal
+// "criteria synthesis" marker in the system prompt — the offline LLM mock keys
+// off it.
+export async function synthesizeCriteriaCore(args: {
+  title: string;
+  sources: IngestedSource[];
+  hasAuthoritativeSpec: boolean;
+}): Promise<{ endGoal: string; criteria: Criterion[] }> {
+  const { title, sources, hasAuthoritativeSpec } = args;
   const system =
     "You are DevAsign's criteria synthesis step. Read the ticket and surrounding context, then emit a JSON object: " +
     "{\"endGoal\": string, \"criteria\": [{\"id\": string, \"text\": string}]}. " +
     "The endGoal is one sentence summarising what success looks like. Each criterion is independently checkable. " +
-    "Sources labelled `github_issue_primary` are the canonical job-to-be-done (the issue the PR closes/fixes); " +
-    "treat their description as authoritative. `github_issue` rows are secondary background. " +
-    "`video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague." +
+    "Sources labelled `github_issue_primary` or `linear_issue_primary` are the canonical job-to-be-done (the issue the " +
+    "PR closes/fixes); treat their description as authoritative. `linear_subissue` rows are sub-tasks of that issue and " +
+    "`linear_comment` rows are discussion on it — treat both as authoritative detail. `linear_attachment` rows are linked " +
+    "resources (Figma, docs, the PR); `linear_file` rows summarise files attached to the ticket (PDFs/images); " +
+    "`linear_project_update` rows are project-status background. `github_issue` rows are secondary " +
+    "background. `video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague." +
     (hasAuthoritativeSpec
       ? ""
       : " IMPORTANT: This PR has NO linked issue and NO attached specification. Derive acceptance criteria ONLY from " +
@@ -662,8 +942,8 @@ async function synthesizeCriteria(
         "brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent acceptance criteria " +
         "just to have something to check, and never turn vague phrasing into a hard requirement.");
   const userText =
-    `# PR ${review.prTitle}\n\n## Context\n` +
-    context.sources
+    `# ${title}\n\n## Context\n` +
+    sources
       .filter((s) => s.kind !== "diff")
       .map((s) => `### ${s.kind} (${s.ref})\n${s.text}`)
       .join("\n\n");
@@ -680,6 +960,177 @@ async function synthesizeCriteria(
     evidence: null,
   }));
   return { endGoal: String(parsed.endGoal || ""), criteria };
+}
+
+// ─── Linear ticket ingestion ──────────────────────────────────────────────
+// Turn a fetched Linear issue into the same `IngestedSource[]` shape the PR
+// pipeline feeds to criteria synthesis. The issue itself is the primary spec;
+// sub-issues and comments are authoritative detail. Reused both when a ticket
+// is opened (runLinearIngestJob) and when a PR is resolved to a Linear issue
+// during review (ingestContext).
+export function linearSourcesFromIssue(issue: LinearIssueContext): IngestedSource[] {
+  const sources: IngestedSource[] = [];
+  const head =
+    (issue.parent ? `Parent: ${issue.parent.identifier} — ${issue.parent.title}\n` : "") +
+    (issue.project ? `Project: ${issue.project.name}\n` : "") +
+    (issue.labels.length ? `Labels: ${issue.labels.join(", ")}\n` : "");
+  sources.push({
+    kind: "linear_issue_primary",
+    ref: issue.identifier,
+    text: `${issue.title}\n\n${head}${issue.description || ""}`.trim(),
+  });
+  for (const child of issue.children) {
+    sources.push({
+      kind: "linear_subissue",
+      ref: child.identifier,
+      text: `${child.title}\n\n${child.description || ""}`.trim(),
+    });
+  }
+  for (const c of issue.comments) {
+    sources.push({
+      kind: "linear_comment",
+      ref: issue.identifier,
+      text: c.user ? `${c.user}: ${c.body}` : c.body,
+    });
+  }
+  // Linked resources (Figma, docs, the GitHub PR, etc.).
+  for (const a of issue.attachments) {
+    sources.push({
+      kind: "linear_attachment",
+      ref: a.url,
+      text: [a.title, a.subtitle, a.url].filter(Boolean).join(" — "),
+    });
+  }
+  // Recent status posts on the issue's project, as background context.
+  if (issue.project) {
+    const updates = db
+      .filter("linearProjectUpdates", (u) => u.projectId === issue.project!.id)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .slice(0, 3);
+    for (const u of updates) {
+      sources.push({
+        kind: "linear_project_update",
+        ref: issue.project.name || issue.project.id,
+        text: (u.health ? `[${u.health}] ` : "") + u.body,
+      });
+    }
+  }
+  return sources;
+}
+
+// True for files we can hand to the model: Linear-hosted uploads, or any URL
+// with a PDF/image extension.
+function isLinearFileUrl(url: string): boolean {
+  return /\blinear\.app\b/i.test(url) || /\.(pdf|png|jpe?g|webp|gif)(?:\?|#|$)/i.test(url);
+}
+
+// Gather candidate file URLs from the issue body, comments, and attachments.
+function collectLinearFileUrls(issue: LinearIssueContext): string[] {
+  const urls = new Set<string>();
+  const texts = [issue.description, ...issue.comments.map((c) => c.body)];
+  for (const t of texts) {
+    for (const u of (t || "").match(/https?:\/\/[^\s)>\]"']+/g) || []) {
+      if (isLinearFileUrl(u)) urls.add(u);
+    }
+  }
+  for (const a of issue.attachments) {
+    if (a.url && isLinearFileUrl(a.url)) urls.add(a.url);
+  }
+  return Array.from(urls);
+}
+
+// Download and summarise files attached to a Linear ticket (PDFs/images) so the
+// criteria step can reason about their contents. Bounded (first few, size-
+// capped) and entirely best-effort.
+async function summarizeLinearFiles(
+  issue: LinearIssueContext,
+  token: string,
+  bearer: boolean
+): Promise<IngestedSource[]> {
+  const out: IngestedSource[] = [];
+  for (const url of collectLinearFileUrls(issue).slice(0, 3)) {
+    const file = await downloadLinearFile(token, url, { bearer });
+    if (!file || file.size > 10_000_000) continue; // skip undownloadable / >10MB
+    const summary = await summarizeLinearFile({ url, base64: file.base64, mediaType: file.mediaType });
+    if (summary) out.push({ kind: "linear_file", ref: url, text: summary });
+  }
+  return out;
+}
+
+// Webhook-driven: a Linear ticket was opened/updated (or a comment was added).
+// Fetch the full issue, synthesize acceptance criteria, and cache them on a
+// Linear-sourced Task keyed `linear:<issueId>`. A PR that later targets this
+// issue seeds its review criteria from here (see ingestContext).
+export async function runLinearIngestJob(integrationId: string, issueId: string): Promise<void> {
+  const integration = db.find("integrations", (i) => i.id === integrationId);
+  if (!integration || integration.type !== "linear") {
+    console.warn(`[linear] ingest: integration ${integrationId} not found`);
+    return;
+  }
+  // OAuth access token (preferred) → Bearer; the dev personal-key path uses the
+  // raw key with no scheme.
+  const token = integration.tokens.accessToken || integration.tokens.apiKey || "";
+  if (!token) {
+    console.warn(`[linear] ingest: integration ${integrationId} has no token`);
+    return;
+  }
+  const bearer = Boolean(integration.tokens.accessToken);
+
+  let issue: LinearIssueContext | null;
+  try {
+    issue = await fetchLinearIssueContext(token, issueId, { bearer });
+  } catch (err) {
+    console.warn(`[linear] ingest: fetch ${issueId} failed:`, err);
+    return;
+  }
+  if (!issue) {
+    console.warn(`[linear] ingest: issue ${issueId} not found / inaccessible`);
+    return;
+  }
+
+  // A real Linear ticket is always an authoritative spec. Include text context
+  // plus summaries of any attached files (PDFs/images).
+  const ingestSources = linearSourcesFromIssue(issue);
+  ingestSources.push(...(await summarizeLinearFiles(issue, token, bearer)));
+  const { endGoal, criteria } = await synthesizeCriteriaCore({
+    title: `Linear ${issue.identifier}: ${issue.title}`,
+    sources: ingestSources,
+    hasAuthoritativeSpec: true,
+  });
+
+  const externalId = `linear:${issue.id}`;
+  const now = Date.now();
+  const existing = db.find("tasks", (t) => t.externalId === externalId);
+  if (existing) {
+    db.update("tasks", (t) => t.id === existing.id, {
+      title: issue.title,
+      endGoal: endGoal || existing.endGoal,
+      criteria,
+      externalKey: issue.identifier,
+      url: issue.url,
+      userId: integration.userId,
+      updatedAt: now,
+    });
+  } else {
+    db.insert("tasks", {
+      id: uuid(),
+      source: "linear",
+      externalId,
+      title: issue.title,
+      endGoal: endGoal || null,
+      attachments: [],
+      createdAt: now,
+      criteria,
+      externalKey: issue.identifier,
+      url: issue.url,
+      userId: integration.userId,
+      updatedAt: now,
+    });
+  }
+  console.log(
+    `[linear] ingest: ${issue.identifier} "${issue.title}" → ${criteria.length} criteria ` +
+    `(integration ${integrationId})`
+  );
 }
 
 // --- Goal refinement from video ---
@@ -964,6 +1415,21 @@ function formatReviewBody(
     appendHolisticGroup(lines, "Regressions", holistic.regressions);
     appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
     appendHolisticGroup(lines, "Security findings", holistic.securityFindings);
+    lines.push("");
+  }
+
+  // DEVASIGN.md nits (advisory). Convention violations the diff newly introduced
+  // and DEVASIGN.md statements the diff made outdated. Never block the merge —
+  // surfaced as nitpicks, each with its own copyable fix prompt.
+  const devasignItems = holistic.conventionFindings.length + holistic.docDriftFindings.length;
+  if (devasignItems) {
+    lines.push("## 📝 DEVASIGN.md");
+    lines.push(
+      "Checked against your repo's DEVASIGN.md conventions. These are nits — they don't block the merge:",
+      ""
+    );
+    appendHolisticGroup(lines, "Convention nits", holistic.conventionFindings);
+    appendHolisticGroup(lines, "Docs to update", holistic.docDriftFindings);
     lines.push("");
   }
   if (summary) {
@@ -1845,7 +2311,10 @@ function tryParseJSON<T>(raw: string, fallback: T): T {
 type HolisticFinding = {
   path?: string;
   concern: string;
-  severity: "blocker" | "warn";
+  // "nit" sits below "warn": purely advisory DEVASIGN.md findings that never
+  // gate the merge and render as nitpicks. Only "blocker" gates (see the status
+  // gate in runReviewJob).
+  severity: "blocker" | "warn" | "nit";
   // Self-contained prompt the user can paste into an external AI coding agent
   // to land the fix. Includes the relevant diff hunk inline.
   fixPrompt?: string;
@@ -1865,6 +2334,13 @@ type HolisticVerdict = {
   // spec'd and spec-less paths. Advisory — surfaced prominently but never
   // blocks a merge (forced severity "warn"), like consistencyFindings.
   deferrals: HolisticFinding[];
+  // DEVASIGN.md guidance pass (reviewAgainstDevasignDocs). `conventionFindings`
+  // are rules the diff newly violates; `docDriftFindings` are DEVASIGN.md
+  // statements the diff makes outdated (docs need updating). Both advisory —
+  // forced severity "nit", never gate a merge. Empty when the repo has no
+  // applicable DEVASIGN.md.
+  conventionFindings: HolisticFinding[];
+  docDriftFindings: HolisticFinding[];
   summary: string;
 };
 
@@ -1874,6 +2350,8 @@ const EMPTY_HOLISTIC: HolisticVerdict = {
   securityFindings: [],
   consistencyFindings: [],
   deferrals: [],
+  conventionFindings: [],
+  docDriftFindings: [],
   summary: "",
 };
 
@@ -2017,6 +2495,84 @@ async function reviewAgainstRepo(args: {
     regressions: normaliseFindings(parsed.regressions),
     criticalErrors: normaliseFindings(parsed.criticalErrors),
     securityFindings: normaliseFindings(parsed.securityFindings),
+    summary: String(parsed.summary || ""),
+  };
+}
+
+// ─── DEVASIGN.md guidance ───────────────────────────────────────────────────
+//
+// Check the diff against the team's own DEVASIGN.md conventions. Each doc was
+// already scoped to the changed files it governs (devasignDocsForChangedFiles);
+// here we ask the model for two advisory, nit-level outputs:
+//   • violations — rules the diff NEWLY breaks (→ conventionFindings)
+//   • docUpdates — DEVASIGN.md statements the diff makes outdated (→ docDrift)
+// Both are forced to severity "nit": surfaced as nitpicks, never gate a merge.
+async function reviewAgainstDevasignDocs(args: {
+  review: PRReview;
+  diff: string;
+  docs: DevasignDoc[];
+  scopes: DevasignScope[];
+}): Promise<{ conventionFindings: HolisticFinding[]; docDriftFindings: HolisticFinding[]; summary: string }> {
+  const { docs, scopes } = args;
+  if (!scopes.length) return { conventionFindings: [], docDriftFindings: [], summary: "" };
+
+  const system =
+    "You are DevAsign's DEVASIGN.md guidance step. A DEVASIGN.md states a team's own conventions. " +
+    "Each DEVASIGN.md governs ONLY files under its own directory; the repo-root one governs every file, and rules " +
+    "compound down the tree (a file obeys every DEVASIGN.md on its path, root → leaf). " +
+    "You are given the PR diff and, per governing DEVASIGN.md, its directory scope, the changed files it governs, and its text. " +
+    "Produce two advisory outputs, each strictly scoped to the governed files:\n" +
+    "1. `violations`: conventions a governing DEVASIGN.md states that the diff NEWLY breaks. Only flag violations the diff " +
+    "itself introduces — never pre-existing code, and never a file outside that doc's directory.\n" +
+    "2. `docUpdates`: statements in a DEVASIGN.md that this diff makes outdated or incorrect, so the doc needs updating " +
+    "(e.g. the diff replaces the approach the doc describes).\n" +
+    'Emit ONLY JSON: {"violations": [{"path": string, "concern": string, "fixPrompt": string}], ' +
+    '"docUpdates": [{"path": string, "concern": string, "fixPrompt": string}], "summary": string}. ' +
+    "For a violation, `path` is the offending changed file and `concern` quotes the specific rule and how the diff breaks it. " +
+    "For a docUpdate, `path` is the DEVASIGN.md file and `concern` quotes the now-outdated statement and what changed. " +
+    "These are nitpicks, never blockers: do not flag subjective style, and never invent a rule the DEVASIGN.md doesn't state. " +
+    "Prefer empty arrays over padding. " +
+    "Each item MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
+    "Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence description: the rule or statement, and the conflict the diff creates>\n\n" +
+    "Suggested approach:\n<concrete steps to fix the code, or to update the DEVASIGN.md>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this refers to, copied verbatim from the PR diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the item doesn't map to a hunk.";
+
+  const docByPath = new Map(docs.map((d) => [d.path, d.content]));
+  const docsBlock = scopes
+    .map((s) => {
+      const scopeLabel = s.dir === "" ? "(repo root — governs all files)" : `${s.dir}/**`;
+      const content = docByPath.get(s.docPath) ?? "";
+      return (
+        `### ${s.docPath}\n` +
+        `Scope: ${scopeLabel}\n` +
+        `Governs these changed files:\n${s.governedFiles.map((f) => `- ${f}`).join("\n")}\n\n` +
+        `Rules:\n${content || "(empty)"}`
+      );
+    })
+    .join("\n\n---\n\n");
+
+  const userText =
+    `# Diff\n\`\`\`diff\n${args.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    `# DEVASIGN.md files governing this PR's changed files\n${docsBlock}`;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1500,
+  });
+  const parsed = tryParseJSON<{ violations?: unknown; docUpdates?: unknown; summary?: unknown }>(raw, {});
+  // Force "nit" regardless of model output — DEVASIGN.md findings are uniformly
+  // advisory (mirrors how reviewSpeclessPR forces consistency findings to warn).
+  const toNit = (f: HolisticFinding): HolisticFinding => ({ ...f, severity: "nit" });
+  return {
+    conventionFindings: normaliseFindings(parsed.violations).map(toNit),
+    docDriftFindings: normaliseFindings(parsed.docUpdates).map(toNit),
     summary: String(parsed.summary || ""),
   };
 }

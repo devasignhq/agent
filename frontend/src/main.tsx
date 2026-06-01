@@ -16,17 +16,24 @@ const popupCompletion = (function popupHandshake() {
     const url = new URL(window.location.href);
     const installationId = url.searchParams.get("installation_id");
     const authOk = url.searchParams.get("auth") === "ok";
-    if (!installationId && !authOk) return null;
+    const linearConnected = url.searchParams.get("linear") === "connected";
+    if (!installationId && !authOk && !linearConnected) return null;
     if (!window.opener || window.opener.closed) return null;
     const msg = installationId
       ? { type: "devasign_install_done", installationId: Number(installationId) }
+      : linearConnected
+      ? { type: "devasign_linear_done" }
       : { type: "devasign_auth_done" };
     window.opener.postMessage(msg, window.location.origin);
     // Best-effort self-close. After cross-origin navigation through GitHub,
     // most browsers refuse this — that's why the opener also calls
     // popup.close() via popup-registry on message receipt.
     try { window.close(); } catch {}
-    const label = installationId ? "Install complete." : "Signed in.";
+    const label = installationId
+      ? "Install complete."
+      : linearConnected
+      ? "Linear connected."
+      : "Signed in.";
     document.body.innerHTML =
       '<div style="font-family:ui-monospace,monospace;color:#888;display:grid;place-items:center;height:100vh;text-align:center">' +
       `<div>${label}<br/>Closing…</div></div>`;

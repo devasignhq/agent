@@ -290,6 +290,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
 .pill.warn { color: var(--warn); border-color: rgba(245,165,36,0.3); background: rgba(245,165,36,0.06); }
 .pill.danger { color: var(--danger); border-color: rgba(255,90,95,0.3); background: rgba(255,90,95,0.06); }
 .pill.info { color: var(--info); border-color: rgba(74,168,255,0.3); background: rgba(74,168,255,0.06); }
+.pill.nit { color: var(--fg-dim); border-color: var(--line-2); background: rgba(160,166,173,0.06); }
 .pill.purple { color: var(--purple); border-color: rgba(164,140,255,0.3); background: rgba(164,140,255,0.06); }
 .pill.green { color: var(--green); border-color: rgba(61,220,151,0.3); background: rgba(61,220,151,0.06); }
 .pill.cyan { color: var(--cyan); border-color: rgba(34,211,238,0.3); background: rgba(34,211,238,0.06); }
@@ -3232,6 +3233,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   gap: 6px;
 }
 .finding-card.sev-blocker { border-left-color: var(--danger); }
+.finding-card.sev-nit { border-left-color: var(--line-2); }
 .finding-head {
   display: flex;
   align-items: center;
