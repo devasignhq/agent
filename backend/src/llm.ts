@@ -53,6 +53,22 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     });
   }
 
+  if (system?.includes("Linear issue matching")) {
+    // Deterministic offline matcher: pick the first candidate whose block shares
+    // a meaningful word (>3 chars) with the PR title; null if none. Lets both the
+    // match and no-match paths run without a real model.
+    const prTitle = (last.split("\n")[1] || "").toLowerCase();
+    const words = prTitle.split(/[^a-z0-9]+/).filter((w) => w.length > 3);
+    const blocks = last.split(/\n(?=\d+\. id=)/).filter((b) => /id=/.test(b));
+    for (const b of blocks) {
+      const idM = b.match(/id=(\S+)/);
+      if (idM && words.some((w) => b.toLowerCase().includes(w))) {
+        return JSON.stringify({ id: idM[1] });
+      }
+    }
+    return JSON.stringify({ id: null });
+  }
+
   if (system?.includes("PR review") || last.includes("Review this PR")) {
     return JSON.stringify({
       verdict: "changes_requested",
@@ -367,4 +383,56 @@ function safeJSON(text: string): unknown {
   const m = text.match(/\{[\s\S]*\}/);
   if (!m) return null;
   try { return JSON.parse(m[0]); } catch { return null; }
+}
+
+// ─── File understanding (PDFs / images attached to a Linear ticket) ──────────
+// Claude reads the file directly via a document/image content block, so we don't
+// need a separate PDF parser. Mirrors summarizeVideo: returns a short text
+// summary that downstream criteria synthesis ingests as a `linear_file` source.
+// Best-effort — returns null (and the review proceeds without it) on any error
+// or unsupported media type. Falls back to a deterministic mock with no API key.
+export async function summarizeLinearFile(input: {
+  url: string;
+  base64: string;
+  mediaType: string;
+}): Promise<string | null> {
+  const isPdf = input.mediaType === "application/pdf";
+  const isImage = input.mediaType.startsWith("image/");
+  if (!isPdf && !isImage) return null;
+
+  if (!client) {
+    return `[mock] Attached ${isPdf ? "PDF" : "image"} at ${input.url}. Real file understanding requires ANTHROPIC_API_KEY.`;
+  }
+
+  try {
+    const fileBlock = isPdf
+      ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: input.base64 } }
+      : { type: "image", source: { type: "base64", media_type: input.mediaType, data: input.base64 } };
+    const resp = await client.messages.create({
+      model: config.llm.model,
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: [
+            fileBlock,
+            {
+              type: "text",
+              text:
+                "This file is attached to a Linear ticket. In 3–6 sentences, summarise what it specifies or shows, " +
+                "focusing on concrete, checkable requirements or acceptance signals a code reviewer would need.",
+            },
+          ] as any,
+        },
+      ],
+    });
+    const text = resp.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    return text.trim() || null;
+  } catch (err) {
+    console.warn("[llm] summarizeLinearFile failed:", input.url, err);
+    return null;
+  }
 }

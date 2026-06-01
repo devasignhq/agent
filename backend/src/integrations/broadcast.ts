@@ -5,13 +5,22 @@
 // just paste a token in .env and have verdicts land somewhere.
 import { config, isSlackEnvConfigured, isDiscordEnvConfigured } from "../config.js";
 import { db } from "../db.js";
+import { createLinearComment } from "../linear/client.js";
 import type { PRReview, PRReviewStatus } from "../types.js";
 
 export async function broadcastVerdict(
   review: PRReview,
   repo: { owner: string; name: string },
   status: PRReviewStatus,
-  summary: string
+  summary: string,
+  // Linear write-back is scoped to a specific linked issue + token (resolved by
+  // the pipeline), unlike the chat fan-out which posts to every connected
+  // workspace. Absent these, the Linear step is a no-op.
+  opts: {
+    linkedLinearIssue?: { id: string; identifier: string; url: string } | null;
+    linearToken?: string;
+    linearBearer?: boolean;
+  } = {}
 ) {
   const integrations = db.table("integrations");
 
@@ -28,9 +37,6 @@ export async function broadcastVerdict(
       } else if (i.type === "discord" && i.tokens.botToken) {
         hasUserDiscord = true;
         await postDiscord(i.tokens.botToken, i.workspaceMeta.channelId || "", review, repo, status, summary);
-      } else if (i.type === "linear" && i.tokens.apiKey) {
-        // Linear: comment back on the linked issue, if we can derive one.
-        // Skipped here — the engine would parse `pr.body` for "fixes ENG-123".
       }
     } catch (err) {
       console.warn(`[broadcast] ${i.type} failed:`, err);
@@ -65,6 +71,30 @@ export async function broadcastVerdict(
       );
     } catch (err) {
       console.warn("[broadcast] discord (env fallback) failed:", err);
+    }
+  }
+
+  // Linear: a SHORT notification on the linked issue — the full verdict is on
+  // the PR. Scoped to the issue + the repo owner's token, both resolved by the
+  // pipeline; we deliberately don't fan out to every Linear integration the way
+  // the chat broadcasts above do.
+  if (opts.linkedLinearIssue && opts.linearToken) {
+    try {
+      const prUrl = `https://github.com/${repo.owner}/${repo.name}/pull/${review.prNumber}`;
+      const outcome =
+        status === "passed"
+          ? "reviewed it and all acceptance criteria passed"
+          : status === "changes_requested"
+          ? "reviewed it and requested changes"
+          : "reviewed it";
+      const body =
+        `🔎 **DevAsign** ${outcome} on [${repo.owner}/${repo.name}#${review.prNumber}](${prUrl}), ` +
+        `which targets this issue. The full feedback is on the pull request.`;
+      await createLinearComment(opts.linearToken, opts.linkedLinearIssue.id, body, {
+        bearer: opts.linearBearer,
+      });
+    } catch (err) {
+      console.warn("[broadcast] linear notify failed:", err);
     }
   }
 }
@@ -113,21 +143,5 @@ async function postDiscord(
       content: `${statusEmoji(status)} **DevAsign** · ${repo.owner}/${repo.name}#${review.prNumber} — ${status}\n${summary}`,
     }),
   });
-}
-
-// Pulls Linear issue context — used by review pipeline ingestion.
-export async function fetchLinearIssue(apiKey: string, issueKey: string): Promise<string | null> {
-  const query = `query($id: String!) { issue(id: $id) { title description comments { nodes { body } } } }`;
-  const res = await fetch("https://api.linear.app/graphql", {
-    method: "POST",
-    headers: { Authorization: apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({ query, variables: { id: issueKey } }),
-  });
-  if (!res.ok) return null;
-  const body = (await res.json()) as any;
-  const issue = body?.data?.issue;
-  if (!issue) return null;
-  const comments = (issue.comments?.nodes || []).map((c: any) => c.body).join("\n---\n");
-  return `${issue.title}\n\n${issue.description || ""}\n\n${comments}`;
 }
 

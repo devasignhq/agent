@@ -1,6 +1,6 @@
 // Subscribe to the in-memory queue and run review + index jobs.
 import { onJob } from "./queue.js";
-import { runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
+import { runLinearIngestJob, runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
 import { buildRepoIndex } from "./review/indexer.js";
 
 export function startWorker() {
@@ -13,6 +13,10 @@ export function startWorker() {
       case "maintainer_feedback":
         console.log(`[worker] maintainer_feedback ${job.payload.reviewId}`);
         await runMaintainerFeedbackJob(job.payload.reviewId, job.payload.comment);
+        return;
+      case "linear_ingest":
+        console.log(`[worker] linear_ingest ${job.payload.issueId}`);
+        await runLinearIngestJob(job.payload.integrationId, job.payload.issueId);
         return;
       case "index":
         console.log(

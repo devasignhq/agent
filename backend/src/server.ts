@@ -12,6 +12,8 @@ import {
 } from "./config.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { handleWebhook } from "./github/webhooks.js";
+import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
+import { handleLinearWebhook } from "./linear/webhooks.js";
 import { api } from "./routes/api.js";
 import { startWorker } from "./worker.js";
 import { db, initDb, shutdownDb } from "./db.js";
@@ -40,12 +42,25 @@ app.post(
   handleWebhook
 );
 
+// Linear webhook also needs the raw body for HMAC verification — register it
+// before express.json() for the same reason as the GitHub receiver above.
+app.post(
+  "/api/webhooks/linear",
+  express.raw({ type: "application/json", limit: "5mb" }),
+  handleLinearWebhook
+);
+
 app.use(express.json({ limit: "1mb" }));
 
 // Identity routes
 app.get("/api/auth/github", startOAuth);
 app.get("/api/auth/github/callback", finishOAuth);
 app.post("/api/auth/signout", signOut);
+
+// Linear workspace connect (OAuth). Connects an already-signed-in user's Linear
+// workspace and registers the ticket webhook; see linear/oauth.ts.
+app.get("/api/auth/linear", startLinearOAuth);
+app.get("/api/auth/linear/callback", finishLinearOAuth);
 
 // API
 app.use("/api", api);

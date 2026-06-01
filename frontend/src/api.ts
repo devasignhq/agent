@@ -14,6 +14,7 @@ const API_BASE =
 export const apiBase = API_BASE;
 export const oauthStartUrl = `${API_BASE}/api/auth/github`;
 export const installRedirectUrl = `${API_BASE}/api/install/redirect`;
+export const linearConnectUrl = `${API_BASE}/api/auth/linear`;
 
 export class ApiError extends Error {
   status: number;
@@ -121,6 +122,13 @@ export type Task = {
   endGoal: string | null;
   attachments: TaskAttachment[];
   createdAt: number;
+  // Linear ticket support (optional; mirror of backend/src/types.ts).
+  criteria?: Criterion[];
+  externalKey?: string | null;
+  url?: string;
+  userId?: string;
+  updatedAt?: number;
+  linkedLinearIssue?: { id: string; identifier: string; url: string } | null;
 };
 
 export type PRReviewStatus =

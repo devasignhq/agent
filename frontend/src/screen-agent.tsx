@@ -500,6 +500,8 @@ const FINDING_LABEL = {
   security: "Security finding",
   consistency: "Consistency",
   deferral: "Deferred work",
+  convention: "DEVASIGN.md",
+  docDrift: "DEVASIGN.md — docs outdated",
   suggestion: "Suggested change",
 };
 
@@ -547,8 +549,8 @@ const TimelineFor = ({ events, runningStageIdx }) =>
             {e.finding &&
           <div className={`finding-card sev-${e.finding.severity}`}>
                 <div className="finding-head">
-                  <span className={`pill ${e.finding.severity === "blocker" ? "danger" : "warn"}`}>
-                    <i className="dot"></i> {e.finding.severity === "blocker" ? "Blocker" : "Warn"}
+                  <span className={`pill ${e.finding.severity === "blocker" ? "danger" : e.finding.severity === "nit" ? "nit" : "warn"}`}>
+                    <i className="dot"></i> {e.finding.severity === "blocker" ? "Blocker" : e.finding.severity === "nit" ? "Nit" : "Warn"}
                   </span>
                   <span className="finding-cat">{FINDING_LABEL[e.finding.category] || "Finding"}</span>
                   {e.finding.path && (
@@ -1208,6 +1210,10 @@ function mapLogEntry(entry) {
   if (entry.kind === "finding" && entry.meta?.severity === "blocker") {
     v = { icon: "warn", flavor: "danger" };
   }
+  // DEVASIGN.md nits are advisory — de-emphasise in the rail (no warn flavour).
+  if (entry.kind === "finding" && entry.meta?.severity === "nit") {
+    v = { icon: "dot", flavor: "" };
+  }
   const d = new Date(entry.at);
   const pad = (n) => String(n).padStart(2, "0");
   const sources = entry.meta?.sources;
@@ -1223,7 +1229,12 @@ function mapLogEntry(entry) {
   const finding = entry.kind === "finding"
     ? {
         category: entry.meta?.category || "suggestion",
-        severity: entry.meta?.severity === "blocker" ? "blocker" : "warn",
+        severity:
+          entry.meta?.severity === "blocker"
+            ? "blocker"
+            : entry.meta?.severity === "nit"
+            ? "nit"
+            : "warn",
         path: typeof entry.meta?.path === "string" ? entry.meta.path : undefined,
         title: typeof entry.meta?.title === "string" ? entry.meta.title : entry.action,
         body: typeof entry.meta?.body === "string" ? entry.meta.body : (entry.detail || ""),

@@ -295,7 +295,9 @@ async function summariseAndUpsert(
   return true;
 }
 
-async function fetchBlob(
+// Exported for reuse by the DEVASIGN.md guidance pass (see devasign.ts), which
+// fetches doc blobs by sha from the PR head tree the same way the indexer does.
+export async function fetchBlob(
   repo: Repository,
   install: Installation,
   path: string,

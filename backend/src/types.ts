@@ -83,6 +83,27 @@ export type Task = {
   // issue/attachments). Keeps the "provide an end goal" PR comment idempotent
   // so re-reviews on later pushes don't re-spam the conversation.
   endGoalRequestedAt?: number | null;
+
+  // ── Linear ticket support (all optional so legacy rows still load) ────────
+  // Cached acceptance criteria. For a Linear-sourced task these are synthesized
+  // when the ticket is opened/updated (webhook) and seeded into a PRReview when
+  // a PR is matched to the ticket.
+  criteria?: Criterion[];
+  // Human-facing issue identifier (e.g. "ENG-123"), used to match PRs by text.
+  externalKey?: string | null;
+  // Canonical URL of the source issue (Linear), for linking in comments.
+  url?: string;
+  // Owning DevAsign user (the one who connected the Linear workspace). Lets us
+  // scope/clean up Linear tasks; GitHub PR tasks leave this unset.
+  userId?: string;
+  // Last time the cached criteria were refreshed.
+  updatedAt?: number;
+  // Set on a PR's own task when the review is resolved to a Linear issue
+  // (explicit ref or fuzzy match). Drives the Linear notification write-back.
+  linkedLinearIssue?: { id: string; identifier: string; url: string } | null;
+  // Head SHA we last posted a Linear notification comment for — keeps the
+  // notification idempotent across re-reviews on later pushes.
+  linearNotifiedSha?: string | null;
 };
 
 export type TaskAttachment = {
@@ -191,6 +212,20 @@ export type Notification = {
   readAt: number | null;
 };
 
+// A status post on a Linear project, captured from ProjectUpdate webhooks.
+// Stored per-update and pulled in as background context when synthesizing
+// criteria for any issue belonging to that project.
+export type LinearProjectUpdate = {
+  id: string;            // Linear ProjectUpdate id
+  projectId: string;
+  projectName: string;
+  body: string;
+  health?: string;       // onTrack | atRisk | offTrack (Linear's health enum)
+  userId?: string;       // owning DevAsign user (the connector)
+  createdAt: number;
+  updatedAt: number;
+};
+
 export type DB = {
   users: User[];
   installations: Installation[];
@@ -203,4 +238,5 @@ export type DB = {
   authAudit: AuthAuditEntry[];
   repoIndex: RepoIndexEntry[];
   notifications: Notification[];
+  linearProjectUpdates: LinearProjectUpdate[];
 };

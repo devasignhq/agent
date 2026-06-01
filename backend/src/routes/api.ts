@@ -602,6 +602,9 @@ api.post("/integrations", (req, res) => {
 api.delete("/integrations/:id", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  // Linear webhooks are app-level (not per-connect), so disconnecting just drops
+  // the row; the app keeps delivering but the org no longer resolves to a token,
+  // and the webhook handler acknowledges + ignores it.
   db.remove("integrations", (i) => i.id === req.params.id && i.userId === user.id);
   res.json({ ok: true });
 });

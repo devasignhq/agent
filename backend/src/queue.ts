@@ -52,7 +52,18 @@ export type IndexJob = {
   attempts: number;
 };
 
-export type Job = ReviewJob | MaintainerFeedbackJob | IndexJob;
+// Synthesize acceptance criteria from a Linear ticket when it's opened/updated
+// (or a comment is added). Drains in the review bucket so a long index build
+// can't starve ticket ingestion.
+export type LinearIngestJob = {
+  id: string;
+  type: "linear_ingest";
+  payload: { integrationId: string; issueId: string };
+  enqueuedAt: number;
+  attempts: number;
+};
+
+export type Job = ReviewJob | MaintainerFeedbackJob | IndexJob | LinearIngestJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -78,6 +89,19 @@ export function enqueueMaintainerFeedback(
     id: uuid(),
     type: "maintainer_feedback",
     payload: { reviewId, comment },
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.reviews.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueLinearIngest(integrationId: string, issueId: string): LinearIngestJob {
+  const job: LinearIngestJob = {
+    id: uuid(),
+    type: "linear_ingest",
+    payload: { integrationId, issueId },
     enqueuedAt: Date.now(),
     attempts: 0,
   };
