@@ -474,6 +474,17 @@ const App = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Top-level fallback for the Linear connect round-trip. If popups were blocked,
+  // /api/auth/linear/callback redirected the whole tab to /?linear=connected — strip
+  // the marker. The Integrations/Repository tabs refresh their own data on mount, so
+  // there's nothing else to reload here.
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("linear") !== "connected") return;
+    url.searchParams.delete("linear");
+    window.history.replaceState({}, "", url.pathname + url.search);
+  }, []);
+
   // Popup-completion listener: main.tsx postMessages us when an OAuth or
   // install popup finishes. We close the popup window from the opener side
   // (the popup itself can't reliably window.close() after navigating through
@@ -498,6 +509,11 @@ const App = () => {
               .then((list) => setHasInstall(list.length > 0))
               .catch(() => {});
           });
+      } else if (data.type === "devasign_linear_done") {
+        // Guarantee the popup closes regardless of which screen is mounted; the
+        // Integrations/Repository tabs refresh their own Linear data on this same
+        // message via their local listeners.
+        closePopup("linear");
       }
     };
     window.addEventListener("message", onMessage);

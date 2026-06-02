@@ -7,6 +7,7 @@ import { getSessionUser } from "../github/oauth.js";
 import { appJWT, gh } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
+import { fetchLinearTeams } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import {
   markAllRead,
@@ -607,6 +608,25 @@ api.delete("/integrations/:id", (req, res) => {
   // and the webhook handler acknowledges + ignores it.
   db.remove("integrations", (i) => i.id === req.params.id && i.userId === user.id);
   res.json({ ok: true });
+});
+
+// Teams in the connected Linear workspace, fetched live with the stored token (which
+// never leaves the server). Powers the "Linear workspace" section in Settings →
+// Repository. Returns connected:false (not an error) when the user has no Linear row.
+api.get("/integrations/linear/teams", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const row = db.find(
+    "integrations",
+    (i) => i.userId === user.id && i.type === "linear"
+  );
+  if (!row) return void res.json({ connected: false, teams: [] });
+  const teams = await fetchLinearTeams(row.tokens.accessToken);
+  res.json({
+    connected: true,
+    workspace: row.workspaceMeta?.workspaceName || row.workspaceMeta?.urlKey || "",
+    teams,
+  });
 });
 
 // --- Billing (Stripe stub) ---

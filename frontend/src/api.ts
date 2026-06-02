@@ -105,6 +105,13 @@ export type IntegrationView = {
   createdAt: number;
 };
 
+export type LinearTeam = { id: string; name: string; key: string };
+export type LinearTeamsView = {
+  connected: boolean;
+  workspace?: string;
+  teams: LinearTeam[];
+};
+
 export type TaskAttachment = {
   id: string;
   kind: "loom" | "figma" | "image" | "pdf" | "link" | "text";
@@ -279,6 +286,8 @@ export const api = {
     }),
   removeIntegration: (id: string) =>
     request<{ ok: true }>(`/api/integrations/${id}`, { method: "DELETE" }),
+  linearTeams: () =>
+    request<LinearTeamsView>("/api/integrations/linear/teams"),
 
   // billing
   subscription: () => request<Subscription | null>("/api/billing/subscription"),

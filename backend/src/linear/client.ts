@@ -46,6 +46,11 @@ export type LinearWorkspace = {
   workspaceName: string;
   urlKey: string;
 };
+export type LinearTeam = {
+  id: string;
+  name: string;
+  key: string;
+};
 
 // Open = not finished. Linear state types: triage | backlog | unstarted |
 // started | completed | canceled. We treat the first four as "open".
@@ -199,6 +204,25 @@ export async function fetchLinearWorkspace(
   const org = data?.viewer?.organization;
   if (!org) return null;
   return { organizationId: org.id, workspaceName: org.name || "", urlKey: org.urlKey || "" };
+}
+
+// The teams the connected token can see — i.e. the teams in the workspace the user
+// granted DevAsign access to. Rendered in Settings → Repository. Best-effort: a Linear
+// hiccup or schema change yields an empty list rather than failing the settings page.
+export async function fetchLinearTeams(
+  token: string,
+  opts?: { bearer?: boolean }
+): Promise<LinearTeam[]> {
+  const query = `query { teams(first: 250) { nodes { id name key } } }`;
+  try {
+    const data = await linearGraphQL<{ teams: { nodes: any[] } }>(token, query, {}, opts);
+    return (data?.teams?.nodes || [])
+      .map((t: any) => ({ id: t.id, name: t.name || "", key: t.key || "" }))
+      .filter((t: LinearTeam) => t.id);
+  } catch (err) {
+    console.warn("[linear] teams lookup failed (returning none):", err);
+    return [];
+  }
 }
 
 // Download a file referenced from an issue (a PDF/image dropped into the
