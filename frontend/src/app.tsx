@@ -71,12 +71,9 @@ const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
     </div>
 
     <div className="sb-foot">
-      <div className="sb-avatar">
-        {user?.avatarUrl ? <img src={user.avatarUrl} alt="" style={{ width: "100%", height: "100%", borderRadius: "inherit", objectFit: "cover" }}/> : (user?.githubLogin || "?").charAt(0).toUpperCase()}
-      </div>
       <div className="sb-foot-text col" style={{ flex: 1, minWidth: 0 }}>
         <span style={{ color: "var(--fg)", fontSize: 12 }}>{user?.githubLogin || "unknown"}</span>
-        <span style={{ fontSize: 10 }}>{user?.plan || "free"} · github</span>
+        <span style={{ fontSize: 10 }}>{user?.plan || "free"}</span>
       </div>
     </div>
   </div>

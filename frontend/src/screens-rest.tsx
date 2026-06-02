@@ -489,9 +489,8 @@ const SetInstall = () => {
             </div>
           )}
 
-          <div className="code-block">
-            <code>{installRedirectUrl.replace(/^https?:\/\//, "")}</code>
-            <button className="btn sm" onClick={launchConfigure}>
+          <div>
+            <button className="btn primary" onClick={launchConfigure}>
               <Icon name="external" size={11} /> Configure on GitHub
             </button>
           </div>
