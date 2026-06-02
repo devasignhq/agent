@@ -2,7 +2,7 @@
 // Settings page (and its sub-sections)
 import React from "react";
 import { Icon } from "./icons";
-import { api, installRedirectUrl, linearConnectUrl } from "./api";
+import { api, installRedirectUrl, linearConnectUrl, type LinearTeamsView } from "./api";
 import { useAuth } from "./auth-context";
 import { registerPopup, closePopup } from "./popup-registry";
 
@@ -370,6 +370,7 @@ const SetInstall = () => {
   // catch the round-trip even if the user dismisses the popup themselves.
   const [installs, setInstalls] = React.useState<any[]>([]);
   const [repos, setRepos] = React.useState<any[]>([]);
+  const [linear, setLinear] = React.useState<LinearTeamsView | null>(null);
   // Two-phase load: phase 1 paints the local DB snapshot in one LAN round-
   // trip (the `?fast=1` variant skips awaiting the GitHub reconcile); phase 2
   // calls the default endpoint to pick up anything the background reconcile
@@ -395,6 +396,13 @@ const SetInstall = () => {
   }, []);
   React.useEffect(() => { refresh(); }, [refresh]);
 
+  // Linear workspace teams for the section below the GitHub App card. Fetched live
+  // from the backend (token stays server-side); refreshed on connect.
+  const refreshLinear = React.useCallback(async () => {
+    try { setLinear(await api.linearTeams()); } catch { /* keep prior state */ }
+  }, []);
+  React.useEffect(() => { refreshLinear(); }, [refreshLinear]);
+
   // Same popup-completion message that onboarding listens for.
   React.useEffect(() => {
     const onMsg = (e: MessageEvent) => {
@@ -403,11 +411,13 @@ const SetInstall = () => {
       if (d && d.type === "devasign_install_done") {
         // Give the link round-trip a beat to finish, then refresh.
         setTimeout(refresh, 400);
+      } else if (d && d.type === "devasign_linear_done") {
+        setTimeout(refreshLinear, 400);
       }
     };
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
-  }, [refresh]);
+  }, [refresh, refreshLinear]);
 
   const launchConfigure = () => {
     const popup = window.open(
@@ -494,6 +504,56 @@ const SetInstall = () => {
               <Icon name="external" size={11} /> Configure on GitHub
             </button>
           </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3 className="card-title">Linear workspace</h3>
+          {linear?.connected
+            ? <span className="pill ok"><i className="dot"></i> connected</span>
+            : <span className="pill"><i className="dot"></i> not connected</span>}
+        </div>
+        <div className="card-body">
+          <div className="mute" style={{ fontSize: 12, marginBottom: 12 }}>
+            {linear?.connected
+              ? "Teams in the Linear workspace you connected DevAsign to."
+              : "Connect Linear under Settings → Integrations to list workspace teams."}
+          </div>
+
+          {linear?.connected && linear.teams.length > 0 && (
+            <div className="gh-accounts">
+              <div className="gh-account">
+                <div className="gh-account-head">
+                  <div className="gh-account-avatar personal">
+                    {String(linear.workspace || "?").charAt(0).toUpperCase()}
+                  </div>
+                  <span className="mono gh-account-name">{linear.workspace || "workspace"}</span>
+                  <span className="gh-account-kind mono">linear</span>
+                  <span className="flex-1"></span>
+                  <span className="mono gh-account-count">
+                    {linear.teams.length} team{linear.teams.length === 1 ? "" : "s"}
+                  </span>
+                </div>
+                <ul className="gh-repo-list">
+                  {linear.teams.map((t) => (
+                    <li key={t.id} className="gh-repo-row">
+                      <Icon name="linear" size={11} color="var(--fg-faint)" />
+                      <span className="mono gh-repo-name">{t.key}</span>
+                      <span className="gh-repo-meta mono">{t.name}</span>
+                      <span className="flex-1"></span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            </div>
+          )}
+
+          {linear?.connected && linear.teams.length === 0 && (
+            <div className="mute" style={{ fontSize: 12 }}>
+              No teams found in this workspace.
+            </div>
+          )}
         </div>
       </div>
 
