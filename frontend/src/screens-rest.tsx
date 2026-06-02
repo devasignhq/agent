@@ -60,6 +60,7 @@ const INTEGRATIONS = [
     tagline: "Sync review blockers as issues. Auto-link PRs to tickets.",
     docs: "linear.app/acme/team/ENG",
     connected: true,
+    inDevelopment: false,
     meta: [
       { label: "workspace", value: "acme" },
       { label: "team",      value: "Engineering · ENG" },
@@ -79,6 +80,7 @@ const INTEGRATIONS = [
     tagline: "Push review events to channels. Approve via slash command.",
     docs: "acme.slack.com",
     connected: true,
+    inDevelopment: true,
     meta: [
       { label: "workspace", value: "acme.slack.com" },
       { label: "channel",   value: "#pr-reviews" },
@@ -98,6 +100,7 @@ const INTEGRATIONS = [
     tagline: "Notify your community server about review activity.",
     docs: "discord.gg/acme-builders",
     connected: false,
+    inDevelopment: true,
     meta: [],
     events: [
       { key: "review",   name: "PR ready for review",  desc: "Post to #pr-reviews with diff summary",       on: true },
@@ -215,7 +218,7 @@ const SetIntegrations = () => {
     }
   };
 
-  const connectedCount = Object.values(state).filter(s => s.connected).length;
+  const connectedCount = INTEGRATIONS.filter(i => !i.inDevelopment && state[i.key].connected).length;
 
   // Show the real connected workspace for Linear (from the backend row) instead
   // of the placeholder meta baked into INTEGRATIONS.
@@ -246,16 +249,19 @@ const SetIntegrations = () => {
         <div className="card-body">
           <div className="int-summary">
             {INTEGRATIONS.map(i => {
-              const isOn = state[i.key].connected;
+              const dev = i.inDevelopment;
+              const isOn = !dev && state[i.key].connected;
               return (
-                <div key={i.key} className={`int-summary-cell ${isOn ? "on" : "off"}`}>
+                <div key={i.key} className={`int-summary-cell ${isOn ? "on" : "off"}`} style={dev ? { opacity: 0.55 } : undefined}>
                   <div className="int-mark" style={{ color: isOn ? i.color : "var(--fg-mute)" }}>
                     <Icon name={i.icon} size={14}/>
                   </div>
                   <div className="mono int-summary-name">{i.name}</div>
-                  <span className={`pill ${isOn ? "ok" : ""}`} style={!isOn ? { color: "var(--fg-mute)" } : {}}>
-                    <i className="dot"></i>{isOn ? "connected" : "off"}
-                  </span>
+                  {dev
+                    ? <span className="pill" style={{ color: "var(--fg-mute)" }}><i className="dot"></i> in dev</span>
+                    : <span className={`pill ${isOn ? "ok" : ""}`} style={!isOn ? { color: "var(--fg-mute)" } : {}}>
+                        <i className="dot"></i>{isOn ? "connected" : "off"}
+                      </span>}
                 </div>
               );
             })}
@@ -266,18 +272,21 @@ const SetIntegrations = () => {
       {/* Per-integration cards */}
       {INTEGRATIONS.map(i => {
         const s = state[i.key];
+        const dev = i.inDevelopment;
         const enabledCount = Object.values(s.events).filter(Boolean).length;
         return (
-          <div key={i.key} className="card">
+          <div key={i.key} className="card" style={dev ? { opacity: 0.6 } : undefined}>
             <div className="card-head int-head">
               <div className="int-id">
-                <div className="int-logo" style={{ color: s.connected ? i.color : "var(--fg-mute)" }}>
+                <div className="int-logo" style={{ color: !dev && s.connected ? i.color : "var(--fg-mute)" }}>
                   <Icon name={i.icon} size={20}/>
                 </div>
                 <div className="int-id-body">
                   <div className="int-name-row">
                     <span className="int-name">{i.name}</span>
-                    {s.connected
+                    {dev
+                      ? <span className="pill" style={{ color: "var(--fg-mute)" }}><i className="dot"></i> In development</span>
+                      : s.connected
                       ? <span className="pill ok"><i className="dot"></i> connected</span>
                       : <span className="pill" style={{ color: "var(--fg-mute)" }}><i className="dot"></i> not connected</span>}
                   </div>
@@ -285,7 +294,9 @@ const SetIntegrations = () => {
                 </div>
               </div>
               <div className="int-head-actions">
-                {s.connected ? (
+                {dev ? (
+                  <span className="mono mute" style={{ fontSize: 11 }}>Coming soon</span>
+                ) : s.connected ? (
                   <>
                     <button className="btn ghost sm" onClick={() => setExpanded(i.key, !s.expanded)}>
                       <span className={`chev ${s.expanded ? "open" : ""}`}><Icon name="chevron-d" size={11}/></span>
@@ -300,7 +311,7 @@ const SetIntegrations = () => {
               </div>
             </div>
 
-            {s.connected && s.expanded && (
+            {!dev && s.connected && s.expanded && (
               <div className="card-body int-body">
                 {/* Connection meta — single inline strip */}
                 <div className="int-meta-strip">
@@ -349,24 +360,6 @@ const SetIntegrations = () => {
           </div>
         );
       })}
-
-      {/* Footer: explore more */}
-      <div className="card int-more">
-        <div className="card-body">
-          <div className="flex justify-between items-center" style={{ gap: 12, flexWrap: "wrap" }}>
-            <div>
-              <div className="mono" style={{ fontSize: 13 }}>Need another integration?</div>
-              <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                Jira, Notion, PagerDuty, and 18 more available via the webhook bridge.
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <button className="btn ghost sm"><Icon name="globe" size={11}/> Browse directory</button>
-              <button className="btn sm"><Icon name="code" size={11}/> Build a webhook</button>
-            </div>
-          </div>
-        </div>
-      </div>
     </div>
   );
 };
