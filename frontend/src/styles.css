@@ -54,6 +54,15 @@ body {
 button { font-family: inherit; }
 input, textarea, select { font-family: inherit; color: inherit; }
 
+/* Interactive elements show the pointer cursor on hover so it's clear they can
+   be clicked. Static elements (data rows, table headers) keep their own
+   class-level `cursor` declarations. */
+button, a, summary, label[for],
+[role="button"], [role="tab"], [role="link"], [role="menuitem"], [role="option"], [role="switch"] {
+  cursor: pointer;
+}
+button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed; }
+
 ::selection { background: var(--accent-glow); color: var(--fg); }
 
 /* Scrollbars — thin, hairline-style */
@@ -135,7 +144,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   padding: 7px 10px;
   color: var(--fg-dim);
   font-size: 13px;
-  cursor: default;
+  cursor: pointer;
   border-left: 2px solid transparent;
   border-radius: 0;
 }
@@ -232,7 +241,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   font-family: var(--mono);
   font-size: 12px;
   letter-spacing: 0.01em;
-  cursor: default;
+  cursor: pointer;
   transition: background 0.12s ease, border-color 0.12s ease;
   border-radius: 0;
 }
@@ -466,7 +475,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   font-size: 13px;
   font-weight: 600;
   border: 0;
-  cursor: default;
+  cursor: pointer;
 }
 .gh-btn:hover { background: #fff; }
 
@@ -886,7 +895,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
 .pr-card {
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
-  cursor: default;
+  cursor: pointer;
   border-left: 2px solid transparent;
 }
 .pr-card:hover { background: var(--bg-2); }
@@ -2213,7 +2222,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   color: var(--fg-dim);
   padding: 7px 10px;
   border-left: 2px solid transparent;
-  cursor: default;
+  cursor: pointer;
 }
 .set-nav-item:hover { background: var(--bg-2); color: var(--fg); }
 .set-nav-item.active { color: var(--fg); border-left-color: var(--accent); background: var(--bg-1); }
@@ -2652,7 +2661,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   background: var(--bg-3);
   border: 1px solid var(--line-2);
   position: relative;
-  cursor: default;
+  cursor: pointer;
 }
 .tog::after {
   content: ""; position: absolute; top: 1px; left: 1px;
@@ -3366,7 +3375,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   align-items: flex-start;
   padding: 9px 12px;
   border-bottom: 1px solid var(--line);
-  cursor: default;
+  cursor: pointer;
   transition: background 80ms ease;
 }
 .notif-row:last-child { border-bottom: none; }
