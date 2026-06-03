@@ -110,6 +110,7 @@ const INTEGRATIONS = [
 ];
 
 const SetIntegrations = () => {
+  const { user } = useAuth();
   // Hydrate from the backend so toggle state reflects real connection rows.
   const [rows, setRows] = React.useState([]); // /api/integrations
   const [state, setState] = React.useState(() =>
@@ -118,6 +119,12 @@ const SetIntegrations = () => {
       events: Object.fromEntries(i.events.map(e => [e.key, e.on])),
       expanded: false,
     }]))
+  );
+  // Inline error for the Linear OAuth round-trip. Set when the popup posts
+  // devasign_linear_done {ok:false}; also initialised from ?linear=error for the
+  // popup-blocked fallback where the whole tab was redirected back here.
+  const [linearError, setLinearError] = React.useState(
+    () => new URLSearchParams(window.location.search).get("linear") === "error"
   );
 
   const refresh = React.useCallback(async () => {
@@ -141,19 +148,34 @@ const SetIntegrations = () => {
   React.useEffect(() => { refresh(); }, [refresh]);
 
   // Linear connects via an OAuth popup; main.tsx posts devasign_linear_done when
-  // the callback lands back on our origin. Close the popup and refresh to pick
-  // up the new integration row.
+  // the callback lands back on our origin. Close the popup, then either refresh to
+  // pick up the new integration row (ok) or surface an inline error (!ok).
   React.useEffect(() => {
     const onMsg = (e: MessageEvent) => {
       if (e.origin !== window.location.origin) return;
-      if (e.data && (e.data as any).type === "devasign_linear_done") {
-        closePopup("linear");
+      const d = e.data as any;
+      if (!d || d.type !== "devasign_linear_done") return;
+      closePopup("linear");
+      if (d.ok === false) {
+        setLinearError(true);
+      } else {
+        setLinearError(false);
         setTimeout(refresh, 400);
       }
     };
     window.addEventListener("message", onMsg);
     return () => window.removeEventListener("message", onMsg);
   }, [refresh]);
+
+  // Popup-blocked fallback: the callback redirected the whole tab to /?linear=error
+  // (read into linearError above). Strip the marker so it doesn't linger in the URL
+  // or re-trigger on a later mount.
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    if (url.searchParams.get("linear") !== "error") return;
+    url.searchParams.delete("linear");
+    window.history.replaceState({}, "", url.pathname + url.search);
+  }, []);
 
   const toggle = (intKey, evKey) => setState(s => ({
     ...s,
@@ -166,6 +188,15 @@ const SetIntegrations = () => {
       // the backend authorize endpoint in a popup; on return main.tsx posts
       // devasign_linear_done and the listener above refreshes.
       if (intKey === "linear") {
+        // A fresh attempt clears any prior inline error.
+        setLinearError(false);
+        // Linear integration is a Pro/Max feature; the backend returns 403 for
+        // free users. Route them to the billing upgrade view instead of opening
+        // a popup that would just error.
+        if ((user?.plan || "free") === "free") {
+          window.location.href = `${window.location.origin}/?billing=upgrade`;
+          return;
+        }
         const popup = window.open(
           linearConnectUrl,
           "devasign_linear",
@@ -310,6 +341,27 @@ const SetIntegrations = () => {
                 )}
               </div>
             </div>
+
+            {i.key === "linear" && linearError && !s.connected && (
+              <div className="card-body">
+                <div
+                  className="gh-installed-banner"
+                  style={{ borderColor: "rgba(255,90,95,0.35)", background: "rgba(255,90,95,0.06)" }}
+                >
+                  <div className="gh-installed-icon" style={{ background: "var(--danger)", color: "#2a0b0c" }}>
+                    <Icon name="warn" size={12} />
+                  </div>
+                  <div className="flex-1">
+                    <div className="mono" style={{ fontSize: 12, color: "var(--fg)" }}>
+                      Couldn't connect Linear
+                    </div>
+                    <div className="mute mono" style={{ fontSize: 11, marginTop: 1 }}>
+                      The authorization didn't complete. Please click Connect Linear to try again.
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
 
             {!dev && s.connected && s.expanded && (
               <div className="card-body int-body">
@@ -562,156 +614,139 @@ const SetInstall = () => {
 };
 
 const PLANS = [
-{ id: "free", name: "Free", tagline: "For maintainers of public repos", price: "$0", cadence: "/ free forever", features: "Public repos only" },
-{ id: "pro", name: "Pro", tagline: "For private repos & small teams", price: "$25", cadence: "/ month", features: "Private repos · Limited PR review", cta: "Get Pro Plan" },
-{ id: "max", name: "Max", tagline: "For shipping teams that review at velocity", price: "$100", cadence: "/ month", features: "Unlimited PR reviews · Priority queue", cta: "Get Max Plan" }];
+{ id: "free", name: "Free", price: "$0", cadence: "/ forever", features: "Public repos · Haiku reviews · 10 PR reviews / mo" },
+{ id: "pro", name: "Pro", price: "$15", cadence: "/ month", trial: "14-day free trial", features: "Private repos · Opus reviews · 50 PR reviews / mo · Linear sync", cta: "Upgrade to Pro" },
+{ id: "max", name: "Max", price: "$45", cadence: "/ month", trial: "14-day free trial", features: "Private repos · Opus reviews · Unlimited reviews · Linear sync", cta: "Upgrade to Max" }];
 
-const INVOICES = [
-{ id: "inv-2026-05", date: "May 14, 2026", amount: "$25.00", status: "paid" },
-{ id: "inv-2026-04", date: "Apr 14, 2026", amount: "$25.00", status: "paid" },
-{ id: "inv-2026-03", date: "Mar 14, 2026", amount: "$25.00", status: "paid" }];
-
+const planLabel = (p) => (p === "max" ? "Max" : p === "pro" ? "Pro" : "Free");
 
 const SetBilling = () => {
   const { user } = useAuth();
-  const [cancelStep, setCancelStep] = React.useState("idle"); // idle | confirm | done
-  const [reason, setReason] = React.useState("");
+  const [view, setView] = React.useState(null); // SubscriptionView | null (GET /billing/subscription)
+  const [busy, setBusy] = React.useState(null); // "pro" | "max" | "portal" | null
+  const [err, setErr] = React.useState(null);
 
-  // Map backend `plan` enum to plan card id. Backend's "team" is now "max".
-  const currentPlanId = user?.plan === "team" ? "max" : user?.plan || "pro";
+  React.useEffect(() => {
+    api.subscription().then(setView).catch(() => setView(null));
+  }, []);
+
+  // effectivePlan reflects any lapse-downgrade; `purchased` is what they bought.
+  const effective = view?.effectivePlan || user?.plan || "free";
+  const purchased = view?.subscription?.plan || effective;
+  const status = view?.subscription?.status || null;
+  const lapsed = purchased !== "free" && effective === "free"; // paid but downgraded by Stripe
+  const usage =
+    view == null
+      ? "…"
+      : view.reviewLimit == null
+      ? `${view.reviewsUsed} reviews this month · unlimited`
+      : `${view.reviewsUsed} / ${view.reviewLimit} PR reviews this month`;
+  const renew = view?.subscription?.currentPeriodEnd
+    ? new Date(view.subscription.currentPeriodEnd).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+    : null;
+  const renewLabel = status === "trialing" ? "trial ends" : "renews";
+
+  const startCheckout = async (plan) => {
+    setErr(null);
+    setBusy(plan);
+    try {
+      const { url } = await api.checkout(plan);
+      window.location.href = url;
+    } catch (e) {
+      setErr(e?.message || "Couldn't start checkout. Is billing configured?");
+      setBusy(null);
+    }
+  };
+  const openPortal = async () => {
+    setErr(null);
+    setBusy("portal");
+    try {
+      const { url } = await api.portal();
+      window.location.href = url;
+    } catch (e) {
+      setErr(e?.message || "Couldn't open the billing portal.");
+      setBusy(null);
+    }
+  };
 
   return (
     <div className="col gap-5">
+      {lapsed &&
+      <div className="card" style={{ borderColor: "var(--danger)" }}>
+        <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>
+              Your {planLabel(purchased)} plan lapsed — you're on Free
+            </div>
+            <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
+              {status === "past_due" ? "Your last payment failed." : "Your subscription ended."} Update your
+              payment method to restore {planLabel(purchased)} (private repos, Opus reviews, Linear sync).
+            </div>
+          </div>
+          <button className="btn" disabled={busy === "portal"} onClick={openPortal}>
+            {busy === "portal" ? "Opening…" : "Update payment"}
+          </button>
+        </div>
+      </div>
+      }
+
       <div className="card">
         <div className="card-head"><h3 className="card-title">Current plan</h3>
-          <span className="pill purple"><i className="dot"></i> {currentPlanId}</span></div>
+          <span className="pill purple"><i className="dot"></i> {planLabel(effective)}</span></div>
         <div className="card-body">
+          <div className="mute mono" style={{ fontSize: 12, marginBottom: 12 }}>
+            {usage}{renew ? ` · ${renewLabel} ${renew}` : ""}
+          </div>
           <div className="grid-3">
             {PLANS.map((p) => {
-              const isCurrent = p.id === currentPlanId;
+              const isCurrent = p.id === effective;
               return (
-                <div key={p.id} className="card flex items-center justify-between" style={{
-                  padding: 12,
-                  gap: 12,
-                  borderColor: isCurrent ? "var(--accent)" : "var(--line)"
-                }}>
-                  <div style={{ minWidth: 0, flex: 1 }}>
-                    <div className="flex items-center" style={{ gap: 8 }}>
-                      <div className="mono" style={{ fontSize: 15 }}>{p.name}</div>
-                      {isCurrent && <span className="pill ok"><i className="dot"></i> current</span>}
-                    </div>
-                    <div className="mono" style={{ fontSize: 22, marginTop: 6, lineHeight: 1 }}>
-                      {p.price}<span style={{ fontSize: 10, marginLeft: 4, opacity: 0.55 }}>{p.cadence}</span>
-                    </div>
-                    <div className="mute mono" style={{ fontSize: 11, marginTop: 8 }}>{p.features}</div>
+                <div key={p.id} className="card" style={{ padding: 12, borderColor: isCurrent ? "var(--accent)" : "var(--line)" }}>
+                  <div className="flex items-center" style={{ gap: 8 }}>
+                    <div className="mono" style={{ fontSize: 15 }}>{p.name}</div>
+                    {isCurrent && <span className="pill ok"><i className="dot"></i> current</span>}
                   </div>
-                  {p.cta && !isCurrent &&
-                  <button className="btn sm" style={{ whiteSpace: "nowrap" }}>{p.cta}</button>
-                  }
+                  <div className="mono" style={{ fontSize: 22, marginTop: 6, lineHeight: 1 }}>
+                    {p.price}<span style={{ fontSize: 10, marginLeft: 4, opacity: 0.55 }}>{p.cadence}</span>
+                  </div>
+                  <div className="mute mono" style={{ fontSize: 11, marginTop: 8, minHeight: 30 }}>{p.features}</div>
+                  {p.trial && !isCurrent &&
+                  <div className="mute" style={{ fontSize: 11, marginTop: 6 }}>{p.trial}</div>}
+                  {p.id !== "free" && !isCurrent &&
+                  <button className="btn sm" style={{ marginTop: 10, width: "100%", whiteSpace: "nowrap" }}
+                  disabled={busy === p.id} onClick={() => startCheckout(p.id)}>
+                    {busy === p.id ? "Starting…" : p.cta}
+                  </button>}
+                  {isCurrent && p.id !== "free" &&
+                  <button className="btn sm ghost" style={{ marginTop: 10, width: "100%" }}
+                  disabled={busy === "portal"} onClick={openPortal}>Manage</button>}
                 </div>);
-
             })}
           </div>
+          {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12, marginTop: 10 }}>{err}</div>}
         </div>
       </div>
 
-      {/* Subscription management — cancel / pause */}
+      {effective !== "free" &&
       <div className="card">
         <div className="card-head">
           <h3 className="card-title">Subscription</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>renews Jun 14 · $25.00</span>
+          {renew && <span className="mute mono" style={{ fontSize: 11 }}>{renewLabel} {renew}</span>}
         </div>
-        <div className="card-body">
-          {cancelStep === "idle" &&
-          <div className="flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="mono" style={{ fontSize: 13 }}>Pro plan · billed monthly</div>
-              <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                Cancel anytime. Your plan stays active until the end of the current period, then drops to Free.
-              </div>
-            </div>
-            <div className="flex gap-2">
-              <button className="btn ghost">Update payment method</button>
-              <button className="btn ghost danger" onClick={() => setCancelStep("confirm")}>Cancel subscription</button>
+        <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div className="mono" style={{ fontSize: 13 }}>{planLabel(effective)} plan · billed monthly</div>
+            <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
+              Update your card, view invoices, or cancel anytime in the Stripe portal. Cancelling keeps your
+              plan until the period ends, then drops to Free.
             </div>
           </div>
-          }
-
-          {cancelStep === "confirm" &&
-          <div className="col gap-3">
-            <div>
-              <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>Cancel Pro plan?</div>
-              <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                You'll keep Pro features until <span className="mono" style={{ color: "var(--fg-dim)" }}>Jun 14, 2026</span>.
-                After that, your org reverts to Free (public repos only).
-              </div>
-            </div>
-            <div>
-              <div className="mute mono" style={{ fontSize: 11, marginBottom: 6 }}>Optional · help us improve</div>
-              <select
-              className="input"
-              value={reason}
-              onChange={(e) => setReason(e.target.value)}
-              style={{ width: "100%", maxWidth: 360 }}>
-                <option value="">Reason for cancelling…</option>
-                <option value="cost">Too expensive</option>
-                <option value="usage">Not using it enough</option>
-                <option value="missing">Missing a feature I need</option>
-                <option value="competitor">Switching to another tool</option>
-                <option value="bug">Bugs / quality issues</option>
-                <option value="other">Other</option>
-              </select>
-            </div>
-            <div className="flex gap-2">
-              <button className="btn" onClick={() => {setCancelStep("idle");setReason("");}}>Keep my plan</button>
-              <button className="btn danger" onClick={() => setCancelStep("done")}>Confirm cancellation</button>
-            </div>
-          </div>
-          }
-
-          {cancelStep === "done" &&
-          <div className="col gap-3">
-            <div className="flex items-center gap-2">
-              <Icon name="check" size={14} color="var(--accent)" />
-              <span className="mono" style={{ fontSize: 13 }}>Subscription cancelled</span>
-            </div>
-            <div className="mute" style={{ fontSize: 12 }}>
-              You'll keep Pro features until Jun 14, 2026. Changed your mind?
-              <button className="btn sm ghost" style={{ marginLeft: 10 }} onClick={() => setCancelStep("idle")}>
-                Reactivate
-              </button>
-            </div>
-          </div>
-          }
+          <button className="btn ghost" disabled={busy === "portal"} onClick={openPortal}>
+            {busy === "portal" ? "Opening…" : "Manage subscription"}
+          </button>
         </div>
       </div>
-
-      {/* Invoices */}
-      <div className="card">
-        <div className="card-head">
-          <h3 className="card-title">Invoices</h3>
-          <span className="mute mono" style={{ fontSize: 11 }}>last 12 months</span>
-        </div>
-        <div className="card-body">
-          {INVOICES.map((inv, i) =>
-          <div
-          key={inv.id}
-          className="flex items-center justify-between"
-          style={{
-            gap: 12,
-            padding: "10px 0",
-            borderTop: i === 0 ? "none" : "1px solid var(--line)"
-          }}>
-            <div className="mono" style={{ fontSize: 13, flex: 1, minWidth: 0 }}>{inv.date}</div>
-            <div className="mono" style={{ fontSize: 13, width: 80, textAlign: "right" }}>{inv.amount}</div>
-            <span className="pill ok"><i className="dot"></i> {inv.status}</span>
-            <button className="btn sm ghost" style={{ whiteSpace: "nowrap" }}>
-              <Icon name="eye" size={11} /> View
-            </button>
-          </div>
-          )}
-        </div>
-      </div>
+      }
     </div>);
 };
 

@@ -433,6 +433,8 @@ const App = () => {
   const [forceStage, setForceStage] = React.useState<null | "onboarding" | "app">(null);
   const [hasInstall, setHasInstall] = React.useState<null | boolean>(null);
   const [current, setCurrent] = React.useState("agent");
+  // Lets a deep-link (e.g. returning from Stripe) open a specific Settings tab.
+  const [settingsSection, setSettingsSection] = React.useState<string | undefined>(undefined);
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
@@ -475,14 +477,35 @@ const App = () => {
   }, []);
 
   // Top-level fallback for the Linear connect round-trip. If popups were blocked,
-  // /api/auth/linear/callback redirected the whole tab to /?linear=connected — strip
-  // the marker. The Integrations/Repository tabs refresh their own data on mount, so
-  // there's nothing else to reload here.
+  // /api/auth/linear/callback redirected the whole tab to /?linear=connected|error.
+  // On success just strip the marker (Integrations/Repository tabs refresh on mount).
+  // On error, route to Settings → Integrations, which reads ?linear=error for its
+  // inline notice and strips the marker itself.
   React.useEffect(() => {
     const url = new URL(window.location.href);
-    if (url.searchParams.get("linear") !== "connected") return;
-    url.searchParams.delete("linear");
+    const linear = url.searchParams.get("linear");
+    if (linear === "connected") {
+      url.searchParams.delete("linear");
+      window.history.replaceState({}, "", url.pathname + url.search);
+    } else if (linear === "error") {
+      setCurrent("settings");
+      setSettingsSection("integrations");
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Return from Stripe Checkout/Portal (or an "upgrade" link from a PR comment):
+  // /?billing=success|cancel|portal|upgrade. Strip the marker, reload the
+  // session (the webhook may have changed the plan), and open Settings → Billing.
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    if (!url.searchParams.get("billing")) return;
+    url.searchParams.delete("billing");
     window.history.replaceState({}, "", url.pathname + url.search);
+    auth.reload();
+    setCurrent("settings");
+    setSettingsSection("billing");
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Popup-completion listener: main.tsx postMessages us when an OAuth or
@@ -651,7 +674,7 @@ const App = () => {
         />
         <div className="content" style={current === "agent" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}
-          {current === "settings" && <SettingsPage />}
+          {current === "settings" && <SettingsPage initialSection={settingsSection} />}
         </div>
       </div>
       {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} />}
