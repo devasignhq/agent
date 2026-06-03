@@ -721,7 +721,13 @@ const SetAccount = () => {
   const { user } = useAuth();
   const [step, setStep] = React.useState("idle"); // idle | confirm | done
   const [confirmText, setConfirmText] = React.useState("");
+  const [confirmName, setConfirmName] = React.useState("");
   const REQUIRED = "delete my account";
+
+  // Both factors must match: the user's own username AND the literal phrase. The
+  // non-empty githubLogin guard keeps the button disabled when both fields are blank.
+  const nameOk = !!user?.githubLogin && confirmName.trim().toLowerCase() === user.githubLogin.toLowerCase();
+  const phraseOk = confirmText.trim().toLowerCase() === REQUIRED;
 
   const memberSince = user?.createdAt
     ? new Date(user.createdAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
@@ -732,7 +738,7 @@ const SetAccount = () => {
       <div className="card">
         <div className="card-head"><h3 className="card-title">Profile</h3></div>
         <div className="card-body">
-          <div className="kv-grid" style={{ gridTemplateColumns: "1fr 1fr" }}>
+          <div className="kv-grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 0 }}>
             <div className="kv">
               <div className="kv-k">github</div>
               <div className="kv-v mono" style={{ fontSize: 13 }}>@{user?.githubLogin || "—"}</div>
@@ -753,21 +759,6 @@ const SetAccount = () => {
         </div>
       </div>
 
-      <div className="card">
-        <div className="card-head"><h3 className="card-title">Export data</h3></div>
-        <div className="card-body">
-          <div className="flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
-            <div style={{ minWidth: 0, flex: 1 }}>
-              <div className="mono" style={{ fontSize: 13 }}>Download a copy of your data</div>
-              <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                Reviews and agent run logs. Delivered as a zipped archive within 24h.
-              </div>
-            </div>
-            <button className="btn ghost">Request export</button>
-          </div>
-        </div>
-      </div>
-
       <div className="card" style={{ borderColor: "color-mix(in oklch, var(--danger) 35%, var(--line))" }}>
         <div className="card-head">
           <h3 className="card-title" style={{ color: "var(--danger)" }}>Danger zone</h3>
@@ -780,7 +771,6 @@ const SetAccount = () => {
               <div className="mono" style={{ fontSize: 13 }}>Delete your account</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
                 Permanently removes your profile, agent settings, review history, and connected GitHub installs.
-                As the org admin, you must transfer or close <span className="mono" style={{ color: "var(--fg-dim)" }}>acme</span> first.
               </div>
             </div>
             <button className="btn danger" onClick={() => setStep("confirm")}>Delete account…</button>
@@ -791,19 +781,30 @@ const SetAccount = () => {
           <div className="col gap-3">
             <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>This cannot be undone.</div>
             <div className="mute" style={{ fontSize: 12 }}>
-              Type <span className="mono" style={{ color: "var(--fg)" }}>"{REQUIRED}"</span> below to confirm.
+              Type your username <span className="mono" style={{ color: "var(--fg)" }}>{user?.githubLogin || "—"}</span> to confirm.
+            </div>
+            <input
+            className="input"
+            placeholder={user?.githubLogin || "username"}
+            value={confirmName}
+            autoComplete="off"
+            onChange={(e) => setConfirmName(e.target.value)}
+            style={{ maxWidth: 360, fontFamily: "var(--mono)" }} />
+            <div className="mute" style={{ fontSize: 12 }}>
+              Then type <span className="mono" style={{ color: "var(--fg)" }}>"{REQUIRED}"</span> to confirm.
             </div>
             <input
             className="input"
             placeholder={REQUIRED}
             value={confirmText}
+            autoComplete="off"
             onChange={(e) => setConfirmText(e.target.value)}
             style={{ maxWidth: 360, fontFamily: "var(--mono)" }} />
             <div className="flex gap-2">
-              <button className="btn" onClick={() => {setStep("idle");setConfirmText("");}}>Cancel</button>
+              <button className="btn" onClick={() => {setStep("idle");setConfirmText("");setConfirmName("");}}>Cancel</button>
               <button
               className="btn danger"
-              disabled={confirmText.trim().toLowerCase() !== REQUIRED}
+              disabled={!nameOk || !phraseOk}
               onClick={() => setStep("done")}>
                 Permanently delete account
               </button>
