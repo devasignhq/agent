@@ -13,7 +13,7 @@ import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import type { Subscription, SubscriptionStatus, User } from "../types.js";
-import { effectivePlan, priceIdToPlan } from "./plans.js";
+import { effectivePlan, normalizePlan, priceIdToPlan } from "./plans.js";
 
 // null when unconfigured so the app still boots; the routes 503 before calling
 // these helpers, so they can assume a live client.
@@ -198,7 +198,13 @@ function customerIdOf(
 }
 
 function periodEndMs(stripeSub: Stripe.Subscription): number | null {
-  const sec = stripeSub.items?.data?.[0]?.current_period_end;
+  // `current_period_end` moved from the Subscription top-level (≤ 2025-01 acacia)
+  // onto the subscription item (2025-03 basil+, which our SDK pins). Read the
+  // item first, then fall back to the legacy top-level field, so a webhook
+  // destination configured on an older API version still yields a renewal date.
+  const sec =
+    stripeSub.items?.data?.[0]?.current_period_end ??
+    (stripeSub as Stripe.Subscription & { current_period_end?: number }).current_period_end;
   return typeof sec === "number" ? sec * 1000 : null;
 }
 
@@ -229,7 +235,7 @@ function syncSubscription(stripeSub: Stripe.Subscription, resetUsage = false): v
     return;
   }
   const priceId = stripeSub.items?.data?.[0]?.price?.id;
-  const newPlan = priceIdToPlan(priceId) ?? sub.plan;
+  const newPlan = priceIdToPlan(priceId) ?? normalizePlan(sub.plan);
   const patch: Partial<Subscription> = {
     plan: newPlan,
     status: mapStatus(stripeSub.status),

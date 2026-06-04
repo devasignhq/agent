@@ -11,6 +11,7 @@ import {
   PLAN_LIMITS,
   effectivePlan,
   modelForPlan,
+  normalizePlan,
   planForUser,
   priceIdToPlan,
   rollAndCheckUsage,
@@ -79,6 +80,15 @@ test("planForUser reads the user's subscription (defaulting to free)", () => {
   db.insert("subscriptions", sub({ userId, plan: "pro", status: "active" }));
   assert.equal(planForUser(userId), "pro");
   assert.equal(planForUser(uuid()), "free"); // no subscription → free
+});
+
+test("normalizePlan canonicalizes legacy/unknown plans", () => {
+  assert.equal(normalizePlan("pro"), "pro");
+  assert.equal(normalizePlan("max"), "max");
+  assert.equal(normalizePlan("team"), "max"); // legacy tier
+  assert.equal(normalizePlan("garbage"), "free");
+  assert.equal(normalizePlan(null), "free");
+  assert.equal(normalizePlan(undefined), "free");
 });
 
 test("priceIdToPlan maps configured price ids; unknown/null → null", () => {
