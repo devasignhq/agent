@@ -1451,8 +1451,8 @@ function formatReviewBody(
 
   // Consolidated "fix everything in one paste" prompt for an external AI
   // coding agent (Claude Code, Cursor, Aider, Codex). Only included when
-  // there's anything to fix — at least one unmet criterion or one
-  // blocker-severity holistic finding. The per-suggestion fixPrompts above
+  // there's anything to fix — at least one unmet criterion or one review
+  // finding (any category or severity). The per-suggestion fixPrompts above
   // stay too, for users who want to fix one item at a time.
   //
   // The outer fence adapts to the content (codeFence) so per-suggestion
@@ -1461,19 +1461,15 @@ function formatReviewBody(
   // button, so the user gets one-click copy of the whole prompt. A blank line
   // separates the </summary> from the fence so GitHub renders the markdown
   // inside <details> instead of treating it as raw HTML.
-  const blockerHolistic = [
-    ...holistic.regressions,
-    ...holistic.criticalErrors,
-    ...holistic.securityFindings,
-  ].filter((f) => f.severity === "blocker");
-  if (context && (unmet.length > 0 || blockerHolistic.length > 0)) {
+  const findings = collectConsolidatedFindings(holistic);
+  if (context && (unmet.length > 0 || findings.length > 0)) {
     const prompt = buildConsolidatedFixPrompt({
       prTitle: context.prTitle,
       repoFullName: context.repoFullName,
       endGoal,
       unmetCriteria: unmet,
       suggestions,
-      blockerHolistic,
+      findings,
     });
     const fence = codeFence(prompt);
     lines.push("");
@@ -1498,6 +1494,42 @@ function formatReviewBody(
   return lines.join("\n").trim() || "DevAsign review.";
 }
 
+// Flatten every category of the holistic verdict into one labelled list for
+// the consolidated fix prompt. Array order doubles as display priority (most
+// severe categories first, advisory nits last). Partitioning by category key
+// — not by severity — means warn/nit findings (security warnings, DEVASIGN.md
+// convention nits, deferred work, etc.) are included, not just blockers, and
+// nothing is double-listed.
+const CONSOLIDATED_FINDING_GROUPS: Array<{
+  key:
+    | "regressions"
+    | "criticalErrors"
+    | "securityFindings"
+    | "consistencyFindings"
+    | "deferrals"
+    | "conventionFindings"
+    | "docDriftFindings";
+  label: string;
+}> = [
+  { key: "regressions", label: "Regression" },
+  { key: "criticalErrors", label: "Critical error" },
+  { key: "securityFindings", label: "Security" },
+  { key: "consistencyFindings", label: "Consistency" },
+  { key: "deferrals", label: "Deferred work" },
+  { key: "conventionFindings", label: "Convention" },
+  { key: "docDriftFindings", label: "Docs" },
+];
+
+function collectConsolidatedFindings(
+  holistic: HolisticVerdict
+): Array<{ label: string; finding: HolisticFinding }> {
+  const out: Array<{ label: string; finding: HolisticFinding }> = [];
+  for (const { key, label } of CONSOLIDATED_FINDING_GROUPS) {
+    for (const finding of holistic[key]) out.push({ label, finding });
+  }
+  return out;
+}
+
 // Compose a single self-contained prompt the developer can paste once into
 // an external AI coding agent to fix the whole PR. Reuses the per-suggestion
 // `fixPrompt`s the LLM already produces (each carries File / Symbol / Issue
@@ -1509,11 +1541,11 @@ function buildConsolidatedFixPrompt(args: {
   endGoal: string;
   unmetCriteria: Criterion[];
   suggestions: ReviewSuggestion[];
-  blockerHolistic: HolisticFinding[];
+  findings: Array<{ label: string; finding: HolisticFinding }>;
 }): string {
-  const { prTitle, repoFullName, endGoal, unmetCriteria, suggestions, blockerHolistic } = args;
+  const { prTitle, repoFullName, endGoal, unmetCriteria, suggestions, findings } = args;
   const lines: string[] = [];
-  lines.push(`You are helping fix PR "${prTitle}" in ${repoFullName}. Automated review flagged the items below as blocking approval. Apply the changes so each one passes — don't introduce changes beyond what's listed.`);
+  lines.push(`You are helping fix PR "${prTitle}" in ${repoFullName}. Automated review surfaced the items below — failed acceptance criteria and review findings, each tagged by category and severity. Apply each fix so the item is resolved. Items tagged **Blocker** gate approval; the rest are advisory but worth addressing. Don't introduce changes beyond what's listed.`);
   lines.push("");
   if (endGoal) {
     lines.push("## End goal");
@@ -1558,21 +1590,25 @@ function buildConsolidatedFixPrompt(args: {
       }
     });
   }
-  if (blockerHolistic.length) {
-    lines.push("## Repo-wide blockers (must also be addressed)");
+  if (findings.length) {
+    lines.push("## Review findings");
     lines.push("");
-    blockerHolistic.forEach((f, i) => {
-      const where = f.path ? `\`${f.path}\` — ` : "";
-      lines.push(`### ${i + 1}. ${where}${f.concern}`);
+    findings.forEach(({ label, finding }, i) => {
+      const sev =
+        finding.severity === "blocker" ? "Blocker" : finding.severity === "warn" ? "Warn" : "Nit";
+      const where = finding.path ? `\`${finding.path}\` — ` : "";
+      lines.push(`### ${i + 1}. [${label} · ${sev}] ${where}${finding.concern}`);
       lines.push("");
-      if (f.fixPrompt) {
-        lines.push(f.fixPrompt);
+      if (finding.fixPrompt) {
+        // Each fixPrompt is already a complete block (File / Symbol / Issue /
+        // Suggested approach / Relevant diff) — drop it in verbatim.
+        lines.push(finding.fixPrompt);
+        lines.push("");
       }
-      lines.push("");
     });
   }
   lines.push("## Your task");
-  lines.push("For each failed criterion and blocker above, apply the suggested fix. Use the `Relevant diff` hunks as the anchor for where to make the change. After each change, re-verify it satisfies the criterion or addresses the blocker it's tied to.");
+  lines.push("Work through every item above — the failed acceptance criteria and each review finding. Use the `Relevant diff` hunks in each fix prompt as the anchor for where to make the change. After each change, re-verify it resolves the item. Treat **Blocker**-tagged items as required (they block approval); address the rest too.");
   return lines.join("\n").trimEnd();
 }
 
