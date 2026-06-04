@@ -885,17 +885,51 @@ const SetBilling = () => {
 
 
 // ─── Account · delete + export ──────────────────────────────────────────
+// Backend teardown is retry-safe: on these failures nothing was deleted, so the
+// copy tells the user they can simply try again.
+const DELETE_ERRORS = {
+  billing_cancel_failed:
+    "We couldn't cancel your subscription, so nothing was deleted. Please try again.",
+  github_uninstall_failed:
+    "We couldn't uninstall the GitHub App, so nothing was deleted. Please try again.",
+};
+
 const SetAccount = () => {
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
   const [step, setStep] = React.useState("idle"); // idle | confirm | done
   const [confirmText, setConfirmText] = React.useState("");
   const [confirmName, setConfirmName] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState(null);
   const REQUIRED = "delete my account";
 
   // Both factors must match: the user's own username AND the literal phrase. The
   // non-empty githubLogin guard keeps the button disabled when both fields are blank.
   const nameOk = !!user?.githubLogin && confirmName.trim().toLowerCase() === user.githubLogin.toLowerCase();
   const phraseOk = confirmText.trim().toLowerCase() === REQUIRED;
+
+  // Hard-delete the account server-side, then advance to the confirmation step.
+  // On failure the backend leaves everything intact (retry-safe), so we surface
+  // the error and stay on the confirm step instead of pretending it worked.
+  const deleteAccount = async () => {
+    setErr(null);
+    setBusy(true);
+    try {
+      await api.deleteAccount();
+      setStep("done");
+    } catch (e) {
+      setErr(DELETE_ERRORS[e?.message] || e?.message || "Couldn't delete your account. Please try again.");
+      setBusy(false);
+    }
+  };
+
+  // Once the account is gone, end the session and bounce to the sign-in screen
+  // (the cookie is already cleared server-side; this flips client auth state).
+  React.useEffect(() => {
+    if (step !== "done") return;
+    const t = setTimeout(() => { void signOut(); }, 2000);
+    return () => clearTimeout(t);
+  }, [step, signOut]);
 
   const memberSince = user?.createdAt
     ? new Date(user.createdAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
@@ -969,14 +1003,15 @@ const SetAccount = () => {
             onChange={(e) => setConfirmText(e.target.value)}
             style={{ maxWidth: 360, fontFamily: "var(--mono)" }} />
             <div className="flex gap-2">
-              <button className="btn" onClick={() => {setStep("idle");setConfirmText("");setConfirmName("");}}>Cancel</button>
+              <button className="btn" disabled={busy} onClick={() => {setStep("idle");setConfirmText("");setConfirmName("");setErr(null);}}>Cancel</button>
               <button
               className="btn danger"
-              disabled={!nameOk || !phraseOk}
-              onClick={() => setStep("done")}>
-                Permanently delete account
+              disabled={!nameOk || !phraseOk || busy}
+              onClick={deleteAccount}>
+                {busy ? "Deleting…" : "Permanently delete account"}
               </button>
             </div>
+            {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12 }}>{err}</div>}
           </div>
           }
 
@@ -984,11 +1019,11 @@ const SetAccount = () => {
           <div className="col gap-2">
             <div className="flex items-center gap-2">
               <Icon name="check" size={14} color="var(--accent)" />
-              <span className="mono" style={{ fontSize: 13 }}>Account scheduled for deletion</span>
+              <span className="mono" style={{ fontSize: 13 }}>Account permanently deleted</span>
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
-              Your data will be purged within 30 days. We've emailed maya@acme.dev with details and a
-              link to cancel if this was a mistake.
+              Your profile, agent settings, review history, and GitHub installs have been removed, and
+              any active subscription was canceled. Signing you out…
             </div>
           </div>
           }

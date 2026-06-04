@@ -218,10 +218,15 @@ export function getSessionUser(req: Request): User | null {
   }
 }
 
-export function signOut(_req: Request, res: Response) {
-  // clearCookie only overwrites the cookie when path/sameSite/secure match how
-  // it was set; reuse the same attributes (maxAge is irrelevant when clearing).
+// Clear the session cookie. clearCookie only overwrites the cookie when
+// path/sameSite/secure match how it was set; reuse the same attributes (maxAge
+// is irrelevant when clearing). Shared by signOut and account deletion.
+export function clearSessionCookie(res: Response): void {
   const { maxAge: _ignored, ...clearOpts } = sessionCookieOptions();
   res.clearCookie("devasign_session", clearOpts);
+}
+
+export function signOut(_req: Request, res: Response) {
+  clearSessionCookie(res);
   res.json({ ok: true });
 }

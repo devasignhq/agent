@@ -53,6 +53,33 @@ export async function installationToken(installationId: number): Promise<string>
   return body.token;
 }
 
+// Uninstall the App from an account by deleting its installation. This revokes
+// the App's access to every repository the installation covered in one call —
+// there's no per-repo uninstall to do; the installation *is* the App's presence
+// on that account. GitHub responds by emitting an `installation.deleted` webhook,
+// which our webhook handler uses to clean up the local install/repo rows.
+//
+// Authenticates with the App JWT (Bearer), NOT an installation token — an
+// installation token can't delete its own installation. Success is 204 No
+// Content; a 404 means it's already gone, which we treat as success so callers
+// (account deletion) stay idempotent and retry-safe.
+export async function uninstallApp(installationId: number): Promise<void> {
+  const res = await fetch(`https://api.github.com/app/installations/${installationId}`, {
+    method: "DELETE",
+    headers: {
+      Authorization: `Bearer ${appJWT()}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "devasign-app",
+    },
+  });
+  if (!res.ok && res.status !== 404) {
+    throw new Error(`uninstall failed: ${res.status} ${await res.text()}`);
+  }
+  // The cached installation token (if any) is now invalid — drop it.
+  installTokens.delete(installationId);
+}
+
 export async function gh<T>(
   installationId: number,
   pathOrUrl: string,

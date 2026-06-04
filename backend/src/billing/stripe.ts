@@ -181,6 +181,26 @@ export async function cancelScheduledChange(sub: Subscription): Promise<void> {
   await releaseSchedule(sub);
 }
 
+// Hard-cancel the user's subscription as part of account deletion: release any
+// pending schedule first (a schedule manages the subscription and can block a
+// direct cancel), then cancel immediately so Stripe raises no further invoices.
+// Idempotent — unconfigured Stripe, no subscription, or an already-canceled /
+// missing one all resolve quietly, so the delete flow can retry safely.
+export async function cancelSubscriptionForDeletion(sub: Subscription): Promise<void> {
+  if (!stripe) return; // unconfigured — nothing to cancel
+  await releaseSchedule(sub);
+  if (!sub.stripeSubscriptionId) return;
+  try {
+    await client().subscriptions.cancel(sub.stripeSubscriptionId);
+  } catch (err) {
+    // Already canceled / not found is fine; re-throw anything else so the
+    // caller can surface a real failure and the user can retry.
+    const e = err as { statusCode?: number; code?: string };
+    if (e?.statusCode === 404 || e?.code === "resource_missing") return;
+    throw err;
+  }
+}
+
 // ─── Webhook → local sync ───────────────────────────────────────────────────
 
 function mapStatus(s: Stripe.Subscription.Status): SubscriptionStatus {
