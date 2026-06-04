@@ -2366,7 +2366,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .int-summary-name { font-size: 12px; color: var(--fg); }
 
 .int-head {
-  align-items: flex-start;
+  align-items: center;
   gap: 14px;
 }
 .int-id {

@@ -505,8 +505,8 @@ const SetInstall = () => {
   }, [installs, repos]);
 
   return (
-    <div className="col gap-5">
-      <div className="card">
+    <div className="flex gap-5">
+      <div className="card" style={{ flex: "1 1 0", minWidth: 0 }}>
         <div className="card-head">
           <h3 className="card-title">GitHub App</h3>
           {installRows.length > 0
@@ -521,34 +521,17 @@ const SetInstall = () => {
           </div>
 
           {installRows.length > 0 && (
-            <div className="gh-accounts" style={{ marginBottom: 14 }}>
-              {installRows.map(({ inst, repos: rs }) => (
-                <div key={inst.id} className="gh-account">
-                  <div className="gh-account-head">
-                    <div className="gh-account-avatar personal">
-                      {String(inst.accountLogin || "?").charAt(0).toUpperCase()}
-                    </div>
-                    <span className="mono gh-account-name">{inst.accountLogin}</span>
-                    <span className="gh-account-kind mono">install · #{inst.installationId}</span>
-                    <span className="flex-1"></span>
-                    <span className="mono gh-account-count">{rs.length} repo{rs.length === 1 ? "" : "s"}</span>
-                  </div>
-                  <ul className="gh-repo-list">
-                    {rs.map((r) => (
-                      <li key={r.id} className="gh-repo-row">
-                        <Icon name="git" size={11} color="var(--fg-faint)" />
-                        <span className="mono gh-repo-name">{r.owner}/{r.name}</span>
-                        <span className="gh-repo-meta mono">
-                          {r.defaultBranch} · {r.reviewsEnabled ? "reviews on" : "reviews off"}
-                        </span>
-                        <span className="flex-1"></span>
-                        <span className="gh-repo-vis mono private">private</span>
-                      </li>
-                    ))}
-                  </ul>
-                </div>
+            <ul className="gh-repo-list" style={{ marginBottom: 14 }}>
+              {installRows.flatMap(({ repos: rs }) => rs).map((r) => (
+                <li key={r.id} className="gh-repo-row">
+                  <Icon name="git" size={11} color="var(--fg-faint)" />
+                  <span className="mono gh-repo-name">{r.owner}/{r.name}</span>
+                  <span className="gh-repo-meta mono">{r.defaultBranch}</span>
+                  <span className="flex-1"></span>
+                  <span className="gh-repo-vis mono private">private</span>
+                </li>
               ))}
-            </div>
+            </ul>
           )}
 
           <div>
@@ -559,7 +542,7 @@ const SetInstall = () => {
         </div>
       </div>
 
-      <div className="card">
+      <div className="card" style={{ flex: "1 1 0", minWidth: 0 }}>
         <div className="card-head">
           <h3 className="card-title">Linear workspace</h3>
           {linear?.connected
