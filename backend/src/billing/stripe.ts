@@ -13,7 +13,7 @@ import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import type { Subscription, SubscriptionStatus, User } from "../types.js";
-import { effectivePlan, priceIdToPlan } from "./plans.js";
+import { effectivePlan, normalizePlan, priceIdToPlan } from "./plans.js";
 
 // null when unconfigured so the app still boots; the routes 503 before calling
 // these helpers, so they can assume a live client.
@@ -229,7 +229,7 @@ function syncSubscription(stripeSub: Stripe.Subscription, resetUsage = false): v
     return;
   }
   const priceId = stripeSub.items?.data?.[0]?.price?.id;
-  const newPlan = priceIdToPlan(priceId) ?? sub.plan;
+  const newPlan = priceIdToPlan(priceId) ?? normalizePlan(sub.plan);
   const patch: Partial<Subscription> = {
     plan: newPlan,
     status: mapStatus(stripeSub.status),

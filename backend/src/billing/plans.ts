@@ -34,7 +34,7 @@ export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
 export const PLAN_RANK: Record<Plan, number> = { free: 0, pro: 1, max: 2 };
 
 // Legacy rows used "team"; treat it as "max". Anything unknown → "free".
-function normalizePlan(plan: string | null | undefined): Plan {
+export function normalizePlan(plan: string | null | undefined): Plan {
   if (plan === "pro") return "pro";
   if (plan === "max" || plan === "team") return "max";
   return "free";
