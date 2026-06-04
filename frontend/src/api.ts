@@ -320,6 +320,8 @@ export const api = {
     request<{ ok: true }>(`/api/integrations/${id}`, { method: "DELETE" }),
   linearTeams: () =>
     request<LinearTeamsView>("/api/integrations/linear/teams"),
+  validateLinear: () =>
+    request<{ connected: boolean }>("/api/integrations/linear/validate", { method: "POST" }),
 
   // billing
   subscription: () => request<SubscriptionView>("/api/billing/subscription"),

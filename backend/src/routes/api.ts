@@ -9,7 +9,7 @@ import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh, uninstallApp } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
-import { fetchLinearTeams } from "../linear/client.js";
+import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, cancelSubscriptionForDeletion, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { effectivePlan, PLAN_LIMITS } from "../billing/plans.js";
@@ -741,6 +741,26 @@ api.get("/integrations/linear/teams", async (req, res) => {
     workspace: row.workspaceMeta?.workspaceName || row.workspaceMeta?.urlKey || "",
     teams,
   });
+});
+
+// Re-check the stored Linear token against Linear. Called after the user visits
+// "Manage Access" (where they can revoke DevAsign) — Linear has no revocation
+// webhook, so we probe on demand. If the token is confirmed revoked we drop the
+// row so the UI flips back to "Connect Linear"; a transient failure keeps it.
+api.post("/integrations/linear/validate", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const row = db.find(
+    "integrations",
+    (i) => i.userId === user.id && i.type === "linear"
+  );
+  if (!row) return void res.json({ connected: false });
+  const status = await validateLinearToken(row.tokens.accessToken);
+  if (status === "revoked") {
+    db.remove("integrations", (i) => i.id === row.id && i.userId === user.id);
+    return void res.json({ connected: false });
+  }
+  res.json({ connected: true }); // "valid" or "unknown" → keep the row
 });
 
 // --- Billing (Stripe) ---

@@ -126,6 +126,11 @@ const SetIntegrations = () => {
   const [linearError, setLinearError] = React.useState(
     () => new URLSearchParams(window.location.search).get("linear") === "error"
   );
+  // Set while the user is on a "Manage Access" trip to Linear (opened in a new
+  // tab). Gates the focus/visibility listener below so we only re-probe Linear
+  // after an explicit Manage Access click, then is cleared once the backend
+  // confirms the token is gone.
+  const managingLinearRef = React.useRef(false);
 
   const refresh = React.useCallback(async () => {
     try {
@@ -146,6 +151,34 @@ const SetIntegrations = () => {
     }
   }, []);
   React.useEffect(() => { refresh(); }, [refresh]);
+
+  // After a "Manage Access" trip, re-check the Linear token against the backend:
+  // if the user revoked DevAsign in Linear, the backend drops the row and the
+  // following refresh() collapses the card back to "Connect Linear".
+  const validateAndRefreshLinear = React.useCallback(async () => {
+    try {
+      const { connected } = await api.validateLinear();
+      if (!connected) managingLinearRef.current = false; // revoked — stop probing
+    } catch {
+      /* transient — keep the flag and retry on the next return */
+    }
+    await refresh();
+  }, [refresh]);
+
+  // The Manage Access target opens in a new tab, so the signal that the user
+  // finished (and possibly revoked) is them returning to this tab.
+  React.useEffect(() => {
+    const onReturn = () => {
+      if (!managingLinearRef.current || document.visibilityState === "hidden") return;
+      validateAndRefreshLinear();
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, [validateAndRefreshLinear]);
 
   // Linear connects via an OAuth popup; main.tsx posts devasign_linear_done when
   // the callback lands back on our origin. Close the popup, then either refresh to
@@ -247,6 +280,20 @@ const SetIntegrations = () => {
       }
       setState(s => ({ ...s, [intKey]: { ...s[intKey], connected: false, expanded: false } }));
     }
+  };
+
+  // Send the user to their Linear workspace's authorized-applications page (new
+  // tab) to revoke DevAsign. Arming managingLinearRef lets the focus/visibility
+  // listener re-validate when they return; if they revoked, the card flips to
+  // "Connect Linear" on its own.
+  const manageLinearAccess = () => {
+    const row = rows.find((r) => r.type === "linear");
+    const urlKey = row?.workspaceMeta?.urlKey;
+    const url = urlKey
+      ? `https://linear.app/${urlKey}/settings/applications`
+      : "https://linear.app/settings/applications"; // fallback if urlKey wasn't captured
+    managingLinearRef.current = true;
+    window.open(url, "_blank", "noopener,noreferrer");
   };
 
   const connectedCount = INTEGRATIONS.filter(i => !i.inDevelopment && state[i.key].connected).length;
@@ -402,10 +449,16 @@ const SetIntegrations = () => {
 
                 {/* Footer actions */}
                 <div className="int-foot">
-                  <button
-                    className="btn ghost sm danger"
-                    onClick={() => setConnected(i.key, false)}
-                  >Disconnect</button>
+                  {i.key === "linear" ? (
+                    <button className="btn ghost sm" onClick={manageLinearAccess}>
+                      <Icon name="external" size={11}/> Manage Access
+                    </button>
+                  ) : (
+                    <button
+                      className="btn ghost sm danger"
+                      onClick={() => setConnected(i.key, false)}
+                    >Disconnect</button>
+                  )}
                 </div>
               </div>
             )}
