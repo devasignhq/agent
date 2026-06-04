@@ -9,7 +9,6 @@ import { config, isLinearOAuthConfigured } from "../config.js";
 import { db } from "../db.js";
 import { getSessionUser } from "../github/oauth.js";
 import { fetchLinearWorkspace, type LinearWorkspace } from "./client.js";
-import { planForUser } from "../billing/plans.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
 // state -> the DevAsign user who started the connect. Binding the userId here
@@ -38,15 +37,6 @@ export function startLinearOAuth(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) {
     res.status(401).json({ error: "not_signed_in" });
-    return;
-  }
-  // Linear integration + acceptance-criteria sync is a Pro/Max feature. The
-  // frontend hides the connect button for free users; this is the backstop.
-  if (planForUser(user.id) === "free") {
-    res.status(403).json({
-      error: "upgrade_required",
-      message: "Linear integration is available on Pro and Max. Upgrade to connect your workspace.",
-    });
     return;
   }
   pruneState();
