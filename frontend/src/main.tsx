@@ -6,23 +6,30 @@ import "./styles.css";
 
 (window as any).__resources = { logo: "/devasign-logo.svg" };
 
-// Popup-completion shortcut. The auth + GitHub-App-install flows both open in
-// a popup; when GitHub finishes and redirects the popup back to our origin
-// with either `?installation_id=N&setup_action=install` (install) or
-// `?auth=ok` (oauth callback's post-redirect), we postMessage the opener and
-// self-close so the user never leaves their original tab.
+// Popup-completion shortcut. The auth + GitHub-App-install + Linear-connect
+// flows all open in a popup; when the provider finishes and redirects the
+// popup back to our origin with `?installation_id=N&setup_action=install`
+// (install), `?auth=ok` (GitHub oauth post-redirect), or
+// `?linear=connected|error` (Linear connect outcome), we postMessage the
+// opener and self-close so the user never leaves their original tab. The
+// Linear *error* case is handled here too — otherwise the full SPA would mount
+// inside the popup instead of closing.
 const popupCompletion = (function popupHandshake() {
   try {
     const url = new URL(window.location.href);
     const installationId = url.searchParams.get("installation_id");
     const authOk = url.searchParams.get("auth") === "ok";
-    const linearConnected = url.searchParams.get("linear") === "connected";
-    if (!installationId && !authOk && !linearConnected) return null;
+    const linearParam = url.searchParams.get("linear");
+    const linearConnected = linearParam === "connected";
+    const linearError = linearParam === "error";
+    if (!installationId && !authOk && !linearConnected && !linearError) return null;
     if (!window.opener || window.opener.closed) return null;
     const msg = installationId
       ? { type: "devasign_install_done", installationId: Number(installationId) }
       : linearConnected
-      ? { type: "devasign_linear_done" }
+      ? { type: "devasign_linear_done", ok: true }
+      : linearError
+      ? { type: "devasign_linear_done", ok: false }
       : { type: "devasign_auth_done" };
     window.opener.postMessage(msg, window.location.origin);
     // Best-effort self-close. After cross-origin navigation through GitHub,
@@ -33,6 +40,8 @@ const popupCompletion = (function popupHandshake() {
       ? "Install complete."
       : linearConnected
       ? "Linear connected."
+      : linearError
+      ? "Couldn't connect Linear."
       : "Signed in.";
     document.body.innerHTML =
       '<div style="font-family:ui-monospace,monospace;color:#888;display:grid;place-items:center;height:100vh;text-align:center">' +

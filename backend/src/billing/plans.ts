@@ -1,0 +1,103 @@
+// Central plan policy — the single source of truth for what each tier may do.
+// Every gate (model selection, monthly review cap, private-repo access, Linear)
+// resolves through here, so the tier rules live in exactly one place.
+//
+// Key idea: a Subscription stores the *purchased* tier, but `effectivePlan()`
+// downgrades it to "free" whenever the Stripe status isn't paying (active or
+// trialing). That collapses "trial expired + payment failed", "renewal failed",
+// and "canceled" all into Free with no per-call special-casing — a lapsed Pro
+// user is treated exactly like a Free user everywhere.
+import { config } from "../config.js";
+import { db } from "../db.js";
+import type { Subscription } from "../types.js";
+
+export type Plan = "free" | "pro" | "max";
+
+export type PlanLimits = {
+  model: string; // review model for this tier
+  monthlyReviews: number; // unique PRs reviewable per period; Infinity = unlimited
+  privateRepos: boolean; // may review private repos
+  linear: boolean; // Linear integration + acceptance-criteria sync
+  priceKey: "pricePro" | "priceMax" | null; // which config.stripe price funds it
+};
+
+// Free uses the cheap model; paid tiers use the configured frontier model
+// (ANTHROPIC_MODEL — opus). Reading config.llm.model means a prod model bump
+// (e.g. opus-4-8) automatically applies to Pro/Max with no code change here.
+export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
+  free: { model: "claude-haiku-4-5", monthlyReviews: 10, privateRepos: false, linear: false, priceKey: null },
+  pro: { model: config.llm.model, monthlyReviews: 50, privateRepos: true, linear: true, priceKey: "pricePro" },
+  max: { model: config.llm.model, monthlyReviews: Infinity, privateRepos: true, linear: true, priceKey: "priceMax" },
+};
+
+// Tier ordering for upgrade/downgrade comparisons (free < pro < max).
+export const PLAN_RANK: Record<Plan, number> = { free: 0, pro: 1, max: 2 };
+
+// Legacy rows used "team"; treat it as "max". Anything unknown → "free".
+function normalizePlan(plan: string | null | undefined): Plan {
+  if (plan === "pro") return "pro";
+  if (plan === "max" || plan === "team") return "max";
+  return "free";
+}
+
+// The downgrade rule. Returns the purchased tier only while Stripe says we're
+// collecting payment (active) or in the trial (trialing); every other status —
+// past_due, canceled, incomplete, or a null/missing sub — yields "free".
+export function effectivePlan(sub: Subscription | null | undefined): Plan {
+  if (!sub) return "free";
+  const purchased = normalizePlan(sub.plan);
+  if (purchased === "free") return "free";
+  return sub.status === "active" || sub.status === "trialing" ? purchased : "free";
+}
+
+export function subscriptionForUser(userId: string): Subscription | null {
+  return db.find("subscriptions", (s) => s.userId === userId);
+}
+
+// The single entry point every gate uses. A lapsed sub is uniformly Free.
+export function planForUser(userId: string): Plan {
+  return effectivePlan(subscriptionForUser(userId));
+}
+
+export function modelForPlan(plan: Plan): string {
+  return PLAN_LIMITS[plan].model;
+}
+
+// Reverse map for the Stripe webhook: which tier does this Price ID fund?
+export function priceIdToPlan(priceId: string | null | undefined): Plan | null {
+  if (!priceId) return null;
+  if (priceId === config.stripe.pricePro) return "pro";
+  if (priceId === config.stripe.priceMax) return "max";
+  return null;
+}
+
+const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;
+
+export type UsageCheck = { plan: Plan; used: number; limit: number; allowed: boolean };
+
+// Rolls the usage window if it has elapsed (persisting the reset), then reports
+// whether another review is allowed. Does NOT consume a review — the caller
+// calls recordReviewUsage() only when it actually starts a new-PR review.
+//
+// `usagePeriodStart` anchors the window. The Stripe webhook resets it on each
+// paid renewal (invoice.payment_succeeded); this 30-day fallback covers free
+// users (who have no webhook) and any missed renewal event. Max's Infinity
+// limit makes `allowed` always true regardless.
+export function rollAndCheckUsage(sub: Subscription): UsageCheck {
+  const plan = effectivePlan(sub);
+  const limit = PLAN_LIMITS[plan].monthlyReviews;
+  const now = Date.now();
+  let used = sub.reviewsUsed || 0;
+  if (now - (sub.usagePeriodStart || 0) >= THIRTY_DAYS_MS) {
+    used = 0;
+    db.update("subscriptions", (s) => s.id === sub.id, { reviewsUsed: 0, usagePeriodStart: now });
+  }
+  return { plan, used, limit, allowed: used < limit };
+}
+
+// Record one consumed review. `used` must be the post-roll count returned by
+// rollAndCheckUsage — NOT sub.reviewsUsed, which can be stale after a roll
+// (db.update replaces the row object rather than mutating the passed reference).
+export function recordReviewUsage(subId: string, used: number): void {
+  db.update("subscriptions", (s) => s.id === subId, { reviewsUsed: used + 1 });
+}

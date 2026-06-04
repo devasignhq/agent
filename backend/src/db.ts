@@ -79,6 +79,44 @@ function backfillAttachmentIds(snapshot: DB): boolean {
   return mutated;
 }
 
+// One-shot normalization on load for the billing/paywall migration:
+//  • plan "team" → "max" on users + subscriptions (the tier was renamed)
+//  • backfill new Subscription fields (status / usage window / Stripe ids) on
+//    pre-paywall rows
+//  • backfill Repository.private:false (the real visibility is refreshed on the
+//    next install/PR webhook or reconcile)
+// Operates on loosely-typed loaded rows; idempotent.
+function migrateForPaywall(snapshot: DB): boolean {
+  let mutated = false;
+  for (const u of snapshot.users || []) {
+    if ((u as any).plan === "team") {
+      (u as any).plan = "max";
+      mutated = true;
+    }
+  }
+  for (const s of snapshot.subscriptions || []) {
+    const sub = s as any;
+    let changed = false;
+    if (sub.plan === "team") { sub.plan = "max"; changed = true; }
+    if (sub.status === undefined) { sub.status = null; changed = true; }
+    if (sub.stripeSubscriptionId === undefined) { sub.stripeSubscriptionId = null; changed = true; }
+    if (sub.currentPeriodEnd === undefined) { sub.currentPeriodEnd = null; changed = true; }
+    if (sub.cancelAtPeriodEnd === undefined) { sub.cancelAtPeriodEnd = false; changed = true; }
+    if (sub.reviewsUsed === undefined) { sub.reviewsUsed = 0; changed = true; }
+    if (sub.usagePeriodStart === undefined) { sub.usagePeriodStart = Date.now(); changed = true; }
+    if (sub.pendingPlan === undefined) { sub.pendingPlan = null; changed = true; }
+    if (sub.scheduleId === undefined) { sub.scheduleId = null; changed = true; }
+    if (changed) mutated = true;
+  }
+  for (const r of snapshot.repositories || []) {
+    if ((r as any).private === undefined) {
+      (r as any).private = false;
+      mutated = true;
+    }
+  }
+  return mutated;
+}
+
 // ---------------------------------------------------------------------------
 // Write-through batching
 //
@@ -286,6 +324,14 @@ export async function initDb(): Promise<void> {
     for (const task of state.tasks) stageUpsert("tasks", task);
     await flushPending();
     console.log("[db] migrated attachment ids");
+  }
+
+  if (migrateForPaywall(state)) {
+    for (const u of state.users) stageUpsert("users", u);
+    for (const s of state.subscriptions) stageUpsert("subscriptions", s);
+    for (const r of state.repositories) stageUpsert("repositories", r);
+    await flushPending();
+    console.log("[db] migrated plans/subscriptions/repos for paywall");
   }
 
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);

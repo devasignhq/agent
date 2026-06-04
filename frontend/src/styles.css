@@ -241,6 +241,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   font-family: var(--mono);
   font-size: 12px;
   letter-spacing: 0.01em;
+  text-decoration: none;
   cursor: pointer;
   transition: background 0.12s ease, border-color 0.12s ease;
   border-radius: 0;
@@ -2227,6 +2228,109 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .set-nav-item:hover { background: var(--bg-2); color: var(--fg); }
 .set-nav-item.active { color: var(--fg); border-left-color: var(--accent); background: var(--bg-1); }
 
+/* Settings · billing plan cards */
+.plan-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 14px;
+}
+.plan {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  padding: 18px;
+  background: var(--bg-1);
+  border: 1px solid var(--line);
+  transition: border-color 0.14s ease, background 0.14s ease;
+}
+.plan:hover { border-color: var(--line-2); }
+.plan.featured { background: var(--bg-2); }
+.plan.current { border-color: var(--accent); }
+
+.plan-badge { position: absolute; top: 14px; right: 14px; }
+
+.plan-icon {
+  width: 34px;
+  height: 34px;
+  display: grid;
+  place-items: center;
+  margin-bottom: 14px;
+  color: var(--accent);
+  border: 1px solid var(--line-2);
+}
+.plan.featured .plan-icon {
+  border-color: rgba(255, 122, 61, 0.4);
+  background: var(--accent-glow);
+}
+
+.plan-name {
+  font-family: var(--mono);
+  font-size: 16px;
+  letter-spacing: 0.01em;
+  color: var(--fg);
+}
+.plan-tag {
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--fg-mute);
+  margin-top: 4px;
+  min-height: 32px;
+}
+.plan-price {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  margin-top: 14px;
+}
+.plan-price b {
+  font-family: var(--mono);
+  font-size: 30px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--fg);
+}
+.plan-unit {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.02em;
+  color: var(--fg-mute);
+}
+.plan-note {
+  font-size: 11px;
+  color: var(--fg-faint);
+  margin-top: 7px;
+  min-height: 14px;
+}
+.plan-cta {
+  width: 100%;
+  justify-content: center;
+  margin-top: 14px;
+}
+.plan-cta:disabled { opacity: 0.5; }
+.plan-feats {
+  list-style: none;
+  margin: 16px 0 0;
+  padding: 16px 0 0;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.plan.featured .plan-feats { border-top-color: var(--line-2); }
+.plan-feat {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  font-size: 12px;
+  line-height: 1.4;
+  color: var(--fg-dim);
+}
+.plan-feat svg { flex: none; margin-top: 1px; color: var(--accent); }
+
+@media (max-width: 780px) {
+  .plan-grid { grid-template-columns: 1fr; }
+}
+
 .code-block {
   background: var(--bg);
   border: 1px solid var(--line);
@@ -2366,7 +2470,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .int-summary-name { font-size: 12px; color: var(--fg); }
 
 .int-head {
-  align-items: flex-start;
+  align-items: center;
   gap: 14px;
 }
 .int-id {

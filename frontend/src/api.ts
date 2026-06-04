@@ -63,17 +63,41 @@ export type User = {
   githubLogin: string;
   email: string;
   avatarUrl?: string;
-  plan: "free" | "pro" | "team";
+  plan: Plan;
   createdAt: number;
 };
+
+export type Plan = "free" | "pro" | "max";
+
+export type SubscriptionStatus =
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "canceled"
+  | "incomplete";
 
 export type Subscription = {
   id: string;
   userId: string;
-  plan: "free" | "pro" | "team";
-  credits: number;
-  autoRefill: boolean;
+  plan: Plan;
   stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  status: SubscriptionStatus | null;
+  currentPeriodEnd: number | null;
+  cancelAtPeriodEnd: boolean;
+  pendingPlan: Plan | null;
+  scheduleId: string | null;
+  reviewsUsed: number;
+  usagePeriodStart: number;
+};
+
+// Enriched shape returned by GET /api/billing/subscription.
+export type SubscriptionView = {
+  subscription: Subscription | null;
+  effectivePlan: Plan;
+  reviewsUsed: number;
+  reviewLimit: number | null; // null = unlimited (Max)
+  features: { privateRepos: boolean; linear: boolean };
 };
 
 export type Installation = {
@@ -91,6 +115,7 @@ export type Repository = {
   owner: string;
   name: string;
   defaultBranch: string;
+  private: boolean;
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
@@ -290,12 +315,24 @@ export const api = {
     request<LinearTeamsView>("/api/integrations/linear/teams"),
 
   // billing
-  subscription: () => request<Subscription | null>("/api/billing/subscription"),
-  addCredits: (add: number) =>
-    request<{ ok: true }>("/api/billing/credits", {
+  subscription: () => request<SubscriptionView>("/api/billing/subscription"),
+  checkout: (plan: "pro" | "max") =>
+    request<{ url: string }>("/api/billing/checkout", {
       method: "POST",
-      body: JSON.stringify({ add }),
+      body: JSON.stringify({ plan }),
     }),
+  portal: (opts?: { cancel?: boolean }) =>
+    request<{ url: string }>("/api/billing/portal", {
+      method: "POST",
+      body: JSON.stringify(opts?.cancel ? { flow: "cancel" } : {}),
+    }),
+  changePlan: (plan: "pro" | "max", opts?: { immediate?: boolean }) =>
+    request<{ ok: true }>("/api/billing/change-plan", {
+      method: "POST",
+      body: JSON.stringify({ plan, immediate: Boolean(opts?.immediate) }),
+    }),
+  cancelScheduledChange: () =>
+    request<{ ok: true }>("/api/billing/scheduled-change/cancel", { method: "POST", body: "{}" }),
 
   // audit
   audit: () => request<AuthAuditEntry[]>("/api/audit"),

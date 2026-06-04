@@ -1,0 +1,114 @@
+// Plan-policy unit tests — the brain of the paywall: the tier matrix, the
+// status-driven downgrade (effectivePlan), and the monthly usage roll. These
+// run without Stripe or Postgres (the db falls back to an in-memory store). Run:
+//   node --import tsx/esm --test src/billing/plans.test.ts
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { v4 as uuid } from "uuid";
+import { config } from "../config.js";
+import { db } from "../db.js";
+import {
+  PLAN_LIMITS,
+  effectivePlan,
+  modelForPlan,
+  planForUser,
+  priceIdToPlan,
+  rollAndCheckUsage,
+} from "./plans.js";
+import type { Subscription, SubscriptionStatus } from "../types.js";
+
+function sub(partial: Partial<Subscription>): Subscription {
+  return {
+    id: uuid(),
+    userId: uuid(),
+    plan: "free",
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    status: null,
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    reviewsUsed: 0,
+    usagePeriodStart: Date.now(),
+    pendingPlan: null,
+    scheduleId: null,
+    ...partial,
+  };
+}
+
+test("PLAN_LIMITS encode the tier matrix", () => {
+  assert.equal(PLAN_LIMITS.free.model, "claude-haiku-4-5");
+  assert.equal(PLAN_LIMITS.pro.model, config.llm.model);
+  assert.equal(PLAN_LIMITS.max.model, config.llm.model);
+  assert.equal(PLAN_LIMITS.free.monthlyReviews, 10);
+  assert.equal(PLAN_LIMITS.pro.monthlyReviews, 50);
+  assert.equal(PLAN_LIMITS.max.monthlyReviews, Infinity);
+  assert.equal(PLAN_LIMITS.free.privateRepos, false);
+  assert.equal(PLAN_LIMITS.pro.privateRepos, true);
+  assert.equal(PLAN_LIMITS.max.privateRepos, true);
+  assert.equal(PLAN_LIMITS.free.linear, false);
+  assert.equal(PLAN_LIMITS.pro.linear, true);
+  assert.equal(PLAN_LIMITS.max.linear, true);
+});
+
+test("modelForPlan: Free → Haiku, Pro/Max → frontier", () => {
+  assert.equal(modelForPlan("free"), "claude-haiku-4-5");
+  assert.equal(modelForPlan("pro"), config.llm.model);
+  assert.equal(modelForPlan("max"), config.llm.model);
+});
+
+test("effectivePlan: paid only while active/trialing, else downgrades to free", () => {
+  assert.equal(effectivePlan(null), "free");
+  assert.equal(effectivePlan(sub({ plan: "free", status: null })), "free");
+  assert.equal(effectivePlan(sub({ plan: "pro", status: "active" })), "pro");
+  assert.equal(effectivePlan(sub({ plan: "pro", status: "trialing" })), "pro");
+  assert.equal(effectivePlan(sub({ plan: "max", status: "active" })), "max");
+
+  // Every lapsed / non-collecting status collapses to free.
+  const lapsed: (SubscriptionStatus | null)[] = ["past_due", "canceled", "incomplete", null];
+  for (const s of lapsed) {
+    assert.equal(effectivePlan(sub({ plan: "pro", status: s })), "free", `pro/${s}`);
+    assert.equal(effectivePlan(sub({ plan: "max", status: s })), "free", `max/${s}`);
+  }
+
+  // Legacy "team" tier maps to max.
+  assert.equal(effectivePlan(sub({ plan: "team" as any, status: "active" })), "max");
+});
+
+test("planForUser reads the user's subscription (defaulting to free)", () => {
+  const userId = uuid();
+  db.insert("subscriptions", sub({ userId, plan: "pro", status: "active" }));
+  assert.equal(planForUser(userId), "pro");
+  assert.equal(planForUser(uuid()), "free"); // no subscription → free
+});
+
+test("priceIdToPlan maps configured price ids; unknown/null → null", () => {
+  if (config.stripe.pricePro) assert.equal(priceIdToPlan(config.stripe.pricePro), "pro");
+  if (config.stripe.priceMax) assert.equal(priceIdToPlan(config.stripe.priceMax), "max");
+  assert.equal(priceIdToPlan("price_does_not_exist"), null);
+  assert.equal(priceIdToPlan(null), null);
+});
+
+test("rollAndCheckUsage: free blocks at the cap and rolls after a month", () => {
+  // Under the cap → allowed.
+  const under = db.insert("subscriptions", sub({ plan: "free", reviewsUsed: 9 }));
+  const u1 = rollAndCheckUsage(under);
+  assert.deepEqual({ allowed: u1.allowed, used: u1.used, limit: u1.limit }, { allowed: true, used: 9, limit: 10 });
+
+  // At the cap → blocked.
+  const atCap = db.insert("subscriptions", sub({ plan: "free", reviewsUsed: 10 }));
+  assert.equal(rollAndCheckUsage(atCap).allowed, false);
+
+  // Window elapsed (>30d) → reset to 0, allowed again, and the reset persists.
+  const stale = db.insert(
+    "subscriptions",
+    sub({ plan: "free", reviewsUsed: 10, usagePeriodStart: Date.now() - 31 * 24 * 60 * 60 * 1000 })
+  );
+  const u3 = rollAndCheckUsage(stale);
+  assert.equal(u3.used, 0);
+  assert.equal(u3.allowed, true);
+  assert.equal(db.find("subscriptions", (x) => x.id === stale.id)?.reviewsUsed, 0);
+
+  // Max (unlimited) is always allowed regardless of usage.
+  const max = db.insert("subscriptions", sub({ plan: "max", status: "active", reviewsUsed: 99999 }));
+  assert.equal(rollAndCheckUsage(max).allowed, true);
+});

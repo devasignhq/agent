@@ -6,7 +6,7 @@ export type User = {
   githubLogin: string;
   email: string;
   avatarUrl?: string;
-  plan: "free" | "pro" | "team";
+  plan: "free" | "pro" | "max";
   createdAt: number;
 };
 
@@ -25,6 +25,10 @@ export type Repository = {
   owner: string;
   name: string;
   defaultBranch: string;
+  // GitHub repo visibility. Free tier reviews public repos only; the review
+  // gate refuses private repos for effective-free users. Persisted from the
+  // `private` flag on install/PR webhook payloads.
+  private: boolean;
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
@@ -171,13 +175,40 @@ export type ReviewLogEntry = {
   meta?: Record<string, unknown>;
 };
 
+// Mirrors the Stripe subscription status enum (the subset we act on).
+export type SubscriptionStatus =
+  | "active"
+  | "trialing"
+  | "past_due"
+  | "canceled"
+  | "incomplete";
+
 export type Subscription = {
   id: string;
   userId: string;
-  plan: "free" | "pro" | "team";
-  credits: number;
-  autoRefill: boolean;
+  // The PURCHASED tier. Gating never reads this directly — it goes through
+  // effectivePlan() (billing/plans.ts), which downgrades to "free" whenever
+  // `status` isn't active/trialing. So a lapsed sub is treated as Free without
+  // rewriting this field, and the UI still knows what to restore.
+  plan: "free" | "pro" | "max";
   stripeCustomerId: string | null;
+  stripeSubscriptionId: string | null;
+  // null for a brand-new free row that never had a Stripe subscription.
+  status: SubscriptionStatus | null;
+  currentPeriodEnd: number | null;
+  cancelAtPeriodEnd: boolean;
+  // A deferred downgrade scheduled via a Stripe Subscription Schedule: the tier
+  // it switches to at period end + the schedule id (for revert). null when none.
+  pendingPlan: "free" | "pro" | "max" | null;
+  scheduleId: string | null;
+  // Monthly PR-review usage: `reviewsUsed` counts unique PRs reviewed in the
+  // window that began at `usagePeriodStart` (rolls monthly for free; synced to
+  // the Stripe billing period for paid).
+  reviewsUsed: number;
+  usagePeriodStart: number;
+  // Legacy credits model — kept optional so old rows still load; no longer read.
+  credits?: number;
+  autoRefill?: boolean;
 };
 
 export type AuthAuditEntry = {
