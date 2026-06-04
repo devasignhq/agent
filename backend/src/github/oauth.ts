@@ -51,6 +51,49 @@ export function startOAuth(req: Request, res: Response) {
   res.redirect(u.toString());
 }
 
+// GitHub's GET /user only returns an email when the user has a public one; with
+// "Keep my email addresses private" enabled it's null and we'd otherwise mint a
+// useless ${login}@users.noreply.github.com address. The user:email scope (above)
+// lets us read every address via GET /user/emails and pick the real, verified one.
+type GithubEmail = { email: string; primary: boolean; verified: boolean; visibility: string | null };
+const NOREPLY_SUFFIX = "@users.noreply.github.com";
+const isRealEmail = (e: string | null | undefined): e is string =>
+  !!e && !e.endsWith(NOREPLY_SUFFIX);
+
+// Pure: the verified, non-noreply address (primary first), or null when there's no
+// real one — the caller owns the noreply fallback. Exported for a quick unit check.
+export function pickPrimaryEmail(emails: GithubEmail[]): string | null {
+  const real = emails.filter((e) => typeof e.email === "string" && e.verified && isRealEmail(e.email));
+  if (real.length === 0) return null;
+  return (real.find((e) => e.primary) ?? real[0]).email;
+}
+
+// Best-effort: null on any failure so the caller falls back. Same fetch pattern as /user.
+async function fetchPrimaryEmail(token: string): Promise<string | null> {
+  try {
+    const res = await fetch("https://api.github.com/user/emails", {
+      headers: { Authorization: `Bearer ${token}`, "User-Agent": "devasign-app" },
+    });
+    if (!res.ok) return null;
+    const emails = (await res.json()) as GithubEmail[];
+    return Array.isArray(emails) ? pickPrimaryEmail(emails) : null;
+  } catch {
+    return null;
+  }
+}
+
+// Keep the Stripe customer email aligned with our user record after a backfill.
+// Dynamic import so this auth handler keeps no static dependency on billing, and
+// fully swallowed so a Stripe hiccup can never block sign-in.
+async function syncStripeEmail(user: User): Promise<void> {
+  try {
+    const { updateCustomerEmail } = await import("../billing/stripe.js");
+    await updateCustomerEmail(user);
+  } catch {
+    /* best-effort; never block login */
+  }
+}
+
 export async function finishOAuth(req: Request, res: Response) {
   const { code, state } = req.query as { code?: string; state?: string };
   if (!code || !state || !pendingState.has(state)) {
@@ -88,6 +131,13 @@ export async function finishOAuth(req: Request, res: Response) {
     avatar_url?: string;
   };
 
+  // Prefer the real, verified address from /user/emails; fall back to the public
+  // profile email, then a synthetic noreply so new users always get *some* value.
+  const resolvedEmail =
+    (await fetchPrimaryEmail(tokenBody.access_token)) ||
+    me.email ||
+    `${me.login}@users.noreply.github.com`;
+
   // Find-or-create
   let user = db.find("users", (u) => u.githubId === me.id);
   if (!user) {
@@ -95,7 +145,7 @@ export async function finishOAuth(req: Request, res: Response) {
       id: uuid(),
       githubId: me.id,
       githubLogin: me.login,
-      email: me.email || `${me.login}@users.noreply.github.com`,
+      email: resolvedEmail,
       avatarUrl: me.avatar_url,
       plan: "free",
       createdAt: Date.now(),
@@ -115,6 +165,11 @@ export async function finishOAuth(req: Request, res: Response) {
       pendingPlan: null,
       scheduleId: null,
     });
+  } else if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
+    // Backfill returning users whose stored email is stale/noreply — but never
+    // downgrade a good address to a noreply fallback (isRealEmail guards that).
+    user = db.update("users", (u) => u.id === user!.id, { email: resolvedEmail }) ?? user;
+    await syncStripeEmail(user);
   }
 
   db.insert("authAudit", {

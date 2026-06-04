@@ -43,6 +43,15 @@ export async function getOrCreateCustomer(user: User, sub: Subscription): Promis
   return customer.id;
 }
 
+// Align the Stripe customer email with our user record (e.g. after an OAuth email
+// backfill). No-op without Stripe configured or before the user has a customer.
+export async function updateCustomerEmail(user: User): Promise<void> {
+  if (!stripe) return;
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  if (!sub?.stripeCustomerId) return;
+  await stripe.customers.update(sub.stripeCustomerId, { email: user.email || undefined });
+}
+
 // Hosted Checkout for a paid tier. Subscription mode + a 14-day trial collects
 // the card up front and auto-converts on day 14. metadata.userId lets the
 // webhook map the resulting subscription back to our user even before the
