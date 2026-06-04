@@ -94,6 +94,12 @@ async function syncStripeEmail(user: User): Promise<void> {
   }
 }
 
+// True when a *different* user already holds this email — keeps the write path
+// from minting duplicate-email rows (a verified GitHub address can migrate
+// between accounts over time). There is no DB constraint; users are keyed by id.
+const emailTakenByOther = (email: string, selfId: string | null): boolean =>
+  !!db.find("users", (u) => u.email === email && u.id !== selfId);
+
 export async function finishOAuth(req: Request, res: Response) {
   const { code, state } = req.query as { code?: string; state?: string };
   if (!code || !state || !pendingState.has(state)) {
@@ -141,11 +147,18 @@ export async function finishOAuth(req: Request, res: Response) {
   // Find-or-create
   let user = db.find("users", (u) => u.githubId === me.id);
   if (!user) {
+    // Don't mint a duplicate-email row if a verified address already belongs to
+    // another account; fall back to the per-login (unique) noreply instead.
+    let email = resolvedEmail;
+    if (isRealEmail(email) && emailTakenByOther(email, null)) {
+      console.warn(`[oauth] ${email} already in use; new user ${me.login} gets noreply`);
+      email = `${me.login}@users.noreply.github.com`;
+    }
     user = {
       id: uuid(),
       githubId: me.id,
       githubLogin: me.login,
-      email: resolvedEmail,
+      email,
       avatarUrl: me.avatar_url,
       plan: "free",
       createdAt: Date.now(),
@@ -167,9 +180,14 @@ export async function finishOAuth(req: Request, res: Response) {
     });
   } else if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
     // Backfill returning users whose stored email is stale/noreply — but never
-    // downgrade a good address to a noreply fallback (isRealEmail guards that).
-    user = db.update("users", (u) => u.id === user!.id, { email: resolvedEmail }) ?? user;
-    await syncStripeEmail(user);
+    // downgrade a good address to a noreply fallback (isRealEmail guards that),
+    // and never duplicate an address another account already holds.
+    if (emailTakenByOther(resolvedEmail, user.id)) {
+      console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
+    } else {
+      user = db.update("users", (u) => u.id === user!.id, { email: resolvedEmail }) ?? user;
+      await syncStripeEmail(user);
+    }
   }
 
   db.insert("authAudit", {
