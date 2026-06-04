@@ -198,7 +198,13 @@ function customerIdOf(
 }
 
 function periodEndMs(stripeSub: Stripe.Subscription): number | null {
-  const sec = stripeSub.items?.data?.[0]?.current_period_end;
+  // `current_period_end` moved from the Subscription top-level (≤ 2025-01 acacia)
+  // onto the subscription item (2025-03 basil+, which our SDK pins). Read the
+  // item first, then fall back to the legacy top-level field, so a webhook
+  // destination configured on an older API version still yields a renewal date.
+  const sec =
+    stripeSub.items?.data?.[0]?.current_period_end ??
+    (stripeSub as Stripe.Subscription & { current_period_end?: number }).current_period_end;
   return typeof sec === "number" ? sec * 1000 : null;
 }
 
