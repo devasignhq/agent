@@ -105,9 +105,15 @@ export async function finishOAuth(req: Request, res: Response) {
       id: uuid(),
       userId: user.id,
       plan: "free",
-      credits: 50,
-      autoRefill: false,
       stripeCustomerId: null,
+      stripeSubscriptionId: null,
+      status: null,
+      currentPeriodEnd: null,
+      cancelAtPeriodEnd: false,
+      reviewsUsed: 0,
+      usagePeriodStart: Date.now(),
+      pendingPlan: null,
+      scheduleId: null,
     });
   }
 

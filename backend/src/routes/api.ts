@@ -5,10 +5,12 @@ import { db } from "../db.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { getSessionUser } from "../github/oauth.js";
 import { appJWT, gh } from "../github/app.js";
-import { config, isGithubAppConfigured, isLLMLive } from "../config.js";
+import { config, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { fetchLinearTeams } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
+import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
+import { effectivePlan, PLAN_LIMITS } from "../billing/plans.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -137,8 +139,12 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
             (x) => x.owner === owner && x.name === name
           );
           if (existing) {
-            if (existing.installationId !== row.id) {
-              db.update("repositories", (x) => x.id === existing.id, { installationId: row.id });
+            const visChanged = typeof r.private === "boolean" && existing.private !== r.private;
+            if (existing.installationId !== row.id || visChanged) {
+              db.update("repositories", (x) => x.id === existing.id, {
+                installationId: row.id,
+                ...(typeof r.private === "boolean" ? { private: r.private } : {}),
+              });
             }
             continue;
           }
@@ -148,6 +154,7 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
             owner,
             name,
             defaultBranch: r.default_branch || "main",
+            private: Boolean(r.private),
             defaultModel: "claude-opus-4-7",
             modelOverrides: {},
             reviewsEnabled: true,
@@ -224,10 +231,16 @@ api.post("/installations/:installationId/link", async (req, res) => {
       (x) => x.owner === owner && x.name === name
     );
     if (existing) {
-      if (existing.installationId !== install!.id || existing.defaultBranch !== (r.default_branch || existing.defaultBranch)) {
+      const visChanged = typeof r.private === "boolean" && existing.private !== r.private;
+      if (
+        existing.installationId !== install!.id ||
+        existing.defaultBranch !== (r.default_branch || existing.defaultBranch) ||
+        visChanged
+      ) {
         db.update("repositories", (x) => x.id === existing.id, {
           installationId: install!.id,
           defaultBranch: r.default_branch || existing.defaultBranch,
+          ...(typeof r.private === "boolean" ? { private: r.private } : {}),
         });
       }
       continue;
@@ -238,6 +251,7 @@ api.post("/installations/:installationId/link", async (req, res) => {
       owner,
       name,
       defaultBranch: r.default_branch || "main",
+      private: Boolean(r.private),
       defaultModel: "claude-opus-4-7",
       modelOverrides: {},
       reviewsEnabled: true,
@@ -629,23 +643,115 @@ api.get("/integrations/linear/teams", async (req, res) => {
   });
 });
 
-// --- Billing (Stripe stub) ---
+// --- Billing (Stripe) ---
 
+// Enriched subscription view for the Billing settings page: the row plus the
+// effective plan (after any lapse-downgrade) and the monthly review allowance
+// + usage. `reviewLimit: null` means unlimited (Max).
 api.get("/billing/subscription", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  res.json(db.find("subscriptions", (s) => s.userId === user.id));
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  const plan = effectivePlan(sub);
+  const limits = PLAN_LIMITS[plan];
+  res.json({
+    subscription: sub ?? null,
+    effectivePlan: plan,
+    reviewsUsed: sub?.reviewsUsed ?? 0,
+    reviewLimit: Number.isFinite(limits.monthlyReviews) ? limits.monthlyReviews : null,
+    features: { privateRepos: limits.privateRepos, linear: limits.linear },
+  });
 });
 
-// Simulate a credit top-up. Real Stripe would happen via webhook → grant credits.
-api.post("/billing/credits", (req, res) => {
+// Start a Stripe Checkout for a paid tier. Returns a hosted-page URL the
+// frontend redirects to. Card up front + 14-day trial (see billing/stripe.ts).
+api.post("/billing/checkout", async (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (!isStripeConfigured()) {
+    return void res.status(503).json({
+      error: "stripe_not_configured",
+      message: "Set STRIPE_SECRET_KEY, STRIPE_PRICE_PRO and STRIPE_PRICE_MAX in the backend env.",
+    });
+  }
+  const plan = req.body?.plan;
+  if (plan !== "pro" && plan !== "max") {
+    return void res.status(400).json({ error: "invalid_plan", message: "plan must be 'pro' or 'max'" });
+  }
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   if (!sub) return void res.status(404).json({ error: "no_subscription" });
-  const add = Math.max(0, Math.floor(Number(req.body?.add) || 0));
-  db.update("subscriptions", (s) => s.id === sub.id, { credits: sub.credits + add });
-  res.json({ ok: true });
+  try {
+    const url = await createCheckoutSession(user, sub, plan);
+    res.json({ url });
+  } catch (err) {
+    console.error("[billing] checkout failed:", err);
+    res.status(502).json({ error: "checkout_failed" });
+  }
+});
+
+// Open the Stripe Customer Portal (update card, cancel, view invoices).
+api.post("/billing/portal", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (!isStripeConfigured()) {
+    return void res.status(503).json({ error: "stripe_not_configured" });
+  }
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  if (!sub?.stripeCustomerId) {
+    return void res
+      .status(404)
+      .json({ error: "no_customer", message: "No billing account yet — subscribe first." });
+  }
+  try {
+    const url = await createPortalSession(sub, { cancel: req.body?.flow === "cancel" });
+    res.json({ url });
+  } catch (err) {
+    console.error("[billing] portal failed:", err);
+    res.status(502).json({ error: "portal_failed" });
+  }
+});
+
+// Switch the active subscription to another paid tier. body: { plan, immediate }.
+// Upgrades are typically immediate; downgrades default to scheduled (immediate=false).
+api.post("/billing/change-plan", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (!isStripeConfigured()) return void res.status(503).json({ error: "stripe_not_configured" });
+  const plan = req.body?.plan;
+  if (plan !== "pro" && plan !== "max") {
+    return void res.status(400).json({ error: "invalid_plan", message: "plan must be 'pro' or 'max'" });
+  }
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  // Must have an active paid plan to switch; free/lapsed users subscribe via checkout.
+  if (!sub?.stripeSubscriptionId || effectivePlan(sub) === "free") {
+    return void res.status(404).json({ error: "no_active_subscription", message: "Start a plan first." });
+  }
+  if (effectivePlan(sub) === plan) {
+    return void res.status(400).json({ error: "already_on_plan" });
+  }
+  try {
+    await changePlan(sub, plan, Boolean(req.body?.immediate));
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[billing] change-plan failed:", err);
+    res.status(502).json({ error: "change_plan_failed" });
+  }
+});
+
+// Revert a pending scheduled downgrade — keep the current plan.
+api.post("/billing/scheduled-change/cancel", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (!isStripeConfigured()) return void res.status(503).json({ error: "stripe_not_configured" });
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  if (!sub) return void res.status(404).json({ error: "no_subscription" });
+  try {
+    await cancelScheduledChange(sub);
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("[billing] cancel scheduled change failed:", err);
+    res.status(502).json({ error: "cancel_scheduled_failed" });
+  }
 });
 
 // --- Audit log (Security screen) ---

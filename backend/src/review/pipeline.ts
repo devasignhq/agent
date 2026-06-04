@@ -7,7 +7,7 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { gh } from "../github/app.js";
-import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, type VideoSummary } from "../llm.js";
+import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
 import { config } from "../config.js";
@@ -26,6 +26,7 @@ import {
   type DevasignScope,
 } from "./devasign.js";
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
+import { modelForPlan, planForUser } from "../billing/plans.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -116,6 +117,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   if (!repo) throw new Error(`repo ${review.repoId} not found`);
   const install = db.find("installations", (i) => i.id === repo.installationId);
 
+  // Tier the review model by the repo owner's effective plan: Free → Haiku,
+  // Pro/Max → the configured frontier model. withModel scopes it to every
+  // complete() call this job makes. Unlinked installs (no userId yet) keep the
+  // frontier default rather than being degraded to Haiku before linking.
+  const reviewModel = install?.userId ? modelForPlan(planForUser(install.userId)) : config.llm.model;
+
+  return withModel(reviewModel, async () => {
   setStatus(review.id, { status: "reviewing" });
   log(review.id, "review", "Pipeline started");
 
@@ -517,6 +525,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       `${repo.owner}/${repo.name} — ${errMsg.slice(0, 140)}`
     );
   }
+  });
 }
 
 // --- Context ingestion ---
@@ -812,6 +821,10 @@ export function extractLinkedLinearIssues(body: string, branch?: string): string
 // integration). Returns null when the owner hasn't connected Linear.
 function linearIntegrationForUser(userId: string | undefined): Integration | null {
   if (!userId) return null;
+  // Linear integration + acceptance-criteria sync is a Pro/Max feature. A
+  // free/lapsed owner's review skips all Linear ingestion even if a stale
+  // integration row lingers from a previous paid period.
+  if (planForUser(userId) === "free") return null;
   return db.find("integrations", (i) => i.userId === userId && i.type === "linear");
 }
 

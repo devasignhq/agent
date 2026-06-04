@@ -75,3 +75,25 @@ export async function gh<T>(
   }
   return (await res.json()) as T;
 }
+
+// Post a comment on a PR (the issues API — PRs are issues for commenting).
+// Centralizes the "issues/{n}/comments" POST so plan/limit notices and review
+// comments share one path. Best-effort: logs and swallows on failure so a
+// commenting hiccup never breaks webhook handling.
+export async function postPRComment(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  body: string
+): Promise<void> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/issues/${prNumber}/comments`, {
+      method: "POST",
+      body: JSON.stringify({ body }),
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.warn(`[github] failed to post PR comment on ${owner}/${name}#${prNumber}:`, err);
+  }
+}

@@ -14,6 +14,7 @@ import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { handleWebhook } from "./github/webhooks.js";
 import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
 import { handleLinearWebhook } from "./linear/webhooks.js";
+import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { startWorker } from "./worker.js";
 import { db, initDb, shutdownDb } from "./db.js";
@@ -48,6 +49,15 @@ app.post(
   "/api/webhooks/linear",
   express.raw({ type: "application/json", limit: "5mb" }),
   handleLinearWebhook
+);
+
+// Stripe webhook needs the raw body too — for `stripe.webhooks.constructEvent`
+// signature verification. Register it before express.json() like the
+// GitHub/Linear receivers above.
+app.post(
+  "/api/webhooks/stripe",
+  express.raw({ type: "application/json", limit: "1mb" }),
+  handleStripeWebhook
 );
 
 app.use(express.json({ limit: "1mb" }));

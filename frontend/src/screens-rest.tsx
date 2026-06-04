@@ -597,21 +597,40 @@ const SetInstall = () => {
 };
 
 const PLANS = [
-{ id: "free", name: "Free", price: "$0", cadence: "/ forever", features: "Public repos · Haiku reviews · 10 PR reviews / mo" },
-{ id: "pro", name: "Pro", price: "$15", cadence: "/ month", trial: "14-day free trial", features: "Private repos · Opus reviews · 50 PR reviews / mo · Linear sync", cta: "Upgrade to Pro" },
-{ id: "max", name: "Max", price: "$45", cadence: "/ month", trial: "14-day free trial", features: "Private repos · Opus reviews · Unlimited reviews · Linear sync", cta: "Upgrade to Max" }];
+{
+  id: "free", name: "Free", icon: "terminal",
+  tagline: "Automated review on public repos",
+  price: "$0", unit: "/ forever",
+  features: ["Public repositories", "Standard model (Haiku)", "10 PR reviews / month"],
+},
+{
+  id: "pro", name: "Pro", icon: "spark", featured: true,
+  tagline: "For developers shipping private code",
+  price: "$15", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
+  features: ["Private + public repositories", "Frontier model (Opus)", "50 PR reviews / month", "Linear sync"],
+},
+{
+  id: "max", name: "Max", icon: "brain",
+  tagline: "For teams reviewing at scale",
+  price: "$45", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
+  features: ["Private + public repositories", "Frontier model (Opus)", "Unlimited PR reviews", "Linear sync"],
+}];
 
 const planLabel = (p) => (p === "max" ? "Max" : p === "pro" ? "Pro" : "Free");
+const PLAN_RANK = { free: 0, pro: 1, max: 2 };
+// A plan card's CTA relative to the user's current plan — null when it IS the current plan.
+const ctaLabel = (target, current) =>
+  target === current ? null : `${PLAN_RANK[target] > PLAN_RANK[current] ? "Upgrade" : "Downgrade"} to ${planLabel(target)}`;
 
 const SetBilling = () => {
   const { user } = useAuth();
   const [view, setView] = React.useState(null); // SubscriptionView | null (GET /billing/subscription)
-  const [busy, setBusy] = React.useState(null); // "pro" | "max" | "portal" | null
+  const [busy, setBusy] = React.useState(null); // plan id | "portal" | "cancel" | "switch" | "revert" | null
   const [err, setErr] = React.useState(null);
+  const [switchTo, setSwitchTo] = React.useState(null); // { plan, upgrade } while confirming a switch
 
-  React.useEffect(() => {
-    api.subscription().then(setView).catch(() => setView(null));
-  }, []);
+  const refresh = React.useCallback(() => api.subscription().then(setView).catch(() => {}), []);
+  React.useEffect(() => { refresh(); }, [refresh]);
 
   // effectivePlan reflects any lapse-downgrade; `purchased` is what they bought.
   const effective = view?.effectivePlan || user?.plan || "free";
@@ -651,6 +670,54 @@ const SetBilling = () => {
       setBusy(null);
     }
   };
+  // Deep-links straight into Stripe's cancel flow; on confirm it auto-redirects
+  // back to /?billing=canceled (handled in app.tsx → opens this page).
+  const cancelSub = async () => {
+    setErr(null);
+    setBusy("cancel");
+    try {
+      const { url } = await api.portal({ cancel: true });
+      window.location.href = url;
+    } catch (e) {
+      setErr(e?.message || "Couldn't open the cancel flow.");
+      setBusy(null);
+    }
+  };
+  const pendingCancel = !!view?.subscription?.cancelAtPeriodEnd;
+  const pendingPlan = view?.subscription?.pendingPlan || null;
+
+  // Plan-card CTA click: free→checkout (new sub), paid↔paid→confirm panel, →free→cancel.
+  const onCardCta = (target) => {
+    setErr(null);
+    if (effective === "free") return void startCheckout(target);
+    if (target === "free") return void cancelSub();
+    setSwitchTo({ plan: target, upgrade: PLAN_RANK[target] > PLAN_RANK[effective] });
+  };
+  const doChangePlan = async (plan, immediate) => {
+    setErr(null);
+    setBusy("switch");
+    try {
+      await api.changePlan(plan, { immediate });
+      setSwitchTo(null);
+      await refresh();
+    } catch (e) {
+      setErr(e?.message || "Couldn't change plan.");
+    } finally {
+      setBusy(null);
+    }
+  };
+  const revertScheduled = async () => {
+    setErr(null);
+    setBusy("revert");
+    try {
+      await api.cancelScheduledChange();
+      await refresh();
+    } catch (e) {
+      setErr(e?.message || "Couldn't revert the scheduled switch.");
+    } finally {
+      setBusy(null);
+    }
+  };
 
   return (
     <div className="col gap-5">
@@ -673,60 +740,143 @@ const SetBilling = () => {
       </div>
       }
 
-      <div className="card">
-        <div className="card-head"><h3 className="card-title">Current plan</h3>
-          <span className="pill purple"><i className="dot"></i> {planLabel(effective)}</span></div>
-        <div className="card-body">
-          <div className="mute mono" style={{ fontSize: 12, marginBottom: 12 }}>
-            {usage}{renew ? ` · ${renewLabel} ${renew}` : ""}
+      {pendingPlan &&
+      <div className="card" style={{ borderColor: "var(--accent)" }}>
+        <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
+          <div style={{ minWidth: 0, flex: 1 }}>
+            <div className="mono" style={{ fontSize: 13 }}>
+              Switching to {planLabel(pendingPlan)}{renew ? ` on ${renew}` : ""}
+            </div>
+            <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
+              You keep {planLabel(effective)} until then.
+            </div>
           </div>
-          <div className="grid-3">
-            {PLANS.map((p) => {
-              const isCurrent = p.id === effective;
-              return (
-                <div key={p.id} className="card" style={{ padding: 12, borderColor: isCurrent ? "var(--accent)" : "var(--line)" }}>
-                  <div className="flex items-center" style={{ gap: 8 }}>
-                    <div className="mono" style={{ fontSize: 15 }}>{p.name}</div>
-                    {isCurrent && <span className="pill ok"><i className="dot"></i> current</span>}
-                  </div>
-                  <div className="mono" style={{ fontSize: 22, marginTop: 6, lineHeight: 1 }}>
-                    {p.price}<span style={{ fontSize: 10, marginLeft: 4, opacity: 0.55 }}>{p.cadence}</span>
-                  </div>
-                  <div className="mute mono" style={{ fontSize: 11, marginTop: 8, minHeight: 30 }}>{p.features}</div>
-                  {p.trial && !isCurrent &&
-                  <div className="mute" style={{ fontSize: 11, marginTop: 6 }}>{p.trial}</div>}
-                  {p.id !== "free" && !isCurrent &&
-                  <button className="btn sm" style={{ marginTop: 10, width: "100%", whiteSpace: "nowrap" }}
-                  disabled={busy === p.id} onClick={() => startCheckout(p.id)}>
-                    {busy === p.id ? "Starting…" : p.cta}
-                  </button>}
-                  {isCurrent && p.id !== "free" &&
-                  <button className="btn sm ghost" style={{ marginTop: 10, width: "100%" }}
-                  disabled={busy === "portal"} onClick={openPortal}>Manage</button>}
-                </div>);
-            })}
-          </div>
-          {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12, marginTop: 10 }}>{err}</div>}
+          <button className="btn ghost" disabled={busy === "revert"} onClick={revertScheduled}>
+            {busy === "revert" ? "…" : `Keep ${planLabel(effective)}`}
+          </button>
         </div>
       </div>
+      }
+
+      <div>
+        <div className="flex justify-between items-center" style={{ gap: 12, flexWrap: "wrap", marginBottom: 14 }}>
+          <div style={{ minWidth: 0 }}>
+            <h3 className="card-title" style={{ marginBottom: 5 }}>Plans</h3>
+            <div className="mute mono" style={{ fontSize: 12 }}>
+              {usage}{renew ? ` · ${renewLabel} ${renew}` : ""}
+            </div>
+          </div>
+          <span className="pill purple"><i className="dot"></i> {planLabel(effective)} plan</span>
+        </div>
+
+        <div className="plan-grid">
+          {PLANS.map((p) => {
+            const isCurrent = p.id === effective;
+            const cta = ctaLabel(p.id, effective);
+            const upgrade = PLAN_RANK[p.id] > PLAN_RANK[effective];
+            return (
+              <div key={p.id} className={`plan${p.featured ? " featured" : ""}${isCurrent ? " current" : ""}`}>
+                {isCurrent
+                  ? <span className="pill ok plan-badge"><i className="dot"></i> current</span>
+                  : p.featured
+                  ? <span className="pill purple plan-badge">popular</span>
+                  : null}
+
+                <div className="plan-icon"><Icon name={p.icon} size={18} /></div>
+                <div className="plan-name">{p.name}</div>
+                <div className="plan-tag">{p.tagline}</div>
+
+                <div className="plan-price">
+                  <b>{p.price}</b><span className="plan-unit">{p.unit}</span>
+                </div>
+                <div className="plan-note">{p.reassure || ""}</div>
+
+                {isCurrent
+                  ? (p.id === "free"
+                    ? <button className="btn lg ghost plan-cta" disabled>Current plan</button>
+                    : <button className="btn lg ghost plan-cta" disabled={busy === "portal"} onClick={openPortal}>
+                        {busy === "portal" ? "Opening…" : "Manage plan"}
+                      </button>)
+                  : <button className={`btn lg plan-cta ${upgrade ? "primary" : "ghost"}`}
+                    disabled={busy === p.id || busy === "switch"} onClick={() => onCardCta(p.id)}>
+                      {busy === p.id ? "Starting…" : cta}
+                    </button>}
+
+                <ul className="plan-feats">
+                  {p.features.map((f) =>
+                    <li key={f} className="plan-feat"><Icon name="check" size={13} /><span>{f}</span></li>)}
+                </ul>
+              </div>);
+          })}
+        </div>
+        {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12, marginTop: 12 }}>{err}</div>}
+      </div>
+
+      {switchTo &&
+      <div className="card" style={{ borderColor: "var(--accent)" }}>
+        <div className="card-body col gap-3">
+          {switchTo.upgrade ? (
+            <>
+              <div className="mono" style={{ fontSize: 13 }}>Upgrade to {planLabel(switchTo.plan)} now?</div>
+              <div className="mute" style={{ fontSize: 12 }}>
+                Takes effect immediately
+                {status === "trialing" ? " — no charge until your trial ends." : ", with a prorated charge today."}
+              </div>
+              <div className="flex gap-2">
+                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, true)}>
+                  {busy === "switch" ? "Switching…" : `Upgrade to ${planLabel(switchTo.plan)}`}
+                </button>
+                <button className="btn ghost" disabled={busy === "switch"} onClick={() => setSwitchTo(null)}>Cancel</button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="mono" style={{ fontSize: 13 }}>Switch to {planLabel(switchTo.plan)}</div>
+              <div className="mute" style={{ fontSize: 12 }}>
+                Takes effect {renew ? `on ${renew}` : "next period"} — you keep {planLabel(effective)} until then.
+                Or switch now and we'll credit the prorated difference.
+              </div>
+              <div className="flex gap-2">
+                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, false)}>
+                  {busy === "switch" ? "Scheduling…" : (renew ? `Switch on ${renew}` : "Switch next period")}
+                </button>
+                <button className="btn ghost" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, true)}>
+                  Switch immediately
+                </button>
+                <button className="btn ghost" disabled={busy === "switch"} onClick={() => setSwitchTo(null)}>Cancel</button>
+              </div>
+            </>
+          )}
+        </div>
+      </div>
+      }
 
       {effective !== "free" &&
       <div className="card">
         <div className="card-head">
           <h3 className="card-title">Subscription</h3>
-          {renew && <span className="mute mono" style={{ fontSize: 11 }}>{renewLabel} {renew}</span>}
+          {renew && <span className="mute mono" style={{ fontSize: 11 }}>
+            {pendingCancel ? "cancels" : renewLabel} {renew}
+          </span>}
         </div>
         <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div className="mono" style={{ fontSize: 13 }}>{planLabel(effective)} plan · billed monthly</div>
             <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-              Update your card, view invoices, or cancel anytime in the Stripe portal. Cancelling keeps your
-              plan until the period ends, then drops to Free.
+              {pendingCancel
+                ? `Set to cancel${renew ? ` on ${renew}` : ""} — you'll drop to Free then. Reopen the portal to keep it.`
+                : "Update your card or view invoices in the Stripe portal. Cancelling sends you to Stripe to confirm, then back here."}
             </div>
           </div>
-          <button className="btn ghost" disabled={busy === "portal"} onClick={openPortal}>
-            {busy === "portal" ? "Opening…" : "Manage subscription"}
-          </button>
+          <div className="flex gap-2">
+            <button className="btn ghost" disabled={busy === "portal"} onClick={openPortal}>
+              {busy === "portal" ? "Opening…" : "Manage subscription"}
+            </button>
+            {!pendingCancel &&
+            <button className="btn ghost danger" disabled={busy === "cancel"} onClick={cancelSub}>
+              {busy === "cancel" ? "Opening…" : "Cancel subscription"}
+            </button>}
+          </div>
         </div>
       </div>
       }
@@ -848,24 +998,29 @@ const SetAccount = () => {
 };
 
 
+const SUPPORT_CHANNELS = [
+  { name: "Documentation", desc: "Full docs · API reference · self-serve guides", cta: "devasign.com/docs", href: "https://devasign.com/docs", i: "doc" },
+  { name: "Discord community", desc: "Join the community · #help channel", cta: "Join Discord", href: "https://discord.com/invite/GtvqA4UPwT", i: "discord" },
+  {
+    name: "Email support", i: "send",
+    desc: <>Send us an email at <a className="mono" style={{ color: "var(--accent)", textDecoration: "none" }} href="mailto:bethel@devasign.com">bethel@devasign.com</a> and we'll reply within an hour.</>,
+  },
+];
+
 const SetSupport = () =>
 <div className="col gap-5">
     <div className="card">
       <div className="card-head"><h3 className="card-title">Support channels</h3></div>
       <div>
-        {[
-      { name: "Documentation", desc: "Full docs · API reference · self-serve guides", cta: "docs.devasign.dev", i: "doc" },
-      { name: "Discord community", desc: "1,840 devs · #help channel, avg reply 12m", cta: "Join Discord", i: "discord" },
-      { name: "Email support", desc: "support@devasign.dev · SLA 24h (team), 4h (org)", cta: "Open ticket", i: "send" },
-      { name: "Status page", desc: "Uptime · incident history · subscribe", cta: "status.devasign.dev", i: "globe" }].
-      map((s) =>
+        {SUPPORT_CHANNELS.map((s) =>
       <div key={s.name} className="row" style={{ display: "grid", gridTemplateColumns: "40px 1fr auto", gap: 14, height: 64 }}>
             <div className="integ-icon"><Icon name={s.i} size={14} /></div>
             <div>
               <div className="mono" style={{ fontSize: 13 }}>{s.name}</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 2 }}>{s.desc}</div>
             </div>
-            <button className="btn">{s.cta} <Icon name="external" size={11} /></button>
+            {s.href &&
+            <a className="btn" href={s.href} target="_blank" rel="noopener noreferrer">{s.cta} <Icon name="external" size={11} /></a>}
           </div>
       )}
       </div>

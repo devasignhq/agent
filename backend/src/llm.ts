@@ -1,9 +1,19 @@
 // Claude wrapper. Falls back to a deterministic mock when no API key is set,
 // so local dev works end-to-end without billing.
 import Anthropic from "@anthropic-ai/sdk";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { config, isGeminiLive, isLLMLive } from "./config.js";
 
 const client = isLLMLive() ? new Anthropic({ apiKey: config.llm.apiKey }) : null;
+
+// Lets a job set the default model for every complete() call it makes, without
+// threading a `model` arg through its whole call graph. Precedence: explicit
+// opts.model > job context (withModel) > config.llm.model. Used to tier PR
+// reviews by plan (Free → Haiku, Pro/Max → frontier); see runReviewJob.
+const modelContext = new AsyncLocalStorage<string>();
+export function withModel<T>(model: string, fn: () => T): T {
+  return modelContext.run(model, fn);
+}
 
 export type LLMMessage = { role: "user" | "assistant"; content: string };
 
@@ -23,7 +33,7 @@ export async function complete(opts: {
     : undefined;
 
   const resp = await client.messages.create({
-    model: opts.model || config.llm.model,
+    model: opts.model || modelContext.getStore() || config.llm.model,
     max_tokens: opts.maxTokens ?? 2048,
     system: sys as any,
     messages: opts.messages.map((m) => ({ role: m.role, content: m.content })),

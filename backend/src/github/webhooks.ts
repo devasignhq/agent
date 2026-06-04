@@ -5,9 +5,16 @@ import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { config } from "../config.js";
 import { db } from "../db.js";
-import { gh } from "./app.js";
+import { gh, postPRComment } from "./app.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { notifyForReview } from "../notifications.js";
+import {
+  PLAN_LIMITS,
+  planForUser,
+  recordReviewUsage,
+  rollAndCheckUsage,
+  subscriptionForUser,
+} from "../billing/plans.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) return true; // dev mode: skip verification
@@ -513,8 +520,12 @@ function upsertRepoFromInstallEvent(
     (r) => r.owner === owner && r.name === name
   );
   if (existing) {
-    if (existing.installationId !== installDbId) {
-      db.update("repositories", (r) => r.id === existing.id, { installationId: installDbId });
+    const visChanged = typeof repo.private === "boolean" && existing.private !== repo.private;
+    if (existing.installationId !== installDbId || visChanged) {
+      db.update("repositories", (r) => r.id === existing.id, {
+        installationId: installDbId,
+        ...(typeof repo.private === "boolean" ? { private: repo.private } : {}),
+      });
     }
     return;
   }
@@ -524,12 +535,37 @@ function upsertRepoFromInstallEvent(
     owner,
     name,
     defaultBranch: "main",
+    private: Boolean(repo.private),
     defaultModel: "claude-opus-4-7",
     modelOverrides: {},
     reviewsEnabled: true,
     indexState: "queued",
   });
   enqueueIndex({ repoId: newRepo.id, full: true });
+}
+
+// Author-facing notices posted when a PR can't be reviewed under the owner's
+// plan. Kept short; the upgrade link lands on the dashboard's billing page.
+function privateRepoNotice(): string {
+  return [
+    "### 🔒 DevAsign — private repositories need a paid plan",
+    "",
+    "Your current plan reviews **public repositories only**. Upgrade to **Pro** or **Max** to get automated reviews on private repos.",
+    "",
+    `[Upgrade your plan →](${config.webOrigin}/?billing=upgrade)`,
+  ].join("\n");
+}
+
+function capReachedNotice(limit: number): string {
+  return [
+    "### 📊 DevAsign — monthly review limit reached",
+    "",
+    `You've used all **${limit} PR reviews** included in your plan this month, so this PR wasn't reviewed.`,
+    "",
+    "Your allowance resets next billing period. Need more headroom? Upgrade for a higher limit:",
+    "",
+    `[Upgrade your plan →](${config.webOrigin}/?billing=upgrade)`,
+  ].join("\n");
 }
 
 function handlePullRequest(event: any) {
@@ -609,6 +645,7 @@ function handlePullRequest(event: any) {
       owner,
       name,
       defaultBranch: event.repository.default_branch || "main",
+      private: Boolean(event.repository.private),
       defaultModel: "claude-opus-4-7",
       modelOverrides: {},
       reviewsEnabled: true,
@@ -621,6 +658,33 @@ function handlePullRequest(event: any) {
 
   const pullReq = event.pull_request;
   const newSha: string = pullReq.head.sha;
+  const installationId: number | undefined = event.installation?.id;
+
+  // Keep stored visibility fresh from the event payload — self-heals rows the
+  // migration backfilled to private:false and any later visibility change.
+  if (typeof event.repository.private === "boolean" && event.repository.private !== repo.private) {
+    db.update("repositories", (r) => r.id === repo!.id, { private: event.repository.private });
+    repo.private = event.repository.private;
+  }
+
+  // ── Plan gates ────────────────────────────────────────────────────────────
+  // Resolve the owning user's effective plan. An unlinked install (webhook
+  // landed before onboarding linked it) has no userId — skip gating there
+  // rather than risk false-blocking a paying user; gates apply once linked.
+  const ownerUserId =
+    db.find("installations", (i) => i.id === repo!.installationId)?.userId || "";
+  const plan = ownerUserId ? planForUser(ownerUserId) : null;
+  // Only nudge the author on a fresh open/reopen, so re-pushes never re-comment.
+  const notifiable = event.action === "opened" || event.action === "reopened";
+
+  // Private-repo gate — applies to every review path (including re-pushes), so a
+  // free or lapsed user's private repos stop being reviewed.
+  if (plan && repo.private && !PLAN_LIMITS[plan].privateRepos) {
+    if (notifiable && installationId) {
+      void postPRComment(installationId, owner, name, pullReq.number, privateRepoNotice());
+    }
+    return;
+  }
 
   // `synchronize` fires when a contributor pushes new commits to an open PR.
   // The semantics are "same PR, new state" — we keep ONE prReview row per
@@ -674,6 +738,35 @@ function handlePullRequest(event: any) {
     // No row yet (race: synchronize arrived before opened, or the user only
     // installed the app after the PR was already open). Fall through to the
     // insert path so we still pick up the work.
+  }
+
+  // Monthly-cap gate — charged once per unique PR. Re-pushes take the
+  // synchronize path above (free) and re-opens reuse the prior row, so neither
+  // re-charges. Max's unlimited allowance always passes.
+  if (plan && ownerUserId) {
+    const priorReview = db.find(
+      "prReviews",
+      (r) => r.repoId === repo!.id && r.prNumber === pullReq.number
+    );
+    if (!priorReview) {
+      const sub = subscriptionForUser(ownerUserId);
+      if (sub) {
+        const usage = rollAndCheckUsage(sub);
+        if (!usage.allowed) {
+          if (notifiable && installationId) {
+            void postPRComment(
+              installationId,
+              owner,
+              name,
+              pullReq.number,
+              capReachedNotice(usage.limit)
+            );
+          }
+          return;
+        }
+        recordReviewUsage(sub.id, usage.used);
+      }
+    }
   }
 
   const review = {

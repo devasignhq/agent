@@ -58,6 +58,15 @@ export const config = {
     discordBotToken: process.env.DISCORD_BOT_TOKEN || "",
     discordBotChannelId: process.env.DISCORD_BOT_CHANNEL_ID || "",
   },
+  // Stripe billing. Secret key + webhook signing secret + the recurring Price
+  // IDs for each paid tier. When unset, billing routes 503 and the app still
+  // boots (mirrors the GitHub-OAuth-not-configured fallback).
+  stripe: {
+    secretKey: process.env.STRIPE_SECRET_KEY || "",
+    webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || "",
+    pricePro: process.env.STRIPE_PRICE_PRO || "",
+    priceMax: process.env.STRIPE_PRICE_MAX || "",
+  },
   // Neon/Postgres connection string. Source of truth for all persisted state.
   databaseUrl: process.env.DATABASE_URL || "",
 };
@@ -76,3 +85,7 @@ export const isSlackEnvConfigured = () =>
   Boolean(config.integrations.slackBotToken && config.integrations.slackBotChannel);
 export const isDiscordEnvConfigured = () =>
   Boolean(config.integrations.discordBotToken && config.integrations.discordBotChannelId);
+// Paid checkout/portal need the secret key + both Price IDs. The webhook secret
+// is checked separately at the webhook receiver.
+export const isStripeConfigured = () =>
+  Boolean(config.stripe.secretKey && config.stripe.pricePro && config.stripe.priceMax);
