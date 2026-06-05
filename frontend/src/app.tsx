@@ -31,7 +31,7 @@ const NAV = [
 ];
 
 const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
-  const recents = useRecentReviews(3);
+  const recents = useRecentReviews(user?.id, 3);
   return (
   <div className={`sidebar ${iconOnly ? "icon-only" : ""}`}>
     <div className="sb-head">
