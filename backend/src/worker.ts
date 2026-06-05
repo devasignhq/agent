@@ -2,15 +2,26 @@
 import { onJob } from "./queue.js";
 import { runLinearIngestJob, runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
 import { buildRepoIndex } from "./review/indexer.js";
+import { reviewOwnerPendingDeletion } from "./account.js";
 
 export function startWorker() {
   onJob(async (job) => {
     switch (job.type) {
       case "review":
+        // Skip while the install owner is pending deletion — no analysis, no
+        // GitHub comments. Reviews resume automatically once they restore.
+        if (reviewOwnerPendingDeletion(job.payload.reviewId)) {
+          console.log(`[worker] skip review ${job.payload.reviewId} — owner pending deletion`);
+          return;
+        }
         console.log(`[worker] review ${job.payload.reviewId}`);
         await runReviewJob(job.payload.reviewId);
         return;
       case "maintainer_feedback":
+        if (reviewOwnerPendingDeletion(job.payload.reviewId)) {
+          console.log(`[worker] skip maintainer_feedback ${job.payload.reviewId} — owner pending deletion`);
+          return;
+        }
         console.log(`[worker] maintainer_feedback ${job.payload.reviewId}`);
         await runMaintainerFeedbackJob(job.payload.reviewId, job.payload.comment);
         return;

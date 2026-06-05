@@ -10,10 +10,13 @@ import { db } from "../db.js";
 import {
   PLAN_LIMITS,
   effectivePlan,
+  intervalOf,
   modelForPlan,
   normalizePlan,
   planForUser,
+  priceFor,
   priceIdToPlan,
+  priceIdToPlanInterval,
   rollAndCheckUsage,
 } from "./plans.js";
 import type { Subscription, SubscriptionStatus } from "../types.js";
@@ -96,6 +99,51 @@ test("priceIdToPlan maps configured price ids; unknown/null → null", () => {
   if (config.stripe.priceMax) assert.equal(priceIdToPlan(config.stripe.priceMax), "max");
   assert.equal(priceIdToPlan("price_does_not_exist"), null);
   assert.equal(priceIdToPlan(null), null);
+});
+
+test("price catalog: priceFor + priceIdToPlanInterval round-trip across tier × interval", () => {
+  // Pin the four price ids deterministically (independent of env).
+  config.stripe.pricePro = "price_pro_m";
+  config.stripe.priceMax = "price_max_m";
+  config.stripe.priceProAnnual = "price_pro_y";
+  config.stripe.priceMaxAnnual = "price_max_y";
+
+  assert.equal(priceFor("pro", "month"), "price_pro_m");
+  assert.equal(priceFor("pro", "year"), "price_pro_y");
+  assert.equal(priceFor("max", "month"), "price_max_m");
+  assert.equal(priceFor("max", "year"), "price_max_y");
+
+  assert.deepEqual(priceIdToPlanInterval("price_pro_m"), { plan: "pro", interval: "month" });
+  assert.deepEqual(priceIdToPlanInterval("price_pro_y"), { plan: "pro", interval: "year" });
+  assert.deepEqual(priceIdToPlanInterval("price_max_m"), { plan: "max", interval: "month" });
+  assert.deepEqual(priceIdToPlanInterval("price_max_y"), { plan: "max", interval: "year" });
+
+  // The thin wrapper still yields just the tier.
+  assert.equal(priceIdToPlan("price_pro_y"), "pro");
+  assert.equal(priceIdToPlan("price_max_m"), "max");
+
+  // Unknown / null / undefined → null.
+  assert.equal(priceIdToPlanInterval("price_unknown"), null);
+  assert.equal(priceIdToPlanInterval(null), null);
+  assert.equal(priceIdToPlanInterval(undefined), null);
+});
+
+test("priceIdToPlanInterval ignores unconfigured (empty) annual slots", () => {
+  config.stripe.pricePro = "price_pro_m";
+  config.stripe.priceMax = "price_max_m";
+  config.stripe.priceProAnnual = "";
+  config.stripe.priceMaxAnnual = "";
+  // An empty incoming id never matches, and an empty slot never matches a real id.
+  assert.equal(priceIdToPlanInterval(""), null);
+  assert.deepEqual(priceIdToPlanInterval("price_pro_m"), { plan: "pro", interval: "month" });
+});
+
+test("intervalOf defaults legacy/free rows to month", () => {
+  assert.equal(intervalOf(null), "month");
+  assert.equal(intervalOf(sub({})), "month"); // no interval field (legacy row)
+  assert.equal(intervalOf(sub({ interval: null })), "month");
+  assert.equal(intervalOf(sub({ interval: "month" })), "month");
+  assert.equal(intervalOf(sub({ interval: "year" })), "year");
 });
 
 test("rollAndCheckUsage: free blocks at the cap and rolls after a month", () => {

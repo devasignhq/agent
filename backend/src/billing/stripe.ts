@@ -13,7 +13,7 @@ import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import type { Subscription, SubscriptionStatus, User } from "../types.js";
-import { effectivePlan, normalizePlan, priceIdToPlan } from "./plans.js";
+import { effectivePlan, intervalOf, normalizePlan, priceFor, priceIdToPlanInterval, type Interval } from "./plans.js";
 
 // null when unconfigured so the app still boots; the routes 503 before calling
 // these helpers, so they can assume a live client.
@@ -24,10 +24,12 @@ function client(): Stripe {
   return stripe;
 }
 
-const PRICE_BY_PLAN: Record<"pro" | "max", () => string> = {
-  pro: () => config.stripe.pricePro,
-  max: () => config.stripe.priceMax,
-};
+// Annual subscriptions carry the 20%-off coupon; monthly carry none. Returning
+// an explicit [] on monthly is what REMOVES a lingering coupon when a sub
+// switches year→month via subscriptions.update or a schedule phase.
+function annualDiscounts(interval: Interval): { coupon: string }[] {
+  return interval === "year" ? [{ coupon: config.stripe.annualCouponId }] : [];
+}
 
 // ─── Session creation (Checkout + Portal) ──────────────────────────────────
 
@@ -55,21 +57,28 @@ export async function updateCustomerEmail(user: User): Promise<void> {
 // Hosted Checkout for a paid tier. Subscription mode + a 14-day trial collects
 // the card up front and auto-converts on day 14. metadata.userId lets the
 // webhook map the resulting subscription back to our user even before the
-// customer id is persisted locally.
+// customer id is persisted locally. interval picks the monthly vs annual Price;
+// annual auto-applies the 20% coupon (callers gate annual on isAnnualConfigured).
 export async function createCheckoutSession(
   user: User,
   sub: Subscription,
-  plan: "pro" | "max"
+  plan: "pro" | "max",
+  interval: Interval
 ): Promise<string> {
   const customerId = await getOrCreateCustomer(user, sub);
   const session = await client().checkout.sessions.create({
     mode: "subscription",
     customer: customerId,
-    line_items: [{ price: PRICE_BY_PLAN[plan](), quantity: 1 }],
-    subscription_data: { trial_period_days: 14, metadata: { userId: user.id, plan } },
+    line_items: [{ price: priceFor(plan, interval), quantity: 1 }],
+    subscription_data: { trial_period_days: 14, metadata: { userId: user.id, plan, interval } },
     client_reference_id: user.id,
-    metadata: { userId: user.id, plan },
-    allow_promotion_codes: true,
+    metadata: { userId: user.id, plan, interval },
+    // Annual auto-applies the 20% coupon. Stripe forbids combining a coupon with
+    // customer-entered promotion codes in one session, so only monthly opts into
+    // allow_promotion_codes; annual passes the coupon via discounts instead.
+    ...(interval === "year"
+      ? { discounts: [{ coupon: config.stripe.annualCouponId }] }
+      : { allow_promotion_codes: true }),
     success_url: `${config.webOrigin}/?billing=success`,
     cancel_url: `${config.webOrigin}/?billing=cancel`,
   });
@@ -133,19 +142,36 @@ async function releaseSchedule(sub: Subscription): Promise<void> {
   }
 }
 
-// Switch an active subscription to another paid tier. immediate=true swaps the
-// price now (prorated, charged via always_invoice — trials aren't charged until
-// they end); immediate=false defers the switch to the end of the current period
-// via a 2-phase Subscription Schedule. The webhook syncs the resulting plan.
+// Switch an active subscription to another paid tier and/or interval (e.g.
+// monthly→annual). immediate=true swaps the price now (prorated, charged via
+// always_invoice — trials aren't charged until they end); immediate=false defers
+// the switch to the end of the current period via a 2-phase Subscription
+// Schedule. discounts carries (or removes) the 20% annual coupon so a year→month
+// switch drops it and a →year switch (re)applies it. The webhook syncs the
+// resulting plan + interval.
 export async function changePlan(
   sub: Subscription,
   plan: "pro" | "max",
+  interval: Interval,
   immediate: boolean
 ): Promise<void> {
   if (!sub.stripeSubscriptionId) throw new Error("No active subscription to change");
   await releaseSchedule(sub);
-  const newPrice = PRICE_BY_PLAN[plan]();
+  const newPrice = priceFor(plan, interval);
   const stripeSub = await client().subscriptions.retrieve(sub.stripeSubscriptionId);
+  const currentPrice = stripeSub.items.data[0]?.price?.id;
+  const currentInterval = priceIdToPlanInterval(currentPrice)?.interval ?? intervalOf(sub);
+
+  // Only touch discounts when the annual-coupon state actually changes, so a
+  // monthly→monthly tier switch leaves any promo code the user applied at
+  // checkout intact (subscriptions.update's `discounts` REPLACES the whole set).
+  //   → year: apply the 20% coupon · year→month: drop it · month→month: leave as-is.
+  const discounts =
+    interval === "year"
+      ? [{ coupon: config.stripe.annualCouponId }]
+      : currentInterval === "year"
+      ? []
+      : undefined;
 
   if (immediate) {
     // Active sub → charge the prorated difference now (always_invoice). Trialing
@@ -154,14 +180,17 @@ export async function changePlan(
     const updated = await client().subscriptions.update(sub.stripeSubscriptionId, {
       items: [{ id: stripeSub.items.data[0]?.id, price: newPrice }],
       proration_behavior: stripeSub.status === "trialing" ? "none" : "always_invoice",
+      ...(discounts !== undefined ? { discounts } : {}),
     });
     syncSubscription(updated); // reflect locally now; the webhook re-confirms (idempotent)
     return;
   }
 
-  // Defer to period end: keep the current price for the rest of this period,
-  // then switch to the new price.
-  const currentPrice = stripeSub.items.data[0]?.price?.id;
+  // Defer to period end: keep the current price (and its coupon) for the rest of
+  // this period, then switch to the new price (with the target's coupon). Phases
+  // don't inherit the subscription's discount, so set each phase's explicitly. (A
+  // promo code on a monthly→monthly deferred switch isn't carried across the
+  // phase boundary — rare, and schedules require per-phase discounts.)
   const schedule = await client().subscriptionSchedules.create({
     from_subscription: sub.stripeSubscriptionId,
   });
@@ -169,11 +198,20 @@ export async function changePlan(
   await client().subscriptionSchedules.update(schedule.id, {
     end_behavior: "release",
     phases: [
-      { items: [{ price: currentPrice, quantity: 1 }], start_date: phase0.start_date, end_date: phase0.end_date },
-      { items: [{ price: newPrice, quantity: 1 }] },
+      {
+        items: [{ price: currentPrice, quantity: 1 }],
+        discounts: annualDiscounts(currentInterval),
+        start_date: phase0.start_date,
+        end_date: phase0.end_date,
+      },
+      { items: [{ price: newPrice, quantity: 1 }], discounts: annualDiscounts(interval) },
     ],
   });
-  db.update("subscriptions", (s) => s.id === sub.id, { pendingPlan: plan, scheduleId: schedule.id });
+  db.update("subscriptions", (s) => s.id === sub.id, {
+    pendingPlan: plan,
+    pendingInterval: interval,
+    scheduleId: schedule.id,
+  });
 }
 
 // Revert a pending (scheduled) switch: release the schedule, keep the current plan.
@@ -195,6 +233,45 @@ export async function cancelSubscriptionForDeletion(sub: Subscription): Promise<
   } catch (err) {
     // Already canceled / not found is fine; re-throw anything else so the
     // caller can surface a real failure and the user can retry.
+    const e = err as { statusCode?: number; code?: string };
+    if (e?.statusCode === 404 || e?.code === "resource_missing") return;
+    throw err;
+  }
+}
+
+// Pause billing when a user *requests* deletion (vs. the hard cancel at purge):
+// schedule the subscription to cancel at period end so no surprise renewal lands
+// during the 14-day restore window, without losing the plan if they come back.
+// Releases any pending schedule first (a schedule blocks subscriptions.update).
+// No-op when Stripe is unconfigured, there's no subscription, or it's already
+// set to cancel — so requesting deletion stays idempotent.
+export async function pauseSubscriptionForDeletion(sub: Subscription): Promise<void> {
+  if (!stripe || !sub.stripeSubscriptionId || sub.cancelAtPeriodEnd) return;
+  await releaseSchedule(sub);
+  try {
+    const updated = await client().subscriptions.update(sub.stripeSubscriptionId, {
+      cancel_at_period_end: true,
+    });
+    syncSubscription(updated); // reflect cancelAtPeriodEnd locally; webhook re-confirms
+  } catch (err) {
+    const e = err as { statusCode?: number; code?: string };
+    if (e?.statusCode === 404 || e?.code === "resource_missing") return;
+    throw err;
+  }
+}
+
+// Reverse pauseSubscriptionForDeletion when the user logs back in to restore:
+// clear the scheduled cancellation so billing continues as before. No-op when
+// Stripe is unconfigured, there's no subscription, or nothing is scheduled to
+// cancel — so restore is safe even if billing was never paused.
+export async function resumeSubscriptionAfterRestore(sub: Subscription): Promise<void> {
+  if (!stripe || !sub.stripeSubscriptionId || !sub.cancelAtPeriodEnd) return;
+  try {
+    const updated = await client().subscriptions.update(sub.stripeSubscriptionId, {
+      cancel_at_period_end: false,
+    });
+    syncSubscription(updated);
+  } catch (err) {
     const e = err as { statusCode?: number; code?: string };
     if (e?.statusCode === 404 || e?.code === "resource_missing") return;
     throw err;
@@ -264,18 +341,28 @@ function syncSubscription(stripeSub: Stripe.Subscription, resetUsage = false): v
     return;
   }
   const priceId = stripeSub.items?.data?.[0]?.price?.id;
-  const newPlan = priceIdToPlan(priceId) ?? normalizePlan(sub.plan);
+  const resolved = priceIdToPlanInterval(priceId);
+  const newPlan = resolved?.plan ?? normalizePlan(sub.plan);
+  const newInterval = resolved?.interval ?? intervalOf(sub);
   const patch: Partial<Subscription> = {
     plan: newPlan,
+    interval: newInterval,
     status: mapStatus(stripeSub.status),
     stripeSubscriptionId: stripeSub.id,
     stripeCustomerId: customerIdOf(stripeSub.customer) ?? sub.stripeCustomerId,
     currentPeriodEnd: periodEndMs(stripeSub),
     cancelAtPeriodEnd: Boolean(stripeSub.cancel_at_period_end),
   };
-  // A scheduled downgrade that just transitioned at period end → clear the marker.
-  if (sub.pendingPlan && newPlan === sub.pendingPlan) {
+  // A scheduled switch that just transitioned at period end → clear the markers.
+  // Require the interval to match too (a tier-only pending switch left
+  // pendingInterval null, in which case the interval check is a no-op).
+  if (
+    sub.pendingPlan &&
+    newPlan === sub.pendingPlan &&
+    newInterval === (sub.pendingInterval ?? newInterval)
+  ) {
     patch.pendingPlan = null;
+    patch.pendingInterval = null;
     patch.scheduleId = null;
   }
   if (resetUsage) {

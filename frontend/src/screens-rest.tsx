@@ -660,12 +660,14 @@ const PLANS = [
   id: "pro", name: "Pro", icon: "spark", featured: true,
   tagline: "For developers shipping private code",
   price: "$15", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
+  annual: { price: "$144", unit: "USD / year", original: "$180", note: "$12/mo · billed annually" },
   features: ["Private + public repositories", "Frontier model (Opus)", "50 PR reviews / month", "Linear sync"],
 },
 {
   id: "max", name: "Max", icon: "brain",
   tagline: "For teams reviewing at scale",
   price: "$45", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
+  annual: { price: "$432", unit: "USD / year", original: "$540", note: "$36/mo · billed annually" },
   features: ["Private + public repositories", "Frontier model (Opus)", "Unlimited PR reviews", "Linear sync"],
 }];
 
@@ -680,16 +682,22 @@ const SetBilling = () => {
   const [view, setView] = React.useState(null); // SubscriptionView | null (GET /billing/subscription)
   const [busy, setBusy] = React.useState(null); // plan id | "portal" | "cancel" | "switch" | "revert" | null
   const [err, setErr] = React.useState(null);
-  const [switchTo, setSwitchTo] = React.useState(null); // { plan, upgrade } while confirming a switch
+  const [switchTo, setSwitchTo] = React.useState(null); // { plan, interval, upgrade } while confirming a switch
+  const [billInterval, setBillInterval] = React.useState("month"); // monthly/annual toggle (display + intent)
 
   const refresh = React.useCallback(() => api.subscription().then(setView).catch(() => {}), []);
   React.useEffect(() => { refresh(); }, [refresh]);
+  // Reflect the current sub's cadence once known (and after a successful change).
+  // Keyed on view.interval so it never clobbers a manual toggle while browsing.
+  React.useEffect(() => { if (view?.interval) setBillInterval(view.interval); }, [view?.interval]);
 
   // effectivePlan reflects any lapse-downgrade; `purchased` is what they bought.
   const effective = view?.effectivePlan || user?.plan || "free";
   const purchased = view?.subscription?.plan || effective;
   const status = view?.subscription?.status || null;
   const lapsed = purchased !== "free" && effective === "free"; // paid but downgraded by Stripe
+  const curInterval = view?.interval || "month"; // the cadence they're actually on
+  const annualAvailable = !!view?.annualAvailable; // gate the toggle on backend config
   const usage =
     view == null
       ? "…"
@@ -705,7 +713,7 @@ const SetBilling = () => {
     setErr(null);
     setBusy(plan);
     try {
-      const { url } = await api.checkout(plan);
+      const { url } = await api.checkout(plan, billInterval);
       window.location.href = url;
     } catch (e) {
       setErr(e?.message || "Couldn't start checkout. Is billing configured?");
@@ -738,19 +746,31 @@ const SetBilling = () => {
   };
   const pendingCancel = !!view?.subscription?.cancelAtPeriodEnd;
   const pendingPlan = view?.subscription?.pendingPlan || null;
+  const pendingInterval = view?.subscription?.pendingInterval || null;
+  // Human label for the confirm panel's target, interval-aware. Same-tier reads
+  // "Pro annual" (an interval switch); cross-tier reads "Max (annual)".
+  const switchName = switchTo
+    ? (switchTo.plan === effective
+        ? `${planLabel(switchTo.plan)} ${switchTo.interval === "year" ? "annual" : "monthly"}`
+        : `${planLabel(switchTo.plan)}${switchTo.interval === "year" ? " (annual)" : ""}`)
+    : "";
 
   // Plan-card CTA click: free→checkout (new sub), paid↔paid→confirm panel, →free→cancel.
+  // A paid→paid change covers tier switches AND same-tier interval switches
+  // (monthly→annual). A higher tier, or moving to annual, defaults to immediate.
   const onCardCta = (target) => {
     setErr(null);
     if (effective === "free") return void startCheckout(target);
     if (target === "free") return void cancelSub();
-    setSwitchTo({ plan: target, upgrade: PLAN_RANK[target] > PLAN_RANK[effective] });
+    const higherTier = PLAN_RANK[target] > PLAN_RANK[effective];
+    const toAnnual = billInterval === "year" && curInterval === "month";
+    setSwitchTo({ plan: target, interval: billInterval, upgrade: higherTier || (target === effective && toAnnual) });
   };
-  const doChangePlan = async (plan, immediate) => {
+  const doChangePlan = async (plan, interval, immediate) => {
     setErr(null);
     setBusy("switch");
     try {
-      await api.changePlan(plan, { immediate });
+      await api.changePlan(plan, { interval, immediate });
       setSwitchTo(null);
       await refresh();
     } catch (e) {
@@ -798,7 +818,7 @@ const SetBilling = () => {
         <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div className="mono" style={{ fontSize: 13 }}>
-              Switching to {planLabel(pendingPlan)}{renew ? ` on ${renew}` : ""}
+              Switching to {planLabel(pendingPlan)}{pendingInterval === "year" ? " (annual)" : ""}{renew ? ` on ${renew}` : ""}
             </div>
             <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
               You keep {planLabel(effective)} until then.
@@ -822,11 +842,33 @@ const SetBilling = () => {
           <span className="pill purple"><i className="dot"></i> {planLabel(effective)} plan</span>
         </div>
 
+        {annualAvailable &&
+        <div className="flex items-center" style={{ gap: 10, marginBottom: 14, flexWrap: "wrap" }}>
+          <div style={{ display: "inline-flex", gap: 4, padding: 4, border: "1px solid var(--border)", borderRadius: 10 }}>
+            <button className={`btn ${billInterval === "month" ? "" : "ghost"}`}
+              style={{ padding: "6px 14px" }} onClick={() => setBillInterval("month")}>Monthly</button>
+            <button className={`btn ${billInterval === "year" ? "" : "ghost"}`}
+              style={{ padding: "6px 14px" }} onClick={() => setBillInterval("year")}>Annual</button>
+          </div>
+          <span className="pill ok"><i className="dot"></i> Save 20% with annual billing</span>
+        </div>
+        }
+
         <div className="plan-grid">
           {PLANS.map((p) => {
-            const isCurrent = p.id === effective;
-            const cta = ctaLabel(p.id, effective);
-            const upgrade = PLAN_RANK[p.id] > PLAN_RANK[effective];
+            // A paid card is "current" only when BOTH tier and the selected
+            // interval match what they're on; same tier + different interval is a
+            // switch (monthly↔annual), not the current plan. Free has no interval.
+            const sameTier = p.id === effective;
+            const isCurrent = sameTier && (p.id === "free" || billInterval === curInterval);
+            const annual = billInterval === "year" && p.annual ? p.annual : null; // annual display block, when applicable
+            const price = annual ? annual.price : p.price;
+            const unit = annual ? annual.unit : p.unit;
+            const note = annual ? annual.note : (p.reassure || "");
+            const upgrade = PLAN_RANK[p.id] > PLAN_RANK[effective] || (sameTier && billInterval === "year");
+            const cta = isCurrent ? null
+              : sameTier ? `Switch to ${billInterval === "year" ? "annual" : "monthly"}`
+              : ctaLabel(p.id, effective);
             return (
               <div key={p.id} className={`plan${p.featured ? " featured" : ""}${isCurrent ? " current" : ""}`}>
                 {isCurrent
@@ -840,9 +882,10 @@ const SetBilling = () => {
                 <div className="plan-tag">{p.tagline}</div>
 
                 <div className="plan-price">
-                  <b>{p.price}</b><span className="plan-unit">{p.unit}</span>
+                  {annual && <span style={{ textDecoration: "line-through", opacity: 0.55, marginRight: 6, fontWeight: 400 }}>{annual.original}</span>}
+                  <b>{price}</b><span className="plan-unit">{unit}</span>
                 </div>
-                <div className="plan-note">{p.reassure || ""}</div>
+                <div className="plan-note">{note}</div>
 
                 {isCurrent
                   ? (p.id === "free"
@@ -870,30 +913,31 @@ const SetBilling = () => {
         <div className="card-body col gap-3">
           {switchTo.upgrade ? (
             <>
-              <div className="mono" style={{ fontSize: 13 }}>Upgrade to {planLabel(switchTo.plan)} now?</div>
+              <div className="mono" style={{ fontSize: 13 }}>Switch to {switchName} now?</div>
               <div className="mute" style={{ fontSize: 12 }}>
                 Takes effect immediately
                 {status === "trialing" ? " — no charge until your trial ends." : ", with a prorated charge today."}
+                {switchTo.interval === "year" ? " You save 20% with annual billing." : ""}
               </div>
               <div className="flex gap-2">
-                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, true)}>
-                  {busy === "switch" ? "Switching…" : `Upgrade to ${planLabel(switchTo.plan)}`}
+                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, switchTo.interval, true)}>
+                  {busy === "switch" ? "Switching…" : `Switch to ${switchName}`}
                 </button>
                 <button className="btn ghost" disabled={busy === "switch"} onClick={() => setSwitchTo(null)}>Cancel</button>
               </div>
             </>
           ) : (
             <>
-              <div className="mono" style={{ fontSize: 13 }}>Switch to {planLabel(switchTo.plan)}</div>
+              <div className="mono" style={{ fontSize: 13 }}>Switch to {switchName}</div>
               <div className="mute" style={{ fontSize: 12 }}>
-                Takes effect {renew ? `on ${renew}` : "next period"} — you keep {planLabel(effective)} until then.
+                Takes effect {renew ? `on ${renew}` : "next period"} — you keep {planLabel(effective)} ({curInterval === "year" ? "annual" : "monthly"}) until then.
                 Or switch now and we'll credit the prorated difference.
               </div>
               <div className="flex gap-2">
-                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, false)}>
+                <button className="btn" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, switchTo.interval, false)}>
                   {busy === "switch" ? "Scheduling…" : (renew ? `Switch on ${renew}` : "Switch next period")}
                 </button>
-                <button className="btn ghost" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, true)}>
+                <button className="btn ghost" disabled={busy === "switch"} onClick={() => doChangePlan(switchTo.plan, switchTo.interval, true)}>
                   Switch immediately
                 </button>
                 <button className="btn ghost" disabled={busy === "switch"} onClick={() => setSwitchTo(null)}>Cancel</button>
@@ -914,7 +958,7 @@ const SetBilling = () => {
         </div>
         <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
-            <div className="mono" style={{ fontSize: 13 }}>{planLabel(effective)} plan · billed monthly</div>
+            <div className="mono" style={{ fontSize: 13 }}>{planLabel(effective)} plan · billed {curInterval === "year" ? "annually" : "monthly"}</div>
             <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
               {pendingCancel
                 ? `Set to cancel${renew ? ` on ${renew}` : ""} — you'll drop to Free then. Reopen the portal to keep it.`
@@ -938,13 +982,12 @@ const SetBilling = () => {
 
 
 // ─── Account · delete + export ──────────────────────────────────────────
-// Backend teardown is retry-safe: on these failures nothing was deleted, so the
-// copy tells the user they can simply try again.
+// Requesting deletion is retry-safe and soft: it schedules deletion with a
+// 14-day restore window rather than erasing anything now. These stay as friendly
+// fallbacks for the rare error shapes the request can still surface.
 const DELETE_ERRORS = {
-  billing_cancel_failed:
-    "We couldn't cancel your subscription, so nothing was deleted. Please try again.",
-  github_uninstall_failed:
-    "We couldn't uninstall the GitHub App, so nothing was deleted. Please try again.",
+  billing_cancel_failed: "Something went wrong. Please try again.",
+  github_uninstall_failed: "Something went wrong. Please try again.",
 };
 
 const SetAccount = () => {
@@ -961,8 +1004,8 @@ const SetAccount = () => {
   const nameOk = !!user?.githubLogin && confirmName.trim().toLowerCase() === user.githubLogin.toLowerCase();
   const phraseOk = confirmText.trim().toLowerCase() === REQUIRED;
 
-  // Hard-delete the account server-side, then advance to the confirmation step.
-  // On failure the backend leaves everything intact (retry-safe), so we surface
+  // Request deletion server-side (soft delete + email), then advance to the
+  // confirmation step. On failure nothing changes (retry-safe), so we surface
   // the error and stay on the confirm step instead of pretending it worked.
   const deleteAccount = async () => {
     setErr(null);
@@ -1017,7 +1060,7 @@ const SetAccount = () => {
       <div className="card" style={{ borderColor: "color-mix(in oklch, var(--danger) 35%, var(--line))" }}>
         <div className="card-head">
           <h3 className="card-title" style={{ color: "var(--danger)" }}>Danger zone</h3>
-          <span className="pill danger"><i className="dot"></i> irreversible</span>
+          <span className="pill danger"><i className="dot"></i> 14-day grace</span>
         </div>
         <div className="card-body">
           {step === "idle" &&
@@ -1025,7 +1068,8 @@ const SetAccount = () => {
             <div style={{ minWidth: 0, flex: 1 }}>
               <div className="mono" style={{ fontSize: 13 }}>Delete your account</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                Permanently removes your profile, agent settings, review history, and connected GitHub installs.
+                We'll keep your data for 14 days so you can restore it by signing back in. After that, your
+                profile, agent settings, review history, and GitHub installs are permanently erased.
               </div>
             </div>
             <button className="btn danger" onClick={() => setStep("confirm")}>Delete account…</button>
@@ -1034,7 +1078,11 @@ const SetAccount = () => {
 
           {step === "confirm" &&
           <div className="col gap-3">
-            <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>This cannot be undone.</div>
+            <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>You can undo this for 14 days.</div>
+            <div className="mute" style={{ fontSize: 12 }}>
+              We'll email you a confirmation and keep your data for 14 days — sign back in any time before then
+              to restore it. Code review pauses until you do.
+            </div>
             <div className="mute" style={{ fontSize: 12 }}>
               Type your username <span className="mono" style={{ color: "var(--fg)" }}>{user?.githubLogin || "—"}</span> to confirm.
             </div>
@@ -1061,7 +1109,7 @@ const SetAccount = () => {
               className="btn danger"
               disabled={!nameOk || !phraseOk || busy}
               onClick={deleteAccount}>
-                {busy ? "Deleting…" : "Permanently delete account"}
+                {busy ? "Scheduling…" : "Delete my account"}
               </button>
             </div>
             {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12 }}>{err}</div>}
@@ -1072,11 +1120,11 @@ const SetAccount = () => {
           <div className="col gap-2">
             <div className="flex items-center gap-2">
               <Icon name="check" size={14} color="var(--accent)" />
-              <span className="mono" style={{ fontSize: 13 }}>Account permanently deleted</span>
+              <span className="mono" style={{ fontSize: 13 }}>Check your email</span>
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
-              Your profile, agent settings, review history, and GitHub installs have been removed, and
-              any active subscription was canceled. Signing you out…
+              We've emailed you a confirmation. Your account is scheduled for deletion in 14 days — sign back in
+              any time before then to restore everything and resume code review. Signing you out…
             </div>
           </div>
           }

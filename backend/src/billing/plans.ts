@@ -63,12 +63,48 @@ export function modelForPlan(plan: Plan): string {
   return PLAN_LIMITS[plan].model;
 }
 
-// Reverse map for the Stripe webhook: which tier does this Price ID fund?
-export function priceIdToPlan(priceId: string | null | undefined): Plan | null {
+// Billing cadence. Annual gets a 20% coupon (see billing/stripe.ts); the limits
+// above are per-tier and identical across intervals.
+export type Interval = "month" | "year";
+
+// The four recurring Prices that fund the paid tiers, indexed by (tier, interval).
+// Annual ids are "" until annual billing is configured — annual paths gate on
+// isAnnualConfigured() (config.ts) before reaching for one.
+function priceTable(): Record<"pro" | "max", Record<Interval, string>> {
+  return {
+    pro: { month: config.stripe.pricePro, year: config.stripe.priceProAnnual },
+    max: { month: config.stripe.priceMax, year: config.stripe.priceMaxAnnual },
+  };
+}
+
+// The Stripe Price ID funding a (tier, interval).
+export function priceFor(plan: "pro" | "max", interval: Interval): string {
+  return priceTable()[plan][interval];
+}
+
+// Reverse map for the Stripe webhook: which tier + interval does this Price ID
+// fund? Skips empty (unconfigured) slots so a blank id never spuriously matches.
+export function priceIdToPlanInterval(
+  priceId: string | null | undefined
+): { plan: Plan; interval: Interval } | null {
   if (!priceId) return null;
-  if (priceId === config.stripe.pricePro) return "pro";
-  if (priceId === config.stripe.priceMax) return "max";
+  const table = priceTable();
+  for (const plan of ["pro", "max"] as const) {
+    for (const interval of ["month", "year"] as const) {
+      if (table[plan][interval] && table[plan][interval] === priceId) return { plan, interval };
+    }
+  }
   return null;
+}
+
+// Thin wrapper for callers that only need the tier.
+export function priceIdToPlan(priceId: string | null | undefined): Plan | null {
+  return priceIdToPlanInterval(priceId)?.plan ?? null;
+}
+
+// The billed interval for a sub, defaulting legacy/free rows to "month".
+export function intervalOf(sub: Subscription | null | undefined): Interval {
+  return sub?.interval === "year" ? "year" : "month";
 }
 
 const THIRTY_DAYS_MS = 30 * 24 * 60 * 60 * 1000;

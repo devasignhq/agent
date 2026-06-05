@@ -3,16 +3,16 @@ import { Router } from "express";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import type { Subscription } from "../types.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
-import { appJWT, gh, uninstallApp } from "../github/app.js";
-import { config, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
+import { appJWT, gh } from "../github/app.js";
+import { config, isAnnualConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
-import { cancelScheduledChange, cancelSubscriptionForDeletion, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
-import { effectivePlan, PLAN_LIMITS } from "../billing/plans.js";
+import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
+import { defaultDeletionDeps, requestAccountDeletion, type DeletionDeps } from "../account.js";
+import { effectivePlan, intervalOf, PLAN_LIMITS, type Interval } from "../billing/plans.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -34,103 +34,44 @@ api.get("/me", (req, res) => {
   res.json({ user, subscription: sub });
 });
 
-// Hard-delete the signed-in user's account: cancel billing, uninstall the
-// GitHub App from every account/repo it reached, then erase all local rows and
-// clear the session. The uninstall uses the App's own JWT (via uninstallApp),
-// so it works without the user's OAuth token — which we deliberately never
-// store. Note this does NOT revoke the "Authorized GitHub Apps" OAuth grant
-// (that needs the user token); the user can revoke it from GitHub settings.
+// Soft-delete the signed-in user's account: mark it for deletion (which pauses
+// code review — see worker.ts), pause billing, email a restore link, and clear
+// the session. The account and all its data are KEPT for 14 days — logging back
+// in restores everything (see account.ts: requestAccountDeletion /
+// restoreAccount). Only if the user never returns does the day-14 purge sweep
+// run the full teardown (cancel billing, uninstall the App, wipe rows) and send
+// a final notice. That final notice asks the user to revoke the "Authorized
+// GitHub Apps" OAuth grant themselves — we never store their token, so we can't.
 //
-// Exported with injectable deps so unit tests can assert the teardown order and
-// failure handling without calling GitHub/Stripe; the route binds the real ones.
+// Exported with injectable deps so unit tests can assert the soft-delete + email
+// without calling Stripe/email; the route binds the real ones.
 export async function deleteAccountHandler(
   req: Request,
   res: Response,
-  deps: {
-    uninstallApp: (installationId: number) => Promise<void>;
-    cancelSubscriptionForDeletion: (sub: Subscription) => Promise<void>;
-  } = { uninstallApp, cancelSubscriptionForDeletion }
+  deps: DeletionDeps = defaultDeletionDeps
 ) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
 
-  // Snapshot every row set up front, before any await. The GitHub uninstall
-  // below triggers an `installation.deleted` webhook that races to delete some
-  // of these same rows; capturing ids now keeps our cleanup independent of it.
-  const installs = db.filter("installations", (i) => i.userId === user.id);
-  const installDbIds = new Set(installs.map((i) => i.id));
-  const repoIds = new Set(
-    db.filter("repositories", (r) => installDbIds.has(r.installationId)).map((r) => r.id)
-  );
-  const reviews = db.filter("prReviews", (r) => repoIds.has(r.repoId));
-  const reviewIds = new Set(reviews.map((r) => r.id));
-  // PR-linked tasks carry no userId (only Linear tasks do), so collect them via
-  // the reviews we're deleting; Linear tasks are dropped by userId below.
-  const prTaskIds = new Set(
-    reviews.map((r) => r.taskId).filter((id): id is string => typeof id === "string")
-  );
-  const sub = db.find("subscriptions", (s) => s.userId === user.id);
-
-  // ── External teardown first ────────────────────────────────────────────────
-  // Must succeed before we drop local state, so a transient failure leaves the
-  // account intact and the call is safe to retry — every step here is idempotent.
-
-  // 1. Cancel Stripe billing so the card stops being charged.
-  if (sub && isStripeConfigured()) {
-    try {
-      await deps.cancelSubscriptionForDeletion(sub);
-    } catch (err) {
-      console.error(`[account] Stripe cancel failed for user ${user.id}:`, err);
-      return void res.status(502).json({ error: "billing_cancel_failed" });
-    }
-  }
-
-  // 2. Uninstall the GitHub App from each account it's installed on. One DELETE
-  //    per installation revokes repo access everywhere that install reached.
-  if (isGithubAppConfigured()) {
-    for (const install of installs) {
-      try {
-        await deps.uninstallApp(install.installationId);
-      } catch (err) {
-        console.error(
-          `[account] GitHub uninstall ${install.installationId} failed for user ${user.id}:`,
-          err
-        );
-        return void res.status(502).json({ error: "github_uninstall_failed" });
-      }
-    }
-  } else if (installs.length > 0) {
-    // No App credentials (e.g. local dev) — we can't call GitHub, so the App
-    // stays installed there even though we erase our local rows. Log it rather
-    // than silently leaving installs behind.
-    console.warn(
-      `[account] GitHub App not configured — leaving ${installs.length} installation(s) in place for user ${user.id}`
-    );
-  }
-
-  // ── Erase local state, child rows first ─────────────────────────────────────
-  db.remove("reviewLogs", (l) => reviewIds.has(l.reviewId));
-  db.remove("prReviews", (r) => reviewIds.has(r.id));
-  db.remove("repoIndex", (e) => repoIds.has(e.repoId));
-  db.remove("repositories", (r) => repoIds.has(r.id));
-  db.remove("installations", (i) => installDbIds.has(i.id));
-  db.remove("tasks", (t) => t.userId === user.id || prTaskIds.has(t.id));
-  db.remove("integrations", (i) => i.userId === user.id);
-  db.remove("subscriptions", (s) => s.userId === user.id);
-  db.remove("notifications", (n) => n.userId === user.id);
-  db.remove("linearProjectUpdates", (u) => u.userId === user.id);
-  db.remove("authAudit", (a) => a.userId === user.id);
-  db.remove("users", (u) => u.id === user.id);
+  await requestAccountDeletion(user, deps);
 
   // Clear the session cookie (same attributes as signOut, or the browser won't
-  // overwrite it) and end the session.
+  // overwrite it). The user is signed out; logging back in is what restores.
   clearSessionCookie(res);
   res.json({ ok: true });
 }
 
 // Wrap so Express's (req, res, next) never leaks `next` into the deps slot —
-// the route always runs with the real GitHub/Stripe implementations.
+// the route always runs with the real implementations.
 api.delete("/me", (req, res) => deleteAccountHandler(req, res));
+
+// Clear the one-shot welcome-back flag once the frontend has shown the pop-up.
+api.post("/me/welcome-back/ack", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (user.welcomeBack) db.update("users", (u) => u.id === user.id, { welcomeBack: undefined });
+  res.json({ ok: true });
+});
 
 api.get("/health", (_req, res) => {
   res.json({
@@ -765,9 +706,17 @@ api.post("/integrations/linear/validate", async (req, res) => {
 
 // --- Billing (Stripe) ---
 
+// Parse + validate the optional billing interval from a request body. Defaults
+// to "month"; returns null when the value is present but not month/year.
+function parseInterval(body: unknown): Interval | null {
+  const i = (body as { interval?: unknown } | null)?.interval ?? "month";
+  return i === "month" || i === "year" ? i : null;
+}
+
 // Enriched subscription view for the Billing settings page: the row plus the
 // effective plan (after any lapse-downgrade) and the monthly review allowance
-// + usage. `reviewLimit: null` means unlimited (Max).
+// + usage. `reviewLimit: null` means unlimited (Max). `annualAvailable` gates the
+// monthly/annual toggle; `interval` is the current sub's cadence.
 api.get("/billing/subscription", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
@@ -777,6 +726,8 @@ api.get("/billing/subscription", (req, res) => {
   res.json({
     subscription: sub ?? null,
     effectivePlan: plan,
+    interval: intervalOf(sub),
+    annualAvailable: isAnnualConfigured(),
     reviewsUsed: sub?.reviewsUsed ?? 0,
     reviewLimit: Number.isFinite(limits.monthlyReviews) ? limits.monthlyReviews : null,
     features: { privateRepos: limits.privateRepos, linear: limits.linear },
@@ -798,10 +749,17 @@ api.post("/billing/checkout", async (req, res) => {
   if (plan !== "pro" && plan !== "max") {
     return void res.status(400).json({ error: "invalid_plan", message: "plan must be 'pro' or 'max'" });
   }
+  const interval = parseInterval(req.body);
+  if (!interval) {
+    return void res.status(400).json({ error: "invalid_interval", message: "interval must be 'month' or 'year'" });
+  }
+  if (interval === "year" && !isAnnualConfigured()) {
+    return void res.status(503).json({ error: "annual_not_configured", message: "Annual billing isn't available." });
+  }
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   if (!sub) return void res.status(404).json({ error: "no_subscription" });
   try {
-    const url = await createCheckoutSession(user, sub, plan);
+    const url = await createCheckoutSession(user, sub, plan, interval);
     res.json({ url });
   } catch (err) {
     console.error("[billing] checkout failed:", err);
@@ -841,16 +799,25 @@ api.post("/billing/change-plan", async (req, res) => {
   if (plan !== "pro" && plan !== "max") {
     return void res.status(400).json({ error: "invalid_plan", message: "plan must be 'pro' or 'max'" });
   }
+  const interval = parseInterval(req.body);
+  if (!interval) {
+    return void res.status(400).json({ error: "invalid_interval", message: "interval must be 'month' or 'year'" });
+  }
+  if (interval === "year" && !isAnnualConfigured()) {
+    return void res.status(503).json({ error: "annual_not_configured", message: "Annual billing isn't available." });
+  }
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   // Must have an active paid plan to switch; free/lapsed users subscribe via checkout.
   if (!sub?.stripeSubscriptionId || effectivePlan(sub) === "free") {
     return void res.status(404).json({ error: "no_active_subscription", message: "Start a plan first." });
   }
-  if (effectivePlan(sub) === plan) {
+  // No-op only when BOTH tier and interval already match (so monthly→annual on
+  // the same tier is a valid change that captures the discount).
+  if (effectivePlan(sub) === plan && intervalOf(sub) === interval) {
     return void res.status(400).json({ error: "already_on_plan" });
   }
   try {
-    await changePlan(sub, plan, Boolean(req.body?.immediate));
+    await changePlan(sub, plan, interval, Boolean(req.body?.immediate));
     res.json({ ok: true });
   } catch (err) {
     console.error("[billing] change-plan failed:", err);

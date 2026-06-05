@@ -5,6 +5,7 @@ import { v4 as uuid } from "uuid";
 import { config, isGithubOAuthConfigured } from "../config.js";
 import { db } from "../db.js";
 import type { User } from "../types.js";
+import { isDeletionPending, restoreAccount } from "../account.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
 const pendingState = new Map<string, number>(); // state -> expiresAt
@@ -190,6 +191,15 @@ export async function finishOAuth(req: Request, res: Response) {
     }
   }
 
+  // If this account was pending deletion, logging in is the restore action:
+  // clear the flag, resume billing, and surface the welcome-back pop-up. Code
+  // review resumes automatically once the flag is gone (see account.ts).
+  let restored = false;
+  if (isDeletionPending(user)) {
+    await restoreAccount(user);
+    restored = true;
+  }
+
   db.insert("authAudit", {
     id: uuid(),
     userId: user.id,
@@ -204,7 +214,9 @@ export async function finishOAuth(req: Request, res: Response) {
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
   // navigation the frontend just strips the query and renders normally.
-  res.redirect(`${config.webOrigin}/?auth=ok`);
+  // welcome_back=1 lets a top-level restore show the pop-up; the durable signal
+  // for the popup-login path is the welcomeBack flag on /api/me.
+  res.redirect(`${config.webOrigin}/?auth=ok${restored ? "&welcome_back=1" : ""}`);
 }
 
 export function getSessionUser(req: Request): User | null {

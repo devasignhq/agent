@@ -61,11 +61,27 @@ export const config = {
   // Stripe billing. Secret key + webhook signing secret + the recurring Price
   // IDs for each paid tier. When unset, billing routes 503 and the app still
   // boots (mirrors the GitHub-OAuth-not-configured fallback).
+  //
+  // Annual billing is additive: the *Annual price IDs are full-rate yearly
+  // Prices and the 20% discount comes from annualCouponId (a percent_off:20
+  // coupon applied to annual subs). All three are optional — when any is unset,
+  // the annual option is hidden and the monthly tiers work unchanged.
   stripe: {
     secretKey: process.env.STRIPE_SECRET_KEY || "",
     webhookSecret: process.env.STRIPE_WEBHOOK_SECRET || "",
     pricePro: process.env.STRIPE_PRICE_PRO || "",
     priceMax: process.env.STRIPE_PRICE_MAX || "",
+    priceProAnnual: process.env.STRIPE_PRICE_PRO_ANNUAL || "",
+    priceMaxAnnual: process.env.STRIPE_PRICE_MAX_ANNUAL || "",
+    annualCouponId: process.env.STRIPE_COUPON_ANNUAL || "",
+  },
+  // Transactional email (Resend), used for the account-deletion lifecycle mails
+  // (scheduled / day-12 reminder / final "wiped"). When RESEND_API_KEY is unset
+  // the email helpers log a preview and no-op, so dev/tests need no provider —
+  // the same graceful-degradation stance as Stripe/GitHub above.
+  email: {
+    resendApiKey: process.env.RESEND_API_KEY || "",
+    from: process.env.EMAIL_FROM || "DevAsign <no-reply@devasign.ai>",
   },
   // Neon/Postgres connection string. Source of truth for all persisted state.
   databaseUrl: process.env.DATABASE_URL || "",
@@ -85,7 +101,18 @@ export const isSlackEnvConfigured = () =>
   Boolean(config.integrations.slackBotToken && config.integrations.slackBotChannel);
 export const isDiscordEnvConfigured = () =>
   Boolean(config.integrations.discordBotToken && config.integrations.discordBotChannelId);
+// Transactional email. When false, the email helpers log a preview and no-op.
+export const isEmailConfigured = () => Boolean(config.email.resendApiKey);
 // Paid checkout/portal need the secret key + both Price IDs. The webhook secret
 // is checked separately at the webhook receiver.
 export const isStripeConfigured = () =>
   Boolean(config.stripe.secretKey && config.stripe.pricePro && config.stripe.priceMax);
+// Annual billing additionally needs both annual Price IDs + the discount coupon.
+// Gated separately so the annual option only surfaces once it's fully set up.
+export const isAnnualConfigured = () =>
+  Boolean(
+    isStripeConfigured() &&
+      config.stripe.priceProAnnual &&
+      config.stripe.priceMaxAnnual &&
+      config.stripe.annualCouponId
+  );

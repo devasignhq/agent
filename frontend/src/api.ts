@@ -65,6 +65,10 @@ export type User = {
   avatarUrl?: string;
   plan: Plan;
   createdAt: number;
+  // Set while the account is pending deletion (within its 14-day restore window).
+  deletionRequestedAt?: number;
+  // One-shot flag set on restore; drives the welcome-back pop-up, then acked.
+  welcomeBack?: boolean;
 };
 
 export type Plan = "free" | "pro" | "max";
@@ -76,6 +80,9 @@ export type SubscriptionStatus =
   | "canceled"
   | "incomplete";
 
+// Billing cadence. Annual carries a 20% discount (see backend billing/stripe.ts).
+export type Interval = "month" | "year";
+
 export type Subscription = {
   id: string;
   userId: string;
@@ -85,7 +92,9 @@ export type Subscription = {
   status: SubscriptionStatus | null;
   currentPeriodEnd: number | null;
   cancelAtPeriodEnd: boolean;
+  interval?: Interval | null;
   pendingPlan: Plan | null;
+  pendingInterval?: Interval | null;
   scheduleId: string | null;
   reviewsUsed: number;
   usagePeriodStart: number;
@@ -95,6 +104,8 @@ export type Subscription = {
 export type SubscriptionView = {
   subscription: Subscription | null;
   effectivePlan: Plan;
+  interval: Interval; // current sub's cadence (defaults to "month")
+  annualAvailable: boolean; // whether the annual option is configured
   reviewsUsed: number;
   reviewLimit: number | null; // null = unlimited (Max)
   features: { privateRepos: boolean; linear: boolean };
@@ -249,13 +260,16 @@ export const api = {
   health: () => request<Health>("/api/health"),
   signOut: () =>
     request<{ ok: true }>("/api/auth/signout", { method: "POST", body: "{}" }),
-  // Hard-delete the account: cancels billing, uninstalls the GitHub App from
-  // every repo, and erases all server-side data. The session cookie is cleared
-  // server-side, so the caller should sign out afterward. Rejects with an
-  // ApiError (billing_cancel_failed / github_uninstall_failed) if external
-  // teardown fails, in which case nothing was deleted and the call is retry-safe.
+  // Request account deletion: soft-deletes with a 14-day restore window. The
+  // backend marks the account for deletion (which pauses code review), pauses
+  // billing, emails a restore link, and clears the session cookie — so the
+  // caller should sign out afterward. Logging back in within 14 days restores
+  // everything; only after the window does the purge sweep erase the account.
   deleteAccount: () =>
     request<{ ok: true }>("/api/me", { method: "DELETE" }),
+  // Clear the one-shot welcome-back flag after the restore pop-up is shown.
+  ackWelcomeBack: () =>
+    request<{ ok: true }>("/api/me/welcome-back/ack", { method: "POST", body: "{}" }),
 
   // installations & repos
   installations: () => request<Installation[]>("/api/installations"),
@@ -325,20 +339,20 @@ export const api = {
 
   // billing
   subscription: () => request<SubscriptionView>("/api/billing/subscription"),
-  checkout: (plan: "pro" | "max") =>
+  checkout: (plan: "pro" | "max", interval: Interval = "month") =>
     request<{ url: string }>("/api/billing/checkout", {
       method: "POST",
-      body: JSON.stringify({ plan }),
+      body: JSON.stringify({ plan, interval }),
     }),
   portal: (opts?: { cancel?: boolean }) =>
     request<{ url: string }>("/api/billing/portal", {
       method: "POST",
       body: JSON.stringify(opts?.cancel ? { flow: "cancel" } : {}),
     }),
-  changePlan: (plan: "pro" | "max", opts?: { immediate?: boolean }) =>
+  changePlan: (plan: "pro" | "max", opts?: { interval?: Interval; immediate?: boolean }) =>
     request<{ ok: true }>("/api/billing/change-plan", {
       method: "POST",
-      body: JSON.stringify({ plan, immediate: Boolean(opts?.immediate) }),
+      body: JSON.stringify({ plan, interval: opts?.interval ?? "month", immediate: Boolean(opts?.immediate) }),
     }),
   cancelScheduledChange: () =>
     request<{ ok: true }>("/api/billing/scheduled-change/cancel", { method: "POST", body: "{}" }),
