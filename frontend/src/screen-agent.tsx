@@ -4,6 +4,7 @@ import React from "react";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
+import { useAuth } from "./auth-context";
 
 const PR_REVIEWS = [
 {
@@ -1428,6 +1429,7 @@ function staticGoalSources(goal) {
 // AgentPage
 // ────────────────────────────────────────────────────────────────────────────
 const AgentPage = ({ logStyle, isMobile } = {}) => {
+  const { user } = useAuth();
   const [mobileView, setMobileView] = React.useState("review");
   // User-appended events per PR id (composer output that hasn't yet round-tripped)
   const [userEvents, setUserEvents] = React.useState({});
@@ -1693,22 +1695,25 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     return { ...card, id: card.uiId, _uuid: card.id };
   }, [mappedReviews, pickedId]);
 
-  // Record the picked review so the sidebar's "recent" list reflects activity.
-  React.useEffect(() => {
-    if (!pickedId) return;
-    const card = mappedReviews.find((m) => m.id === pickedId);
+  // Record a review in the sidebar's "recent" list only when the user
+  // explicitly opens it from the queue — programmatic selection (auto-select,
+  // filter fallback) must not count.
+  const handlePick = React.useCallback((id) => {
+    setPickedId(id);
+    if (!user?.id) return;
+    const card = mappedReviews.find((m) => m.id === id);
     if (!card) return;
     const flag =
       card.status === "blocked" || card.blockers > 0 ? "blocker" :
       card.status === "review_ready" ? "review" : "ok";
-    pushRecent({
+    pushRecent(user.id, {
       id: card.id,
       uiId: card.uiId,
       repo: card.repo,
       title: card.title,
       flag,
     });
-  }, [pickedId, mappedReviews]);
+  }, [mappedReviews, user?.id]);
 
   // Timeline events: map backend logs to event objects, then concat any local
   // optimistic ones (composer sends that haven't yet round-tripped).
@@ -1942,7 +1947,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       <div className={`agent-cols mview-${mobileView}`}>
         <PRQueue
           pickedId={pickedId}
-          onPick={setPickedId}
+          onPick={handlePick}
           reviews={filteredReviews}
           workspace={repos[0] ? repos[0].owner : "no repos yet"}
           onSync={syncOpenPRs}
