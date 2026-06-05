@@ -249,6 +249,13 @@ export const api = {
   health: () => request<Health>("/api/health"),
   signOut: () =>
     request<{ ok: true }>("/api/auth/signout", { method: "POST", body: "{}" }),
+  // Hard-delete the account: cancels billing, uninstalls the GitHub App from
+  // every repo, and erases all server-side data. The session cookie is cleared
+  // server-side, so the caller should sign out afterward. Rejects with an
+  // ApiError (billing_cancel_failed / github_uninstall_failed) if external
+  // teardown fails, in which case nothing was deleted and the call is retry-safe.
+  deleteAccount: () =>
+    request<{ ok: true }>("/api/me", { method: "DELETE" }),
 
   // installations & repos
   installations: () => request<Installation[]>("/api/installations"),
@@ -313,6 +320,8 @@ export const api = {
     request<{ ok: true }>(`/api/integrations/${id}`, { method: "DELETE" }),
   linearTeams: () =>
     request<LinearTeamsView>("/api/integrations/linear/teams"),
+  validateLinear: () =>
+    request<{ connected: boolean }>("/api/integrations/linear/validate", { method: "POST" }),
 
   // billing
   subscription: () => request<SubscriptionView>("/api/billing/subscription"),

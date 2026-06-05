@@ -206,6 +206,42 @@ export async function fetchLinearWorkspace(
   return { organizationId: org.id, workspaceName: org.name || "", urlKey: org.urlKey || "" };
 }
 
+// Confirm whether an OAuth access token still works. Used to detect when a user
+// has revoked DevAsign from their Linear workspace — Linear sends no webhook for
+// that, so we probe on demand (after the user visits "Manage Access"). Returns
+// "revoked" ONLY on a definitive auth failure; a transient hiccup yields
+// "unknown" so we never disconnect a still-valid integration.
+export async function validateLinearToken(
+  token: string,
+  opts: { bearer?: boolean } = {}
+): Promise<"valid" | "revoked" | "unknown"> {
+  const auth = opts.bearer === false ? token : `Bearer ${token}`;
+  try {
+    const res = await fetch(LINEAR_GRAPHQL, {
+      method: "POST",
+      headers: { Authorization: auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "query { viewer { id } }" }),
+    });
+    if (res.status === 401 || res.status === 403) return "revoked";
+    if (res.ok) {
+      const json = (await res.json().catch(() => null)) as
+        | { data?: { viewer?: { id?: string } }; errors?: Array<{ message?: string }> }
+        | null;
+      if (json?.data?.viewer?.id) return "valid";
+      if (json?.errors?.some((e) => /authentic/i.test(e?.message || ""))) return "revoked";
+      return "unknown";
+    }
+    // Linear returns 400 with an authentication error for an invalid/expired token.
+    if (res.status === 400) {
+      const body = await res.text().catch(() => "");
+      return /authenticat|invalid.*token|token.*invalid/i.test(body) ? "revoked" : "unknown";
+    }
+    return "unknown"; // 5xx and other ambiguous responses
+  } catch {
+    return "unknown"; // network error — don't disconnect on a blip
+  }
+}
+
 // The teams the connected token can see — i.e. the teams in the workspace the user
 // granted DevAsign access to. Rendered in Settings → Repository. Best-effort: a Linear
 // hiccup or schema change yields an empty list rather than failing the settings page.

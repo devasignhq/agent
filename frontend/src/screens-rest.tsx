@@ -126,6 +126,11 @@ const SetIntegrations = () => {
   const [linearError, setLinearError] = React.useState(
     () => new URLSearchParams(window.location.search).get("linear") === "error"
   );
+  // Set while the user is on a "Manage Access" trip to Linear (opened in a new
+  // tab). Gates the focus/visibility listener below so we only re-probe Linear
+  // after an explicit Manage Access click, then is cleared once the backend
+  // confirms the token is gone.
+  const managingLinearRef = React.useRef(false);
 
   const refresh = React.useCallback(async () => {
     try {
@@ -146,6 +151,34 @@ const SetIntegrations = () => {
     }
   }, []);
   React.useEffect(() => { refresh(); }, [refresh]);
+
+  // After a "Manage Access" trip, re-check the Linear token against the backend:
+  // if the user revoked DevAsign in Linear, the backend drops the row and the
+  // following refresh() collapses the card back to "Connect Linear".
+  const validateAndRefreshLinear = React.useCallback(async () => {
+    try {
+      const { connected } = await api.validateLinear();
+      if (!connected) managingLinearRef.current = false; // revoked — stop probing
+    } catch {
+      /* transient — keep the flag and retry on the next return */
+    }
+    await refresh();
+  }, [refresh]);
+
+  // The Manage Access target opens in a new tab, so the signal that the user
+  // finished (and possibly revoked) is them returning to this tab.
+  React.useEffect(() => {
+    const onReturn = () => {
+      if (!managingLinearRef.current || document.visibilityState === "hidden") return;
+      validateAndRefreshLinear();
+    };
+    window.addEventListener("focus", onReturn);
+    document.addEventListener("visibilitychange", onReturn);
+    return () => {
+      window.removeEventListener("focus", onReturn);
+      document.removeEventListener("visibilitychange", onReturn);
+    };
+  }, [validateAndRefreshLinear]);
 
   // Linear connects via an OAuth popup; main.tsx posts devasign_linear_done when
   // the callback lands back on our origin. Close the popup, then either refresh to
@@ -247,6 +280,20 @@ const SetIntegrations = () => {
       }
       setState(s => ({ ...s, [intKey]: { ...s[intKey], connected: false, expanded: false } }));
     }
+  };
+
+  // Send the user to their Linear workspace's authorized-applications page (new
+  // tab) to revoke DevAsign. Arming managingLinearRef lets the focus/visibility
+  // listener re-validate when they return; if they revoked, the card flips to
+  // "Connect Linear" on its own.
+  const manageLinearAccess = () => {
+    const row = rows.find((r) => r.type === "linear");
+    const urlKey = row?.workspaceMeta?.urlKey;
+    const url = urlKey
+      ? `https://linear.app/${urlKey}/settings/applications`
+      : "https://linear.app/settings/applications"; // fallback if urlKey wasn't captured
+    managingLinearRef.current = true;
+    window.open(url, "_blank", "noopener,noreferrer");
   };
 
   const connectedCount = INTEGRATIONS.filter(i => !i.inDevelopment && state[i.key].connected).length;
@@ -402,10 +449,16 @@ const SetIntegrations = () => {
 
                 {/* Footer actions */}
                 <div className="int-foot">
-                  <button
-                    className="btn ghost sm danger"
-                    onClick={() => setConnected(i.key, false)}
-                  >Disconnect</button>
+                  {i.key === "linear" ? (
+                    <button className="btn ghost sm" onClick={manageLinearAccess}>
+                      <Icon name="external" size={11}/> Manage Access
+                    </button>
+                  ) : (
+                    <button
+                      className="btn ghost sm danger"
+                      onClick={() => setConnected(i.key, false)}
+                    >Disconnect</button>
+                  )}
                 </div>
               </div>
             )}
@@ -885,17 +938,51 @@ const SetBilling = () => {
 
 
 // ─── Account · delete + export ──────────────────────────────────────────
+// Backend teardown is retry-safe: on these failures nothing was deleted, so the
+// copy tells the user they can simply try again.
+const DELETE_ERRORS = {
+  billing_cancel_failed:
+    "We couldn't cancel your subscription, so nothing was deleted. Please try again.",
+  github_uninstall_failed:
+    "We couldn't uninstall the GitHub App, so nothing was deleted. Please try again.",
+};
+
 const SetAccount = () => {
-  const { user } = useAuth();
+  const { user, signOut } = useAuth();
   const [step, setStep] = React.useState("idle"); // idle | confirm | done
   const [confirmText, setConfirmText] = React.useState("");
   const [confirmName, setConfirmName] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState(null);
   const REQUIRED = "delete my account";
 
   // Both factors must match: the user's own username AND the literal phrase. The
   // non-empty githubLogin guard keeps the button disabled when both fields are blank.
   const nameOk = !!user?.githubLogin && confirmName.trim().toLowerCase() === user.githubLogin.toLowerCase();
   const phraseOk = confirmText.trim().toLowerCase() === REQUIRED;
+
+  // Hard-delete the account server-side, then advance to the confirmation step.
+  // On failure the backend leaves everything intact (retry-safe), so we surface
+  // the error and stay on the confirm step instead of pretending it worked.
+  const deleteAccount = async () => {
+    setErr(null);
+    setBusy(true);
+    try {
+      await api.deleteAccount();
+      setStep("done");
+    } catch (e) {
+      setErr(DELETE_ERRORS[e?.message] || e?.message || "Couldn't delete your account. Please try again.");
+      setBusy(false);
+    }
+  };
+
+  // Once the account is gone, end the session and bounce to the sign-in screen
+  // (the cookie is already cleared server-side; this flips client auth state).
+  React.useEffect(() => {
+    if (step !== "done") return;
+    const t = setTimeout(() => { void signOut(); }, 2000);
+    return () => clearTimeout(t);
+  }, [step, signOut]);
 
   const memberSince = user?.createdAt
     ? new Date(user.createdAt).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
@@ -969,14 +1056,15 @@ const SetAccount = () => {
             onChange={(e) => setConfirmText(e.target.value)}
             style={{ maxWidth: 360, fontFamily: "var(--mono)" }} />
             <div className="flex gap-2">
-              <button className="btn" onClick={() => {setStep("idle");setConfirmText("");setConfirmName("");}}>Cancel</button>
+              <button className="btn" disabled={busy} onClick={() => {setStep("idle");setConfirmText("");setConfirmName("");setErr(null);}}>Cancel</button>
               <button
               className="btn danger"
-              disabled={!nameOk || !phraseOk}
-              onClick={() => setStep("done")}>
-                Permanently delete account
+              disabled={!nameOk || !phraseOk || busy}
+              onClick={deleteAccount}>
+                {busy ? "Deleting…" : "Permanently delete account"}
               </button>
             </div>
+            {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12 }}>{err}</div>}
           </div>
           }
 
@@ -984,11 +1072,11 @@ const SetAccount = () => {
           <div className="col gap-2">
             <div className="flex items-center gap-2">
               <Icon name="check" size={14} color="var(--accent)" />
-              <span className="mono" style={{ fontSize: 13 }}>Account scheduled for deletion</span>
+              <span className="mono" style={{ fontSize: 13 }}>Account permanently deleted</span>
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
-              Your data will be purged within 30 days. We've emailed maya@acme.dev with details and a
-              link to cancel if this was a mistake.
+              Your profile, agent settings, review history, and GitHub installs have been removed, and
+              any active subscription was canceled. Signing you out…
             </div>
           </div>
           }

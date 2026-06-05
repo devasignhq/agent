@@ -1,15 +1,17 @@
 // REST API for the frontend.
 import { Router } from "express";
+import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import type { Subscription } from "../types.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
-import { getSessionUser } from "../github/oauth.js";
-import { appJWT, gh } from "../github/app.js";
+import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
+import { appJWT, gh, uninstallApp } from "../github/app.js";
 import { config, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
-import { fetchLinearTeams } from "../linear/client.js";
+import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
-import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
+import { cancelScheduledChange, cancelSubscriptionForDeletion, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { effectivePlan, PLAN_LIMITS } from "../billing/plans.js";
 import {
   markAllRead,
@@ -31,6 +33,104 @@ api.get("/me", (req, res) => {
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   res.json({ user, subscription: sub });
 });
+
+// Hard-delete the signed-in user's account: cancel billing, uninstall the
+// GitHub App from every account/repo it reached, then erase all local rows and
+// clear the session. The uninstall uses the App's own JWT (via uninstallApp),
+// so it works without the user's OAuth token — which we deliberately never
+// store. Note this does NOT revoke the "Authorized GitHub Apps" OAuth grant
+// (that needs the user token); the user can revoke it from GitHub settings.
+//
+// Exported with injectable deps so unit tests can assert the teardown order and
+// failure handling without calling GitHub/Stripe; the route binds the real ones.
+export async function deleteAccountHandler(
+  req: Request,
+  res: Response,
+  deps: {
+    uninstallApp: (installationId: number) => Promise<void>;
+    cancelSubscriptionForDeletion: (sub: Subscription) => Promise<void>;
+  } = { uninstallApp, cancelSubscriptionForDeletion }
+) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+
+  // Snapshot every row set up front, before any await. The GitHub uninstall
+  // below triggers an `installation.deleted` webhook that races to delete some
+  // of these same rows; capturing ids now keeps our cleanup independent of it.
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installDbIds = new Set(installs.map((i) => i.id));
+  const repoIds = new Set(
+    db.filter("repositories", (r) => installDbIds.has(r.installationId)).map((r) => r.id)
+  );
+  const reviews = db.filter("prReviews", (r) => repoIds.has(r.repoId));
+  const reviewIds = new Set(reviews.map((r) => r.id));
+  // PR-linked tasks carry no userId (only Linear tasks do), so collect them via
+  // the reviews we're deleting; Linear tasks are dropped by userId below.
+  const prTaskIds = new Set(
+    reviews.map((r) => r.taskId).filter((id): id is string => typeof id === "string")
+  );
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+
+  // ── External teardown first ────────────────────────────────────────────────
+  // Must succeed before we drop local state, so a transient failure leaves the
+  // account intact and the call is safe to retry — every step here is idempotent.
+
+  // 1. Cancel Stripe billing so the card stops being charged.
+  if (sub && isStripeConfigured()) {
+    try {
+      await deps.cancelSubscriptionForDeletion(sub);
+    } catch (err) {
+      console.error(`[account] Stripe cancel failed for user ${user.id}:`, err);
+      return void res.status(502).json({ error: "billing_cancel_failed" });
+    }
+  }
+
+  // 2. Uninstall the GitHub App from each account it's installed on. One DELETE
+  //    per installation revokes repo access everywhere that install reached.
+  if (isGithubAppConfigured()) {
+    for (const install of installs) {
+      try {
+        await deps.uninstallApp(install.installationId);
+      } catch (err) {
+        console.error(
+          `[account] GitHub uninstall ${install.installationId} failed for user ${user.id}:`,
+          err
+        );
+        return void res.status(502).json({ error: "github_uninstall_failed" });
+      }
+    }
+  } else if (installs.length > 0) {
+    // No App credentials (e.g. local dev) — we can't call GitHub, so the App
+    // stays installed there even though we erase our local rows. Log it rather
+    // than silently leaving installs behind.
+    console.warn(
+      `[account] GitHub App not configured — leaving ${installs.length} installation(s) in place for user ${user.id}`
+    );
+  }
+
+  // ── Erase local state, child rows first ─────────────────────────────────────
+  db.remove("reviewLogs", (l) => reviewIds.has(l.reviewId));
+  db.remove("prReviews", (r) => reviewIds.has(r.id));
+  db.remove("repoIndex", (e) => repoIds.has(e.repoId));
+  db.remove("repositories", (r) => repoIds.has(r.id));
+  db.remove("installations", (i) => installDbIds.has(i.id));
+  db.remove("tasks", (t) => t.userId === user.id || prTaskIds.has(t.id));
+  db.remove("integrations", (i) => i.userId === user.id);
+  db.remove("subscriptions", (s) => s.userId === user.id);
+  db.remove("notifications", (n) => n.userId === user.id);
+  db.remove("linearProjectUpdates", (u) => u.userId === user.id);
+  db.remove("authAudit", (a) => a.userId === user.id);
+  db.remove("users", (u) => u.id === user.id);
+
+  // Clear the session cookie (same attributes as signOut, or the browser won't
+  // overwrite it) and end the session.
+  clearSessionCookie(res);
+  res.json({ ok: true });
+}
+
+// Wrap so Express's (req, res, next) never leaks `next` into the deps slot —
+// the route always runs with the real GitHub/Stripe implementations.
+api.delete("/me", (req, res) => deleteAccountHandler(req, res));
 
 api.get("/health", (_req, res) => {
   res.json({
@@ -641,6 +741,26 @@ api.get("/integrations/linear/teams", async (req, res) => {
     workspace: row.workspaceMeta?.workspaceName || row.workspaceMeta?.urlKey || "",
     teams,
   });
+});
+
+// Re-check the stored Linear token against Linear. Called after the user visits
+// "Manage Access" (where they can revoke DevAsign) — Linear has no revocation
+// webhook, so we probe on demand. If the token is confirmed revoked we drop the
+// row so the UI flips back to "Connect Linear"; a transient failure keeps it.
+api.post("/integrations/linear/validate", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const row = db.find(
+    "integrations",
+    (i) => i.userId === user.id && i.type === "linear"
+  );
+  if (!row) return void res.json({ connected: false });
+  const status = await validateLinearToken(row.tokens.accessToken);
+  if (status === "revoked") {
+    db.remove("integrations", (i) => i.id === row.id && i.userId === user.id);
+    return void res.json({ connected: false });
+  }
+  res.json({ connected: true }); // "valid" or "unknown" → keep the row
 });
 
 // --- Billing (Stripe) ---
