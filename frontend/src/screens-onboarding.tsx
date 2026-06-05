@@ -2,8 +2,9 @@
 // Auth + Onboarding screens
 import React from "react";
 import { Icon } from "./icons";
-import { api, installRedirectUrl } from "./api";
-import { registerPopup } from "./popup-registry";
+import { api, installRedirectUrl, linearConnectUrl } from "./api";
+import { registerPopup, closePopup } from "./popup-registry";
+import { useAuth } from "./auth-context";
 
 const Auth = ({ onSignIn }) => (
   <div className="auth-shell">
@@ -195,7 +196,7 @@ const Onboarding = ({ onDone }) => {
     }
   }, [ghInstall.status]);
 
-  const [integ, setInteg] = React.useState({ slack: false, linear: false, discord: false });
+  const [integ, setInteg] = React.useState({ linear: false });
 
   const ghReady = ghInstall.status === "installed";
   const canAdvance = step !== 0 || ghReady;
@@ -492,63 +493,94 @@ const GHRepoBrowser = ({ accounts, onReconfigure, totalRepos }) => (
 
 const OBInteg = ({ integ, setInteg }) => {
   const items = [
-    { key: "slack",   icon: "slack",   name: "Slack",   desc: "Get review summaries in a channel. Mention @devasign to re-review." },
     { key: "linear",  icon: "linear",  name: "Linear",  desc: "Auto-pull goal context from the linked ticket on PR open." },
-    { key: "discord", icon: "discord", name: "Discord", desc: "Notify on bounty applications and PR submissions." },
   ];
+
+  // Linear is a Pro/Max feature; the backend 403s free users. We surface a
+  // Pro/Max lock instead of a Connect button for them (gated on planKnown so a
+  // paid user doesn't flash the lock before /api/me resolves).
+  const { user, status } = useAuth();
+  const planKnown = status === "signed_in";
+  const isFree = (user?.plan || "free") === "free";
 
   const [busy, setBusy] = React.useState(null);  // key currently being connected/disconnected
   const [rows, setRows] = React.useState([]);    // /api/integrations response
-  React.useEffect(() => {
-    api.integrations().then((list) => {
-      setRows(list);
-      const next = { slack: false, linear: false, discord: false };
-      for (const r of list) next[r.type] = true;
-      setInteg(next);
-    }).catch(() => {});
-  }, []);
+  // Inline error for the Linear OAuth round-trip, set when the popup posts
+  // devasign_linear_done {ok:false}.
+  const [linearError, setLinearError] = React.useState(false);
 
+  // Hydrate connection state from the backend. Reused after an OAuth connect so
+  // the card flips to "connected" once the integration row lands.
+  const refresh = React.useCallback(async () => {
+    try {
+      const list = await api.integrations();
+      setRows(list);
+      setInteg({ linear: list.some((r) => r.type === "linear") });
+    } catch {
+      /* leave current state on a transient failure */
+    }
+  }, [setInteg]);
+  React.useEffect(() => { refresh(); }, [refresh]);
+
+  // Linear connects via an OAuth popup; main.tsx posts devasign_linear_done when
+  // the callback lands back on our origin. Close the popup, then either refresh to
+  // pick up the new integration row (ok) or surface an inline error (!ok).
+  React.useEffect(() => {
+    const onMsg = (e) => {
+      if (e.origin !== window.location.origin) return;
+      const d = e.data;
+      if (!d || d.type !== "devasign_linear_done") return;
+      closePopup("linear");
+      setBusy(null);
+      if (d.ok === false) setLinearError(true);
+      else { setLinearError(false); setTimeout(refresh, 400); }
+    };
+    window.addEventListener("message", onMsg);
+    return () => window.removeEventListener("message", onMsg);
+  }, [refresh]);
+
+  // Connect = open the Linear OAuth popup (whole-workspace auth, same flow as
+  // Settings → Integrations); disconnect = drop the integration row. Free users
+  // never reach the connect path — the card renders a Pro/Max lock instead.
   const toggle = async (key) => {
     if (busy) return;
-    setBusy(key);
-    try {
-      if (integ[key]) {
+    if (integ[key]) {
+      setBusy(key);
+      try {
         const row = rows.find((r) => r.type === key);
         if (row) {
           await api.removeIntegration(row.id);
           setRows((rs) => rs.filter((r) => r.id !== row.id));
         }
         setInteg({ ...integ, [key]: false });
-      } else {
-        // For onboarding we store a placeholder token; Settings has the full
-        // OAuth/token-paste flow. The real integration UX lives in §6 of the
-        // spec — this is the simplest credible wire-up so the agent has *some*
-        // tokens to broadcast with.
-        const token = prompt(
-          key === "slack"   ? "Slack bot token (xoxb-…)" :
-          key === "linear"  ? "Linear API key (lin_api_…)" :
-                              "Discord bot token"
-        );
-        if (!token) { setBusy(null); return; }
-        const channel =
-          key === "slack" ? (prompt("Channel to broadcast verdicts to (e.g. #pr-reviews)") || "")
-          : key === "discord" ? (prompt("Discord channel ID") || "")
-          : "";
-        const created = await api.addIntegration({
-          type: key,
-          tokens: key === "linear" ? { apiKey: token } : { botToken: token },
-          workspaceMeta: channel
-            ? (key === "slack" ? { channel } : { channelId: channel })
-            : {},
-        });
-        setRows((rs) => [...rs, { id: created.id, type: key, workspaceMeta: {}, createdAt: Date.now() }]);
-        setInteg({ ...integ, [key]: true });
+      } catch (err) {
+        alert(`Disconnect failed: ${err.message || err}`);
+      } finally {
+        setBusy(null);
       }
-    } catch (err) {
-      alert(`Integration ${integ[key] ? "disconnect" : "connect"} failed: ${err.message || err}`);
-    } finally {
-      setBusy(null);
+      return;
     }
+    // A fresh attempt clears any prior inline error. Open the backend authorize
+    // endpoint in a popup; the message listener above refreshes on return.
+    setLinearError(false);
+    const popup = window.open(
+      linearConnectUrl,
+      "devasign_linear",
+      "width=920,height=780,menubar=no,toolbar=no,location=yes"
+    );
+    if (!popup) { window.location.href = linearConnectUrl; return; } // popup blocked
+    registerPopup("linear", popup);
+    popup.focus();
+    setBusy(key);
+    // Fallback: if the user closes the popup before the message lands, stop the
+    // spinner and refresh anyway when it closes.
+    const watch = setInterval(() => {
+      if (popup.closed) {
+        clearInterval(watch);
+        setBusy((b) => (b === key ? null : b));
+        refresh();
+      }
+    }, 500);
   };
 
   return (
@@ -556,31 +588,55 @@ const OBInteg = ({ integ, setInteg }) => {
       <div className="ob-eyebrow">step 02 / integrations</div>
       <h1 className="ob-title">Wire DevAsign into where you already work.</h1>
       <p className="ob-desc">
-        Optional. Connect Slack, Linear or Discord so the agent can pull ticket context
-        and broadcast review verdicts to your team.
+        Optional. Connect Linear so the agent can auto-pull goal context from the
+        linked ticket when a PR opens.
       </p>
 
       <div className="integ-list">
-        {items.map(it => (
-          <div key={it.key} className={`integ ${integ[it.key] ? "connected" : ""}`}>
-            <div className="integ-icon"><Icon name={it.icon} size={16}/></div>
-            <div>
-              <div className="integ-name">{it.name}</div>
-              <div className="integ-desc">{it.desc}</div>
+        {items.map(it => {
+          const connected = integ[it.key];
+          const locked = !connected && planKnown && isFree;
+          return (
+            <div key={it.key} className={`integ ${connected ? "connected" : ""}`}>
+              <div className="integ-icon"><Icon name={it.icon} size={16}/></div>
+              <div>
+                <div className="integ-name">{it.name}</div>
+                <div className="integ-desc">{it.desc}</div>
+              </div>
+              <span className={`pill ${connected ? "ok" : ""}`}>
+                {connected ? <><i className="dot"></i> connected</> : locked ? "Pro · Max" : "not connected"}
+              </span>
+              {locked ? (
+                // Linear is Pro/Max only — show a disabled Connect so the row keeps
+                // its shape; the pill + the note below explain why. Connecting
+                // happens later from Settings once they upgrade.
+                <button className="btn" disabled style={{ opacity: 0.4, cursor: "not-allowed", whiteSpace: "nowrap" }}>
+                  Connect
+                </button>
+              ) : (
+                <button
+                  className={`btn ${connected ? "ghost" : ""}`}
+                  onClick={() => toggle(it.key)}
+                  disabled={busy === it.key}
+                >
+                  {busy === it.key ? "…" : connected ? "Disconnect" : "Connect"}
+                </button>
+              )}
             </div>
-            <span className={`pill ${integ[it.key] ? "ok" : ""}`}>
-              {integ[it.key] ? <><i className="dot"></i> connected</> : "not connected"}
-            </span>
-            <button
-              className={`btn ${integ[it.key] ? "ghost" : ""}`}
-              onClick={() => toggle(it.key)}
-              disabled={busy === it.key}
-            >
-              {busy === it.key ? "…" : integ[it.key] ? "Disconnect" : "Connect"}
-            </button>
-          </div>
-        ))}
+          );
+        })}
       </div>
+
+      {linearError && (
+        <div className="mono txt-danger" style={{ fontSize: 11, marginTop: 10 }}>
+          Couldn't connect Linear — the authorization didn't complete. Click Connect to try again.
+        </div>
+      )}
+      {planKnown && isFree && (
+        <p className="mute mono" style={{ fontSize: 11, marginTop: 12, lineHeight: 1.6 }}>
+          Linear is a Pro &amp; Max feature — connect it any time from Settings → Integrations after upgrading.
+        </p>
+      )}
     </>
   );
 };
