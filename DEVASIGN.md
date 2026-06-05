@@ -10,10 +10,13 @@ for how this file is used and scoped.
 - All Claude / LLM calls go through `complete()` in `backend/src/llm.ts`; pass
   `cacheSystem: true` when the system prompt is static.
 - GitHub REST calls go through the `gh()` helper in `backend/src/github/app.ts`;
-  the documented exceptions are raw blob reads via `installationToken` and the
+  the documented exceptions are raw blob reads via `installationToken`, the
   OAuth user-token identity calls (`/user`, `/user/emails`) in
-  `backend/src/github/oauth.ts`, which need the user's OAuth token rather than an
-  installation token.
+  `backend/src/github/oauth.ts` (which need the user's OAuth token rather than an
+  installation token), and the App-JWT `/app/installations` calls — minting
+  installation tokens, listing installs, and `uninstallApp`'s install delete —
+  which need the App JWT (an installation token can't delete or enumerate
+  installations).
 - Persistence goes through the `db` helper (`db.insert/update/find/filter`); do
   not write raw SQL in feature code.
 - A review finding only blocks a merge when its severity is `blocker`; advisory
