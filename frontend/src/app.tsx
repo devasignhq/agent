@@ -425,12 +425,37 @@ const MobileTabBar = ({ current, setCurrent }) => (
   </nav>
 );
 
+// One-shot "welcome back" pop-up shown after a pending-deletion account is
+// restored by logging in. Reuses the shared .modal-scrim/.modal styling.
+const WelcomeBackModal = ({ onClose }: { onClose: () => void }) => (
+  <div className="modal-scrim" onClick={onClose}>
+    <div
+      className="modal"
+      style={{ width: "min(420px, 100%)", padding: 24 }}
+      onClick={(e) => e.stopPropagation()}>
+      <div className="col gap-3" style={{ alignItems: "flex-start" }}>
+        <div className="flex items-center gap-2">
+          <Icon name="check" size={16} color="var(--accent)" />
+          <span className="mono" style={{ fontSize: 15 }}>Welcome back</span>
+        </div>
+        <div className="mute" style={{ fontSize: 13 }}>
+          Your account has been restored — your code review will resume immediately.
+        </div>
+        <button className="btn" style={{ marginTop: 4 }} onClick={onClose}>Got it</button>
+      </div>
+    </div>
+  </div>
+);
+
 const App = () => {
   const auth = useAuth();
   // stage = auth | onboarding | app — derived from signed-in state + whether
   // the user has any GitHub App installations linked. `force` lets the user
   // re-enter onboarding from settings if they want to add another install.
   const [forceStage, setForceStage] = React.useState<null | "onboarding" | "app">(null);
+  // Optimistically hide the welcome-back pop-up the instant it's dismissed,
+  // before the ack round-trip + reload clears the server-side flag.
+  const [welcomeAcked, setWelcomeAcked] = React.useState(false);
   const [hasInstall, setHasInstall] = React.useState<null | boolean>(null);
   const [current, setCurrent] = React.useState("agent");
   // Lets a deep-link (e.g. returning from Stripe) open a specific Settings tab.
@@ -471,6 +496,7 @@ const App = () => {
     const url = new URL(window.location.href);
     if (url.searchParams.get("auth") !== "ok") return;
     url.searchParams.delete("auth");
+    url.searchParams.delete("welcome_back");
     window.history.replaceState({}, "", url.pathname + url.search);
     auth.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -679,6 +705,14 @@ const App = () => {
       </div>
       {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} />}
       <TweaksUI t={t} setTweak={setTweak} />
+      {auth.user?.welcomeBack && !welcomeAcked && (
+        <WelcomeBackModal
+          onClose={() => {
+            setWelcomeAcked(true);
+            void api.ackWelcomeBack().finally(() => auth.reload());
+          }}
+        />
+      )}
     </div>
   );
 };

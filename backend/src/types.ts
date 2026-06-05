@@ -8,6 +8,16 @@ export type User = {
   avatarUrl?: string;
   plan: "free" | "pro" | "max";
   createdAt: number;
+  // ── Account-deletion lifecycle (soft delete with a 14-day restore window) ──
+  // Set when the user requests deletion; its presence means "pending deletion",
+  // which pauses code review. The purge sweep wipes the account 14 days later.
+  // Cleared when they log back in — logging in is what restores the account.
+  deletionRequestedAt?: number;
+  // Guards the one-time day-12 reminder email so the sweep doesn't resend it.
+  reminderSentAt?: number;
+  // One-shot flag set on restore; the frontend shows a "welcome back" pop-up,
+  // then acks it (POST /api/me/welcome-back/ack) to clear it.
+  welcomeBack?: boolean;
 };
 
 export type Installation = {
@@ -197,9 +207,14 @@ export type Subscription = {
   status: SubscriptionStatus | null;
   currentPeriodEnd: number | null;
   cancelAtPeriodEnd: boolean;
-  // A deferred downgrade scheduled via a Stripe Subscription Schedule: the tier
-  // it switches to at period end + the schedule id (for revert). null when none.
+  // The billed interval, synced from the Stripe price. Optional/absent on legacy
+  // rows and brand-new free rows; read via intervalOf() which defaults to "month".
+  interval?: "month" | "year" | null;
+  // A deferred switch scheduled via a Stripe Subscription Schedule: the tier and
+  // interval it switches to at period end + the schedule id (for revert). null
+  // when none. pendingInterval is optional so old rows still load.
   pendingPlan: "free" | "pro" | "max" | null;
+  pendingInterval?: "month" | "year" | null;
   scheduleId: string | null;
   // Monthly PR-review usage: `reviewsUsed` counts unique PRs reviewed in the
   // window that began at `usagePeriodStart` (rolls monthly for free; synced to
