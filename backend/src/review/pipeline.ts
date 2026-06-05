@@ -27,6 +27,7 @@ import {
 } from "./devasign.js";
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 import { modelForPlan, planForUser } from "../billing/plans.js";
+import { buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -128,6 +129,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   log(review.id, "review", "Pipeline started");
 
   try {
+    // Snapshot the previous run's verdict (met/evidence) per criterion before
+    // anything below overwrites review.criteria. On a `synchronize` re-review
+    // this is what the review step anchors on, so a criterion an earlier commit
+    // already satisfied stays satisfied instead of being re-judged from scratch
+    // (and possibly flipped to "unmet") when a follow-up commit is pushed.
+    // Empty on a first review → every criterion evaluates fresh, as before.
+    const priorVerdicts = new Map<string, PriorVerdict>(
+      review.criteria.map((c) => [c.id, { met: c.met, evidence: c.evidence }])
+    );
+
     // a. Ingest
     const context = await ingestContext(review, repo, install);
     log(review.id, "ingest", "Context ingested", {
@@ -262,7 +273,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     setStatus(review.id, { taskId: task.id, criteria });
 
     // c. Review the diff against the criteria
-    const verdict = await reviewDiff(review, context, criteria);
+    const verdict = await reviewDiff(review, context, criteria, priorVerdicts);
     const filledCriteria: Criterion[] = criteria.map((c) => {
       const m = verdict.criteria.find((vc) => vc.id === c.id);
       return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
@@ -534,6 +545,11 @@ type IngestedSource = { kind: string; ref: string; text: string };
 type Context = {
   sources: IngestedSource[];
   diff: string;
+  // Newline-delimited list of the PR's commits ("<sha7> — <subject>"), with a
+  // one-line preamble. Handed to the review step (not criteria synthesis) so a
+  // re-review understands the diff is the cumulative result of every commit,
+  // not just the latest push. Empty when the fetch is unavailable.
+  commits: string;
   videos: VideoSummary[];
   primaryIssues: number[];
   secondaryIssues: number[];
@@ -552,6 +568,7 @@ async function ingestContext(
 ): Promise<Context> {
   const sources: IngestedSource[] = [];
   let diff = "";
+  let commits = "";
   let prBody = "";
   let prBranch = "";
   let linkedLinearIssue: { id: string; identifier: string; url: string } | null = null;
@@ -605,6 +622,33 @@ async function ingestContext(
         { Accept: "application/vnd.github.v3.diff" }
       );
       sources.push({ kind: "diff", ref: review.headSha, text: diff.slice(0, 50_000) });
+
+      // Commit list — so the review step knows the diff above is the cumulative
+      // result of every commit in the PR (and what each did), not the latest
+      // push in isolation. This is the fix for re-reviews wrongly re-failing
+      // criteria that earlier commits already satisfied. Best-effort and in its
+      // own try/catch: a failure here must not abort the rest of ingestion.
+      // GitHub caps this endpoint at 250 commits; one page of 100 is ample
+      // narrative context (the diff, not the list, is the evidence of record).
+      try {
+        const prCommits = await gh<Array<{ sha: string; commit: { message: string } }>>(
+          install.installationId,
+          `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/commits?per_page=100`
+        );
+        if (prCommits.length) {
+          const total = typeof pr.commits === "number" ? pr.commits : prCommits.length;
+          const lines = prCommits.map(
+            (c) => `- ${c.sha.slice(0, 7)} — ${(c.commit?.message || "").split("\n")[0]}`
+          );
+          const preamble =
+            prCommits.length < total
+              ? `This PR is the cumulative result of ${total} commits (first ${prCommits.length} shown); the diff above already contains all of them:`
+              : `This PR is the cumulative result of these ${prCommits.length} commit${prCommits.length === 1 ? "" : "s"}; the diff above already contains all of them:`;
+          commits = `${preamble}\n${lines.join("\n")}`;
+        }
+      } catch (err) {
+        console.warn(`[ingest] commits fetch failed:`, err);
+      }
 
       // Videos embedded directly in the PR body — same path Gemini takes for
       // attachments. The PR description is often where a Loom lives.
@@ -758,6 +802,7 @@ async function ingestContext(
   return {
     sources,
     diff,
+    commits,
     videos,
     primaryIssues,
     secondaryIssues,
@@ -1240,7 +1285,8 @@ type ReviewSuggestion = {
 async function reviewDiff(
   review: PRReview,
   context: Context,
-  criteria: Criterion[]
+  criteria: Criterion[],
+  prior: Map<string, PriorVerdict> = new Map()
 ): Promise<{
   summary: string;
   criteria: Array<{ id: string; met: boolean; evidence: string }>;
@@ -1254,6 +1300,16 @@ async function reviewDiff(
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
     "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
+    // Stateful re-review: each criterion carries the verdict it got on an
+    // earlier commit in this same PR. We anchor on that to stop a follow-up
+    // commit (e.g. a security fix) from re-failing work earlier commits already
+    // landed — genuine regressions still flip it, and the whole-repo pass is an
+    // independent backstop for breakage/security.
+    "Some criteria are annotated with the verdict they received in a PREVIOUS review of an earlier commit in THIS SAME pull request; the diff below is cumulative and already includes those earlier commits. " +
+    "For a criterion marked '[previously SATISFIED by an earlier commit in this PR]', keep met:true UNLESS the current diff shows that satisfying code was removed, reverted, or broken — only then set met:false, and cite the specific hunk as evidence. " +
+    "Never flip a previously-satisfied criterion to unmet merely because it is not the focus of the latest commit, or because you cannot find its evidence in a truncated diff. " +
+    "Evaluate criteria marked '[previously NOT met — re-evaluate]' or '[not yet evaluated]' fresh against the full diff. " +
+    "If the diff is marked truncated, treat any criterion you cannot verify as unchanged from its previous verdict rather than newly failing it. " +
     "If the criteria list is empty, do NOT invent criteria or acceptance checks — review only for concrete, " +
     "evidence-backed defects in the diff, and if it is sound return empty `comments` and `suggestions` with a brief, " +
     "positive `summary`. Never manufacture issues to appear thorough. " +
@@ -1274,9 +1330,21 @@ async function reviewDiff(
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
     "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk.";
+  // Keep the head of the diff; mark when we drop the tail so the model reads a
+  // missing hunk as "not shown" rather than "not done" (which, combined with the
+  // prior-verdict anchoring above, is what stops truncation from regressing a
+  // previously-met criterion).
+  const DIFF_CAP = 60_000;
+  const diffTruncated = context.diff.length > DIFF_CAP;
+  const diffBody =
+    context.diff.slice(0, DIFF_CAP) +
+    (diffTruncated
+      ? "\n[diff truncated — later hunks omitted; absence of a change here is NOT evidence it is missing]"
+      : "");
   const userText =
-    `# Criteria\n${criteria.map((c) => `- ${c.id}: ${c.text}`).join("\n")}\n\n` +
-    `# Diff\n\`\`\`diff\n${context.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    `# Criteria\n${buildCriteriaSection(criteria, prior)}\n\n` +
+    (context.commits ? `# Commits in this PR\n${context.commits}\n\n` : "") +
+    `# Diff\n\`\`\`diff\n${diffBody}\n\`\`\`\n\n` +
     `# Supporting context\n` +
     context.sources
       .filter((s) => s.kind !== "diff")
