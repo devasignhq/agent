@@ -27,7 +27,7 @@ import {
 } from "./devasign.js";
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 import { modelForPlan, planForUser } from "../billing/plans.js";
-import { buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
+import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -2063,16 +2063,20 @@ async function refineGoalFromFeedback(args: {
   const { review, endGoal, criteria, feedback } = args;
   const system =
     "You are DevAsign's maintainer-feedback goal refinement step. A maintainer or collaborator left a comment " +
-    "on an open PR. Decide whether the comment (plus any video summaries or doc references it carries) " +
-    "meaningfully changes what 'done' means for the PR. Only update the goal/criteria when the feedback adds " +
-    "something concrete and clearly aligned with the product being built. Never invent requirements the " +
-    "feedback didn't actually state. " +
+    "on an open PR. Decide whether the comment (plus any video summaries or doc references it carries) adds " +
+    "any NEW acceptance criteria — concrete, independently checkable requirements that aren't already covered " +
+    "by the existing list. Never invent requirements the feedback didn't actually state. " +
+    "Existing acceptance criteria are LOCKED: you must not remove, rephrase, renumber, merge, or restate them. " +
+    "Your job is purely additive — only return brand-new criteria the comment introduces. If the comment is " +
+    "conversational, off-topic, asks a question, or only restates something already in the list, return " +
+    "`addedCriteria: []` and `changed: false`. " +
     "If there are NO existing acceptance criteria (the criteria list below is empty — the PR had no linked spec) and " +
-    "the comment supplies goal or acceptance information, treat the comment as the authoritative specification: set " +
-    "`changed` to true and synthesize the end goal and acceptance criteria directly from it (its text plus any video " +
-    "summaries or referenced docs provided). " +
-    'Emit ONLY JSON: {"changed": boolean, "endGoal": string, "criteria": [{"id": string, "text": string}], "rationale": string}. ' +
-    "When `changed` is false, echo back the original endGoal and criteria.";
+    "the comment supplies goal or acceptance information, treat the comment as the authoritative specification and " +
+    "populate `addedCriteria` directly from it (its text plus any video summaries or referenced docs provided). " +
+    "You may refine `endGoal` to reflect the new direction, but only when `addedCriteria` is non-empty — otherwise " +
+    "echo the original endGoal back unchanged. " +
+    'Emit ONLY JSON: {"changed": boolean, "endGoal": string, "addedCriteria": [{"text": string}], "rationale": string}. ' +
+    "Each `addedCriteria.text` is one independently checkable statement. Do NOT include ids — the system assigns them.";
 
   const videoBlock = feedback.videoSummaries
     .map((v, i) => {
@@ -2105,33 +2109,32 @@ async function refineGoalFromFeedback(args: {
     cacheSystem: true,
     messages: [{ role: "user", content: userText }],
   });
-  const parsed = tryParseJSON(raw, {
-    changed: false,
-    endGoal,
-    criteria: criteria.map((c) => ({ id: c.id, text: c.text })),
-    rationale: "",
-  });
+  const parsed = tryParseJSON<{
+    changed?: boolean;
+    endGoal?: string;
+    addedCriteria?: Array<{ text?: string }>;
+    rationale?: string;
+  }>(raw, { changed: false, endGoal, addedCriteria: [], rationale: "" });
 
-  if (!parsed.changed) {
-    return { endGoal, criteria, changed: false, rationale: String(parsed.rationale || "") };
+  const addedTexts = (parsed.addedCriteria || [])
+    .map((c) => String(c?.text || "").trim())
+    .filter(Boolean);
+  const rationale = String(parsed.rationale || "");
+
+  // The merge is what enforces the additive contract: existing criteria pass
+  // through bit-for-bit (so met/evidence from prior reviews survive) and the
+  // new ones get appended with fresh non-colliding ids. `changed` is derived
+  // from whether any additions actually landed — that way the contract stays
+  // self-consistent even when the model contradicts itself.
+  if (!addedTexts.length) {
+    return { endGoal, criteria, changed: false, rationale };
   }
-
-  const nextCriteria: Criterion[] = (parsed.criteria || []).map((c: any, i: number) => {
-    const id = String(c.id || `c${i + 1}`);
-    const prev = criteria.find((x) => x.id === id);
-    return {
-      id,
-      text: String(c.text || ""),
-      met: prev?.met ?? null,
-      evidence: prev?.evidence ?? null,
-    };
-  });
-
+  const nextCriteria = appendAddedCriteria(criteria, addedTexts);
   return {
     endGoal: String(parsed.endGoal || endGoal),
-    criteria: nextCriteria.length ? nextCriteria : criteria,
+    criteria: nextCriteria,
     changed: true,
-    rationale: String(parsed.rationale || ""),
+    rationale,
   };
 }
 

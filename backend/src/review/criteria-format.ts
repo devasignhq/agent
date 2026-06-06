@@ -32,3 +32,32 @@ export function buildCriteriaSection(
     })
     .join("\n");
 }
+
+// Append fresh criteria from a maintainer comment (or any other additive source)
+// onto the existing list. Existing criteria pass through untouched — including
+// `met` and `evidence` — so prior verdicts survive the next review pass and
+// already-satisfied requirements don't re-fail just because a new bar moved.
+// New IDs continue the `c{N}` sequence past whatever numeric suffix the
+// existing list reached, so they never collide with a preserved id.
+export function appendAddedCriteria(
+  existing: Criterion[],
+  addedTexts: string[]
+): Criterion[] {
+  const cleaned = addedTexts.map((t) => String(t || "").trim()).filter(Boolean);
+  if (!cleaned.length) return existing;
+  let nextN = 0;
+  for (const c of existing) {
+    const m = /^c(\d+)$/.exec(c.id);
+    if (m) {
+      const n = Number(m[1]);
+      if (n > nextN) nextN = n;
+    }
+  }
+  const added: Criterion[] = cleaned.map((text) => ({
+    id: `c${++nextN}`,
+    text,
+    met: null,
+    evidence: null,
+  }));
+  return [...existing, ...added];
+}
