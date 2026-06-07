@@ -137,3 +137,53 @@ export function rollAndCheckUsage(sub: Subscription): UsageCheck {
 export function recordReviewUsage(subId: string, used: number): void {
   db.update("subscriptions", (s) => s.id === subId, { reviewsUsed: used + 1 });
 }
+
+// Single source of truth for the private-repo rule: a private repo whose owner's
+// effective plan lacks private-repo access (Free, or a lapsed paid sub) is
+// blocked. Unlinked installs (no userId yet) get the onboarding grace window and
+// are never blocked here — gating begins once the install is linked. The webhook
+// nudges the author with an upgrade notice; runReviewJob enforces this for every
+// enqueue path so no review is ever posted on a blocked private repo.
+export function privateRepoBlocked(
+  isPrivate: boolean,
+  ownerUserId: string | null | undefined
+): boolean {
+  if (!isPrivate || !ownerUserId) return false;
+  return !PLAN_LIMITS[planForUser(ownerUserId)].privateRepos;
+}
+
+// Monthly-cap enforcement for a *new* PR review, charged once per unique PR.
+// Returns:
+//   null               → no charge applies: a re-review of a PR we already track,
+//                        a plan-blocked private repo (never reviewed, so it must
+//                        not consume the cap), an unlinked install, or a user
+//                        with no subscription row.
+//   { allowed: true }  → new PR under the cap; one review has been charged.
+//   { allowed: false } → new PR at the cap; nothing charged — caller must skip.
+//
+// Re-pushes/re-opens reuse the existing prReview row and are intentionally free
+// (priorReview short-circuits). Called at every new-PR entry point — the `opened`
+// webhook, comment-triggered ensurePRReview, and /reviews/sync — so the cap can't
+// be bypassed by a path that never reaches the webhook gate.
+export function chargeForNewPRReview(
+  ownerUserId: string,
+  repo: { id: string; private: boolean },
+  prNumber: number
+): { allowed: boolean; limit: number } | null {
+  if (!ownerUserId) return null;
+  // A private repo the plan can't review is blocked outright (privateRepoBlocked
+  // / runReviewJob); it never runs, so it must never consume a review.
+  if (privateRepoBlocked(repo.private, ownerUserId)) return null;
+  // Charge once per unique PR — an existing row means this is a re-review.
+  const priorReview = db.find(
+    "prReviews",
+    (r) => r.repoId === repo.id && r.prNumber === prNumber
+  );
+  if (priorReview) return null;
+  const sub = subscriptionForUser(ownerUserId);
+  if (!sub) return null;
+  const usage = rollAndCheckUsage(sub);
+  if (!usage.allowed) return { allowed: false, limit: usage.limit };
+  recordReviewUsage(sub.id, usage.used);
+  return { allowed: true, limit: usage.limit };
+}

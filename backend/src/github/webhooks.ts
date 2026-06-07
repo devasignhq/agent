@@ -10,11 +10,10 @@ import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue
 import { notifyForReview } from "../notifications.js";
 import {
   PLAN_LIMITS,
+  chargeForNewPRReview,
   planForUser,
-  recordReviewUsage,
-  rollAndCheckUsage,
-  subscriptionForUser,
 } from "../billing/plans.js";
+import { posthog } from "../posthog.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) return true; // dev mode: skip verification
@@ -380,6 +379,20 @@ async function ensurePRReview(
     return null;
   }
 
+  // Monthly-cap gate for a PR surfaced by a maintainer comment — this path
+  // skips the `opened` webhook's cap check. Charge once per unique PR; an
+  // over-cap owner's new PR is dropped rather than reviewed past their limit.
+  // (The private-repo gate is enforced centrally in runReviewJob.)
+  const ownerUserId =
+    db.find("installations", (i) => i.id === repo.installationId)?.userId || "";
+  const cap = chargeForNewPRReview(ownerUserId, repo, prNumber);
+  if (cap && !cap.allowed) {
+    console.log(
+      `[webhook] ensurePRReview: ${repoFullName}#${prNumber} skipped — monthly review cap reached`
+    );
+    return null;
+  }
+
   const review = {
     id: uuid(),
     repoId: repo.id,
@@ -452,12 +465,29 @@ function handleInstallation(event: any) {
       event: "install",
       meta: { account: event.installation.account.login, senderId },
     });
+    if (install.userId) {
+      posthog.capture({
+        distinctId: install.userId,
+        event: "github app installed",
+        properties: {
+          account_login: install.accountLogin,
+          repo_count: (event.repositories || []).length,
+        },
+      });
+    }
   } else if (event.action === "deleted" || event.action === "removed") {
     const install = db.find(
       "installations",
       (i) => i.installationId === event.installation.id
     );
     if (install) {
+      if (install.userId) {
+        posthog.capture({
+          distinctId: install.userId,
+          event: "github app uninstalled",
+          properties: { account_login: install.accountLogin },
+        });
+      }
       db.remove("repositories", (r) => r.installationId === install.id);
     }
     db.remove(
@@ -740,33 +770,16 @@ function handlePullRequest(event: any) {
     // insert path so we still pick up the work.
   }
 
-  // Monthly-cap gate — charged once per unique PR. Re-pushes take the
-  // synchronize path above (free) and re-opens reuse the prior row, so neither
-  // re-charges. Max's unlimited allowance always passes.
-  if (plan && ownerUserId) {
-    const priorReview = db.find(
-      "prReviews",
-      (r) => r.repoId === repo!.id && r.prNumber === pullReq.number
-    );
-    if (!priorReview) {
-      const sub = subscriptionForUser(ownerUserId);
-      if (sub) {
-        const usage = rollAndCheckUsage(sub);
-        if (!usage.allowed) {
-          if (notifiable && installationId) {
-            void postPRComment(
-              installationId,
-              owner,
-              name,
-              pullReq.number,
-              capReachedNotice(usage.limit)
-            );
-          }
-          return;
-        }
-        recordReviewUsage(sub.id, usage.used);
-      }
+  // Monthly-cap gate — charged once per unique PR (chargeForNewPRReview returns
+  // null for re-reviews: re-pushes take the synchronize path above and re-opens
+  // reuse the prior row, so neither re-charges). Max's unlimited allowance always
+  // passes.
+  const cap = chargeForNewPRReview(ownerUserId, repo, pullReq.number);
+  if (cap && !cap.allowed) {
+    if (notifiable && installationId) {
+      void postPRComment(installationId, owner, name, pullReq.number, capReachedNotice(cap.limit));
     }
+    return;
   }
 
   const review = {
@@ -788,6 +801,18 @@ function handlePullRequest(event: any) {
   };
   db.insert("prReviews", review);
   enqueueReview(review.id);
+  if (ownerUserId) {
+    posthog.capture({
+      distinctId: ownerUserId,
+      event: "pr review queued",
+      properties: {
+        repo: `${repo.owner}/${repo.name}`,
+        pr_number: pullReq.number,
+        is_private: repo.private,
+        trigger: event.action,
+      },
+    });
+  }
   // App notification: a PR was opened (or re-opened) on a tracked repo and
   // we've queued it for review.
   notifyForReview(

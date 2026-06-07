@@ -26,7 +26,7 @@ import {
   type DevasignScope,
 } from "./devasign.js";
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
-import { modelForPlan, planForUser } from "../billing/plans.js";
+import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
@@ -117,6 +117,23 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   const repo = db.find("repositories", (r) => r.id === review.repoId);
   if (!repo) throw new Error(`repo ${review.repoId} not found`);
   const install = db.find("installations", (i) => i.id === repo.installationId);
+
+  // Private-repo gate — defence-in-depth at the one chokepoint every enqueue
+  // path funnels through (comment-triggered ensurePRReview, /reviews/sync,
+  // rerun, the synchronize re-enqueue, maintainer-feedback re-review). The
+  // `opened` webhook posts the upgrade notice and returns without a row, but
+  // those other paths skip that gate, so a free/lapsed owner's private-repo PR
+  // can still reach the worker. Refuse it here before any LLM or GitHub call and
+  // drop the stray row + logs, so the queue matches the canonical "no review"
+  // state. Unlinked installs keep their grace window (privateRepoBlocked → false).
+  if (privateRepoBlocked(repo.private, install?.userId)) {
+    console.log(
+      `[review] skip ${review.id} — private repo ${repo.owner}/${repo.name} needs a paid plan`
+    );
+    db.remove("reviewLogs", (l) => l.reviewId === review.id);
+    db.remove("prReviews", (r) => r.id === review.id);
+    return;
+  }
 
   // Tier the review model by the repo owner's effective plan: Free → Haiku,
   // Pro/Max → the configured frontier model. withModel scopes it to every

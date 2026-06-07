@@ -9,6 +9,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import {
   PLAN_LIMITS,
+  chargeForNewPRReview,
   effectivePlan,
   intervalOf,
   modelForPlan,
@@ -17,6 +18,7 @@ import {
   priceFor,
   priceIdToPlan,
   priceIdToPlanInterval,
+  privateRepoBlocked,
   rollAndCheckUsage,
 } from "./plans.js";
 import type { Subscription, SubscriptionStatus } from "../types.js";
@@ -169,4 +171,65 @@ test("rollAndCheckUsage: free blocks at the cap and rolls after a month", () => 
   // Max (unlimited) is always allowed regardless of usage.
   const max = db.insert("subscriptions", sub({ plan: "max", status: "active", reviewsUsed: 99999 }));
   assert.equal(rollAndCheckUsage(max).allowed, true);
+});
+
+test("privateRepoBlocked: only private repos on a no-private-repos plan, only when linked", () => {
+  const free = uuid();
+  db.insert("subscriptions", sub({ userId: free, plan: "free" }));
+  const pro = uuid();
+  db.insert("subscriptions", sub({ userId: pro, plan: "pro", status: "active" }));
+
+  assert.equal(privateRepoBlocked(true, free), true); // private + Free → blocked
+  assert.equal(privateRepoBlocked(true, pro), false); // private + paid → allowed
+  assert.equal(privateRepoBlocked(false, free), false); // public → never blocked
+  // Unlinked install (no userId yet) → onboarding grace window, never blocked.
+  assert.equal(privateRepoBlocked(true, ""), false);
+  assert.equal(privateRepoBlocked(true, null), false);
+  assert.equal(privateRepoBlocked(true, undefined), false);
+});
+
+test("chargeForNewPRReview: charges a new under-cap PR exactly once", () => {
+  const userId = uuid();
+  db.insert("subscriptions", sub({ userId, plan: "free", reviewsUsed: 9 }));
+  const repo = { id: uuid(), private: false };
+
+  assert.deepEqual(chargeForNewPRReview(userId, repo, 1), { allowed: true, limit: 10 });
+  // The charge persisted: 9 → 10.
+  assert.equal(db.find("subscriptions", (s) => s.userId === userId)?.reviewsUsed, 10);
+});
+
+test("chargeForNewPRReview: blocks a new PR at the cap without charging", () => {
+  const userId = uuid();
+  db.insert("subscriptions", sub({ userId, plan: "free", reviewsUsed: 10 }));
+  const repo = { id: uuid(), private: false };
+
+  assert.deepEqual(chargeForNewPRReview(userId, repo, 1), { allowed: false, limit: 10 });
+  assert.equal(db.find("subscriptions", (s) => s.userId === userId)?.reviewsUsed, 10); // untouched
+});
+
+test("chargeForNewPRReview: re-review of a known PR is free (null, no charge)", () => {
+  const userId = uuid();
+  db.insert("subscriptions", sub({ userId, plan: "free", reviewsUsed: 10 }));
+  const repo = { id: uuid(), private: false };
+  // A prior review row for this repo+PR makes this a re-review (re-push/re-open).
+  db.insert("prReviews", { id: uuid(), repoId: repo.id, prNumber: 7 } as any);
+
+  assert.equal(chargeForNewPRReview(userId, repo, 7), null);
+  assert.equal(db.find("subscriptions", (s) => s.userId === userId)?.reviewsUsed, 10); // never re-charges
+});
+
+test("chargeForNewPRReview: a plan-blocked private repo never consumes the cap", () => {
+  const userId = uuid();
+  db.insert("subscriptions", sub({ userId, plan: "free", reviewsUsed: 0 }));
+  // Private repo on Free is refused outright by runReviewJob, so it must not
+  // charge against the public-repo allowance even though it's under the cap.
+  assert.equal(chargeForNewPRReview(userId, { id: uuid(), private: true }, 1), null);
+  assert.equal(db.find("subscriptions", (s) => s.userId === userId)?.reviewsUsed, 0);
+});
+
+test("chargeForNewPRReview: no gating without a linked owner or a subscription row", () => {
+  // Unlinked install (empty ownerUserId) → null.
+  assert.equal(chargeForNewPRReview("", { id: uuid(), private: false }, 1), null);
+  // Linked owner with no subscription row → null (preserves the prior behavior).
+  assert.equal(chargeForNewPRReview(uuid(), { id: uuid(), private: false }, 1), null);
 });

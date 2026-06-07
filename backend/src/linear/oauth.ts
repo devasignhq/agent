@@ -10,6 +10,7 @@ import { db } from "../db.js";
 import { getSessionUser } from "../github/oauth.js";
 import { fetchLinearWorkspace, type LinearWorkspace } from "./client.js";
 import { planForUser } from "../billing/plans.js";
+import { posthog } from "../posthog.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
 // state -> the DevAsign user who started the connect. Binding the userId here
@@ -144,6 +145,16 @@ export async function finishLinearOAuth(req: Request, res: Response) {
   console.log(
     `[linear] connected workspace "${workspace?.workspaceName || "?"}" for user ${userId}`
   );
+
+  posthog.capture({
+    distinctId: userId,
+    event: "linear workspace connected",
+    properties: {
+      workspace_name: workspace?.workspaceName || null,
+      workspace_url_key: workspace?.urlKey || null,
+      reconnected: Boolean(existing),
+    },
+  });
 
   res.redirect(`${config.webOrigin}/?linear=connected`);
 }
