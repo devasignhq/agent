@@ -5,6 +5,7 @@ import { Icon } from "./icons";
 import { useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio, TweakSelect } from "./tweaks-panel";
 import { Auth, Onboarding } from "./screens-onboarding";
 import { AgentPage } from "./screen-agent";
+import { WorkflowPage } from "./screen-workflow";
 import { SettingsPage } from "./screens-rest";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
@@ -27,6 +28,7 @@ export { useIsMobile };
 
 const NAV = [
   { key: "agent",     name: "Agents",    icon: "agent",     kbd: "g a" },
+  { key: "workflow",  name: "Workflow",  icon: "workflow",  kbd: "g w" },
   { key: "settings",  name: "Settings",  icon: "settings",  kbd: "g s" },
 ];
 
@@ -322,7 +324,7 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
 
 const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications }) => {
   const labels = {
-    agent: "Agents", settings: "Settings"
+    agent: "Agents", workflow: "Workflow", settings: "Settings"
   };
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
@@ -636,7 +638,7 @@ const App = () => {
       const now = Date.now();
       if (e.key === "g") { lastKey = "g"; last = now; return; }
       if (lastKey === "g" && now - last < 800) {
-        const map = { a: "agent", s: "settings" };
+        const map = { a: "agent", w: "workflow", s: "settings" };
         if (map[e.key]) { setCurrent(map[e.key]); e.preventDefault(); }
         lastKey = "";
       }
@@ -700,6 +702,7 @@ const App = () => {
         />
         <div className="content" style={current === "agent" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}
+          {current === "workflow" && <WorkflowPage />}
           {current === "settings" && <SettingsPage initialSection={settingsSection} />}
         </div>
       </div>

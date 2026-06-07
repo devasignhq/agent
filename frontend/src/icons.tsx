@@ -52,6 +52,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }: IconProps) => {
     case "eye-off":    return <svg {...p}><path d="M2 2l12 12"/><path d="M6.2 4.5C7 4.2 7.5 4 8 4c4.5 0 7 4.5 7 4.5s-.8 1.5-2.4 2.9M9.8 11.5C9 11.8 8.5 12 8 12c-4.5 0-7-4-7-4s.8-1.5 2.4-2.9"/><path d="M6.7 6.7a2.2 2.2 0 003.1 3.1"/></svg>;
     case "logout":     return <svg {...p}><path d="M9 3H3v10h6M7 8h8M12 5l3 3-3 3"/></svg>;
     case "swap":       return <svg {...p}><path d="M2 5h11M10 2l3 3-3 3M14 11H3M6 8l-3 3 3 3"/></svg>;
+    case "workflow":   return <svg {...p}><rect x="2" y="2" width="5" height="4" rx="1"/><rect x="9" y="10" width="5" height="4" rx="1"/><path d="M4.5 6v3a2 2 0 002 2H9"/></svg>;
     default: return null;
   }
 };

@@ -29,6 +29,32 @@ export type Installation = {
   repoIds: number[];
 };
 
+// Per-repo review workflow: which optional pipeline stages run, the entry
+// trigger policy, and verdict behavior. Surfaced + edited on the frontend
+// "Workflow" screen, enforced by the review pipeline (stages/verdict) and the
+// PR webhook (trigger). Optional on Repository so existing rows load unchanged;
+// effectiveWorkflow() (review/workflow.ts) merges this over defaults that
+// reproduce DevAsign's pre-workflow behavior.
+//
+// Tiering: `stages` (which stages run) is BASIC (free). `trigger` and `verdict`
+// (policy + automation) are ADVANCED (Pro/Max).
+export type RepoWorkflow = {
+  version: 1;
+  trigger: {
+    onSynchronize: boolean; // re-review when new commits are pushed to a PR
+    skipDrafts: boolean;    // ignore draft PRs (still reviews on ready_for_review)
+    skipBots: boolean;      // ignore bot-authored PRs (Dependabot/Renovate/etc)
+  };
+  stages: {
+    holistic: boolean;  // whole-repo review against the index
+    docs: boolean;      // DEVASIGN.md conventions + doc-drift check
+    deferrals: boolean; // self-admitted deferred/incomplete-work scan
+  };
+  verdict: {
+    blocking: boolean; // false = post advisory COMMENT, never REQUEST_CHANGES
+  };
+};
+
 export type Repository = {
   id: string;
   installationId: string;
@@ -42,6 +68,8 @@ export type Repository = {
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
+  // Per-repo review workflow (optional; defaults applied by effectiveWorkflow).
+  workflow?: RepoWorkflow;
   // Repo-index state. Optional so DB rows written before the indexer existed
   // still load — treat undefined as "none" at every branch site.
   indexState?: RepoIndexState;

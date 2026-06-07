@@ -7,6 +7,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import { effectiveWorkflow } from "../review/workflow.js";
 import { notifyForReview } from "../notifications.js";
 import {
   PLAN_LIMITS,
@@ -598,6 +599,15 @@ function capReachedNotice(limit: number): string {
   ].join("\n");
 }
 
+// A PR authored by a bot — Dependabot, Renovate, github-actions, or any GitHub
+// App "[bot]" account. Drives the per-repo workflow `skipBots` trigger.
+function isBotActor(actor: any): boolean {
+  if (!actor) return false;
+  if (actor.type === "Bot") return true;
+  const login = String(actor.login || "").toLowerCase();
+  return /\[bot\]$/.test(login) || /^(dependabot|renovate|github-actions)\b/.test(login);
+}
+
 function handlePullRequest(event: any) {
   if (!["opened", "reopened", "synchronize", "ready_for_review", "closed"].includes(event.action)) return;
   const repoFullName: string = event.repository.full_name;
@@ -716,6 +726,22 @@ function handlePullRequest(event: any) {
     return;
   }
 
+  // ── Workflow trigger policy (per repo; advanced tier) ─────────────────────
+  // Defaults reproduce prior behavior, so uncustomised repos are unaffected.
+  // skipDrafts drops draft PRs entirely (a draft marked "ready for review"
+  // arrives as a non-draft, so that path still reviews); skipBots drops
+  // bot-authored PRs (Dependabot/Renovate/etc). onSynchronize is handled inside
+  // the synchronize branch below.
+  const wf = effectiveWorkflow(repo);
+  if (wf.trigger.skipDrafts && pullReq.draft) {
+    console.log(`[webhook] pull_request: ${repoFullName}#${pullReq.number} skipped — draft (workflow skipDrafts)`);
+    return;
+  }
+  if (wf.trigger.skipBots && isBotActor(pullReq.user)) {
+    console.log(`[webhook] pull_request: ${repoFullName}#${pullReq.number} skipped — bot author (workflow skipBots)`);
+    return;
+  }
+
   // `synchronize` fires when a contributor pushes new commits to an open PR.
   // The semantics are "same PR, new state" — we keep ONE prReview row per
   // PR and update its headSha in place, instead of inserting a duplicate that
@@ -737,6 +763,23 @@ function handlePullRequest(event: any) {
         typeof count === "number" && count > 0
           ? `${pusher} pushed ${count} commit${count === 1 ? "" : "s"} to ${branch}`
           : `${pusher} pushed new commits to ${branch}`;
+      // Re-review on push disabled by workflow: keep headSha fresh and record the
+      // push for the timeline, but don't re-run the review.
+      if (!wf.trigger.onSynchronize) {
+        db.update("prReviews", (r) => r.id === existing.id, { headSha: newSha, updatedAt: Date.now() });
+        db.insert("reviewLogs", {
+          id: uuid(),
+          reviewId: existing.id,
+          kind: "ingest",
+          at: Date.now(),
+          action: "commit.push",
+          target: newSha.slice(0, 7),
+          detail: `${detail} — auto re-review off`,
+          meta: { before, after: newSha, pusher, branch, prevHeadSha: existing.headSha, source: "webhook", reReview: false },
+        });
+        console.log(`[webhook] pull_request: ${repoFullName}#${pullReq.number} push not re-reviewed (workflow onSynchronize off)`);
+        return;
+      }
       db.update("prReviews", (r) => r.id === existing.id, {
         headSha: newSha,
         status: "queued",
