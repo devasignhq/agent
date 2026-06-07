@@ -6,7 +6,7 @@ import { db } from "../db.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh } from "../github/app.js";
-import { config, isAnnualConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
+import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
@@ -81,6 +81,9 @@ api.get("/health", (_req, res) => {
     llm: isLLMLive() ? "live" : "mock",
     githubApp: isGithubAppConfigured() ? "configured" : "missing",
     githubAppName: config.github.appName,
+    // "ephemeral" means DATABASE_URL is unset → all rows (incl. subscriptions)
+    // are wiped on every restart/redeploy. Prod must read "postgres".
+    db: isDbConfigured() ? "postgres" : "ephemeral",
   });
 });
 
