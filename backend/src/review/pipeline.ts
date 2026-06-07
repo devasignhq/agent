@@ -28,6 +28,7 @@ import {
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
+import { effectiveWorkflow } from "./workflow.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -140,6 +141,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   // complete() call this job makes. Unlinked installs (no userId yet) keep the
   // frontier default rather than being degraded to Haiku before linking.
   const reviewModel = install?.userId ? modelForPlan(planForUser(install.userId)) : config.llm.model;
+  // Per-repo workflow config. Defaults reproduce prior behavior, so a repo that
+  // was never customised gates exactly as before.
+  const wf = effectiveWorkflow(repo);
 
   return withModel(reviewModel, async () => {
   setStatus(review.id, { status: "reviewing" });
@@ -184,8 +188,12 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // anything that imports from them + a short manifest of the rest of the
     // repo. The holistic Opus call below uses this so the verdict reflects
     // whole-repo impact, not just the diff.
-    const holistic = gatherHolisticContext(repo, context.diff);
-    if (holistic.entries.length || holistic.manifest.length) {
+    const holistic = wf.stages.holistic
+      ? gatherHolisticContext(repo, context.diff)
+      : { entries: [], touchedCount: 0, dependentCount: 0, manifest: [] };
+    if (!wf.stages.holistic) {
+      log(review.id, "holistic", "Whole-repo review disabled by workflow");
+    } else if (holistic.entries.length || holistic.manifest.length) {
       log(review.id, "holistic", "Repo index retrieved", {
         detail: `${holistic.entries.length} entries (${holistic.touchedCount} touched, ${holistic.dependentCount} dependents)`,
         meta: {
@@ -341,7 +349,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // never gate the merge (forced "warn"); they exist so the author sees the
     // punt on time. Runs after both the spec'd and spec-less review paths since
     // an agent can quietly defer work regardless of whether the PR had a spec.
-    const deferralCandidates = scanDeferralCandidates(context.diff);
+    const deferralCandidates = wf.stages.deferrals ? scanDeferralCandidates(context.diff) : [];
     if (deferralCandidates.length) {
       const promise = buildPromiseText(endGoal || "", filledCriteria, context);
       const deferrals = await detectDeferredWork({
@@ -376,7 +384,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // updating". Both are nits — they never gate the merge. Skipped entirely (no
     // LLM call) when no DEVASIGN.md governs a changed file, so most repos pay
     // nothing. Wrapped so an advisory pass never fails the whole review.
-    if (install) {
+    if (install && wf.stages.docs) {
       try {
         const changedPaths = [...diffFilePaths(context.diff)];
         const docs = await fetchDevasignDocs(repo, install, review.headSha);
@@ -448,6 +456,17 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       } else {
         postConversationReview = false; // already asked → refresh Check Run only
       }
+    }
+
+    // Comment-only mode (workflow.verdict.blocking = false): never block the
+    // merge button — downgrade a REQUEST_CHANGES to an advisory COMMENT. The
+    // internal status stays as computed so the dashboard still shows the real
+    // verdict; only the GitHub review event is softened.
+    if (!wf.verdict.blocking && reviewEvent === "REQUEST_CHANGES") {
+      reviewEvent = "COMMENT";
+      log(review.id, "verdict", "Comment-only mode — merge not blocked", {
+        detail: "Workflow set to advisory: posting a COMMENT instead of REQUEST_CHANGES.",
+      });
     }
 
     const verdictAction =

@@ -8,6 +8,7 @@ import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh } from "../github/app.js";
 import { config, isAnnualConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
+import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
@@ -328,6 +329,45 @@ api.post("/repositories/:id/reindex", (req, res) => {
   db.update("repositories", (r) => r.id === repo.id, { indexState: "queued", indexError: null });
   const job = enqueueIndex({ repoId: repo.id, full: true });
   res.json({ ok: true, jobId: job.id });
+});
+
+// --- Per-repo review workflow ---
+
+// Read a repo's effective workflow (defaults merged over any stored overrides),
+// plus whether advanced controls are locked for this user's plan. Owner-scoped.
+api.get("/repositories/:id/workflow", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  res.json({ workflow: effectiveWorkflow(repo), advancedLocked: effectivePlan(sub) === "free" });
+});
+
+// Save a repo's workflow. Owner-scoped. Paywall: free users may change which
+// stages run (basic) but not the trigger policy or verdict mode (advanced) — an
+// advanced change from a free user is refused with 403 upgrade_required (the UI
+// also locks those controls, so this is the server-side backstop).
+api.put("/repositories/:id/workflow", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const next = normalizeWorkflow(req.body?.workflow ?? req.body);
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  if (effectivePlan(sub) === "free" && advancedChanged(effectiveWorkflow(repo), next)) {
+    return void res.status(403).json({ error: "upgrade_required" });
+  }
+  db.update("repositories", (r) => r.id === repo.id, { workflow: next });
+  res.json({ ok: true, workflow: next });
 });
 
 // --- PR Reviews (the agent's queue) ---

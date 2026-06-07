@@ -132,6 +132,21 @@ export type Repository = {
   reviewsEnabled: boolean;
 };
 
+// Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
+// `stages` is BASIC (free); `trigger` + `verdict` are ADVANCED (Pro/Max).
+export type RepoWorkflow = {
+  version: 1;
+  trigger: { onSynchronize: boolean; skipDrafts: boolean; skipBots: boolean };
+  stages: { holistic: boolean; docs: boolean; deferrals: boolean };
+  verdict: { blocking: boolean };
+};
+
+// GET /api/repositories/:id/workflow response.
+export type RepoWorkflowView = {
+  workflow: RepoWorkflow;
+  advancedLocked: boolean; // true when the user's plan can't edit advanced fields
+};
+
 export type IntegrationType = "slack" | "linear" | "discord";
 
 export type IntegrationView = {
@@ -284,6 +299,16 @@ export const api = {
       body: "{}",
     }),
   repositories: () => request<Repository[]>("/api/repositories"),
+  // Per-repo review workflow: read the effective config (+ whether advanced
+  // controls are locked for this plan), and save it. The backend refuses
+  // advanced (trigger/verdict) changes from free users with 403 upgrade_required.
+  repoWorkflow: (id: string) =>
+    request<RepoWorkflowView>(`/api/repositories/${id}/workflow`),
+  setRepoWorkflow: (id: string, workflow: RepoWorkflow) =>
+    request<{ ok: true; workflow: RepoWorkflow }>(`/api/repositories/${id}/workflow`, {
+      method: "PUT",
+      body: JSON.stringify({ workflow }),
+    }),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>

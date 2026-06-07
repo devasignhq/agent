@@ -4891,3 +4891,28 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   .topbar-logo { display: none; }
   .agent-mview-switch { display: none; }
 }
+
+/* ── Workflow screen — per-repo review pipeline ─────────────────────── */
+.wf-node { margin: 0; }
+/* Vertical line linking the pipeline stage cards into a sequence. */
+.wf-connector {
+  width: 2px;
+  height: 16px;
+  margin-left: 31px;
+  background: var(--border);
+}
+/* Stage / trigger icon chip. */
+.wf-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: transparent;
+  flex: 0 0 auto;
+}
+/* A disabled (toggled-off) optional stage reads dimmer. */
+.wf-off { opacity: 0.55; }
+.wf-row { padding: 2px 0; }
