@@ -44,8 +44,8 @@ pnpm-debug.log*
 Thumbs.db
 desktop.ini
 
-# Claude Code local settings
-.claude/settings.local.json
+# Claude Code local tooling (settings, launch config, installed skills) — any level
+.claude/
 
 # Project memory (local-only working doc)
 memory.md
