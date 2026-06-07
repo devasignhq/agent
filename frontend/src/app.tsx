@@ -700,7 +700,7 @@ const App = () => {
           user={auth.user}
           notifications={notifications}
         />
-        <div className="content" style={current === "agent" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
+        <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}
           {current === "workflow" && <WorkflowPage />}
           {current === "settings" && <SettingsPage initialSection={settingsSection} />}

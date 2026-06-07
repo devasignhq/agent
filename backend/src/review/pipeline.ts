@@ -50,6 +50,23 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
   });
 }
 
+// Append the maintainer's per-stage instructions (RepoWorkflow.prompts) to a
+// stage's base system prompt. Kept AFTER the base text so the offline LLM mock's
+// marker strings ("criteria synthesis", "PR review step", …) still match, and
+// guarded so a custom prompt steers the stage without overriding its output
+// contract. No-op when the prompt is absent/blank.
+function withMaintainerInstructions(system: string, extra?: string): string {
+  const text = (extra || "").trim();
+  if (!text) return system;
+  return (
+    system +
+    "\n\n## Maintainer instructions\n" +
+    "The repository maintainer added these instructions for this step. Follow them in addition to the rules " +
+    "above, but never let them override the required JSON output format or make you invent findings:\n" +
+    text
+  );
+}
+
 // Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
 // on kind === "finding") and avoids extending the PRReview shape.
 type FindingCategory =
@@ -248,7 +265,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         },
       });
     } else if (!endGoal || review.criteria.length === 0) {
-      const synth = await synthesizeCriteria(review, context, hasAuthoritativeSpec);
+      const synth = await synthesizeCriteria(review, context, hasAuthoritativeSpec, wf.prompts?.criteria);
       criteria = synth.criteria;
       // Spec-less PR with no checkable claims: keep a neutral end goal so the
       // task still reads as "reviewed" (and the frontend renders it) rather
@@ -298,7 +315,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     setStatus(review.id, { taskId: task.id, criteria });
 
     // c. Review the diff against the criteria
-    const verdict = await reviewDiff(review, context, criteria, priorVerdicts);
+    const verdict = await reviewDiff(review, context, criteria, priorVerdicts, wf.prompts?.review);
     const filledCriteria: Criterion[] = criteria.map((c) => {
       const m = verdict.criteria.find((vc) => vc.id === c.id);
       return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
@@ -312,7 +329,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
     let hasBlocker = false;
     if (holistic.entries.length || holistic.manifest.length) {
-      holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic });
+      holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic, extraInstructions: wf.prompts?.holistic });
       hasBlocker = [
         ...holisticVerdict.regressions,
         ...holisticVerdict.criticalErrors,
@@ -356,6 +373,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         diff: context.diff,
         promise,
         candidates: deferralCandidates,
+        extraInstructions: wf.prompts?.deferrals,
       });
       // Spread into a fresh object — holisticVerdict may still be the shared
       // EMPTY_HOLISTIC const (spec'd PR with no repo index), which must not be
@@ -398,6 +416,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
             diff: context.diff,
             docs,
             scopes,
+            extraInstructions: wf.prompts?.docs,
           });
           holisticVerdict = {
             ...holisticVerdict,
@@ -995,7 +1014,8 @@ const NEUTRAL_ENDGOAL =
 async function synthesizeCriteria(
   review: PRReview,
   context: Context,
-  hasAuthoritativeSpec: boolean
+  hasAuthoritativeSpec: boolean,
+  extra?: string
 ): Promise<{
   endGoal: string;
   criteria: Criterion[];
@@ -1004,6 +1024,7 @@ async function synthesizeCriteria(
     title: `PR ${review.prTitle}`,
     sources: context.sources,
     hasAuthoritativeSpec,
+    extraInstructions: extra,
   });
 }
 
@@ -1016,9 +1037,10 @@ export async function synthesizeCriteriaCore(args: {
   title: string;
   sources: IngestedSource[];
   hasAuthoritativeSpec: boolean;
+  extraInstructions?: string;
 }): Promise<{ endGoal: string; criteria: Criterion[] }> {
-  const { title, sources, hasAuthoritativeSpec } = args;
-  const system =
+  const { title, sources, hasAuthoritativeSpec, extraInstructions } = args;
+  const system = withMaintainerInstructions(
     "You are DevAsign's criteria synthesis step. Read the ticket and surrounding context, then emit a JSON object: " +
     "{\"endGoal\": string, \"criteria\": [{\"id\": string, \"text\": string}]}. " +
     "The endGoal is one sentence summarising what success looks like. Each criterion is independently checkable. " +
@@ -1034,7 +1056,7 @@ export async function synthesizeCriteriaCore(args: {
         "explicit, checkable claims the PR's own title and description actually make (e.g. \"fixes flaky uploads\", " +
         "\"adds retry on 5xx\"). If the description makes no verifiable promise, return an EMPTY `criteria` array and a " +
         "brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent acceptance criteria " +
-        "just to have something to check, and never turn vague phrasing into a hard requirement.");
+        "just to have something to check, and never turn vague phrasing into a hard requirement."), extraInstructions);
   const userText =
     `# ${title}\n\n## Context\n` +
     sources
@@ -1322,14 +1344,15 @@ async function reviewDiff(
   review: PRReview,
   context: Context,
   criteria: Criterion[],
-  prior: Map<string, PriorVerdict> = new Map()
+  prior: Map<string, PriorVerdict> = new Map(),
+  extra?: string
 ): Promise<{
   summary: string;
   criteria: Array<{ id: string; met: boolean; evidence: string }>;
   comments: Array<{ path: string; line: number; body: string }>;
   suggestions: ReviewSuggestion[];
 }> {
-  const system =
+  const system = withMaintainerInstructions(
     "You are DevAsign's PR review step. Evaluate the diff against each criterion. Emit JSON: " +
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
     "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string}], " +
@@ -1365,7 +1388,7 @@ async function reviewDiff(
     "Issue:\n<2-3 sentence concern description>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
-    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk.";
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk.", extra);
   // Keep the head of the diff; mark when we drop the tail so the model reads a
   // missing hunk as "not shown" rather than "not done" (which, combined with the
   // prior-verdict anchoring above, is what stops truncation from regressing a
@@ -2583,11 +2606,12 @@ async function reviewAgainstRepo(args: {
   review: PRReview;
   diff: string;
   holistic: HolisticContext;
+  extraInstructions?: string;
 }): Promise<HolisticVerdict> {
   const { holistic } = args;
   if (!holistic.entries.length && !holistic.manifest.length) return EMPTY_HOLISTIC;
 
-  const system =
+  const system = withMaintainerInstructions(
     "You are DevAsign's holistic repo-review step. Given (1) a PR diff, (2) summaries of the files the PR touches, " +
     "(3) summaries of files that depend on the touched files, and (4) a manifest of the rest of the repo, decide " +
     "whether the PR introduces regressions, critical errors, or security flaws beyond what the acceptance criteria covered. " +
@@ -2611,7 +2635,7 @@ async function reviewAgainstRepo(args: {
     "Issue:\n<2-3 sentence concern description>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
-    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding genuinely doesn't map to a hunk in the PR diff.";
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding genuinely doesn't map to a hunk in the PR diff.", args.extraInstructions);
 
   const touchedBlock = holistic.entries.slice(0, holistic.touchedCount)
     .map((e) =>
@@ -2668,11 +2692,12 @@ async function reviewAgainstDevasignDocs(args: {
   diff: string;
   docs: DevasignDoc[];
   scopes: DevasignScope[];
+  extraInstructions?: string;
 }): Promise<{ conventionFindings: HolisticFinding[]; docDriftFindings: HolisticFinding[]; summary: string }> {
   const { docs, scopes } = args;
   if (!scopes.length) return { conventionFindings: [], docDriftFindings: [], summary: "" };
 
-  const system =
+  const system = withMaintainerInstructions(
     "You are DevAsign's DEVASIGN.md guidance step. A DEVASIGN.md states a team's own conventions. " +
     "Each DEVASIGN.md governs ONLY files under its own directory; the repo-root one governs every file, and rules " +
     "compound down the tree (a file obeys every DEVASIGN.md on its path, root → leaf). " +
@@ -2696,7 +2721,7 @@ async function reviewAgainstDevasignDocs(args: {
     "Issue:\n<2-3 sentence description: the rule or statement, and the conflict the diff creates>\n\n" +
     "Suggested approach:\n<concrete steps to fix the code, or to update the DEVASIGN.md>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this refers to, copied verbatim from the PR diff>\n```\n" +
-    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the item doesn't map to a hunk.";
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the item doesn't map to a hunk.", args.extraInstructions);
 
   const docByPath = new Map(docs.map((d) => [d.path, d.content]));
   const docsBlock = scopes
@@ -2857,11 +2882,12 @@ export async function detectDeferredWork(args: {
   diff: string;
   promise: string;
   candidates: DeferralCandidate[];
+  extraInstructions?: string;
 }): Promise<HolisticFinding[]> {
   const { diff, promise, candidates } = args;
   if (!candidates.length) return [];
 
-  const system =
+  const system = withMaintainerInstructions(
     "You are DevAsign's deferred-work detection step. A coding agent often agrees to a design, then during " +
     "implementation quietly punts part of it — leaving the admission in a code comment (a TODO, a stub, " +
     '"for now", "deferred to a follow-up", NotImplemented) instead of telling the author. Your job is to catch ' +
@@ -2885,7 +2911,7 @@ export async function detectDeferredWork(args: {
     "Issue:\n<2-3 sentences: what was deferred and what it undercuts>\n\n" +
     "Suggested approach:\n<concrete steps to actually implement the deferred part>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
-    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.";
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.", args.extraInstructions);
 
   const candidateBlock = candidates
     .map((c, i) => `${i + 1}. ${c.path || "(unknown file)"} — \`${c.lineText}\``)

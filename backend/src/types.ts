@@ -36,8 +36,9 @@ export type Installation = {
 // effectiveWorkflow() (review/workflow.ts) merges this over defaults that
 // reproduce DevAsign's pre-workflow behavior.
 //
-// Tiering: `stages` (which stages run) is BASIC (free). `trigger` and `verdict`
-// (policy + automation) are ADVANCED (Pro/Max).
+// Tiering: `stages` (which stages run) is BASIC (free). `trigger`, `verdict`
+// (policy + automation) and `prompts` (per-stage agent steering) are ADVANCED
+// (Pro/Max).
 export type RepoWorkflow = {
   version: 1;
   trigger: {
@@ -52,6 +53,15 @@ export type RepoWorkflow = {
   };
   verdict: {
     blocking: boolean; // false = post advisory COMMENT, never REQUEST_CHANGES
+  };
+  // Optional maintainer instructions appended to a stage's system prompt, for
+  // the stages that make an LLM call. Keyed by stage id; empty/absent = none.
+  prompts?: {
+    criteria?: string;  // criteria synthesis
+    review?: string;    // diff vs. criteria review
+    holistic?: string;  // whole-repo review
+    deferrals?: string; // deferred-work scan
+    docs?: string;      // DEVASIGN.md guidance
   };
 };
 

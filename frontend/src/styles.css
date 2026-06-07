@@ -4892,27 +4892,144 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   .agent-mview-switch { display: none; }
 }
 
-/* ── Workflow screen — per-repo review pipeline ─────────────────────── */
-.wf-node { margin: 0; }
-/* Vertical line linking the pipeline stage cards into a sequence. */
-.wf-connector {
-  width: 2px;
-  height: 16px;
-  margin-left: 31px;
-  background: var(--border);
+/* ── Workflow screen — node-based per-repo review pipeline ───────────── */
+/* Three panes filling the height of .content (set to flex column for the
+   workflow route in app.tsx): repo rail · React Flow canvas · detail panel. */
+.wf-layout { flex: 1; display: flex; min-height: 0; }
+
+/* Left rail — repositories */
+.wf-rail {
+  width: 248px; flex: 0 0 248px;
+  display: flex; flex-direction: column; min-height: 0;
+  border-right: 1px solid var(--line);
+  background: var(--bg-1);
 }
-/* Stage / trigger icon chip. */
-.wf-ico {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
-  border: 1px solid var(--border);
-  background: transparent;
-  flex: 0 0 auto;
+.wf-rail-head {
+  padding: 14px 16px 10px;
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg-mute);
 }
-/* A disabled (toggled-off) optional stage reads dimmer. */
-.wf-off { opacity: 0.55; }
-.wf-row { padding: 2px 0; }
+.wf-rail-list { flex: 1; overflow: auto; min-height: 0; padding: 0 8px 12px; }
+.wf-rail-item {
+  display: flex; align-items: center; gap: 8px;
+  width: 100%; text-align: left;
+  padding: 8px 10px; margin-bottom: 2px;
+  background: transparent; border: 1px solid transparent;
+  color: var(--fg-dim); cursor: pointer;
+  font-family: var(--mono); font-size: 12px;
+}
+.wf-rail-item:hover { background: var(--bg-2); color: var(--fg); }
+.wf-rail-item.is-active {
+  background: var(--bg-2); border-color: var(--line-2); color: var(--fg);
+}
+.wf-rail-item svg { flex: 0 0 auto; color: var(--fg-mute); }
+.wf-rail-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-rail-empty { padding: 12px 10px; font-size: 12px; }
+
+/* Center — canvas */
+.wf-canvas { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+.wf-toolbar {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 10px 16px; border-bottom: 1px solid var(--line);
+}
+.wf-toolbar-title { font-size: 13px; color: var(--fg); }
+.wf-toolbar-right { display: flex; align-items: center; gap: 8px; }
+.wf-err { font-size: 11px; }
+.wf-flow { flex: 1; position: relative; min-height: 0; }
+.wf-canvas-empty {
+  position: absolute; inset: 0;
+  display: flex; align-items: center; justify-content: center;
+  padding: 24px; font-size: 12px;
+}
+
+/* React Flow node — reset the wrapper, style our custom card. */
+.react-flow__node-stage { background: transparent; border: none; padding: 0; width: auto; }
+.wf-node {
+  display: flex; align-items: center; gap: 10px;
+  width: 250px; padding: 10px 12px;
+  background: var(--bg-1); border: 1px solid var(--line-2);
+  cursor: pointer; transition: border-color 0.12s ease, background 0.12s ease;
+}
+.wf-node:hover { border-color: #3a4250; background: var(--bg-2); }
+.wf-node.is-off { opacity: 0.5; }
+.wf-node.is-selected {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 1px var(--accent), 0 0 0 4px var(--accent-glow);
+}
+.wf-node-handle { opacity: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; }
+.wf-node-ico {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 30px; height: 30px; flex: 0 0 auto;
+  border: 1px solid var(--line-2); background: var(--bg);
+}
+.wf-node-text { flex: 1; min-width: 0; }
+.wf-node-name {
+  font-family: var(--mono); font-size: 12px; color: var(--fg);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.wf-node-tag {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.08em;
+  text-transform: uppercase; color: var(--fg-mute); margin-top: 2px;
+}
+.wf-node-flag { color: var(--purple); display: inline-flex; flex: 0 0 auto; }
+.wf-node-dot { width: 7px; height: 7px; flex: 0 0 auto; border-radius: 50%; }
+.wf-node-dot.on { background: var(--accent); }
+.wf-node-dot.off { background: var(--fg-faint); }
+
+.react-flow__attribution { background: transparent; color: var(--fg-faint); font-size: 9px; }
+.react-flow__attribution a { color: var(--fg-faint); }
+
+/* Right — detail / edit panel */
+.wf-panel {
+  width: 340px; flex: 0 0 340px;
+  display: flex; flex-direction: column; min-height: 0;
+  border-left: 1px solid var(--line); background: var(--bg-1);
+}
+.wf-panel-head {
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 16px; border-bottom: 1px solid var(--line);
+}
+.wf-panel-title { font-family: var(--mono); font-size: 13px; color: var(--fg); }
+.wf-panel-sub {
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
+  text-transform: uppercase; margin-top: 3px;
+}
+.wf-panel-body { flex: 1; overflow: auto; min-height: 0; padding: 16px; }
+.wf-panel-desc { font-size: 12px; color: var(--fg-dim); line-height: 1.55; margin: 0 0 16px; }
+.wf-panel-empty { padding: 24px 16px; font-size: 12px; }
+
+/* Controls inside the panel */
+.wf-ctl-group { display: flex; flex-direction: column; gap: 14px; }
+.wf-ctl {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 10px 0; cursor: pointer;
+}
+.wf-ctl + .wf-prompt { margin-top: 4px; }
+.wf-ctl-name {
+  display: flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 12px; color: var(--fg);
+}
+.wf-ctl-desc { font-size: 11px; margin-top: 3px; line-height: 1.45; }
+
+/* Custom-prompt editor */
+.wf-prompt { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
+.wf-prompt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.wf-label {
+  font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--fg-dim);
+}
+.wf-textarea {
+  height: auto; min-height: 150px; padding: 10px; line-height: 1.5; resize: vertical;
+}
+.wf-prompt-foot { font-size: 10px; margin-top: 6px; text-align: right; }
+.wf-prompt-locked {
+  display: flex; align-items: center; gap: 8px;
+  padding: 12px; border: 1px dashed var(--line-2); color: var(--fg-mute);
+  font-size: 12px; cursor: pointer; line-height: 1.45;
+}
+.wf-prompt-locked:hover { border-color: var(--accent); color: var(--fg-dim); }
+
+/* Mobile: stack the panes; the canvas is desktop-first. */
+.is-mobile .wf-layout { flex-direction: column; }
+.is-mobile .wf-rail { width: 100%; flex: 0 0 auto; max-height: 160px; border-right: none; border-bottom: 1px solid var(--line); }
+.is-mobile .wf-panel { width: 100%; flex: 0 0 auto; border-left: none; border-top: 1px solid var(--line); }
