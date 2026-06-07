@@ -387,6 +387,54 @@ function syncFromInvoice(invoice: Stripe.Invoice, patch: Partial<Subscription>):
   mirrorUserPlan(sub, patch);
 }
 
+// ─── Reconcile from Stripe (self-heal) ──────────────────────────────────────
+
+// Pull live subscription state from Stripe — the source of truth — and apply it
+// locally whenever our copy says "free". This self-heals the plan when the
+// webhook-driven state was never recorded or was lost: a webhook that wasn't
+// configured / didn't arrive, or (the common one) the in-memory store being
+// wiped on a redeploy with DATABASE_URL unset, which re-mints the user as a fresh
+// free row even though Stripe still has them trialing with a card on file.
+//
+// Gated to non-paying local rows so already active/trialing users cost no Stripe
+// call, and genuine downgrades (cancel / payment failure) still flow through the
+// webhook. Best-effort and idempotent — it only ever raises us to what Stripe
+// already reports. Runs on sign-in (see github/oauth.ts).
+export async function reconcileSubscriptionFromStripe(user: User): Promise<void> {
+  if (!stripe) return;
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  if (!sub) return;
+  // Already paying locally (active or trialing) → trust the webhook for any
+  // future change and skip the round-trip.
+  if (effectivePlan(sub) !== "free") return;
+
+  // Resolve the Stripe customer. Our stored id wins; otherwise match by email —
+  // the only stable link after an ephemeral wipe re-mints userId (the customer's
+  // metadata.userId is then stale, but its email + login still match). Require the
+  // githubLogin we stamp on every customer (getOrCreateCustomer) to match too, so
+  // a shared email across two GitHub accounts can't attribute one's paid sub to
+  // the other.
+  let customerId = sub.stripeCustomerId;
+  if (!customerId && user.email) {
+    const matches = await stripe.customers.list({ email: user.email, limit: 10 });
+    const mine = matches.data.find((c) => c.metadata?.githubLogin === user.githubLogin);
+    customerId = mine?.id ?? null;
+    if (customerId) db.update("subscriptions", (s) => s.id === sub.id, { stripeCustomerId: customerId });
+  }
+  if (!customerId) return; // never a customer → genuinely free
+
+  // Prefer a paying subscription (trialing or active); fall back to the most
+  // recent so a past_due/canceled one still backfills the Stripe ids (so the
+  // Billing portal works) without changing the effective plan.
+  const list = await stripe.subscriptions.list({ customer: customerId, status: "all", limit: 10 });
+  const chosen =
+    list.data.find((s) => s.status === "trialing" || s.status === "active") ?? list.data[0];
+  if (chosen) {
+    syncSubscription(chosen);
+    console.log(`[stripe] reconciled user ${user.id} from Stripe customer ${customerId}`);
+  }
+}
+
 export async function handleStripeWebhook(req: Request, res: Response): Promise<void> {
   if (!stripe || !config.stripe.webhookSecret) {
     res.status(503).json({ error: "stripe_not_configured" });

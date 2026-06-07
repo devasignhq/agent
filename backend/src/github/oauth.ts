@@ -2,10 +2,11 @@
 // holds repo permissions). See devasign.md §4: "OAuth ≠ GitHub App".
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
-import { config, isGithubOAuthConfigured } from "../config.js";
+import { config, isGithubOAuthConfigured, isStripeConfigured } from "../config.js";
 import { db } from "../db.js";
 import type { User } from "../types.js";
 import { isDeletionPending, restoreAccount } from "../account.js";
+import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
 import { posthog } from "../posthog.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
@@ -201,6 +202,21 @@ export async function finishOAuth(req: Request, res: Response) {
   if (isDeletionPending(user)) {
     await restoreAccount(user);
     restored = true;
+  }
+
+  // Self-heal billing from Stripe: if our local row says "free" but Stripe has
+  // this customer on a trial/active plan (card already on file), promote them now
+  // rather than waiting for a webhook that won't replay. Covers a missed webhook
+  // and — the common case — state lost when the store was wiped on a redeploy.
+  // Best-effort: a Stripe hiccup must never block sign-in. Re-read the user since
+  // a successful reconcile mirrors the new plan onto the user row.
+  if (isStripeConfigured()) {
+    try {
+      await reconcileSubscriptionFromStripe(user);
+      user = db.find("users", (u) => u.id === user!.id) ?? user;
+    } catch (err) {
+      console.error(`[oauth] stripe reconcile failed for user ${user.id}:`, err);
+    }
   }
 
   posthog.identify({
