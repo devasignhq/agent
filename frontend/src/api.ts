@@ -133,12 +133,15 @@ export type Repository = {
 };
 
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
-// `stages` is BASIC (free); `trigger` + `verdict` are ADVANCED (Pro/Max).
+// `stages` is BASIC (free); `trigger`, `verdict` + `prompts` are ADVANCED (Pro/Max).
+export type StagePromptKey = "criteria" | "review" | "holistic" | "deferrals" | "docs";
 export type RepoWorkflow = {
   version: 1;
   trigger: { onSynchronize: boolean; skipDrafts: boolean; skipBots: boolean };
   stages: { holistic: boolean; docs: boolean; deferrals: boolean };
   verdict: { blocking: boolean };
+  // Per-stage maintainer instructions (the stages that make an LLM call).
+  prompts?: Partial<Record<StagePromptKey, string>>;
 };
 
 // GET /api/repositories/:id/workflow response.

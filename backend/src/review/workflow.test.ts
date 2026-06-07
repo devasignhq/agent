@@ -73,3 +73,43 @@ test("paywall gate: free user may save stage changes but not advanced changes", 
   const advancedSave = normalizeWorkflow({ ...current, trigger: { ...current.trigger, skipBots: true } });
   assert.equal(advancedChanged(current, advancedSave), true, "advanced change must be refused for free");
 });
+
+test("normalizeWorkflow keeps valid stage prompts, trims, caps length, drops the rest", () => {
+  const wf = normalizeWorkflow({
+    ...WORKFLOW_DEFAULTS,
+    prompts: {
+      review: "  Focus on error handling.  ", // trimmed
+      holistic: "x".repeat(5000),             // capped at 2000
+      criteria: "   ",                        // blank -> dropped
+      docs: 123,                              // non-string -> dropped
+      bogus: "nope",                          // unknown key -> dropped
+    },
+  });
+  assert.equal(wf.prompts?.review, "Focus on error handling.");
+  assert.equal(wf.prompts?.holistic?.length, 2000);
+  assert.equal(wf.prompts?.criteria, undefined);
+  assert.equal(wf.prompts?.docs, undefined);
+  assert.equal((wf.prompts as any)?.bogus, undefined);
+});
+
+test("normalizeWorkflow defaults prompts to an empty object", () => {
+  assert.deepEqual(normalizeWorkflow({ version: 1 }).prompts, {});
+});
+
+test("effectiveWorkflow fills prompts with {} and merges stored ones", () => {
+  assert.deepEqual(effectiveWorkflow({ workflow: undefined }).prompts, {});
+  const wf = effectiveWorkflow({
+    workflow: { version: 1, prompts: { review: "be strict" } } as any,
+  });
+  assert.deepEqual(wf.prompts, { review: "be strict" });
+});
+
+test("advancedChanged: editing a stage prompt is an ADVANCED change", () => {
+  const base = WORKFLOW_DEFAULTS;
+  const promptEdit = normalizeWorkflow({ ...base, prompts: { review: "focus on tests" } });
+  assert.equal(advancedChanged(base, promptEdit), true, "setting a prompt is advanced");
+  assert.equal(advancedChanged(promptEdit, base), true, "clearing a prompt is advanced");
+  // Two equivalent prompt sets are NOT a change.
+  const same = normalizeWorkflow({ ...base, prompts: { review: "focus on tests" } });
+  assert.equal(advancedChanged(promptEdit, same), false, "identical prompts are not a change");
+});
