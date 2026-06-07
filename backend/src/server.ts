@@ -5,6 +5,7 @@ import morgan from "morgan";
 
 import {
   config,
+  isCiTestingConfigured,
   isDiscordEnvConfigured,
   isGithubAppConfigured,
   isLLMLive,
@@ -17,6 +18,7 @@ import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { startWorker } from "./worker.js";
+import { sweepPendingTestRuns } from "./review/pipeline.js";
 import { runDeletionSweep } from "./account.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
@@ -116,7 +118,7 @@ app.listen(port, () => {
   // first thing to verify is that the matching event here is also subscribed
   // in the GitHub App's settings on github.com → Permissions & events.
   console.log(
-    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, ping`
+    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, workflow_run, ping`
   );
   // Self-diagnose: ask GitHub which events the App is actually configured to
   // deliver. A common failure mode is the handler being ready while the App
@@ -135,6 +137,20 @@ const DELETION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
 void runDeletionSweep();
 setInterval(() => void runDeletionSweep(), DELETION_SWEEP_INTERVAL_MS);
 console.log("[account] deletion sweep scheduled (every 6h, 14-day restore window)");
+
+// Finalize reviews whose CI never reported back (no webhook / fork / dispatch
+// failure) so a held verdict can't hang in "testing" forever. Timestamp-driven
+// and restart-safe; a timeout resolves non-blocking. Only runs when CI gating
+// is enabled. Cadence is a fraction of the timeout so the lag stays bounded.
+if (isCiTestingConfigured()) {
+  const CI_SWEEP_INTERVAL_MS = Math.min(config.ci.timeoutMs, 5 * 60 * 1000);
+  setInterval(() => void sweepPendingTestRuns(), CI_SWEEP_INTERVAL_MS);
+  console.log(
+    `[review] CI test-timeout sweep scheduled (every ${Math.round(CI_SWEEP_INTERVAL_MS / 1000)}s, ${Math.round(
+      config.ci.timeoutMs / 60000
+    )}m timeout)`
+  );
+}
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost.
@@ -158,6 +174,9 @@ const REQUIRED_APP_EVENTS = [
   "issue_comment",
   "pull_request_review",
   "pull_request_review_comment",
+  // Needed for CI test gating — the reviewer resumes a held verdict from the
+  // workflow_run completed event. (Also requires the `actions: read` permission.)
+  "workflow_run",
 ];
 async function verifyAppEventSubscriptions(): Promise<void> {
   const name = config.github.appName;

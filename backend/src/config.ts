@@ -85,6 +85,22 @@ export const config = {
   },
   // Neon/Postgres connection string. Source of truth for all persisted state.
   databaseUrl: process.env.DATABASE_URL || "",
+  // CI test-running. Master switch for gating reviews on the repo's own GitHub
+  // Actions run (per-repo opt-in is still required via Repository.testsEnabled).
+  // When disabled the reviewer behaves exactly as before — no extra GitHub calls.
+  ci: {
+    enabled: process.env.TESTS_CI_ENABLED === "true",
+    // How long to wait for a workflow_run to complete before the sweeper gives
+    // up and finalizes the held verdict non-blocking (default 30 min).
+    timeoutMs: Number(process.env.TESTS_CI_TIMEOUT_MS || 30 * 60 * 1000),
+    // Default workflow name/filename that carries the tests, used when a repo
+    // hasn't set its own Repository.testWorkflow. Empty = match the newest run.
+    defaultWorkflow: process.env.TESTS_CI_WORKFLOW || "",
+    // Attempt workflow_dispatch when no run exists for the head SHA. Off by
+    // default — needs the App's `actions: write` permission and a workflow that
+    // declares `on: workflow_dispatch`.
+    dispatch: process.env.TESTS_CI_DISPATCH === "true",
+  },
 };
 
 export const isDbConfigured = () => Boolean(config.databaseUrl);
@@ -103,6 +119,9 @@ export const isDiscordEnvConfigured = () =>
   Boolean(config.integrations.discordBotToken && config.integrations.discordBotChannelId);
 // Transactional email. When false, the email helpers log a preview and no-op.
 export const isEmailConfigured = () => Boolean(config.email.resendApiKey);
+// CI test-running master switch. Per-repo opt-in (Repository.testsEnabled) is
+// checked separately at each review.
+export const isCiTestingConfigured = () => config.ci.enabled;
 // Paid checkout/portal need the secret key + both Price IDs. The webhook secret
 // is checked separately at the webhook receiver.
 export const isStripeConfigured = () =>

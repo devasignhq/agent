@@ -63,7 +63,24 @@ export type LinearIngestJob = {
   attempts: number;
 };
 
-export type Job = ReviewJob | MaintainerFeedbackJob | IndexJob | LinearIngestJob;
+// Finalize a review once its repo's CI run completed. Enqueued from the
+// workflow_run webhook (and the timeout sweeper). Drains in the review bucket —
+// it's a quick fetch-and-post, never the minutes-long CI wait itself (that
+// happens off-process on GitHub's runners).
+export type TestResultJob = {
+  id: string;
+  type: "test_result";
+  payload: { reviewId: string; workflowRunId: number };
+  enqueuedAt: number;
+  attempts: number;
+};
+
+export type Job =
+  | ReviewJob
+  | MaintainerFeedbackJob
+  | IndexJob
+  | LinearIngestJob
+  | TestResultJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -89,6 +106,19 @@ export function enqueueMaintainerFeedback(
     id: uuid(),
     type: "maintainer_feedback",
     payload: { reviewId, comment },
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.reviews.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueTestResult(reviewId: string, workflowRunId: number): TestResultJob {
+  const job: TestResultJob = {
+    id: uuid(),
+    type: "test_result",
+    payload: { reviewId, workflowRunId },
     enqueuedAt: Date.now(),
     attempts: 0,
   };

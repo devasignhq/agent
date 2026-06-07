@@ -10,7 +10,15 @@ import { gh } from "../github/app.js";
 import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
-import { config } from "../config.js";
+import { config, isCiTestingConfigured } from "../config.js";
+import {
+  combineWithTests,
+  ensureCiForReview,
+  findWorkflowRun,
+  summarizeWorkflowRun,
+  testFailureFinding,
+  workflowNameFor,
+} from "./tests-ci.js";
 import { enqueueReview, type MaintainerComment } from "../queue.js";
 import {
   downloadLinearFile,
@@ -25,7 +33,7 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
+import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, TestRun } from "../types.js";
 import { modelForPlan, planForUser } from "../billing/plans.js";
 import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
 
@@ -61,6 +69,8 @@ type FindingCategory =
   // DEVASIGN.md statement the diff makes outdated (docs need updating).
   | "convention"
   | "docDrift"
+  // A failing CI test run on the PR head SHA (blocker — gates the verdict).
+  | "testFailure"
   | "suggestion";
 
 function emitFindingLog(
@@ -76,6 +86,7 @@ function emitFindingLog(
     deferral: "Deferred / incomplete work",
     convention: "DEVASIGN.md violation",
     docDrift: "DEVASIGN.md needs updating",
+    testFailure: "Failing tests",
   };
   log(reviewId, "finding", titleByCategory[category], {
     detail: finding.concern,
@@ -405,11 +416,95 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
     }
 
-    const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
+    let status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
+
+    // ── CI test gating (opt-in per repo, spec'd PRs only) ────────────────────
+    // Only a would-be-positive verdict is gated on tests: a failing run flips it
+    // to changes_requested; an already-failing review is never delayed; the
+    // absence of CI never blocks. When a run is still in flight we HOLD the
+    // verdict (status "testing", interim COMMENT) and let runTestResultJob post
+    // the final APPROVE/REQUEST_CHANGES once the workflow_run webhook lands.
+    // Crucially, when the repo has no GitHub Actions run for this commit (or we
+    // can't read one), we fall straight back to the normal review — basic
+    // correctness / end-goal criteria — with no test section and no extra noise.
+    let testRun: TestRun | undefined;
+    if (
+      isCiTestingConfigured() &&
+      repo.testsEnabled &&
+      status === "passed" &&
+      filledCriteria.length > 0 &&
+      install
+    ) {
+      const workflowName = workflowNameFor(repo.testWorkflow);
+      const ci = await ensureCiForReview({
+        installationId: install.installationId,
+        repo,
+        headSha: review.headSha,
+        prNumber: review.prNumber,
+        workflowName,
+      });
+      if (ci.state === "pending") {
+        // Hold the positive verdict. We post the detailed review now as a
+        // COMMENT (it doesn't gate the PR) plus an in_progress Check Run; the
+        // short final verdict is posted later by runTestResultJob / the sweeper.
+        testRun = ci;
+        log(review.id, "tool", "Waiting for CI to run tests", {
+          target: ci.htmlUrl,
+          meta: { state: ci.state, workflowRunId: ci.workflowRunId, workflow: ci.workflowName },
+        });
+        setStatus(review.id, {
+          criteria: filledCriteria,
+          verdict: verdict.summary,
+          status: "testing",
+          testRun,
+        });
+        await postGithubOutput(review, repo, install, "testing", {
+          endGoal: endGoal || "",
+          criteria: filledCriteria,
+          summary: verdict.summary,
+          suggestions: verdict.suggestions,
+          comments: verdict.comments,
+          diff: context.diff,
+          holistic: holisticVerdict,
+          event: "COMMENT",
+          postConversationReview: true,
+          endGoalCTA: false,
+          testRun,
+        });
+        log(review.id, "verdict", "Verdict held — waiting for CI", {
+          detail: verdict.summary,
+          meta: { criteriaCount: filledCriteria.length, workflow: testRun.workflowName },
+        });
+        return; // finalize asynchronously
+      } else if (ci.state === "failed") {
+        testRun = ci;
+        status = "changes_requested";
+        emitFindingLog(review.id, "testFailure", testFailureFinding(ci));
+        log(review.id, "tool", "CI tests failed", {
+          target: ci.htmlUrl,
+          meta: { state: ci.state, workflow: ci.workflowName, failedJobs: ci.failedJobs?.length ?? 0 },
+        });
+      } else if (ci.state === "passed") {
+        testRun = ci;
+        log(review.id, "tool", "CI tests passed", {
+          target: ci.htmlUrl,
+          meta: { state: ci.state, workflow: ci.workflowName },
+        });
+      } else {
+        // skipped / errored → no GitHub Actions for this commit (or unreadable).
+        // Review as normal: leave testRun undefined so nothing is rendered or
+        // persisted, and the verdict stands on the acceptance criteria alone.
+        log(review.id, "tool", "No CI run found — reviewing on acceptance criteria only", {
+          detail: ci.detail,
+        });
+      }
+    }
+
     setStatus(review.id, {
       criteria: filledCriteria,
       verdict: verdict.summary,
       status,
+      ...(testRun ? { testRun } : {}),
     });
 
     // Route the verdict to a GitHub review action. We never auto-APPROVE a PR
@@ -478,6 +573,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       event: reviewEvent,
       postConversationReview,
       endGoalCTA: includeEndGoalCTA,
+      testRun,
     });
     // Mark the end-goal request as sent so re-reviews on later pushes don't
     // re-spam the PR conversation.
@@ -537,6 +633,218 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     );
   }
   });
+}
+
+// --- CI test finalize (deferred verdict) ---
+//
+// When a review's positive verdict was HELD pending the repo's CI run, the final
+// APPROVE/REQUEST_CHANGES is posted here — once the workflow_run webhook lands
+// (runTestResultJob) or the timeout sweeper gives up (sweepPendingTestRuns). The
+// detailed review was already posted as an interim COMMENT in runReviewJob; this
+// step posts a short verdict review + flips the Check Run conclusion.
+
+// Concise body for the deferred verdict. The full criteria/holistic breakdown is
+// in the earlier interim comment, so this focuses on the test outcome.
+function formatTestResultBody(testRun: TestRun, effectivePassed: boolean): string {
+  const lines: string[] = [];
+  appendTestSection(lines, testRun);
+  lines.push(
+    effectivePassed
+      ? "All acceptance criteria were met and the test run is green — approving. The detailed review is in the earlier comment on this PR."
+      : "Acceptance criteria were met, but the test run failed — requesting changes until it's green. See the detailed review earlier in this PR."
+  );
+  return lines.join("\n").trimEnd();
+}
+
+async function finalizeAfterTests(
+  review: PRReview,
+  repo: Repository,
+  install: Installation | null,
+  task: Task | null,
+  testRun: TestRun
+): Promise<void> {
+  // We only ever hold a would-be-positive verdict, so the pre-test outcome is
+  // "passed"; the test result is the only thing that can flip it.
+  const effectivePassed = combineWithTests(true, testRun.state).effectivePassed;
+  const status: PRReviewStatus = effectivePassed ? "passed" : "changes_requested";
+  const specless = review.criteria.length === 0;
+
+  if (testRun.state === "failed") {
+    emitFindingLog(review.id, "testFailure", testFailureFinding(testRun));
+  }
+  setStatus(review.id, { status, testRun });
+
+  log(review.id, "verdict", effectivePassed ? "Tests passed — verdict finalized" : "Tests failed — changes requested", {
+    detail: testRun.detail || testRun.conclusion,
+    meta: { state: testRun.state, workflow: testRun.workflowName, failedJobs: testRun.failedJobs?.length ?? 0 },
+  });
+
+  notifyForReview(
+    review.id,
+    effectivePassed ? "review" : "blocker",
+    effectivePassed
+      ? `PR #${review.prNumber} — Tests passed, all criteria met`
+      : `PR #${review.prNumber} — Tests failed`,
+    `${repo.owner}/${repo.name} — ${review.prTitle}`
+  );
+
+  if (install) {
+    const event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT" = !effectivePassed
+      ? "REQUEST_CHANGES"
+      : specless
+        ? "COMMENT"
+        : "APPROVE";
+    const body = formatTestResultBody(testRun, effectivePassed);
+    const conclusion = effectivePassed ? "success" : "action_required";
+    try {
+      await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
+        method: "POST",
+        body: JSON.stringify({
+          name: "DevAsign · End goal",
+          head_sha: review.headSha,
+          status: "completed",
+          conclusion,
+          output: {
+            title: effectivePassed ? "Tests passed — all acceptance criteria met" : "Tests failed",
+            summary: review.verdict || "",
+          },
+        }),
+        headers: { "Content-Type": "application/json" },
+      });
+    } catch (err) {
+      console.warn("[review] failed to post check run (test finalize):", err);
+    }
+    try {
+      await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+        method: "POST",
+        body: JSON.stringify({ event, body }),
+        headers: { "Content-Type": "application/json" },
+      });
+      log(review.id, "comment", "Posted final verdict after CI", { meta: { event, state: testRun.state } });
+    } catch (err) {
+      console.warn("[review] failed to post final test verdict review:", err);
+    }
+  }
+
+  // Mirror the main pipeline's chat/Linear broadcast (idempotent per head SHA).
+  const linearInt = task?.linkedLinearIssue ? linearIntegrationForUser(install?.userId) : null;
+  const notifyLinear = Boolean(
+    task?.linkedLinearIssue && linearInt && task.linearNotifiedSha !== review.headSha
+  );
+  await broadcastVerdict(
+    review,
+    repo,
+    status,
+    review.verdict || "",
+    notifyLinear && linearInt && task?.linkedLinearIssue
+      ? {
+          linkedLinearIssue: task.linkedLinearIssue,
+          linearToken: linearInt.tokens.accessToken || linearInt.tokens.apiKey || "",
+          linearBearer: Boolean(linearInt.tokens.accessToken),
+        }
+      : {}
+  );
+  if (notifyLinear && task) {
+    db.update("tasks", (t) => t.id === task.id, { linearNotifiedSha: review.headSha });
+  }
+}
+
+// Resume a held review once its CI workflow_run completed. Enqueued from the
+// webhook. Guards on testRun.state === "pending" so duplicate/unrelated
+// workflow completions (or a superseded head SHA) are ignored.
+export async function runTestResultJob(reviewId: string, workflowRunId: number): Promise<void> {
+  const review = db.find("prReviews", (r) => r.id === reviewId);
+  if (!review) return;
+  if (review.testRun?.state !== "pending") return; // already finalized / stale
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo) return;
+  const install = db.find("installations", (i) => i.id === repo.installationId) || null;
+  const task = review.taskId ? db.find("tasks", (t) => t.id === review.taskId) || null : null;
+
+  if (!install) {
+    // Dev / no install to read GitHub: resolve non-blocking so nothing hangs.
+    await finalizeAfterTests(review, repo, null, task, {
+      ...review.testRun,
+      state: "skipped",
+      completedAt: Date.now(),
+      detail: "no installation",
+    });
+    return;
+  }
+
+  let summary: Pick<TestRun, "state" | "conclusion" | "htmlUrl" | "failedJobs" | "workflowName">;
+  try {
+    summary = await summarizeWorkflowRun(install.installationId, repo, workflowRunId);
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    log(review.id, "tool", "Failed to read CI result", { detail });
+    await finalizeAfterTests(review, repo, install, task, {
+      ...review.testRun,
+      state: "errored",
+      completedAt: Date.now(),
+      detail,
+    });
+    return;
+  }
+
+  const testRun: TestRun = { ...review.testRun, ...summary, completedAt: Date.now() };
+  // The completing run might not be the final state yet (e.g. a re-run kicked
+  // off). Keep waiting rather than finalizing on an in-flight run.
+  if (testRun.state === "pending") {
+    setStatus(review.id, { testRun: { ...testRun, completedAt: undefined } });
+    return;
+  }
+  log(review.id, "tool", `CI completed: ${testRun.state}`, {
+    target: testRun.htmlUrl,
+    meta: { state: testRun.state, workflowRunId, workflow: testRun.workflowName },
+  });
+  await finalizeAfterTests(review, repo, install, task, testRun);
+}
+
+// Safety net: finalize reviews whose CI never reported back (no webhook, fork
+// restrictions, dispatch failure). Timestamp-driven and restart-safe. Called on
+// an interval from server startup. A timeout is NON-blocking — we gate on a real
+// failure, never on the absence of a result.
+export async function sweepPendingTestRuns(): Promise<void> {
+  const cutoff = Date.now() - config.ci.timeoutMs;
+  const stuck = db.filter(
+    "prReviews",
+    (r) => r.status === "testing" && r.testRun?.state === "pending" && (r.testRun.startedAt ?? 0) < cutoff
+  );
+  for (const review of stuck) {
+    try {
+      const repo = db.find("repositories", (r) => r.id === review.repoId);
+      if (!repo) continue;
+      const install = db.find("installations", (i) => i.id === repo.installationId) || null;
+      const task = review.taskId ? db.find("tasks", (t) => t.id === review.taskId) || null : null;
+      let resolved: TestRun;
+      let summary:
+        | Pick<TestRun, "state" | "conclusion" | "htmlUrl" | "failedJobs" | "workflowName">
+        | null = null;
+      if (install) {
+        const wf = workflowNameFor(repo.testWorkflow);
+        const run = await findWorkflowRun(install.installationId, repo, review.headSha, wf);
+        if (run && run.status === "completed") {
+          summary = await summarizeWorkflowRun(install.installationId, repo, run.id);
+        }
+      }
+      resolved = summary
+        ? { ...review.testRun!, ...summary, completedAt: Date.now() }
+        : {
+            ...review.testRun!,
+            state: "skipped",
+            completedAt: Date.now(),
+            detail: "no CI completed within the timeout",
+          };
+      if (resolved.state === "pending") continue; // still genuinely running
+      log(review.id, "tool", `CI wait timed out — finalizing (${resolved.state})`, {
+        meta: { state: resolved.state },
+      });
+      await finalizeAfterTests(review, repo, install, task, resolved);
+    } catch (err) {
+      console.warn(`[review] test-timeout sweep failed for ${review.id}:`, err);
+    }
+  }
 }
 
 // --- Context ingestion ---
@@ -1407,7 +1715,8 @@ function formatReviewBody(
   suggestions: ReviewSuggestion[],
   summary: string,
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
-  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean }
+  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
+  testRun?: TestRun
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
@@ -1455,6 +1764,11 @@ function formatReviewBody(
     }
     lines.push("");
   }
+
+  // CI test result (opt-in repos). A failing run is the dominant signal, so it
+  // sits right under the criteria. Pending = the verdict is held until the run
+  // finishes; skipped/errored are reported but never block.
+  appendTestSection(lines, testRun);
 
   // Self-admitted deferred / incomplete work the diff's own comments concede.
   // Advisory (never blocks the merge) but surfaced prominently right under the
@@ -1680,6 +1994,47 @@ function buildConsolidatedFixPrompt(args: {
   return lines.join("\n").trimEnd();
 }
 
+// Render the CI test-result block into a review body. No-op when there's no
+// test run (repo not opted in / disabled).
+function appendTestSection(lines: string[], testRun?: TestRun) {
+  if (!testRun) return;
+  const wf = testRun.workflowName ? `\`${testRun.workflowName}\`` : "CI";
+  const link = testRun.htmlUrl ? ` ([run](${testRun.htmlUrl}))` : "";
+  switch (testRun.state) {
+    case "pending":
+      lines.push(
+        "## ⏳ Tests running",
+        `Acceptance criteria are met — holding the verdict until the ${wf} workflow finishes${link}. ` +
+          "This review will update automatically when the run completes.",
+        ""
+      );
+      return;
+    case "passed":
+      lines.push("## ✅ Tests passed", `The ${wf} workflow succeeded for this commit${link}.`, "");
+      return;
+    case "failed": {
+      lines.push("## ❌ Tests failed", `The ${wf} workflow failed for this commit${link}.`);
+      if (testRun.failedJobs?.length) {
+        lines.push("", "Failing jobs:");
+        for (const j of testRun.failedJobs) {
+          lines.push(`- ${j.url ? `[${j.name}](${j.url})` : j.name}`);
+        }
+      }
+      lines.push("");
+      return;
+    }
+    case "skipped":
+    case "errored":
+      lines.push(
+        "## ⚪ Tests not conclusive",
+        `Couldn't get a CI result for this commit${testRun.detail ? ` (${testRun.detail})` : ""}. ` +
+          "Approving on the acceptance criteria — a test run never blocks by its absence.",
+        ""
+      );
+      return;
+  }
+}
+
 function appendHolisticGroup(
   lines: string[],
   label: string,
@@ -1766,25 +2121,33 @@ async function postGithubOutput(
     postConversationReview: boolean;
     // Append the "provide an end goal" call-to-action to the review body.
     endGoalCTA: boolean;
+    // CI test run for this head SHA (opt-in repos). When state is "pending" the
+    // Check Run is posted as in_progress and the body shows a "tests running"
+    // note — the final verdict is posted later by runTestResultJob.
+    testRun?: TestRun;
   }
 ): Promise<{ reviewPosted: boolean }> {
   if (!install) return { reviewPosted: false }; // dev: nothing to post to
+  const testsPending = args.testRun?.state === "pending";
   const conclusion = status === "passed" ? "success" : "action_required";
   const specless = args.criteria.length === 0;
 
   // Check Run is keyed to head_sha, so it's always (re)posted — it updates the
-  // commit status without adding conversation noise.
+  // commit status without adding conversation noise. While tests are pending we
+  // leave it in_progress (no conclusion) so the commit doesn't read as approved
+  // before the run finishes.
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
       method: "POST",
       body: JSON.stringify({
         name: "DevAsign · End goal",
         head_sha: review.headSha,
-        status: "completed",
-        conclusion,
+        status: testsPending ? "in_progress" : "completed",
+        ...(testsPending ? {} : { conclusion }),
         output: {
-          title:
-            status === "passed"
+          title: testsPending
+            ? "Acceptance criteria met — waiting for tests"
+            : status === "passed"
               ? specless
                 ? "No issues found — add an end goal for acceptance-criteria review"
                 : "All acceptance criteria met"
@@ -1807,7 +2170,8 @@ async function postGithubOutput(
     args.suggestions,
     args.summary,
     args.holistic,
-    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA }
+    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
+    args.testRun
   );
 
   // Translate the LLM's inline annotations into GitHub's review-comment shape.

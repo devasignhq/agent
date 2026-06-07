@@ -1,6 +1,11 @@
 // Subscribe to the in-memory queue and run review + index jobs.
 import { onJob } from "./queue.js";
-import { runLinearIngestJob, runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
+import {
+  runLinearIngestJob,
+  runMaintainerFeedbackJob,
+  runReviewJob,
+  runTestResultJob,
+} from "./review/pipeline.js";
 import { buildRepoIndex } from "./review/indexer.js";
 import { reviewOwnerPendingDeletion } from "./account.js";
 
@@ -28,6 +33,14 @@ export function startWorker() {
       case "linear_ingest":
         console.log(`[worker] linear_ingest ${job.payload.issueId}`);
         await runLinearIngestJob(job.payload.integrationId, job.payload.issueId);
+        return;
+      case "test_result":
+        if (reviewOwnerPendingDeletion(job.payload.reviewId)) {
+          console.log(`[worker] skip test_result ${job.payload.reviewId} — owner pending deletion`);
+          return;
+        }
+        console.log(`[worker] test_result ${job.payload.reviewId} (run ${job.payload.workflowRunId})`);
+        await runTestResultJob(job.payload.reviewId, job.payload.workflowRunId);
         return;
       case "index":
         console.log(

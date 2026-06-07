@@ -329,6 +329,32 @@ api.post("/repositories/:id/reindex", (req, res) => {
   res.json({ ok: true, jobId: job.id });
 });
 
+// Opt a repo in/out of CI test gating, and optionally set which workflow carries
+// the tests. Owner-scoped like reindex above. The master switch (TESTS_CI_ENABLED)
+// still has to be on server-side for gating to actually run.
+api.post("/repositories/:id/tests", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const enabled = Boolean(req.body?.enabled);
+  const workflowRaw = req.body?.workflow;
+  const workflow = typeof workflowRaw === "string" ? workflowRaw.trim() : undefined;
+  db.update("repositories", (r) => r.id === repo.id, {
+    testsEnabled: enabled,
+    ...(workflow !== undefined ? { testWorkflow: workflow || null } : {}),
+  });
+  res.json({
+    ok: true,
+    testsEnabled: enabled,
+    ...(workflow !== undefined ? { testWorkflow: workflow || null } : {}),
+  });
+});
+
 // --- PR Reviews (the agent's queue) ---
 
 api.get("/reviews", (req, res) => {

@@ -543,6 +543,17 @@ const SetInstall = () => {
     }, 500);
   };
 
+  // Opt a repo in/out of CI test gating. Optimistic; reverts on failure.
+  const toggleTests = React.useCallback(async (repo: any) => {
+    const next = !repo.testsEnabled;
+    setRepos((prev) => prev.map((x) => (x.id === repo.id ? { ...x, testsEnabled: next } : x)));
+    try {
+      await api.setRepoTests(repo.id, next);
+    } catch {
+      setRepos((prev) => prev.map((x) => (x.id === repo.id ? { ...x, testsEnabled: !next } : x)));
+    }
+  }, []);
+
   // Group repos under their installation for the connected-repos list.
   const installRows = React.useMemo(() => {
     const byInstall = new Map<string, { inst: any; repos: any[] }>();
@@ -581,6 +592,15 @@ const SetInstall = () => {
                   <span className="mono gh-repo-name">{r.owner}/{r.name}</span>
                   <span className="gh-repo-meta mono">{r.defaultBranch}</span>
                   <span className="flex-1"></span>
+                  <button
+                    type="button"
+                    className={`pill mono ${r.testsEnabled ? "ok" : ""}`}
+                    style={{ cursor: "pointer", fontSize: 11 }}
+                    title="Run this repo's GitHub Actions on each review and block the verdict if they fail"
+                    onClick={() => toggleTests(r)}
+                  >
+                    <i className="dot"></i> tests {r.testsEnabled ? "on" : "off"}
+                  </button>
                   <span className="gh-repo-vis mono private">private</span>
                 </li>
               ))}

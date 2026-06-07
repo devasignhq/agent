@@ -6,7 +6,8 @@ import { v4 as uuid } from "uuid";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
-import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueTestResult } from "../queue.js";
+import { runMatchesWorkflow, workflowNameFor } from "../review/tests-ci.js";
 import { notifyForReview } from "../notifications.js";
 import {
   PLAN_LIMITS,
@@ -72,6 +73,9 @@ export function handleWebhook(req: Request, res: Response) {
       break;
     case "pull_request_review_comment":
       handlePullRequestReviewComment(event);
+      break;
+    case "workflow_run":
+      handleWorkflowRun(event);
       break;
     case "ping":
       // GitHub sends this when the webhook is created. Nothing to do.
@@ -311,6 +315,46 @@ function handlePullRequestReviewComment(event: any) {
     });
     console.log(`[webhook] pull_request_review_comment: enqueued for review ${review.id}`);
   })();
+}
+
+// A repo's GitHub Actions run finished. If a review is holding its verdict for
+// this exact head SHA (status "testing"), enqueue the finalize job. We key on
+// `testRun.state === "pending"` so only awaited reviews react — every other
+// workflow_run is ignored. When the repo designated a specific test workflow,
+// only that workflow's completion finalizes (a PR fires one run per workflow).
+function handleWorkflowRun(event: any) {
+  if (event.action !== "completed") return;
+  const run = event.workflow_run;
+  const repoFullName: string = event.repository?.full_name || "";
+  const [owner, name] = repoFullName.split("/");
+  if (!run || !owner || !name) return;
+  const headSha: string = run.head_sha || "";
+  if (!headSha) return;
+  const repo = db.find("repositories", (r) => r.owner === owner && r.name === name);
+  if (!repo) return;
+
+  const reviews = db.filter(
+    "prReviews",
+    (r) => r.repoId === repo.id && r.headSha === headSha && r.testRun?.state === "pending"
+  );
+  if (!reviews.length) return;
+
+  const wf = workflowNameFor(repo.testWorkflow);
+  if (
+    wf &&
+    !runMatchesWorkflow(
+      { id: run.id, head_sha: headSha, name: run.name, path: run.path, status: run.status, conclusion: run.conclusion },
+      wf
+    )
+  ) {
+    console.log(`[webhook] workflow_run "${run.name}" ≠ designated "${wf}" — ignoring`);
+    return;
+  }
+
+  for (const review of reviews) {
+    enqueueTestResult(review.id, run.id);
+    console.log(`[webhook] workflow_run completed → finalize review ${review.id} (run ${run.id})`);
+  }
 }
 
 function findPRReview(repoFullName: string | undefined, prNumber: number | undefined) {

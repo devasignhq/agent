@@ -130,6 +130,9 @@ export type Repository = {
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
+  // CI test gating (opt-in). Mirror of backend/src/types.ts.
+  testsEnabled?: boolean;
+  testWorkflow?: string | null;
 };
 
 export type IntegrationType = "slack" | "linear" | "discord";
@@ -177,9 +180,23 @@ export type Task = {
 export type PRReviewStatus =
   | "queued"
   | "reviewing"
+  // Criteria review done; verdict held pending the repo's CI run (opt-in repos).
+  | "testing"
   | "passed"
   | "changes_requested"
   | "errored";
+
+export type TestRun = {
+  state: "pending" | "passed" | "failed" | "skipped" | "errored";
+  workflowRunId?: number;
+  workflowName?: string;
+  htmlUrl?: string;
+  conclusion?: string;
+  failedJobs?: Array<{ name: string; url: string }>;
+  startedAt: number;
+  completedAt?: number;
+  detail?: string;
+};
 
 export type Criterion = {
   id: string;
@@ -199,6 +216,7 @@ export type PRReview = {
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;
+  testRun?: TestRun;
   createdAt: number;
   updatedAt: number;
 };
@@ -210,7 +228,9 @@ export type ReviewLogKind =
   | "tool"
   | "comment"
   | "verdict"
-  | "error";
+  | "error"
+  | "holistic"
+  | "finding";
 
 export type ReviewLogEntry = {
   id: string;
@@ -284,6 +304,12 @@ export const api = {
       body: "{}",
     }),
   repositories: () => request<Repository[]>("/api/repositories"),
+  // Opt a repo in/out of CI test gating (and optionally set the test workflow).
+  setRepoTests: (id: string, enabled: boolean, workflow?: string) =>
+    request<{ ok: true; testsEnabled: boolean; testWorkflow?: string | null }>(
+      `/api/repositories/${id}/tests`,
+      { method: "POST", body: JSON.stringify({ enabled, ...(workflow !== undefined ? { workflow } : {}) }) }
+    ),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>

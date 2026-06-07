@@ -1168,6 +1168,8 @@ const AgentComposer = ({ onSend, disabled }) => {
 function mapStatus(s) {
   switch (s) {
     case "reviewing":          return "running";
+    // Criteria done, verdict held for CI — still in-flight from the user's POV.
+    case "testing":            return "running";
     case "queued":             return "queued";
     case "passed":             return "approved";
     case "changes_requested":  return "blocked";
@@ -1508,7 +1510,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       }
       if (cancelled) return;
       const anyLive = liveReviewsRef.current.some(
-        (r) => r.status === "queued" || r.status === "reviewing"
+        (r) => r.status === "queued" || r.status === "reviewing" || r.status === "testing"
       );
       timer = setTimeout(tick, anyLive ? 3000 : 6000);
     };
@@ -1629,7 +1631,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       author: "",
       model: repo?.defaultModel || "—",
       status: mapStatus(r.status),
-      progress: r.status === "reviewing" ? 0.5 : r.status === "queued" ? 0 : 1,
+      progress: r.status === "reviewing" ? 0.5 : r.status === "testing" ? 0.75 : r.status === "queued" ? 0 : 1,
       stage: r.status,
       issueId: r.taskId ? r.taskId.slice(0, 8) : "—",
       eta: RELATIVE(r.updatedAt),
@@ -1858,7 +1860,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     if (lastWeek > 0) wow = ((thisWeek - lastWeek) / lastWeek) * 100;
     else if (thisWeek > 0) wow = 100;
     else wow = null; // "—" when there's no data either week
-    const openReviews = liveReviews.filter((r) => r.status === "reviewing" || r.status === "queued").length;
+    const openReviews = liveReviews.filter((r) => r.status === "reviewing" || r.status === "queued" || r.status === "testing").length;
     const passed = liveReviews.filter((r) => r.status === "passed").length;
     const requestedChanges = liveReviews.filter((r) => r.status === "changes_requested").length;
     return { tasksTotal, thisWeek, lastWeek, wow, openReviews, passed, requestedChanges };

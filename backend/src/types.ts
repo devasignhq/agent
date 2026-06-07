@@ -42,6 +42,15 @@ export type Repository = {
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
+  // ── CI test-running (opt-in per repo) ─────────────────────────────────────
+  // When true, the reviewer waits for this repo's GitHub Actions to run on the
+  // PR head SHA and gates the verdict on the result (a failing run blocks).
+  // Optional so legacy rows load as "off".
+  testsEnabled?: boolean;
+  // Which workflow carries the tests (its `name` or filename, e.g. "CI" or
+  // "ci.yml"). Disambiguates when a PR fires several workflows. Falls back to
+  // config.ci.defaultWorkflow when unset/null.
+  testWorkflow?: string | null;
   // Repo-index state. Optional so DB rows written before the indexer existed
   // still load — treat undefined as "none" at every branch site.
   indexState?: RepoIndexState;
@@ -132,9 +141,29 @@ export type TaskAttachment = {
 export type PRReviewStatus =
   | "queued"
   | "reviewing"
+  // The criteria/holistic review is done but the verdict is held pending the
+  // repo's CI test run (opt-in repos only). Resolves to passed/changes_requested
+  // once the workflow_run webhook lands or the timeout sweeper gives up.
+  | "testing"
   | "passed"
   | "changes_requested"
   | "errored";
+
+// Result of waiting on a repo's GitHub Actions run for a PR's head SHA. Lives on
+// PRReview.testRun (optional/JSONB so legacy rows load). `state` drives the held
+// verdict: "failed" blocks (changes_requested); "skipped"/"errored" are
+// non-blocking (we gate on a real failure, not on the absence of CI).
+export type TestRun = {
+  state: "pending" | "passed" | "failed" | "skipped" | "errored";
+  workflowRunId?: number;
+  workflowName?: string;
+  htmlUrl?: string;
+  conclusion?: string; // raw GitHub run conclusion (success|failure|cancelled|…)
+  failedJobs?: Array<{ name: string; url: string }>;
+  startedAt: number;
+  completedAt?: number;
+  detail?: string; // "no CI found", timeout note, error text, …
+};
 
 export type Criterion = {
   id: string;
@@ -159,6 +188,9 @@ export type PRReview = {
   additions: number | null;
   deletions: number | null;
   changedFiles: number | null;
+  // CI test run for this review's head SHA (opt-in repos only). Undefined when
+  // the repo isn't opted in or tests were never awaited.
+  testRun?: TestRun;
   createdAt: number;
   updatedAt: number;
 };
