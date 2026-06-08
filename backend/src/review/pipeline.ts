@@ -6,7 +6,7 @@
 //   e. Eval (LLM-as-judge; out-of-band, not in this hot path)
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { gh } from "../github/app.js";
+import { dispatchWorkflow, gh } from "../github/app.js";
 import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
@@ -575,6 +575,33 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         },
       }
     );
+
+    // e. Optional "Run GitHub Action": dispatch the configured workflow now that
+    // the verdict is posted. Gated by the per-repo workflow + runWhen condition.
+    // Best-effort — a missing actions:write scope or a workflow without a
+    // workflow_dispatch trigger logs a note instead of failing the review.
+    if (install && wf.actions?.enabled && wf.actions.workflow && context.branch) {
+      const shouldRun = wf.actions.runWhen === "always" || status === "passed";
+      if (shouldRun) {
+        try {
+          await dispatchWorkflow(
+            install.installationId,
+            repo.owner,
+            repo.name,
+            wf.actions.workflow,
+            context.branch
+          );
+          log(review.id, "verdict", `Dispatched GitHub Action: ${wf.actions.workflow}`, {
+            detail: `ref ${context.branch}`,
+            meta: { workflow: wf.actions.workflow, ref: context.branch, runWhen: wf.actions.runWhen },
+          });
+        } catch (err) {
+          log(review.id, "verdict", "GitHub Action dispatch skipped", {
+            detail: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
   } catch (err) {
     console.error(`[review] ${review.id} failed:`, err);
     setStatus(review.id, { status: "errored" });
@@ -605,6 +632,8 @@ type Context = {
   // re-review understands the diff is the cumulative result of every commit,
   // not just the latest push. Empty when the fetch is unavailable.
   commits: string;
+  // PR head branch (pr.head.ref) — the ref a "Run GitHub Action" dispatch uses.
+  branch: string;
   videos: VideoSummary[];
   primaryIssues: number[];
   secondaryIssues: number[];
@@ -858,6 +887,7 @@ async function ingestContext(
     sources,
     diff,
     commits,
+    branch: prBranch,
     videos,
     primaryIssues,
     secondaryIssues,

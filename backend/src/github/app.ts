@@ -124,3 +124,39 @@ export async function postPRComment(
     console.warn(`[github] failed to post PR comment on ${owner}/${name}#${prNumber}:`, err);
   }
 }
+
+// Dispatch a GitHub Actions workflow (workflow_dispatch) — powers the optional
+// "Run GitHub Action" node. `workflow` is the file name (e.g. "deploy.yml") or
+// numeric id; `ref` is the branch/tag to run on (the PR head branch). The
+// endpoint returns 204 with no body, so unlike gh() we don't parse JSON. Throws
+// on !ok so the caller can log a non-fatal note (missing actions:write, or the
+// workflow has no workflow_dispatch trigger → 422).
+export async function dispatchWorkflow(
+  installationId: number,
+  owner: string,
+  name: string,
+  workflow: string,
+  ref: string,
+  inputs?: Record<string, string>
+): Promise<void> {
+  const token = await installationToken(installationId);
+  const res = await fetch(
+    `https://api.github.com/repos/${owner}/${name}/actions/workflows/${encodeURIComponent(workflow)}/dispatches`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `token ${token}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "devasign-app",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ref, ...(inputs ? { inputs } : {}) }),
+    }
+  );
+  if (!res.ok) {
+    throw new Error(
+      `GitHub workflow_dispatch ${res.status} on ${owner}/${name} (${workflow}): ${await res.text()}`
+    );
+  }
+}

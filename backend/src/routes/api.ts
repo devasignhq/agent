@@ -314,7 +314,24 @@ api.get("/repositories", (req, res) => {
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const installs = db.filter("installations", (i) => i.userId === user.id);
   const installIds = new Set(installs.map((i) => i.id));
-  res.json(db.filter("repositories", (r) => installIds.has(r.installationId)));
+  const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
+  // Attach per-repo review counts for the Workflow rail cards. One pass over the
+  // user's reviews: approved = "passed", blocked = "changes_requested".
+  const repoIds = new Set(repos.map((r) => r.id));
+  const stats = new Map<string, { total: number; approved: number; blocked: number }>();
+  for (const rv of db.filter("prReviews", (r) => repoIds.has(r.repoId))) {
+    const s = stats.get(rv.repoId) || { total: 0, approved: 0, blocked: 0 };
+    s.total++;
+    if (rv.status === "passed") s.approved++;
+    else if (rv.status === "changes_requested") s.blocked++;
+    stats.set(rv.repoId, s);
+  }
+  res.json(
+    repos.map((r) => ({
+      ...r,
+      reviewStats: stats.get(r.id) || { total: 0, approved: 0, blocked: 0 },
+    }))
+  );
 });
 
 // Trigger a full repo re-index. Useful when the indexer prompt or allow-list
@@ -371,6 +388,38 @@ api.put("/repositories/:id/workflow", (req, res) => {
   }
   db.update("repositories", (r) => r.id === repo.id, { workflow: next });
   res.json({ ok: true, workflow: next });
+});
+
+// List the repo's GitHub Actions workflows — populates the "Run GitHub Action"
+// node's picker. Owner-scoped. Best-effort: if the App lacks `actions:read`
+// (or the repo has none), return an empty list + flag so the UI can nudge the
+// user to grant the permission rather than erroring.
+api.get("/repositories/:id/actions/workflows", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) return void res.status(404).json({ error: "repo_not_found" });
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const install = installs.find((i) => i.id === repo.installationId);
+  if (!install) return void res.status(403).json({ error: "forbidden" });
+  try {
+    const data = await gh<{ workflows: Array<{ id: number; name: string; path: string; state: string }> }>(
+      install.installationId,
+      `/repos/${repo.owner}/${repo.name}/actions/workflows?per_page=100`
+    );
+    const workflows = (data.workflows || [])
+      .filter((w) => w.state === "active")
+      .map((w) => ({
+        id: w.id,
+        name: w.name,
+        // The dispatch API accepts the workflow file name as its id.
+        file: w.path.split("/").pop() || String(w.id),
+      }));
+    res.json({ workflows });
+  } catch (err) {
+    console.warn(`[actions] list workflows failed for ${repo.owner}/${repo.name}:`, err);
+    res.json({ workflows: [], error: "actions_unavailable" });
+  }
 });
 
 // --- PR Reviews (the agent's queue) ---
