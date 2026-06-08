@@ -113,3 +113,43 @@ test("advancedChanged: editing a stage prompt is an ADVANCED change", () => {
   const same = normalizeWorkflow({ ...base, prompts: { review: "focus on tests" } });
   assert.equal(advancedChanged(promptEdit, same), false, "identical prompts are not a change");
 });
+
+test("normalizeWorkflow coerces the actions step and defaults it off", () => {
+  const def = normalizeWorkflow({ version: 1 });
+  assert.deepEqual(def.actions, { enabled: false, workflow: "", runWhen: "passed" });
+
+  const wf = normalizeWorkflow({
+    ...WORKFLOW_DEFAULTS,
+    actions: { enabled: "yes", workflow: "  deploy.yml  ", runWhen: "weird" },
+  });
+  assert.equal(wf.actions?.enabled, false);          // non-bool -> false
+  assert.equal(wf.actions?.workflow, "deploy.yml");  // trimmed
+  assert.equal(wf.actions?.runWhen, "passed");        // invalid enum -> default
+
+  const capped = normalizeWorkflow({ ...WORKFLOW_DEFAULTS, actions: { enabled: true, workflow: "x".repeat(500), runWhen: "always" } });
+  assert.equal(capped.actions?.enabled, true);
+  assert.equal(capped.actions?.workflow.length, 200); // capped
+  assert.equal(capped.actions?.runWhen, "always");
+});
+
+test("effectiveWorkflow fills the actions defaults and merges stored ones", () => {
+  assert.deepEqual(effectiveWorkflow({ workflow: undefined }).actions, {
+    enabled: false,
+    workflow: "",
+    runWhen: "passed",
+  });
+  const wf = effectiveWorkflow({
+    workflow: { version: 1, actions: { enabled: true, workflow: "ci.yml" } } as any,
+  });
+  assert.deepEqual(wf.actions, { enabled: true, workflow: "ci.yml", runWhen: "passed" });
+});
+
+test("advancedChanged: editing the actions step is an ADVANCED change", () => {
+  const base = WORKFLOW_DEFAULTS;
+  const enableEdit = normalizeWorkflow({ ...base, actions: { enabled: true, workflow: "ci.yml", runWhen: "passed" } });
+  assert.equal(advancedChanged(base, enableEdit), true, "enabling actions is advanced");
+  const runWhenEdit = normalizeWorkflow({ ...enableEdit, actions: { enabled: true, workflow: "ci.yml", runWhen: "always" } });
+  assert.equal(advancedChanged(enableEdit, runWhenEdit), true, "changing runWhen is advanced");
+  const same = normalizeWorkflow({ ...enableEdit });
+  assert.equal(advancedChanged(enableEdit, same), false, "identical actions are not a change");
+});

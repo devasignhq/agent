@@ -3,9 +3,9 @@
 // enforced by the review pipeline (stages + verdict) and the PR webhook (trigger).
 //
 // Tiering: `stages` (which stages run) is BASIC (free). `trigger`, `verdict`
-// (policy + automation) and `prompts` (per-stage agent steering) are ADVANCED
-// (Pro/Max) — the API rejects advanced changes from free users (see
-// advancedChanged); the UI locks them behind an upgrade nudge.
+// (policy + automation), `prompts` (per-stage agent steering) and `actions`
+// (GitHub Actions workflow dispatch) are ADVANCED (Pro/Max) — the API rejects
+// advanced changes from free users (see advancedChanged); the UI locks them.
 import type { Repository, RepoWorkflow } from "../types.js";
 
 // The stages that make an LLM call and can therefore carry maintainer
@@ -13,6 +13,8 @@ import type { Repository, RepoWorkflow } from "../types.js";
 export const PROMPT_KEYS = ["criteria", "review", "holistic", "deferrals", "docs"] as const;
 // Cap a single stage prompt so a pasted essay can't blow up the system prompt.
 const PROMPT_CAP = 2000;
+// Cap the stored workflow file name for the "Run GitHub Action" step.
+const WORKFLOW_NAME_CAP = 200;
 
 // Defaults reproduce DevAsign's behavior before workflows existed, so any repo
 // whose `workflow` is undefined (every existing repo) reviews exactly as before.
@@ -22,6 +24,7 @@ export const WORKFLOW_DEFAULTS: RepoWorkflow = {
   stages: { holistic: true, docs: true, deferrals: true },
   verdict: { blocking: true },
   prompts: {},
+  actions: { enabled: false, workflow: "", runWhen: "passed" },
 };
 
 // Merge a repo's stored (possibly partial/legacy) workflow over the defaults so
@@ -36,6 +39,7 @@ export function effectiveWorkflow(repo: Pick<Repository, "workflow">): RepoWorkf
     stages: { ...WORKFLOW_DEFAULTS.stages, ...(w.stages || {}) },
     verdict: { ...WORKFLOW_DEFAULTS.verdict, ...(w.verdict || {}) },
     prompts: { ...(w.prompts || {}) },
+    actions: { ...WORKFLOW_DEFAULTS.actions!, ...(w.actions || {}) },
   };
 }
 
@@ -57,6 +61,14 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
     const text = raw.trim().slice(0, PROMPT_CAP);
     if (text) prompts[k] = text;
   }
+  // GitHub Action dispatch step: coerce enabled→bool, workflow→trimmed/capped
+  // string, runWhen→one of the two allowed values.
+  const a = (o.actions || {}) as Record<string, any>;
+  const actions: NonNullable<RepoWorkflow["actions"]> = {
+    enabled: b(a.enabled, false),
+    workflow: typeof a.workflow === "string" ? a.workflow.trim().slice(0, WORKFLOW_NAME_CAP) : "",
+    runWhen: a.runWhen === "always" ? "always" : "passed",
+  };
   return {
     version: 1,
     trigger: {
@@ -71,18 +83,22 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
     },
     verdict: { blocking: b(v.blocking, WORKFLOW_DEFAULTS.verdict.blocking) },
     prompts,
+    actions,
   };
 }
 
 // Whether two workflows differ in their ADVANCED fields (trigger/verdict/
-// prompts). The API uses this to refuse advanced changes from free users while
-// still allowing basic (stage) edits.
+// prompts/actions). The API uses this to refuse advanced changes from free
+// users while still allowing basic (stage) edits.
 export function advancedChanged(a: RepoWorkflow, b: RepoWorkflow): boolean {
   return (
     a.trigger.onSynchronize !== b.trigger.onSynchronize ||
     a.trigger.skipDrafts !== b.trigger.skipDrafts ||
     a.trigger.skipBots !== b.trigger.skipBots ||
     a.verdict.blocking !== b.verdict.blocking ||
-    PROMPT_KEYS.some((k) => (a.prompts?.[k] || "") !== (b.prompts?.[k] || ""))
+    PROMPT_KEYS.some((k) => (a.prompts?.[k] || "") !== (b.prompts?.[k] || "")) ||
+    !!a.actions?.enabled !== !!b.actions?.enabled ||
+    (a.actions?.workflow || "") !== (b.actions?.workflow || "") ||
+    (a.actions?.runWhen || "passed") !== (b.actions?.runWhen || "passed")
   );
 }

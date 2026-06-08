@@ -63,6 +63,14 @@ export type RepoWorkflow = {
     deferrals?: string; // deferred-work scan
     docs?: string;      // DEVASIGN.md guidance
   };
+  // Optional "Run GitHub Action" step (ADVANCED): when enabled, dispatch a
+  // chosen GitHub Actions workflow after a review. `runWhen` gates dispatch on
+  // the verdict. Off by default — needs the App's actions:read/write scopes.
+  actions?: {
+    enabled: boolean;
+    workflow: string;            // workflow file name (e.g. "deploy.yml") or numeric id
+    runWhen: "always" | "passed"; // dispatch on every review, or only when it passes
+  };
 };
 
 export type Repository = {
@@ -80,6 +88,9 @@ export type Repository = {
   reviewsEnabled: boolean;
   // Per-repo review workflow (optional; defaults applied by effectiveWorkflow).
   workflow?: RepoWorkflow;
+  // Per-repo review counts, attached by GET /api/repositories for the rail
+  // cards (not persisted). approved = "passed", blocked = "changes_requested".
+  reviewStats?: { total: number; approved: number; blocked: number };
   // Repo-index state. Optional so DB rows written before the indexer existed
   // still load — treat undefined as "none" at every branch site.
   indexState?: RepoIndexState;

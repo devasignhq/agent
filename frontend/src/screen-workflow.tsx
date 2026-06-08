@@ -1,15 +1,16 @@
 // @ts-nocheck
 // Workflow screen — a node-based editor for the per-repo review pipeline.
 //
-// Three panes: a repository rail (left), a React Flow canvas of the pipeline
-// (center), and a detail panel for the selected node (right). The pipeline is a
-// fixed, linear chain — users can't add/remove nodes, only activate/deactivate
-// the optional stages and steer each AI stage with a custom prompt.
+// Three panes: a repository rail (left, styled like the Settings submenu and
+// showing per-repo review counts), a React Flow canvas of the pipeline (center),
+// and a detail panel for the selected node (right). The pipeline is a fixed,
+// linear chain — users can't add/remove nodes, only activate/deactivate the
+// optional steps and steer each AI stage with a custom prompt.
 //
 // Tiering: toggling which optional stages run is BASIC (free). The entry-trigger
-// policy, verdict mode and per-stage custom prompts are ADVANCED (Pro/Max): free
-// users see them locked with an upgrade nudge. Saves are optimistic and persist
-// per repo via PUT /api/repositories/:id/workflow.
+// policy, verdict mode, per-stage custom prompts and the GitHub Action step are
+// ADVANCED (Pro/Max): free users see them locked with an upgrade nudge. Saves
+// are optimistic and persist per repo via PUT /api/repositories/:id/workflow.
 import React from "react";
 import {
   ReactFlow,
@@ -23,51 +24,65 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
-import { api, type Repository, type RepoWorkflow, type StagePromptKey } from "./api";
+import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow } from "./api";
 import { useAuth } from "./auth-context";
 
 type StageKey = "holistic" | "deferrals" | "docs";
 type NodeId =
   | "trigger" | "ingest" | "criteria" | "review"
-  | "holistic" | "deferrals" | "docs" | "verdict";
+  | "holistic" | "deferrals" | "docs" | "verdict" | "actions";
 
 // Canonical pipeline nodes, in run order. The trigger is node 0 (auto-selected
-// on load). `stageKey` marks an optional stage that can be toggled; `promptKey`
-// marks a stage that makes an LLM call and so accepts a custom prompt.
+// on load). `stageKey` marks an optional stage in wf.stages; `promptKey` marks a
+// stage that makes an LLM call and accepts a custom prompt; `short` is the
+// one-liner shown on the node, `desc` the fuller text in the detail panel.
 type NodeDef = {
   id: NodeId;
   name: string;
   tag: string;        // category chip shown on the node
   icon: string;
-  desc: string;
+  short: string;      // brief description on the node
+  desc: string;       // fuller description in the panel
   mandatory: boolean; // always runs — no on/off switch
   stageKey?: StageKey;
   promptKey?: StagePromptKey;
-  advanced?: boolean; // node exposes Pro/Max-only switches (trigger / verdict)
+  advanced?: boolean; // node exposes Pro/Max-only switches
 };
 
 const NODE_DEFS: NodeDef[] = [
   { id: "trigger", name: "New PR", tag: "Trigger", icon: "play", mandatory: true, advanced: true,
+    short: "Fires on PR opened / updated",
     desc: "Runs whenever a pull request is opened or updated." },
   { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", mandatory: true,
+    short: "Diff, tickets, Looms & frames",
     desc: "Pull the diff, linked tickets, attached Looms & design frames." },
   { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", mandatory: true, promptKey: "criteria",
+    short: "Derive end goal & criteria",
     desc: "Derive the end goal & acceptance criteria the PR must meet." },
   { id: "review", name: "Review diff", tag: "Agent", icon: "code", mandatory: true, promptKey: "review",
+    short: "Diff vs. each criterion",
     desc: "Check the diff against each acceptance criterion." },
   { id: "holistic", name: "Whole-repo review", tag: "Agent", icon: "git", mandatory: false, stageKey: "holistic", promptKey: "holistic",
+    short: "Regressions & security, repo-wide",
     desc: "Check the change against the repo index for regressions, critical errors & security flaws." },
   { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", mandatory: false, stageKey: "deferrals", promptKey: "deferrals",
+    short: "TODOs, stubs & silent punts",
     desc: "Catch self-admitted punts — TODOs, stubs, NotImplemented buried in the diff." },
   { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", mandatory: false, stageKey: "docs", promptKey: "docs",
+    short: "Conventions & doc drift",
     desc: "Enforce your repo conventions & flag docs the change makes outdated." },
   { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", mandatory: true, advanced: true,
+    short: "Check Run + PR review + notify",
     desc: "Post the Check Run + PR review and notify your connected integrations." },
+  { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", mandatory: false, advanced: true,
+    short: "Dispatch a workflow on finish",
+    desc: "Dispatch a chosen GitHub Actions workflow after the review (workflow_dispatch)." },
 ];
 
-// One-click presets (advanced). Strict = maximum rigor; Balanced = quieter
-// defaults; Light = lean + advisory (never blocks the merge).
-const TEMPLATES: Record<string, Omit<RepoWorkflow, "version">> = {
+// One-click presets. Strict = maximum rigor; Balanced = quieter defaults;
+// Light = lean + advisory (never blocks the merge). Only the core policy
+// (trigger / stages / verdict) — prompts & actions are preserved on apply.
+const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdict">> = {
   strict: {
     trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
     stages: { holistic: true, docs: true, deferrals: true },
@@ -87,7 +102,7 @@ const TEMPLATES: Record<string, Omit<RepoWorkflow, "version">> = {
 
 const PROMPT_MAX = 2000;
 const EDGE_COLOR = "#39414c";
-const NODE_GAP = 108; // vertical spacing between nodes on the canvas
+const NODE_GAP = 150; // vertical spacing between (taller) nodes on the canvas
 
 const goUpgrade = () =>
   (window.location.href = `${window.location.origin}/?billing=upgrade`);
@@ -108,16 +123,39 @@ const ProLock = () => (
   </span>
 );
 
-// Is an optional stage currently on? Mandatory stages always run.
+// Is a node currently "on"? Mandatory stages always run; the actions step keys
+// off wf.actions.enabled; optional stages off wf.stages[key].
 const nodeOn = (def: NodeDef, wf: RepoWorkflow) =>
-  def.stageKey ? !!wf.stages[def.stageKey] : true;
+  def.id === "actions" ? !!wf.actions?.enabled : def.stageKey ? !!wf.stages[def.stageKey] : true;
 
-// Whether to stamp a lock glyph on the node: only when the node's controls are
-// entirely Pro/Max-locked. Optional stages keep their (free) on/off switch, so
-// they never get the glyph even though their prompt is locked.
+// Stamp a lock glyph only when ALL of a node's controls are Pro/Max-locked.
+// Optional stages keep their (free) on/off switch, so they never get the glyph
+// even though their prompt is locked.
 const nodeLocked = (def: NodeDef, advancedLocked: boolean) =>
   advancedLocked &&
-  (def.id === "trigger" || def.id === "verdict" || (!!def.promptKey && def.mandatory));
+  (def.id === "trigger" ||
+    def.id === "verdict" ||
+    def.id === "actions" ||
+    (!!def.promptKey && def.mandatory));
+
+// A node shows an on/off dot when it can be toggled (optional stage or the
+// actions step) and isn't fully locked.
+const nodeToggleable = (def: NodeDef) => !!def.stageKey || def.id === "actions";
+
+// Does a workflow's core policy match a preset? (Ignores prompts & actions.)
+const matchesPreset = (wf: RepoWorkflow, t: typeof TEMPLATES[string]) =>
+  wf.trigger.onSynchronize === t.trigger.onSynchronize &&
+  wf.trigger.skipDrafts === t.trigger.skipDrafts &&
+  wf.trigger.skipBots === t.trigger.skipBots &&
+  wf.stages.holistic === t.stages.holistic &&
+  wf.stages.docs === t.stages.docs &&
+  wf.stages.deferrals === t.stages.deferrals &&
+  wf.verdict.blocking === t.verdict.blocking;
+
+const activeMode = (wf: RepoWorkflow): string | null => {
+  for (const [name, t] of Object.entries(TEMPLATES)) if (matchesPreset(wf, t)) return name;
+  return null;
+};
 
 // ── Custom React Flow node ──────────────────────────────────────────────────
 function StageNode({ data }: NodeProps) {
@@ -126,15 +164,18 @@ function StageNode({ data }: NodeProps) {
     <div className={`wf-node ${on ? "" : "is-off"} ${selected ? "is-selected" : ""}`}>
       <Handle type="target" position={Position.Top} isConnectable={false} className="wf-node-handle" />
       <span className="wf-node-ico" style={{ color: on ? "var(--accent)" : "var(--fg-mute)" }}>
-        <Icon name={def.icon} size={15} />
+        <Icon name={def.icon} size={17} />
       </span>
       <div className="wf-node-text">
-        <div className="wf-node-name">{def.name}</div>
-        <div className="wf-node-tag">{def.tag}</div>
+        <div className="wf-node-name-row">
+          <span className="wf-node-name">{def.name}</span>
+          <span className="wf-node-tag">{def.tag}</span>
+        </div>
+        <div className="wf-node-desc">{def.short}</div>
       </div>
       {locked ? (
         <span className="wf-node-flag" title="Pro/Max"><Icon name="lock" size={11} /></span>
-      ) : def.stageKey ? (
+      ) : nodeToggleable(def) ? (
         <span className={`wf-node-dot ${on ? "on" : "off"}`} title={on ? "active" : "inactive"} />
       ) : null}
       <Handle type="source" position={Position.Bottom} isConnectable={false} className="wf-node-handle" />
@@ -172,7 +213,7 @@ function buildGraph(wf: RepoWorkflow, selectedId: string, advancedLocked: boolea
 // ── Per-stage custom prompt editor (advanced) ───────────────────────────────
 function PromptEditor({ promptKey, value, locked, onSave }) {
   const [text, setText] = React.useState(value || "");
-  // Re-seed if the underlying value changes (e.g. a template was applied).
+  // Re-seed if the underlying value changes (e.g. a mode was applied).
   React.useEffect(() => setText(value || ""), [value]);
 
   if (locked) {
@@ -215,8 +256,96 @@ function PromptEditor({ promptKey, value, locked, onSave }) {
   );
 }
 
+// ── "Run GitHub Action" editor (advanced) ───────────────────────────────────
+function ActionsEditor({ repoId, actions, locked, onSave }) {
+  const a = actions || { enabled: false, workflow: "", runWhen: "passed" };
+  const [list, setList] = React.useState({ loading: true, workflows: [] as ActionWorkflow[], error: null as string | null });
+
+  React.useEffect(() => {
+    if (locked) return;
+    let alive = true;
+    setList({ loading: true, workflows: [], error: null });
+    api
+      .repoActionWorkflows(repoId)
+      .then((r) => alive && setList({ loading: false, workflows: r.workflows || [], error: r.error || null }))
+      .catch((e) => alive && setList({ loading: false, workflows: [], error: e?.message || "failed" }));
+    return () => {
+      alive = false;
+    };
+  }, [repoId, locked]);
+
+  if (locked) {
+    return (
+      <div className="wf-prompt">
+        <div className="wf-prompt-head">
+          <span className="wf-label">GitHub Action</span>
+          <ProLock />
+        </div>
+        <div className="wf-prompt-locked" onClick={goUpgrade}>
+          <Icon name="lock" size={12} />
+          <span>Dispatch a GitHub Actions workflow after each review — a Pro/Max feature. Upgrade to edit →</span>
+        </div>
+      </div>
+    );
+  }
+
+  // Keep the stored workflow selectable even if the live list is empty/unavailable.
+  const options = list.workflows.slice();
+  if (a.workflow && !options.some((w) => w.file === a.workflow)) {
+    options.unshift({ id: -1, name: a.workflow, file: a.workflow });
+  }
+
+  return (
+    <>
+      <label className="wf-ctl">
+        <Toggle on={a.enabled} onClick={() => onSave({ enabled: !a.enabled })} />
+        <div>
+          <div className="wf-ctl-name">{a.enabled ? "Enabled" : "Disabled"}</div>
+          <div className="wf-ctl-desc mute">Dispatch a workflow when a review finishes.</div>
+        </div>
+      </label>
+
+      <div className="wf-field">
+        <span className="wf-label">Workflow</span>
+        {list.loading ? (
+          <div className="mute mono" style={{ fontSize: 12 }}>loading workflows…</div>
+        ) : list.error === "actions_unavailable" ? (
+          <div className="wf-prompt-foot mute" style={{ textAlign: "left" }}>
+            No Actions access yet — grant the GitHub App <span className="mono">actions:read</span> /{" "}
+            <span className="mono">actions:write</span>, then reload.
+          </div>
+        ) : options.length === 0 ? (
+          <div className="wf-prompt-foot mute" style={{ textAlign: "left" }}>
+            No workflows found in <span className="mono">.github/workflows</span>.
+          </div>
+        ) : (
+          <select className="input" value={a.workflow} onChange={(e) => onSave({ workflow: e.target.value })}>
+            <option value="">Select a workflow…</option>
+            {options.map((w) => (
+              <option key={w.file} value={w.file}>
+                {w.name} ({w.file})
+              </option>
+            ))}
+          </select>
+        )}
+      </div>
+
+      <div className="wf-field">
+        <span className="wf-label">Run when</span>
+        <select className="input" value={a.runWhen} onChange={(e) => onSave({ runWhen: e.target.value })}>
+          <option value="passed">Review approved</option>
+          <option value="always">Every review</option>
+        </select>
+        <div className="wf-prompt-foot mute" style={{ textAlign: "left" }}>
+          Dispatched on the PR's head branch (needs a <span className="mono">workflow_dispatch</span> trigger).
+        </div>
+      </div>
+    </>
+  );
+}
+
 // ── Right-hand detail / edit panel for the selected node ─────────────────────
-function NodeDetails({ def, wf, advancedLocked, onToggleStage, onToggleTrigger, onToggleBlocking, onSavePrompt }) {
+function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleTrigger, onToggleBlocking, onSavePrompt, onSaveActions }) {
   const on = nodeOn(def, wf);
   const status = def.mandatory ? "always on" : on ? "active" : "inactive";
   return (
@@ -298,6 +427,17 @@ function NodeDetails({ def, wf, advancedLocked, onToggleStage, onToggleTrigger, 
             value={wf.prompts?.[def.promptKey] || ""}
             locked={advancedLocked}
             onSave={onSavePrompt}
+          />
+        )}
+
+        {/* GitHub Action step (ADVANCED). */}
+        {def.id === "actions" && (
+          <ActionsEditor
+            key={repoId}
+            repoId={repoId}
+            actions={wf.actions}
+            locked={advancedLocked}
+            onSave={onSaveActions}
           />
         )}
       </div>
@@ -392,7 +532,7 @@ const WorkflowPage = () => {
   const toggleStage = (key: StageKey) =>
     wf && save({ ...wf, stages: { ...wf.stages, [key]: !wf.stages[key] } });
 
-  // Advanced (paid): trigger policy + verdict mode + prompts. Locked → upgrade.
+  // Advanced (paid): trigger policy + verdict mode + prompts + actions.
   const toggleTrigger = (key: string) => {
     if (advancedLocked) return goUpgrade();
     if (wf) save({ ...wf, trigger: { ...wf.trigger, [key]: !wf.trigger[key] } });
@@ -409,34 +549,55 @@ const WorkflowPage = () => {
     else delete prompts[key];
     save({ ...wf, prompts });
   };
-  const applyTemplate = (name: string) => {
+  const saveActions = (patch: Partial<RepoWorkflow["actions"]>) => {
     if (advancedLocked) return goUpgrade();
-    save({ version: 1, ...TEMPLATES[name] });
+    if (!wf) return;
+    const actions = { enabled: false, workflow: "", runWhen: "passed", ...(wf.actions || {}), ...patch };
+    save({ ...wf, actions });
+  };
+  // Apply a mode but preserve prompts/actions (merge over the current workflow).
+  const applyMode = (name: string) => {
+    if (advancedLocked) return goUpgrade();
+    if (!wf) return;
+    save({ ...wf, version: 1, ...TEMPLATES[name] });
   };
 
   const repo = repos.find((r) => r.id === repoId);
   const selectedDef = NODE_DEFS.find((n) => n.id === selectedId) || null;
   const noRepos = repos.length === 0 && !loading;
+  const mode = wf ? activeMode(wf) : null;
 
   return (
     <div className="wf-layout">
-      {/* Left rail — repositories */}
+      {/* Left rail — repositories (Settings-submenu style + review counts) */}
       <aside className="wf-rail">
         <div className="wf-rail-head">Repositories</div>
         <div className="wf-rail-list">
-          {repos.map((r) => (
-            <button
-              key={r.id}
-              className={`wf-rail-item ${r.id === repoId ? "is-active" : ""}`}
-              onClick={() => setRepoId(r.id)}
-              title={`${r.owner}/${r.name}`}
-            >
-              <Icon name="github" size={13} />
-              <span className="wf-rail-name">
-                <span className="mute">{r.owner}/</span>{r.name}
-              </span>
-            </button>
-          ))}
+          {repos.map((r) => {
+            const s = r.reviewStats;
+            return (
+              <button
+                key={r.id}
+                className={`wf-rail-item ${r.id === repoId ? "is-active" : ""}`}
+                onClick={() => setRepoId(r.id)}
+                title={`${r.owner}/${r.name}`}
+              >
+                <Icon name="github" size={13} />
+                <span className="wf-rail-text">
+                  <span className="wf-rail-name">
+                    <span className="mute">{r.owner}/</span>{r.name}
+                  </span>
+                  {s && (
+                    <span className="wf-rail-stats">
+                      <span title="Pull requests reviewed">{s.total} {s.total === 1 ? "review" : "reviews"}</span>
+                      <span className="wf-stat-ok" title="Approved (passed)">✓ {s.approved}</span>
+                      <span className="wf-stat-blk" title="Blocked (changes requested)">✕ {s.blocked}</span>
+                    </span>
+                  )}
+                </span>
+              </button>
+            );
+          })}
           {noRepos && <div className="wf-rail-empty mute">No repositories connected.</div>}
         </div>
       </aside>
@@ -449,7 +610,7 @@ const WorkflowPage = () => {
           </div>
           <div className="wf-toolbar-right">
             {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
-            <span className="mute" style={{ fontSize: 11 }}>Templates</span>
+            <span className="mute" style={{ fontSize: 11 }}>Mode</span>
             {([
               ["strict", "Strict"],
               ["balanced", "Balanced"],
@@ -457,10 +618,10 @@ const WorkflowPage = () => {
             ] as const).map(([id, name]) => (
               <button
                 key={id}
-                className="btn ghost sm"
-                onClick={() => applyTemplate(id)}
+                className={`wf-mode-btn ${mode === id ? "is-active" : ""}`}
+                onClick={() => applyMode(id)}
                 style={advancedLocked ? { opacity: 0.6 } : undefined}
-                title={advancedLocked ? "Pro/Max feature" : `Apply the ${name} preset`}
+                title={advancedLocked ? "Pro/Max feature" : `Apply ${name} mode`}
               >
                 {name}
               </button>
@@ -489,8 +650,9 @@ const WorkflowPage = () => {
               onNodesChange={onNodesChange}
               onEdgesChange={onEdgesChange}
               onNodeClick={(_, n) => setSelectedId(n.id as NodeId)}
+              onInit={(inst) => requestAnimationFrame(() => inst.fitView({ padding: 0.15, maxZoom: 1 }))}
               fitView
-              fitViewOptions={{ padding: 0.25, maxZoom: 1 }}
+              fitViewOptions={{ padding: 0.15, maxZoom: 1 }}
               minZoom={0.4}
               maxZoom={1.5}
               nodesDraggable={false}
@@ -513,11 +675,13 @@ const WorkflowPage = () => {
           <NodeDetails
             def={selectedDef}
             wf={wf}
+            repoId={repoId}
             advancedLocked={advancedLocked}
             onToggleStage={toggleStage}
             onToggleTrigger={toggleTrigger}
             onToggleBlocking={toggleBlocking}
             onSavePrompt={savePrompt}
+            onSaveActions={saveActions}
           />
         ) : (
           <div className="wf-panel-empty mute">

@@ -130,10 +130,13 @@ export type Repository = {
   defaultModel: string;
   modelOverrides: Record<string, string>;
   reviewsEnabled: boolean;
+  // Attached by GET /api/repositories for the Workflow rail cards (not persisted).
+  reviewStats?: { total: number; approved: number; blocked: number };
 };
 
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
-// `stages` is BASIC (free); `trigger`, `verdict` + `prompts` are ADVANCED (Pro/Max).
+// `stages` is BASIC (free); `trigger`, `verdict`, `prompts` + `actions` are
+// ADVANCED (Pro/Max).
 export type StagePromptKey = "criteria" | "review" | "holistic" | "deferrals" | "docs";
 export type RepoWorkflow = {
   version: 1;
@@ -142,7 +145,12 @@ export type RepoWorkflow = {
   verdict: { blocking: boolean };
   // Per-stage maintainer instructions (the stages that make an LLM call).
   prompts?: Partial<Record<StagePromptKey, string>>;
+  // Optional "Run GitHub Action" step — dispatch a workflow after a review.
+  actions?: { enabled: boolean; workflow: string; runWhen: "always" | "passed" };
 };
+
+// One GitHub Actions workflow, from GET /api/repositories/:id/actions/workflows.
+export type ActionWorkflow = { id: number; name: string; file: string };
 
 // GET /api/repositories/:id/workflow response.
 export type RepoWorkflowView = {
@@ -312,6 +320,10 @@ export const api = {
       method: "PUT",
       body: JSON.stringify({ workflow }),
     }),
+  repoActionWorkflows: (id: string) =>
+    request<{ workflows: ActionWorkflow[]; error?: string }>(
+      `/api/repositories/${id}/actions/workflows`
+    ),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>
