@@ -646,9 +646,9 @@ const WorkflowPage = () => {
         </div>
       </aside>
 
-      {/* Floating top bar — selected repo + Mode */}
+      {/* Repo name + Mode — directly on the canvas (no card behind them) */}
       {!noRepos && (
-        <div className="wf-toolbar wf-float">
+        <div className="wf-toolbar">
           <span className="wf-toolbar-title mono">
             {repo ? `${repo.owner}/${repo.name}` : "Workflow"}
           </span>
