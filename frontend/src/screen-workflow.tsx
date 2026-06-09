@@ -39,8 +39,9 @@ type NodeId =
 type NodeDef = {
   id: NodeId;
   name: string;
-  tag: string;        // category chip shown on the node
+  tag: string;        // category, shown in the detail-panel header
   icon: string;
+  color: string;      // per-node icon colour (a CSS var, e.g. "var(--info)")
   short: string;      // brief description on the node
   desc: string;       // fuller description in the panel
   mandatory: boolean; // always runs — no on/off switch
@@ -50,31 +51,31 @@ type NodeDef = {
 };
 
 const NODE_DEFS: NodeDef[] = [
-  { id: "trigger", name: "New PR", tag: "Trigger", icon: "play", mandatory: true, advanced: true,
+  { id: "trigger", name: "New PR", tag: "Trigger", icon: "play", color: "var(--info)", mandatory: true, advanced: true,
     short: "Fires on PR opened / updated",
     desc: "Runs whenever a pull request is opened or updated." },
-  { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", mandatory: true,
+  { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", color: "var(--cyan)", mandatory: true,
     short: "Diff, tickets, Looms & frames",
     desc: "Pull the diff, linked tickets, attached Looms & design frames." },
-  { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", mandatory: true, promptKey: "criteria",
+  { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", color: "var(--purple)", mandatory: true, promptKey: "criteria",
     short: "Derive end goal & criteria",
     desc: "Derive the end goal & acceptance criteria the PR must meet." },
-  { id: "review", name: "Review diff", tag: "Agent", icon: "code", mandatory: true, promptKey: "review",
+  { id: "review", name: "Review diff", tag: "Agent", icon: "code", color: "var(--accent)", mandatory: true, promptKey: "review",
     short: "Diff vs. each criterion",
     desc: "Check the diff against each acceptance criterion." },
-  { id: "holistic", name: "Whole-repo review", tag: "Agent", icon: "git", mandatory: false, stageKey: "holistic", promptKey: "holistic",
+  { id: "holistic", name: "Whole-repo review", tag: "Agent", icon: "git", color: "var(--green)", mandatory: false, stageKey: "holistic", promptKey: "holistic",
     short: "Regressions & security, repo-wide",
     desc: "Check the change against the repo index for regressions, critical errors & security flaws." },
-  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", mandatory: false, stageKey: "deferrals", promptKey: "deferrals",
+  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", color: "var(--warn)", mandatory: false, stageKey: "deferrals", promptKey: "deferrals",
     short: "TODOs, stubs & silent punts",
     desc: "Catch self-admitted punts — TODOs, stubs, NotImplemented buried in the diff." },
-  { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", mandatory: false, stageKey: "docs", promptKey: "docs",
+  { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", color: "var(--pink)", mandatory: false, stageKey: "docs", promptKey: "docs",
     short: "Conventions & doc drift",
     desc: "Enforce your repo conventions & flag docs the change makes outdated." },
-  { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", mandatory: true, advanced: true,
+  { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", color: "var(--lemon)", mandatory: true, advanced: true,
     short: "Check Run + PR review + notify",
     desc: "Post the Check Run + PR review and notify your connected integrations." },
-  { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", mandatory: false, advanced: true,
+  { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", color: "var(--danger)", mandatory: false, advanced: true,
     short: "Dispatch a workflow on finish",
     desc: "Dispatch a chosen GitHub Actions workflow after the review (workflow_dispatch)." },
 ];
@@ -102,7 +103,7 @@ const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdi
 
 const PROMPT_MAX = 2000;
 const EDGE_COLOR = "#39414c";
-const NODE_GAP = 150; // vertical spacing between (taller) nodes on the canvas
+const NODE_GAP = 108; // vertical spacing between nodes on the canvas
 
 const goUpgrade = () =>
   (window.location.href = `${window.location.origin}/?billing=upgrade`);
@@ -160,17 +161,20 @@ const activeMode = (wf: RepoWorkflow): string | null => {
 // ── Custom React Flow node ──────────────────────────────────────────────────
 function StageNode({ data }: NodeProps) {
   const { def, on, selected, locked } = data as any;
+  // Per-node icon colour flows through the --nc custom property (used by the
+  // icon square + the on dot). Sharp edges throughout, matching the app buttons.
   return (
-    <div className={`wf-node ${on ? "" : "is-off"} ${selected ? "is-selected" : ""}`}>
+    <div
+      className={`wf-node ${on ? "" : "is-off"} ${selected ? "is-selected" : ""}`}
+      style={{ ["--nc" as any]: def.color }}
+    >
+      {def.id === "trigger" && <span className="wf-node-tab">Trigger</span>}
       <Handle type="target" position={Position.Top} isConnectable={false} className="wf-node-handle" />
-      <span className="wf-node-ico" style={{ color: on ? "var(--accent)" : "var(--fg-mute)" }}>
-        <Icon name={def.icon} size={17} />
+      <span className="wf-node-ico">
+        <Icon name={def.icon} size={15} />
       </span>
       <div className="wf-node-text">
-        <div className="wf-node-name-row">
-          <span className="wf-node-name">{def.name}</span>
-          <span className="wf-node-tag">{def.tag}</span>
-        </div>
+        <div className="wf-node-name">{def.name}</div>
         <div className="wf-node-desc">{def.short}</div>
       </div>
       {locked ? (
@@ -569,8 +573,48 @@ const WorkflowPage = () => {
 
   return (
     <div className="wf-layout">
-      {/* Left rail — repositories (Settings-submenu style + review counts) */}
-      <aside className="wf-rail">
+      {/* Full-bleed canvas — the floating panels below sit over it. */}
+      <div className="wf-flow">
+        {noRepos ? (
+          <div className="wf-canvas-empty">
+            <div className="card" style={{ maxWidth: 460 }}>
+              <div className="card-body mute" style={{ fontSize: 13 }}>
+                No repositories connected yet. Install the DevAsign GitHub App under{" "}
+                <span className="mono" style={{ color: "var(--fg)" }}>Settings → Repository</span>{" "}
+                to start customizing review workflows.
+              </div>
+            </div>
+          </div>
+        ) : !wf ? (
+          <div className="wf-canvas-empty mono mute">loading…</div>
+        ) : (
+          <ReactFlow
+            nodes={rfNodes}
+            edges={rfEdges}
+            nodeTypes={nodeTypes}
+            onNodesChange={onNodesChange}
+            onEdgesChange={onEdgesChange}
+            onNodeClick={(_, n) => setSelectedId(n.id as NodeId)}
+            onInit={(inst) => requestAnimationFrame(() => inst.fitView({ padding: 0.18, maxZoom: 1 }))}
+            fitView
+            fitViewOptions={{ padding: 0.18, maxZoom: 1 }}
+            minZoom={0.4}
+            maxZoom={1.5}
+            nodesDraggable={false}
+            nodesConnectable={false}
+            elementsSelectable={false}
+            zoomOnDoubleClick={false}
+            deleteKeyCode={null}
+            panOnScroll
+            proOptions={{ hideAttribution: false }}
+          >
+            <Background color="var(--line)" gap={22} size={1} />
+          </ReactFlow>
+        )}
+      </div>
+
+      {/* Floating left section — repositories */}
+      <aside className="wf-rail wf-float">
         <div className="wf-rail-head">Repositories</div>
         <div className="wf-rail-list">
           {repos.map((r) => {
@@ -602,12 +646,12 @@ const WorkflowPage = () => {
         </div>
       </aside>
 
-      {/* Center — pipeline canvas */}
-      <div className="wf-canvas">
-        <div className="wf-toolbar">
-          <div className="wf-toolbar-title mono">
+      {/* Floating top bar — selected repo + Mode */}
+      {!noRepos && (
+        <div className="wf-toolbar wf-float">
+          <span className="wf-toolbar-title mono">
             {repo ? `${repo.owner}/${repo.name}` : "Workflow"}
-          </div>
+          </span>
           <div className="wf-toolbar-right">
             {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
             <span className="mute" style={{ fontSize: 11 }}>Mode</span>
@@ -628,49 +672,10 @@ const WorkflowPage = () => {
             ))}
           </div>
         </div>
+      )}
 
-        <div className="wf-flow">
-          {noRepos ? (
-            <div className="wf-canvas-empty">
-              <div className="card" style={{ maxWidth: 460 }}>
-                <div className="card-body mute" style={{ fontSize: 13 }}>
-                  No repositories connected yet. Install the DevAsign GitHub App under{" "}
-                  <span className="mono" style={{ color: "var(--fg)" }}>Settings → Repository</span>{" "}
-                  to start customizing review workflows.
-                </div>
-              </div>
-            </div>
-          ) : !wf ? (
-            <div className="wf-canvas-empty mono mute">loading…</div>
-          ) : (
-            <ReactFlow
-              nodes={rfNodes}
-              edges={rfEdges}
-              nodeTypes={nodeTypes}
-              onNodesChange={onNodesChange}
-              onEdgesChange={onEdgesChange}
-              onNodeClick={(_, n) => setSelectedId(n.id as NodeId)}
-              onInit={(inst) => requestAnimationFrame(() => inst.fitView({ padding: 0.15, maxZoom: 1 }))}
-              fitView
-              fitViewOptions={{ padding: 0.15, maxZoom: 1 }}
-              minZoom={0.4}
-              maxZoom={1.5}
-              nodesDraggable={false}
-              nodesConnectable={false}
-              elementsSelectable={false}
-              zoomOnDoubleClick={false}
-              deleteKeyCode={null}
-              panOnScroll
-              proOptions={{ hideAttribution: false }}
-            >
-              <Background color="var(--line)" gap={22} size={1} />
-            </ReactFlow>
-          )}
-        </div>
-      </div>
-
-      {/* Right — node detail / edit */}
-      <aside className="wf-panel">
+      {/* Floating right section — node detail / edit */}
+      <aside className="wf-panel wf-float">
         {wf && selectedDef && !noRepos ? (
           <NodeDetails
             def={selectedDef}

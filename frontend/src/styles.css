@@ -4893,16 +4893,20 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 
 /* ── Workflow screen — node-based per-repo review pipeline ───────────── */
-/* Three panes filling the height of .content (set to flex column for the
-   workflow route in app.tsx): repo rail · React Flow canvas · detail panel. */
-.wf-layout { flex: 1; display: flex; min-height: 0; }
+/* Full-bleed React Flow canvas with floating sections layered over it (the
+   repo list and node details detach from the page edges). */
+.wf-layout { position: relative; flex: 1; min-height: 0; overflow: hidden; }
 
-/* Left rail — repositories */
+/* Shared "floating" card look for the side sections + the top bar. */
+.wf-float {
+  background: var(--bg-1); border: 1px solid var(--line-2);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
+}
+
+/* Left section — repositories. Floats; detached from the page edges. */
 .wf-rail {
-  width: 248px; flex: 0 0 248px;
-  display: flex; flex-direction: column; min-height: 0;
-  border-right: 1px solid var(--line);
-  background: var(--bg-1);
+  position: absolute; left: 16px; top: 16px; bottom: 16px; z-index: 5;
+  width: 248px; display: flex; flex-direction: column; min-height: 0;
 }
 .wf-rail-head {
   padding: 14px 16px 10px;
@@ -4934,14 +4938,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-stat-blk { color: var(--warn); }
 .wf-rail-empty { padding: 12px 10px; font-size: 12px; }
 
-/* Center — canvas */
-.wf-canvas { flex: 1; display: flex; flex-direction: column; min-height: 0; min-width: 0; }
+/* Floating top bar — selected repo + Mode. Spans between the side sections. */
 .wf-toolbar {
+  position: absolute; top: 16px; left: 280px; right: 372px; z-index: 6;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 10px 16px; border-bottom: 1px solid var(--line);
+  padding: 9px 14px;
 }
-.wf-toolbar-title { font-size: 13px; color: var(--fg); }
-.wf-toolbar-right { display: flex; align-items: center; gap: 8px; }
+.wf-toolbar-title { font-size: 13px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.wf-toolbar-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .wf-err { font-size: 11px; }
 /* Mode (preset) buttons — the applied mode stays highlighted. */
 .wf-mode-btn {
@@ -4955,7 +4959,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-mode-btn.is-active {
   background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
 }
-.wf-flow { flex: 1; position: relative; min-height: 0; }
+.wf-flow { position: absolute; inset: 0; }
 .wf-canvas-empty {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
@@ -4965,10 +4969,10 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 /* React Flow node — reset the wrapper, style our custom card. */
 .react-flow__node-stage { background: transparent; border: none; padding: 0; width: auto; }
 .wf-node {
-  display: flex; align-items: center; gap: 12px;
-  width: 296px; padding: 12px 14px;
-  background: linear-gradient(180deg, var(--bg-2), var(--bg-1));
-  border: 1px solid var(--line-2);
+  position: relative;
+  display: flex; align-items: center; gap: 11px;
+  width: 272px; padding: 11px 13px;
+  background: var(--bg-1); border: 1px solid var(--line-2);
   cursor: pointer; transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
 }
 .wf-node:hover { border-color: #3a4250; transform: translateY(-1px); }
@@ -4978,40 +4982,41 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   box-shadow: 0 0 0 1px var(--accent), 0 0 0 5px var(--accent-glow);
 }
 .wf-node-handle { opacity: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; }
+/* Per-node coloured icon square (colour via --nc). Sharp edges, like the app buttons. */
 .wf-node-ico {
   display: inline-flex; align-items: center; justify-content: center;
-  width: 38px; height: 38px; flex: 0 0 auto;
-  border: 1px solid var(--line-2); background: var(--bg);
+  width: 30px; height: 30px; flex: 0 0 auto;
+  color: var(--nc, var(--accent));
+  background: color-mix(in srgb, var(--nc, var(--accent)) 16%, var(--bg-2));
+  border: 1px solid color-mix(in srgb, var(--nc, var(--accent)) 42%, transparent);
 }
-.wf-node-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 4px; }
-.wf-node-name-row { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.wf-node-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .wf-node-name {
   font-family: var(--mono); font-size: 13px; color: var(--fg);
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.wf-node-tag {
-  flex: 0 0 auto;
-  font-family: var(--mono); font-size: 8px; letter-spacing: 0.08em;
-  text-transform: uppercase; color: var(--fg-mute);
-  border: 1px solid var(--line-2); padding: 1px 5px;
-}
 .wf-node-desc {
-  font-size: 11px; color: var(--fg-dim); line-height: 1.35;
+  font-size: 11px; color: var(--fg-mute); line-height: 1.35;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* "Trigger" tab above the entry node (matches the reference design). */
+.wf-node-tab {
+  position: absolute; top: -1px; left: 0; transform: translateY(-100%);
+  padding: 2px 9px; font-family: var(--mono); font-size: 10px; color: var(--fg-dim);
+  background: var(--bg-1); border: 1px solid var(--line-2); border-bottom: none;
 }
 .wf-node-flag { color: var(--purple); display: inline-flex; flex: 0 0 auto; }
 .wf-node-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; }
-.wf-node-dot.on { background: var(--accent); box-shadow: 0 0 0 3px var(--accent-glow); }
+.wf-node-dot.on { background: var(--nc, var(--accent)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc, var(--accent)) 22%, transparent); }
 .wf-node-dot.off { background: var(--fg-faint); }
 
 .react-flow__attribution { background: transparent; color: var(--fg-faint); font-size: 9px; }
 .react-flow__attribution a { color: var(--fg-faint); }
 
-/* Right — detail / edit panel */
+/* Right section — node detail / edit. Floats, detached from the page edges. */
 .wf-panel {
-  width: 340px; flex: 0 0 340px;
-  display: flex; flex-direction: column; min-height: 0;
-  border-left: 1px solid var(--line); background: var(--bg-1);
+  position: absolute; right: 16px; top: 16px; bottom: 16px; z-index: 5;
+  width: 340px; display: flex; flex-direction: column; min-height: 0;
 }
 .wf-panel-head {
   display: flex; align-items: center; gap: 10px;
@@ -5060,7 +5065,15 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .wf-prompt-locked:hover { border-color: var(--accent); color: var(--fg-dim); }
 
-/* Mobile: stack the panes; the canvas is desktop-first. */
-.is-mobile .wf-layout { flex-direction: column; }
-.is-mobile .wf-rail { width: 100%; flex: 0 0 auto; max-height: 160px; border-right: none; border-bottom: 1px solid var(--line); }
-.is-mobile .wf-panel { width: 100%; flex: 0 0 auto; border-left: none; border-top: 1px solid var(--line); }
+/* Mobile: drop the floating overlay and stack the sections; canvas is desktop-first. */
+.is-mobile .wf-layout { display: flex; flex-direction: column; overflow: auto; }
+.is-mobile .wf-rail,
+.is-mobile .wf-panel,
+.is-mobile .wf-toolbar {
+  position: static; inset: auto; transform: none; width: auto; z-index: auto;
+  box-shadow: none; margin: 8px;
+}
+.is-mobile .wf-rail { max-height: 180px; order: 1; }
+.is-mobile .wf-toolbar { order: 2; }
+.is-mobile .wf-flow { position: relative; inset: auto; height: 52vh; flex: 0 0 auto; order: 3; }
+.is-mobile .wf-panel { order: 4; }
