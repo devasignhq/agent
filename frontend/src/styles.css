@@ -4938,12 +4938,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-stat-blk { color: var(--warn); }
 .wf-rail-empty { padding: 12px 10px; font-size: 12px; }
 
-/* Floating top bar — selected repo + Mode. Spans between the side sections. */
+/* Repo name + Mode — sit directly on the canvas (no card behind them). */
 .wf-toolbar {
   position: absolute; top: 16px; left: 280px; right: 372px; z-index: 6;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 9px 14px;
+  padding: 0;
+  pointer-events: none; /* let canvas panning work through the empty gaps */
 }
+.wf-toolbar > * { pointer-events: auto; }
 .wf-toolbar-title { font-size: 13px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .wf-toolbar-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .wf-err { font-size: 11px; }
@@ -5013,10 +5015,12 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .react-flow__attribution { background: transparent; color: var(--fg-faint); font-size: 9px; }
 .react-flow__attribution a { color: var(--fg-faint); }
 
-/* Right section — node detail / edit. Floats, detached from the page edges. */
+/* Right section — node detail / edit. Floats and hugs its content height
+   (capped to the viewport, with the body scrolling if it gets tall). */
 .wf-panel {
-  position: absolute; right: 16px; top: 16px; bottom: 16px; z-index: 5;
-  width: 340px; display: flex; flex-direction: column; min-height: 0;
+  position: absolute; right: 16px; top: 16px; z-index: 5;
+  width: 340px; max-height: calc(100% - 32px);
+  display: flex; flex-direction: column; min-height: 0;
 }
 .wf-panel-head {
   display: flex; align-items: center; gap: 10px;
