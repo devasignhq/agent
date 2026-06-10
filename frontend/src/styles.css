@@ -4903,10 +4903,13 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
 }
 
-/* Left section — repositories. Floats; detached from the page edges. */
+/* Left section — repositories. Floats and hugs its content height (capped to
+   the viewport); no shadow and no top/bottom border lines. */
 .wf-rail {
-  position: absolute; left: 16px; top: 16px; bottom: 16px; z-index: 5;
-  width: 248px; display: flex; flex-direction: column; min-height: 0;
+  position: absolute; left: 16px; top: 16px; z-index: 5;
+  width: 248px; max-height: calc(100% - 32px);
+  display: flex; flex-direction: column; min-height: 0;
+  box-shadow: none; border-top: none; border-bottom: none;
 }
 .wf-rail-head {
   padding: 14px 16px 10px;
