@@ -30,21 +30,19 @@ export function progressCommentBody(): string {
   ].join("\n");
 }
 
-// The verdict banner the placeholder is edited into when the run finishes. Concise
-// by design: outcome headline (✅/🔴), the one-line summary, and a pointer to the
-// formal review (linked when we captured its URL). `specless` distinguishes a clean
-// pass with no acceptance criteria from one where every criterion was met.
+// The full verdict the placeholder is edited into when the run finishes. This one
+// comment IS the review the developer reads: an outcome headline (✅/🔴) followed
+// by the complete review body (end goal, criteria, suggestions, feedback) built by
+// the pipeline's formatReviewBody. `specless` distinguishes a clean pass with no
+// acceptance criteria from one where every criterion was met.
 export function verdictCommentBody(args: {
   status: PRReviewStatus;
   specless: boolean;
-  summary: string;
-  reviewUrl?: string;
-  // Whether a formal PR review was posted this run. When false (e.g. a
-  // refresh-only re-review), the banner omits the "see the full review" pointer
-  // so it doesn't claim a review exists that we deliberately didn't post.
-  hasReview?: boolean;
+  // The full review body (formatReviewBody output). The one-line summary already
+  // lives at the bottom of it, so we don't repeat it here.
+  reviewBody: string;
 }): string {
-  const { status, specless, summary, reviewUrl, hasReview = true } = args;
+  const { status, specless, reviewBody } = args;
   const headline =
     status === "passed"
       ? specless
@@ -54,24 +52,18 @@ export function verdictCommentBody(args: {
       ? "## 🔴 DevAsign review — changes requested"
       : "## ✅ DevAsign review — complete";
 
-  const lines: string[] = [headline, ""];
-  if (status === "passed" && specless) {
-    lines.push(
-      "No blocking bugs, regressions, or security concerns surfaced. This PR has no linked " +
-        "issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
-      ""
-    );
-  }
-  const trimmed = (summary || "").trim();
-  if (trimmed) lines.push(trimmed, "");
+  return [headline, "", reviewBody].join("\n").trim();
+}
 
-  if (reviewUrl) {
-    lines.push(`📋 [View the full review](${reviewUrl}) — criteria, suggestions, and inline comments.`);
-  } else if (hasReview) {
-    lines.push("📋 See the full review below for the criteria, suggestions, and inline comments.");
-  }
-
-  return lines.join("\n").trim();
+// The body of the formal GitHub PR review, which we keep ONLY for its structural
+// roles a plain comment can't fill: the Approve/Request-changes event (the merge
+// gate) and inline line-level comments. The full verdict lives in the editable
+// conversation comment above (verdictCommentBody), so this body is just a one-line
+// pointer — no duplicated criteria/suggestions. A non-empty body is required by
+// GitHub for REQUEST_CHANGES/COMMENT and is harmless under APPROVE, so we send the
+// same one-liner for every event.
+export function minimalReviewBody(): string {
+  return "📋 DevAsign's full verdict — acceptance criteria, suggestions, and the consolidated fix prompt — is in the pinned comment above.";
 }
 
 // Replaces the placeholder when a run throws, so the comment never stays stuck on

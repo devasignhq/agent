@@ -1,7 +1,9 @@
 // Offline end-to-end: the review pipeline posts a "review in progress" comment at
-// run start, persists its id, and edits THAT comment into the verdict on finish —
-// while still posting the formal PR review (keep-review-as-is). A fresh comment is
-// posted per run, so a re-review on a new push gets its own announce→verdict comment.
+// run start, persists its id, and edits THAT comment into the FULL verdict on
+// finish. The formal PR review is still posted, but its body is now just a one-line
+// pointer — it exists only to carry the merge-gate event + inline comments. A fresh
+// comment is posted per run, so a re-review on a new push gets its own
+// announce→verdict comment.
 //
 // Fully offline: empty ANTHROPIC_API_KEY forces the LLM mock, and global.fetch is
 // stubbed so every GitHub call (token, PR/diff/commits, git tree, check run, review,
@@ -145,16 +147,30 @@ test("posts a 'review in progress' comment on start and edits it into the verdic
   // 2. Its id is persisted on the review row.
   assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, 4242);
 
-  // 3. That exact comment is edited into the verdict banner.
+  // 3. That exact comment is edited into the FULL verdict — outcome headline plus
+  //    the complete review body (end goal, criteria) — not a concise banner.
   const patchCall = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/4242$/.test(c.url));
   assert.ok(patchCall, "expected a PATCH editing comment 4242 into the verdict");
-  assert.match(String(patchCall!.body?.body), /DevAsign review —/);
-  assert.match(String(patchCall!.body?.body), /✅|🔴/);
+  const verdictComment = String(patchCall!.body?.body);
+  assert.match(verdictComment, /DevAsign review —/);
+  assert.match(verdictComment, /✅|🔴/);
+  // The full verdict lives here now (the mock review is spec'd + changes_requested).
+  assert.match(verdictComment, /## End goal|Acceptance criteria/);
+  // …and it is NOT the formal review's one-line pointer.
+  assert.doesNotMatch(verdictComment, /is in the pinned comment above/);
 
-  // 4. The formal PR review is still posted (keep-review-as-is).
+  // 4. The formal PR review is still posted (merge-gate event + inline comments),
+  //    but its body is only the MINIMAL one-line pointer — the verdict is not
+  //    duplicated there.
+  const reviewCall = calls.find((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
+  assert.ok(reviewCall, "the formal PR review must still be posted");
+  assert.match(String(reviewCall!.body?.body), /pinned comment above/);
+  assert.doesNotMatch(String(reviewCall!.body?.body), /## End goal/);
+  // Inline line-level comments still ride on the formal review (the mock emits one
+  // annotation against the single diff file).
   assert.ok(
-    calls.some((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url)),
-    "the formal PR review must still be posted"
+    Array.isArray(reviewCall!.body?.comments) && reviewCall!.body.comments.length >= 1,
+    "inline comments should still be attached to the formal review"
   );
 });
 
