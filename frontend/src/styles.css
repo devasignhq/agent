@@ -4928,6 +4928,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-err { font-size: 11px; }
 /* Mode (preset) buttons — the applied mode stays highlighted. */
 .wf-mode-btn {
+  display: inline-flex; align-items: center; justify-content: center;
   height: 26px; padding: 0 11px;
   background: transparent; border: 1px solid var(--line-2);
   color: var(--fg-dim); cursor: pointer;
