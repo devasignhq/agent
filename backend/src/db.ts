@@ -13,6 +13,7 @@
 import { v4 as uuid } from "uuid";
 import pg from "pg";
 import { config } from "./config.js";
+import { isUnstorableDataError, sanitizeForJsonb } from "./db-sanitize.js";
 import type { DB } from "./types.js";
 
 const { Pool } = pg;
@@ -131,6 +132,73 @@ const deleted = new Map<keyof DB, Set<string>>();
 let flushTimer: NodeJS.Timeout | null = null;
 let flushing: Promise<void> | null = null;
 
+// --- Write-through health (surfaced via dbHealth() -> /api/health) ----------
+// The old flush re-staged a failed batch and retried it forever; because the
+// whole dataset went in one transaction, a single row Postgres refused to store
+// (e.g. a NUL byte in jsonb) froze ALL persistence while reads kept coming from
+// the in-memory snapshot — so the app looked fine until a redeploy reloaded the
+// stale DB. We now (a) scrub values that jsonb rejects before writing, (b) on a
+// batch failure fall back to row-by-row and QUARANTINE any row the DB still
+// rejects (dropped from persistence + counted, never re-staged) so it can't
+// block the batch, and (c) bound transient retries so we never hot-spin.
+let consecutiveFlushFailures = 0;
+let lastFlushError: string | null = null;
+let lastFlushErrorAt: number | null = null;
+let quarantinedRows = 0;
+// 0.5s, 1s, 2s, 4s, 5s — capped low so a clean shutdown (Render SIGKILLs after
+// ~30s) and boot can't hang on an unreachable DB. Transient work left after a
+// give-up is retried when the next mutation reschedules a flush.
+const MAX_TRANSIENT_RETRIES = 5;
+const backoffMs = (attempt: number) => Math.min(500 * 2 ** (attempt - 1), 5_000);
+
+function pendingCount(): number {
+  let n = 0;
+  for (const m of dirty.values()) n += m.size;
+  for (const s of deleted.values()) n += s.size;
+  return n;
+}
+
+function onFlushOk(): void {
+  consecutiveFlushFailures = 0;
+  lastFlushError = null;
+}
+
+function recordFlushFailure(message: string): void {
+  consecutiveFlushFailures++;
+  lastFlushError = message;
+  lastFlushErrorAt = Date.now();
+  console.error(`[db] flush failed — ${message}`);
+}
+
+function quarantineRow(name: keyof DB, row: unknown, err: unknown): void {
+  quarantinedRows++;
+  const id = rowId(row);
+  console.error(
+    `[db] QUARANTINED unstorable row ${String(name)}/${id ?? "?"}: ` +
+      `${(err as Error)?.message || String(err)}. The row stays in memory this ` +
+      `session but will NOT survive a restart — it is dropped from persistence so ` +
+      `it can't block other writes. Investigate this row; it is a data bug.`
+  );
+}
+
+/**
+ * Write-through health snapshot for /api/health. `writeThrough` reads "degraded"
+ * while flushes are failing or after any row was quarantined (a dropped write =
+ * latent data loss worth surfacing until the next clean restart).
+ */
+export function dbHealth() {
+  return {
+    mode: pool ? "postgres" : "ephemeral",
+    writeThrough:
+      !pool || (consecutiveFlushFailures === 0 && quarantinedRows === 0) ? "ok" : "degraded",
+    pendingWrites: pendingCount(),
+    consecutiveFlushFailures,
+    quarantinedRows,
+    lastFlushError,
+    lastFlushErrorAt,
+  };
+}
+
 function rowId(row: unknown): string | null {
   const id = (row as { id?: unknown } | null)?.id;
   return typeof id === "string" ? id : null;
@@ -185,7 +253,8 @@ async function persistBatch(
         const slice = rows.slice(i, i + CHUNK);
         const params: unknown[] = [];
         const tuples = slice.map((row, j) => {
-          params.push(rowId(row), row);
+          // Scrub NUL / lone surrogates that jsonb would reject (see db-sanitize).
+          params.push(rowId(row), sanitizeForJsonb(row));
           return `($${j * 2 + 1}, $${j * 2 + 2})`;
         });
         await client.query(
@@ -208,46 +277,135 @@ async function persistBatch(
   }
 }
 
+type Batch = {
+  upserts: Array<[keyof DB, unknown[]]>;
+  deletes: Array<[keyof DB, string[]]>;
+};
+
+// Drain the staged maps into batch arrays, clearing them so mutations arriving
+// mid-flush accumulate into the next batch instead of being lost.
+function drainStaged(): Batch {
+  const upserts: Array<[keyof DB, unknown[]]> = [];
+  for (const [name, m] of dirty) {
+    if (m.size) {
+      upserts.push([name, [...m.values()]]);
+      m.clear();
+    }
+  }
+  const deletes: Array<[keyof DB, string[]]> = [];
+  for (const [name, s] of deleted) {
+    if (s.size) {
+      deletes.push([name, [...s]]);
+      s.clear();
+    }
+  }
+  return { upserts, deletes };
+}
+
+// Re-stage unpersisted work without clobbering newer writes to the same id.
+function restage(upserts: Array<[keyof DB, unknown[]]>, deletes: Array<[keyof DB, string[]]>): void {
+  for (const [name, rows] of upserts) {
+    const d = dirty.get(name) ?? (dirty.set(name, new Map()), dirty.get(name)!);
+    for (const row of rows) {
+      const id = rowId(row);
+      if (id && !d.has(id) && !deleted.get(name)?.has(id)) d.set(id, row);
+    }
+  }
+  for (const [name, ids] of deletes) {
+    const s = deleted.get(name) ?? (deleted.set(name, new Set()), deleted.get(name)!);
+    for (const id of ids) if (!dirty.get(name)?.has(id)) s.add(id);
+  }
+}
+
+// Fallback when the atomic batch fails: persist row-by-row so a single row the
+// database rejects is QUARANTINED (dropped + counted) rather than rolling back
+// and blocking every other write. Returns "ok" when every row was stored or
+// quarantined; otherwise the unprocessed remainder — a transient/connection
+// failure — for the caller to re-stage and retry with backoff.
+async function persistIsolating(
+  upserts: Array<[keyof DB, unknown[]]>,
+  deletes: Array<[keyof DB, string[]]>
+): Promise<"ok" | Batch> {
+  const client = await pool!.connect().catch(() => null);
+  if (!client) return { upserts, deletes }; // can't even connect -> all transient
+  try {
+    for (let ui = 0; ui < upserts.length; ui++) {
+      const [name, rows] = upserts[ui];
+      const t = TABLES[name];
+      for (let ri = 0; ri < rows.length; ri++) {
+        const row = rows[ri];
+        try {
+          await client.query(
+            `insert into "${t}" (id, data) values ($1, $2) ` +
+              `on conflict (id) do update set data = excluded.data`,
+            [rowId(row), sanitizeForJsonb(row)]
+          );
+        } catch (err) {
+          if (isUnstorableDataError(err)) {
+            quarantineRow(name, row, err);
+            continue;
+          }
+          // Transient mid-stream: re-stage this row and everything after it.
+          return { upserts: [[name, rows.slice(ri)], ...upserts.slice(ui + 1)], deletes };
+        }
+      }
+    }
+    for (let di = 0; di < deletes.length; di++) {
+      const [name, ids] = deletes[di];
+      const t = TABLES[name];
+      for (let ii = 0; ii < ids.length; ii++) {
+        try {
+          await client.query(`delete from "${t}" where id = $1`, [ids[ii]]);
+        } catch (err) {
+          if (isUnstorableDataError(err)) continue; // implausible for a delete; drop
+          return { upserts: [], deletes: [[name, ids.slice(ii)], ...deletes.slice(di + 1)] };
+        }
+      }
+    }
+    return "ok";
+  } finally {
+    client.release();
+  }
+}
+
 async function runFlush(): Promise<void> {
   if (flushing) return flushing;
   flushing = (async () => {
+    let transientRetries = 0;
     try {
       while (pool && hasPending()) {
-        // Snapshot and clear the shared maps so mutations arriving mid-flush
-        // accumulate into the next batch instead of being lost.
-        const upserts: Array<[keyof DB, unknown[]]> = [];
-        for (const [name, m] of dirty) {
-          if (m.size) {
-            upserts.push([name, [...m.values()]]);
-            m.clear();
-          }
-        }
-        const deletes: Array<[keyof DB, string[]]> = [];
-        for (const [name, s] of deleted) {
-          if (s.size) {
-            deletes.push([name, [...s]]);
-            s.clear();
-          }
-        }
+        const { upserts, deletes } = drainStaged();
+        // Fast path: the whole batch in one transaction.
         try {
           await persistBatch(upserts, deletes);
-        } catch (err) {
-          // Re-stage the failed batch (without clobbering newer writes) and
-          // back off before the loop retries.
-          for (const [name, rows] of upserts) {
-            const d = dirty.get(name) ?? (dirty.set(name, new Map()), dirty.get(name)!);
-            for (const row of rows) {
-              const id = rowId(row);
-              if (id && !d.has(id) && !deleted.get(name)?.has(id)) d.set(id, row);
-            }
-          }
-          for (const [name, ids] of deletes) {
-            const s = deleted.get(name) ?? (deleted.set(name, new Set()), deleted.get(name)!);
-            for (const id of ids) if (!dirty.get(name)?.has(id)) s.add(id);
-          }
-          console.error("[db] flush failed — will retry:", (err as Error).message);
-          await new Promise((r) => setTimeout(r, 500));
+          onFlushOk();
+          transientRetries = 0;
+          continue;
+        } catch {
+          // Atomic batch failed — fall through to row-by-row isolation so one
+          // poison row is quarantined instead of rolling back (and blocking)
+          // every other write in the batch.
         }
+        const remaining = await persistIsolating(upserts, deletes);
+        if (remaining === "ok") {
+          onFlushOk();
+          transientRetries = 0;
+          continue;
+        }
+        // Genuinely transient (couldn't connect / mid-stream drop): re-stage the
+        // remainder and back off — bounded, so we never hot-spin or hang.
+        restage(remaining.upserts, remaining.deletes);
+        transientRetries++;
+        recordFlushFailure(`transient write failure (attempt ${transientRetries}/${MAX_TRANSIENT_RETRIES})`);
+        if (transientRetries >= MAX_TRANSIENT_RETRIES) {
+          console.error(
+            `[db] giving up after ${transientRetries} transient failures; ` +
+              `${pendingCount()} write(s) remain in memory and will retry on the next ` +
+              `mutation or flushPending().`
+          );
+          break;
+        }
+        await new Promise((r) => setTimeout(r, backoffMs(transientRetries)));
       }
     } finally {
       flushing = null;
@@ -256,17 +414,24 @@ async function runFlush(): Promise<void> {
   return flushing;
 }
 
-/** Block until all staged writes are durable in Postgres. */
+/**
+ * Block until staged writes are flushed (graceful shutdown + post-load
+ * migrations). Bounded: one runFlush drains everything storable and quarantines
+ * what it can't; only a persistently-unreachable DB leaves work pending, which
+ * we warn about rather than hang on (Render SIGKILLs after its grace window).
+ */
 export async function flushPending(): Promise<void> {
   if (!pool) return;
   if (flushTimer) {
     clearTimeout(flushTimer);
     flushTimer = null;
   }
-  // Loop in case writes land between draining and the await resolving.
-  do {
-    await runFlush();
-  } while (hasPending());
+  await runFlush();
+  if (hasPending()) {
+    console.error(
+      `[db] flushPending: ${pendingCount()} write(s) still unpersisted (database unreachable?).`
+    );
+  }
 }
 
 // node-postgres reads `ssl` straight from the config below, so the libpq-style
@@ -279,6 +444,18 @@ function sanitizeUrl(url: string): string {
     return u.toString();
   } catch {
     return url;
+  }
+}
+
+// Host + database name only (never credentials), for the boot log. Makes it
+// obvious at a glance WHICH database an environment is talking to — the cheapest
+// guard against dev and prod accidentally sharing one (see .env.example).
+function describeDb(url: string): string {
+  try {
+    const u = new URL(url);
+    return `${u.host}${u.pathname}`;
+  } catch {
+    return "unknown";
   }
 }
 
@@ -304,19 +481,30 @@ async function loadAll(): Promise<void> {
  * in-memory snapshot. Must be awaited before the server starts serving so the
  * synchronous read API has data. With no DATABASE_URL configured, falls back
  * to an ephemeral in-memory store (no persistence) so the server can still boot.
+ *
+ * `poolOverride` injects a pool for tests (exercise the write-through flush with
+ * a fake pg pool); production always constructs its own from DATABASE_URL.
  */
-export async function initDb(): Promise<void> {
-  if (!config.databaseUrl) {
+export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
+  // Reset health counters so each boot (and each test that re-inits) starts clean.
+  consecutiveFlushFailures = 0;
+  lastFlushError = null;
+  lastFlushErrorAt = null;
+  quarantinedRows = 0;
+  if (opts?.poolOverride) {
+    pool = opts.poolOverride;
+  } else if (!config.databaseUrl) {
     console.warn("[db] DATABASE_URL not set — using ephemeral in-memory store (no persistence)");
     state = structuredClone(empty);
     pool = null;
     return;
+  } else {
+    pool = new Pool({
+      connectionString: sanitizeUrl(config.databaseUrl),
+      ssl: { rejectUnauthorized: true },
+      max: 5,
+    });
   }
-  pool = new Pool({
-    connectionString: sanitizeUrl(config.databaseUrl),
-    ssl: { rejectUnauthorized: true },
-    max: 5,
-  });
   await ensureSchema();
   await loadAll();
 
@@ -335,7 +523,10 @@ export async function initDb(): Promise<void> {
   }
 
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);
-  console.log(`[db] connected to Postgres — loaded ${total} rows across ${COLLECTIONS.length} tables`);
+  const target = opts?.poolOverride ? "injected test pool" : describeDb(config.databaseUrl);
+  console.log(
+    `[db] connected [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
+  );
 }
 
 /** Flush pending writes and close the pool. Call on graceful shutdown. */
