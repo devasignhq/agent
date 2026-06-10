@@ -21,6 +21,7 @@ for how this file is used and scoped.
   not write raw SQL in feature code.
 - A review finding only blocks a merge when its severity is `blocker`; advisory
   findings use `warn` or `nit`.
+- Always read, always write tests for all the changes made.
 
 ## Frontend (`frontend/`)
 - The browser talks to the backend only through the typed client in

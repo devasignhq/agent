@@ -153,9 +153,11 @@ const matchesPreset = (wf: RepoWorkflow, t: typeof TEMPLATES[string]) =>
   wf.stages.deferrals === t.stages.deferrals &&
   wf.verdict.blocking === t.verdict.blocking;
 
-const activeMode = (wf: RepoWorkflow): string | null => {
+// The active preset, or "custom" once the workflow has been tweaked so it no
+// longer matches Strict / Balanced / Light.
+const activeMode = (wf: RepoWorkflow): string => {
   for (const [name, t] of Object.entries(TEMPLATES)) if (matchesPreset(wf, t)) return name;
-  return null;
+  return "custom";
 };
 
 // ── Custom React Flow node ──────────────────────────────────────────────────
@@ -677,6 +679,14 @@ const WorkflowPage = () => {
                 {name}
               </button>
             ))}
+            {/* "Custom" isn't an applyable preset — a read-only status that
+                lights up when the workflow is tweaked off every preset. */}
+            <span
+              className={`wf-mode-btn is-custom ${mode === "custom" ? "is-active" : ""}`}
+              title="Your settings don't match Strict, Balanced, or Light"
+            >
+              Custom
+            </span>
           </div>
         </div>
       )}

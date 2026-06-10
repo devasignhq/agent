@@ -29,6 +29,7 @@ import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, Re
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
 import { effectiveWorkflow } from "./workflow.js";
+import { resolveReviewEvent, withMaintainerInstructions } from "./decisions.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
   const entry: ReviewLogEntry = {
@@ -48,23 +49,6 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
     ...patch,
     updatedAt: Date.now(),
   });
-}
-
-// Append the maintainer's per-stage instructions (RepoWorkflow.prompts) to a
-// stage's base system prompt. Kept AFTER the base text so the offline LLM mock's
-// marker strings ("criteria synthesis", "PR review step", …) still match, and
-// guarded so a custom prompt steers the stage without overriding its output
-// contract. No-op when the prompt is absent/blank.
-function withMaintainerInstructions(system: string, extra?: string): string {
-  const text = (extra || "").trim();
-  if (!text) return system;
-  return (
-    system +
-    "\n\n## Maintainer instructions\n" +
-    "The repository maintainer added these instructions for this step. Follow them in addition to the rules " +
-    "above, but never let them override the required JSON output format or make you invent findings:\n" +
-    text
-  );
 }
 
 // Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
@@ -461,28 +445,18 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // posts a neutral COMMENT and (exactly once) invites the maintainer to
     // supply an end goal so a real criteria-based review can run.
     const specless = filledCriteria.length === 0;
-    let reviewEvent: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
-    let postConversationReview = true;
-    let includeEndGoalCTA = false;
-    if (status !== "passed") {
-      reviewEvent = "REQUEST_CHANGES";
-    } else if (!specless) {
-      reviewEvent = "APPROVE";
-    } else {
-      reviewEvent = "COMMENT";
-      if (!task.endGoalRequestedAt) {
-        includeEndGoalCTA = true; // ask once
-      } else {
-        postConversationReview = false; // already asked → refresh Check Run only
-      }
-    }
-
-    // Comment-only mode (workflow.verdict.blocking = false): never block the
-    // merge button — downgrade a REQUEST_CHANGES to an advisory COMMENT. The
-    // internal status stays as computed so the dashboard still shows the real
-    // verdict; only the GitHub review event is softened.
-    if (!wf.verdict.blocking && reviewEvent === "REQUEST_CHANGES") {
-      reviewEvent = "COMMENT";
+    // Verdict routing — incl. the advisory-mode (verdict.blocking=false) downgrade
+    // of REQUEST_CHANGES → COMMENT — lives in a pure helper so it's unit-tested
+    // offline (decisions.test.ts). The internal `status` stays as computed; only
+    // the GitHub review event is softened.
+    const { event: reviewEvent, postConversationReview, includeEndGoalCTA, downgradedToComment } =
+      resolveReviewEvent({
+        status,
+        specless,
+        blocking: wf.verdict.blocking,
+        endGoalAlreadyRequested: !!task.endGoalRequestedAt,
+      });
+    if (downgradedToComment) {
       log(review.id, "verdict", "Comment-only mode — merge not blocked", {
         detail: "Workflow set to advisory: posting a COMMENT instead of REQUEST_CHANGES.",
       });
