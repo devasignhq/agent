@@ -8,6 +8,7 @@ import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { effectiveWorkflow } from "../review/workflow.js";
+import { triggerOutcome } from "../review/decisions.js";
 import { notifyForReview } from "../notifications.js";
 import {
   PLAN_LIMITS,
@@ -733,11 +734,12 @@ function handlePullRequest(event: any) {
   // bot-authored PRs (Dependabot/Renovate/etc). onSynchronize is handled inside
   // the synchronize branch below.
   const wf = effectiveWorkflow(repo);
-  if (wf.trigger.skipDrafts && pullReq.draft) {
+  const trig = triggerOutcome(wf, { isDraft: !!pullReq.draft, isBot: isBotActor(pullReq.user) });
+  if (trig.skip === "draft") {
     console.log(`[webhook] pull_request: ${repoFullName}#${pullReq.number} skipped — draft (workflow skipDrafts)`);
     return;
   }
-  if (wf.trigger.skipBots && isBotActor(pullReq.user)) {
+  if (trig.skip === "bot") {
     console.log(`[webhook] pull_request: ${repoFullName}#${pullReq.number} skipped — bot author (workflow skipBots)`);
     return;
   }
@@ -765,7 +767,7 @@ function handlePullRequest(event: any) {
           : `${pusher} pushed new commits to ${branch}`;
       // Re-review on push disabled by workflow: keep headSha fresh and record the
       // push for the timeline, but don't re-run the review.
-      if (!wf.trigger.onSynchronize) {
+      if (!trig.reReviewOnSync) {
         db.update("prReviews", (r) => r.id === existing.id, { headSha: newSha, updatedAt: Date.now() });
         db.insert("reviewLogs", {
           id: uuid(),
