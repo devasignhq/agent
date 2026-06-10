@@ -2,7 +2,12 @@
 //   node --import tsx/esm --test src/review/criteria-format.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
+import {
+  appendAddedCriteria,
+  buildCriteriaSection,
+  splitForComment,
+  type PriorVerdict,
+} from "./criteria-format.js";
 import type { Criterion } from "../types.js";
 
 const crit = (id: string, text: string): Criterion => ({ id, text, met: null, evidence: null });
@@ -115,4 +120,47 @@ test("non-`c{n}` existing ids don't interfere with sequential numbering", () => 
   const merged = appendAddedCriteria(existing, ["new"]);
   // c3 is the highest numeric suffix recognised — next is c4
   assert.equal(merged[2].id, "c4");
+});
+
+// --- splitForComment: regressed vs unmet vs met buckets for the comment/UI ---
+
+test("splitForComment: the reported scenario — 11 met + 4 new unmet → zero regressions", () => {
+  const filled: Criterion[] = [];
+  const prior = new Map<string, PriorVerdict>();
+  for (let i = 1; i <= 11; i++) {
+    filled.push(verdict(`c${i}`, `met ${i}`, true, "ok"));
+    prior.set(`c${i}`, { met: true, evidence: "ok" }); // satisfied by the first commit
+  }
+  for (let i = 12; i <= 15; i++) {
+    filled.push(verdict(`c${i}`, `new ${i}`, false, "not yet")); // added by the comment, no prior
+  }
+  const { regressed, unmet, met } = splitForComment(filled, prior);
+  assert.equal(regressed.length, 0); // the bug: these used to be reported as "not met"
+  assert.deepEqual(unmet.map((c) => c.id), ["c12", "c13", "c14", "c15"]);
+  assert.equal(met.length, 11);
+});
+
+test("splitForComment: a previously-met criterion now unmet is a regression, not plain unmet", () => {
+  const filled = [
+    verdict("c1", "was met", false, "removed the retry loop"),
+    verdict("c2", "never met", false, "missing"),
+    verdict("c3", "still met", true, "present"),
+  ];
+  const prior = new Map<string, PriorVerdict>([
+    ["c1", { met: true, evidence: "retry loop in api.ts" }],
+    ["c2", { met: false, evidence: "missing" }],
+    ["c3", { met: true, evidence: "present" }],
+  ]);
+  const { regressed, unmet, met } = splitForComment(filled, prior);
+  assert.deepEqual(regressed.map((c) => c.id), ["c1"]);
+  assert.deepEqual(unmet.map((c) => c.id), ["c2"]);
+  assert.deepEqual(met.map((c) => c.id), ["c3"]);
+});
+
+test("splitForComment: an inconclusive (met:null) prior is not treated as a regression", () => {
+  const filled = [verdict("c1", "x", false, "no")];
+  const prior = new Map<string, PriorVerdict>([["c1", { met: null, evidence: null }]]);
+  const { regressed, unmet } = splitForComment(filled, prior);
+  assert.equal(regressed.length, 0);
+  assert.deepEqual(unmet.map((c) => c.id), ["c1"]);
 });

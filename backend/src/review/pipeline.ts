@@ -12,7 +12,7 @@ import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, wit
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
 import { config } from "../config.js";
-import { enqueueReview, type MaintainerComment } from "../queue.js";
+import { type MaintainerComment } from "../queue.js";
 import {
   downloadLinearFile,
   fetchLinearIssueContext,
@@ -28,7 +28,12 @@ import {
 } from "./devasign.js";
 import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
-import { appendAddedCriteria, buildCriteriaSection, type PriorVerdict } from "./criteria-format.js";
+import {
+  appendAddedCriteria,
+  buildCriteriaSection,
+  splitForComment,
+  type PriorVerdict,
+} from "./criteria-format.js";
 import { effectiveWorkflow } from "./workflow.js";
 import { resolveReviewEvent, withMaintainerInstructions } from "./decisions.js";
 
@@ -321,13 +326,20 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     setStatus(review.id, { taskId: task.id, criteria });
 
-    // c. Review the diff against the criteria
+    // c. Review the diff against the criteria. priorVerdicts anchors criteria an
+    // earlier commit already satisfied so a follow-up commit doesn't re-fail them.
     const verdict = await reviewDiff(review, context, criteria, priorVerdicts, wf.prompts?.review);
     const filledCriteria: Criterion[] = criteria.map((c) => {
       const m = verdict.criteria.find((vc) => vc.id === c.id);
       return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
     });
     const allMet = filledCriteria.every((c) => c.met === true);
+    // Criteria an earlier commit satisfied that this diff broke — persisted and
+    // rendered as "previously met, now broken" so the developer sees the
+    // regression instead of it being lumped in with never-met criteria.
+    const regressedCriteriaIds = splitForComment(filledCriteria, priorVerdicts).regressed.map(
+      (c) => c.id
+    );
 
     // c.1 Whole-repo review: ask Opus to check the diff against the repo index
     // for regressions, critical errors, and security flaws. Skipped when the
@@ -461,6 +473,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       criteria: filledCriteria,
       verdict: verdict.summary,
       status,
+      // Persist the regressions (met by an earlier commit, broken by this diff)
+      // so the GitHub comment and the in-app timeline can flag them.
+      regressedCriteriaIds,
     });
 
     // Route the verdict to a GitHub review action. We never auto-APPROVE a PR
@@ -531,6 +546,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       postConversationReview,
       endGoalCTA: includeEndGoalCTA,
       progressCommentId,
+      prior: priorVerdicts,
     });
     // The verdict banner + formal PR review are now posted. Clear the local id so
     // a later non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit
@@ -1512,7 +1528,8 @@ function formatReviewBody(
   suggestions: ReviewSuggestion[],
   summary: string,
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
-  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean }
+  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
+  prior: Map<string, PriorVerdict> = new Map()
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
@@ -1536,12 +1553,25 @@ function formatReviewBody(
     lines.push("## End goal", endGoal, "");
   }
 
-  // Split the criteria into two labeled sections instead of one mixed
-  // task list. The single `[x]`/`[ ]` list reads as "status"; the split
-  // makes failures the dominant signal at the top of the comment so the
-  // developer sees what they have to fix at a glance.
-  const unmet = filledCriteria.filter((c) => c.met !== true);
-  const met = filledCriteria.filter((c) => c.met === true);
+  // Lead with what needs attention. `splitForComment` (using the previous run's
+  // verdicts) separates criteria a later commit broke (regressed) from still-open
+  // ones (unmet) and the satisfied ones (met). Regressions and unmet are surfaced
+  // prominently; met criteria are NOT re-listed inline on every run — they
+  // collapse into a count header + a <details> block — so a re-review that only
+  // added new criteria doesn't read as "all of them failed" when most already passed.
+  const { regressed, unmet, met } = splitForComment(filledCriteria, prior);
+  if (regressed.length) {
+    lines.push("## ⚠️ Previously met — now broken");
+    lines.push(
+      "These acceptance criteria were satisfied by an earlier commit in this PR, but a later change broke them:",
+      ""
+    );
+    for (const c of regressed) {
+      lines.push(`- **${c.id}** — ${c.text}`);
+      if (c.evidence) lines.push(`  _What broke:_ ${c.evidence}`);
+    }
+    lines.push("");
+  }
   if (unmet.length) {
     lines.push("## ❌ Acceptance criteria not met");
     for (const c of unmet) {
@@ -1551,14 +1581,18 @@ function formatReviewBody(
     lines.push("");
   }
   if (met.length) {
-    const header = unmet.length === 0
-      ? `## ✅ Acceptance criteria met (all ${met.length} met)`
-      : `## ✅ Acceptance criteria met (${met.length} / ${filledCriteria.length})`;
-    lines.push(header);
+    const header =
+      unmet.length === 0 && regressed.length === 0
+        ? `## ✅ All ${met.length} acceptance criteria met`
+        : `## ✅ ${met.length} of ${filledCriteria.length} acceptance criteria met`;
+    // Collapsed by default: the developer already saw these pass, so they're here
+    // for reference, not re-litigation. The blank line after </summary> is what
+    // lets GitHub render the list inside the <details>.
+    lines.push(header, "", "<details><summary>Show met criteria</summary>", "");
     for (const c of met) {
       lines.push(`- **${c.id}** — ${c.text}`);
     }
-    lines.push("");
+    lines.push("", "</details>", "");
   }
 
   // Self-admitted deferred / incomplete work the diff's own comments concede.
@@ -1875,6 +1909,10 @@ async function postGithubOutput(
     // posted (runReviewJob). We edit it into the verdict banner; null → post a
     // fresh verdict comment instead.
     progressCommentId: number | null;
+    // Per-criterion verdict from the PREVIOUS run, so the comment body can tell a
+    // criterion that's still-open from one an earlier commit met but a later
+    // commit broke (a regression). Empty on a first review.
+    prior: Map<string, PriorVerdict>;
   }
 ): Promise<{ reviewPosted: boolean }> {
   if (!install) return { reviewPosted: false }; // dev: nothing to post to
@@ -1942,7 +1980,8 @@ async function postGithubOutput(
     args.suggestions,
     args.summary,
     args.holistic,
-    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA }
+    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
+    args.prior
   );
 
   // Translate the LLM's inline annotations into GitHub's review-comment shape.
@@ -1996,6 +2035,46 @@ async function postGithubOutput(
   // posted (when we got its URL).
   await resolveVerdictComment(reviewUrl, true);
   return { reviewPosted };
+}
+
+// Lightweight "changes requested" signal that blocks the merge WITHOUT re-running
+// the review pipeline. Refreshes the Check Run and submits a formal review
+// carrying `event`/`body` — no inline comments, no per-criterion findings, and
+// (unlike postGithubOutput) no verdict-banner comment. Used by the maintainer-
+// feedback path, which has already posted the actionable implementation guide as
+// its own comment, so a second detailed verdict would just be noise. `event` is
+// REQUEST_CHANGES in blocking mode and COMMENT in advisory mode (resolved by the
+// caller via resolveReviewEvent). Best-effort: each POST is independently guarded.
+async function postChangesRequestedNotice(
+  review: PRReview,
+  repo: { owner: string; name: string },
+  install: { installationId: number },
+  args: { event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; body: string; summary: string }
+): Promise<void> {
+  try {
+    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: "DevAsign · End goal",
+        head_sha: review.headSha,
+        status: "completed",
+        conclusion: "action_required",
+        output: { title: "Changes requested", summary: args.summary || "" },
+      }),
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.warn("[feedback] failed to refresh check run:", err);
+  }
+  try {
+    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+      method: "POST",
+      body: JSON.stringify({ event: args.event, body: args.body }),
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.warn("[feedback] failed to post changes-requested review:", err);
+  }
 }
 
 // --- Mid-review bug-fix comments ---
@@ -2201,7 +2280,13 @@ async function refineGoalFromFeedback(args: {
     docUrls: string[];
     sourceUrl: string;
   };
-}): Promise<{ endGoal: string; criteria: Criterion[]; changed: boolean; rationale: string }> {
+}): Promise<{
+  endGoal: string;
+  criteria: Criterion[];
+  added: Criterion[];
+  changed: boolean;
+  rationale: string;
+}> {
   const { review, endGoal, criteria, feedback } = args;
   const system =
     "You are DevAsign's maintainer-feedback goal refinement step. A maintainer or collaborator left a comment " +
@@ -2269,12 +2354,15 @@ async function refineGoalFromFeedback(args: {
   // from whether any additions actually landed — that way the contract stays
   // self-consistent even when the model contradicts itself.
   if (!addedTexts.length) {
-    return { endGoal, criteria, changed: false, rationale };
+    return { endGoal, criteria, added: [], changed: false, rationale };
   }
   const nextCriteria = appendAddedCriteria(criteria, addedTexts);
   return {
     endGoal: String(parsed.endGoal || endGoal),
     criteria: nextCriteria,
+    // The tail beyond the prior list is exactly what the comment introduced —
+    // the copyable prompt lists these so the developer's agent knows the new bar.
+    added: nextCriteria.slice(criteria.length),
     changed: true,
     rationale,
   };
@@ -2336,9 +2424,56 @@ async function synthesizeImplementationGuide(args: {
   };
 }
 
-function formatImplementationGuide(
+// Compose the single paste-once prompt the developer hands to their own AI
+// coding agent to implement the maintainer's feedback. Pure string composition
+// from the guide the LLM already synthesised plus the criteria the comment
+// introduced — no extra LLM call (mirrors buildConsolidatedFixPrompt). Rendered
+// inside formatImplementationGuide's fenced "Prompt for your AI agent" block.
+function buildFeedbackFixPrompt(args: {
+  prTitle: string;
+  repoFullName: string;
+  guide: ImplementationGuide;
+  newCriteria: Criterion[];
+}): string {
+  const { prTitle, repoFullName, guide, newCriteria } = args;
+  const lines: string[] = [];
+  lines.push(
+    `You are implementing maintainer feedback on PR "${prTitle}" in ${repoFullName}. ` +
+      `Apply the change in a new commit so the automated review can re-check it.`
+  );
+  lines.push("");
+  if (guide.ask) {
+    lines.push("## What to implement", guide.ask, "");
+  }
+  if (guide.approach) {
+    lines.push("## Suggested approach", guide.approach, "");
+  }
+  if (guide.code) {
+    const fence = codeFence(guide.code);
+    lines.push("## Reference snippet", fence, guide.code, fence, "");
+  }
+  if (newCriteria.length) {
+    lines.push("## Acceptance criteria to satisfy");
+    for (const c of newCriteria) lines.push(`- ${c.text}`);
+    lines.push("");
+  }
+  if (guide.references.length) {
+    lines.push("## References");
+    for (const r of guide.references) lines.push(`- ${r}`);
+    lines.push("");
+  }
+  lines.push("## Your task");
+  lines.push(
+    "Implement the above so each acceptance criterion is satisfied, then commit. " +
+      "Keep the change scoped to this feedback — don't introduce unrelated edits."
+  );
+  return lines.join("\n").trimEnd();
+}
+
+export function formatImplementationGuide(
   guide: ImplementationGuide,
-  comment: { author: string; sourceUrl: string }
+  comment: { author: string; sourceUrl: string },
+  ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[] }
 ): string {
   const lines: string[] = [
     `### 🛠️ How to implement ${comment.author}'s feedback — ${guide.title}`,
@@ -2355,6 +2490,16 @@ function formatImplementationGuide(
     for (const r of guide.references) lines.push(`- ${r}`);
     lines.push("");
   }
+  // Copy-paste prompt for the developer's own AI agent — rendered in a fenced
+  // block (via appendFixPrompt) so GitHub's one-click copy button picks it up.
+  const fixPrompt = buildFeedbackFixPrompt({
+    prTitle: ctx.prTitle,
+    repoFullName: ctx.repoFullName,
+    guide,
+    newCriteria: ctx.newCriteria,
+  });
+  appendFixPrompt(lines, fixPrompt);
+  lines.push("");
   if (comment.sourceUrl) lines.push(`_Source: ${comment.sourceUrl}_`);
   return lines.join("\n");
 }
@@ -2453,18 +2598,21 @@ export async function runMaintainerFeedbackJob(
     }
     // The bar moved: new criteria came in from the maintainer's comment.
     // Flip the visible status to `changes_requested` so a PR that read as
-    // "passed" no longer reads as approved while the developer hasn't had
-    // a chance to implement the new requirement yet. Re-enqueue a full
-    // review so the diff is re-checked against the updated criteria and a
-    // fresh REQUEST_CHANGES review lands on the GitHub PR.
+    // "passed" no longer reads as approved while the developer hasn't had a
+    // chance to implement the new requirement yet. We deliberately do NOT
+    // re-run the full review here: the diff is unchanged, so re-checking it
+    // against a criterion we just learned it can't meet only burns an LLM pass
+    // and posts redundant findings. The implementation guide below is the
+    // actionable feedback, and the lightweight REQUEST_CHANGES further down
+    // blocks the merge. The real re-review fires on the next `synchronize`
+    // webhook, once the developer actually pushes a commit.
     setStatus(review.id, {
       criteria: refined.criteria,
       status: "changes_requested",
     });
-    enqueueReview(review.id);
     log(review.id, "criteria", "End goal updated from maintainer feedback", {
       detail: refined.rationale || refined.endGoal,
-      meta: { count: refined.criteria.length, statusGated: true },
+      meta: { count: refined.criteria.length, added: refined.added.length, statusGated: true },
     });
   } else {
     log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
@@ -2507,7 +2655,11 @@ export async function runMaintainerFeedbackJob(
 
   if (!install) return; // dev: nothing to post to
 
-  const body = formatImplementationGuide(guide, comment);
+  const body = formatImplementationGuide(guide, comment, {
+    prTitle: review.prTitle,
+    repoFullName: `${repo.owner}/${repo.name}`,
+    newCriteria: refined.added,
+  });
   try {
     await gh(
       install.installationId,
@@ -2527,6 +2679,34 @@ export async function runMaintainerFeedbackJob(
     target: comment.sourceUrl,
     detail: guide.title,
     meta: { author: comment.author, refs: guide.references.length },
+  });
+
+  // Block merge without re-running the pipeline: submit a lightweight
+  // REQUEST_CHANGES review (no LLM, no per-criterion findings) that points at
+  // the implementation guide above, and refresh the Check Run. Advisory mode
+  // (verdict.blocking=false) downgrades the event to COMMENT so the merge is
+  // never blocked — the policy lives in resolveReviewEvent (decisions.ts).
+  // Submitted as the same bot reviewer, REQUEST_CHANGES supersedes any earlier
+  // APPROVE for branch protection, so no explicit dismiss is needed.
+  const wf = effectiveWorkflow(repo);
+  const { event: reviewEvent } = resolveReviewEvent({
+    status: "changes_requested",
+    specless: refined.criteria.length === 0,
+    blocking: wf.verdict.blocking,
+    endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
+  });
+  const noticeBody =
+    `### 🔧 Changes requested — new acceptance criteria from ${comment.author}\n\n` +
+    `A maintainer's feedback added new acceptance criteria to this PR. See the **implementation guide** ` +
+    `comment for what to change and a copy-paste prompt for your AI agent.\n\n` +
+    `This review re-runs automatically when you push a new commit.`;
+  await postChangesRequestedNotice(review, repo, install, {
+    event: reviewEvent,
+    body: noticeBody,
+    summary: "Maintainer feedback added new acceptance criteria; see the implementation guide.",
+  });
+  log(review.id, "verdict", "Changes requested — merge blocked; awaiting developer commit", {
+    meta: { event: reviewEvent, reReview: false },
   });
 }
 

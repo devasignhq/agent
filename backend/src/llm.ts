@@ -162,11 +162,15 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     // need a deterministic toggle so offline tests can exercise both paths.
     const lower = last.toLowerCase();
     const isAck = /\b(lgtm|looks good|ship it|approved|thanks!?|nice)\b/.test(lower);
+    // refineGoalFromFeedback reads `addedCriteria` (the brand-new criteria the
+    // comment introduces) — NOT a full `criteria` list — and derives `changed`
+    // from whether any additions landed. Mirror that production contract here so
+    // the offline changed-path actually fires.
     if (isAck) {
       return JSON.stringify({
         changed: false,
         endGoal: "",
-        criteria: [],
+        addedCriteria: [],
         rationale: "Comment reads as an acknowledgement; no new requirements detected.",
       });
     }
@@ -174,12 +178,8 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       changed: true,
       endGoal:
         "Deliver the described capability and incorporate the maintainer's request to validate inputs before persisting.",
-      criteria: [
-        { id: "c1", text: "All paths described in the linked issue are implemented." },
-        { id: "c2", text: "No regressions in existing covered behavior." },
-        { id: "c3", text: "User-facing copy matches the ticket's wording." },
-        { id: "c4", text: "Edge cases listed in the issue are handled." },
-        { id: "c5", text: "Inputs are validated before persistence, per maintainer request." },
+      addedCriteria: [
+        { text: "Inputs are validated before persistence, per maintainer request." },
       ],
       rationale: "Maintainer asked for an explicit input-validation step before the persistence call.",
     });

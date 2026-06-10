@@ -213,6 +213,11 @@ export type PRReview = {
   // review run and edits it into the verdict when done, so this is re-set per run
   // (one comment per run). Optional so rows written before this existed still load.
   progressCommentId?: number | null;
+  // Criterion ids that were met by an earlier commit but came back not-met after
+  // a code change in this PR — genuine regressions. Drives the "previously met,
+  // now broken" callout in the GitHub comment and the in-app timeline. Empty/
+  // absent on a clean run.
+  regressedCriteriaIds?: string[];
   createdAt: number;
   updatedAt: number;
 };

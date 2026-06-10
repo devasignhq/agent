@@ -61,3 +61,25 @@ export function appendAddedCriteria(
   }));
   return [...existing, ...added];
 }
+
+// Partition the scored criteria for the verdict comment / in-app timeline.
+// `regressed` are criteria an earlier commit satisfied that a later commit broke
+// — surfaced prominently because the developer needs to know their change undid
+// prior work. `unmet` are still-open requirements (newly added or never met).
+// `met` are currently satisfied; the comment collapses these instead of
+// re-listing them on every run. A criterion is only "regressed", never also
+// "unmet" — the prior-met check takes precedence over the not-met bucket.
+export function splitForComment(
+  criteria: Criterion[],
+  prior: Map<string, PriorVerdict>
+): { regressed: Criterion[]; unmet: Criterion[]; met: Criterion[] } {
+  const regressed: Criterion[] = [];
+  const unmet: Criterion[] = [];
+  const met: Criterion[] = [];
+  for (const c of criteria) {
+    if (c.met === true) met.push(c);
+    else if (prior.get(c.id)?.met === true) regressed.push(c);
+    else unmet.push(c);
+  }
+  return { regressed, unmet, met };
+}
