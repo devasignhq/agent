@@ -1581,9 +1581,19 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     };
   }, []);
 
-  // Fetch the picked review's logs/task when selection changes; poll while
-  // the tab is visible so the timeline streams in. Same visibility contract
-  // as the queue poll — pause on hidden tabs, snap fresh on return.
+  // Is the selected review still in flight? Read from the queue's live list
+  // (kept fresh by the queue poll), so it flips to false the moment the review
+  // reaches a terminal status — and back to true if a Re-run re-queues it.
+  const pickedLive = liveReviews.some(
+    (r) => r.id === pickedId && (r.status === "queued" || r.status === "reviewing")
+  );
+
+  // Fetch the picked review's logs/task when selection changes, and poll while
+  // it's in flight so the timeline streams in. Same visibility contract as the
+  // queue poll — pause on hidden tabs, snap fresh on return. Once the review
+  // hits a terminal status (passed/changes_requested/errored) its log is
+  // immutable, so we fetch the final state once and stop rescheduling; a later
+  // Re-run flips pickedLive back on, re-running this effect to resume the stream.
   React.useEffect(() => {
     if (!pickedId) { setDetail(null); return; }
     let cancelled = false;
@@ -1596,7 +1606,8 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       if (cancelled) return;
       if (document.visibilityState === "visible") await fetchOnce();
       if (cancelled) return;
-      timer = setTimeout(tick, 2500);
+      // Only keep the 2.5s stream alive while the review is in flight.
+      if (pickedLive) timer = setTimeout(tick, 2500);
     };
     tick();
     const onVisible = () => {
@@ -1608,7 +1619,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       if (timer) clearTimeout(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
-  }, [pickedId]);
+  }, [pickedId, pickedLive]);
 
   // Index helpers
   const repoById = React.useMemo(

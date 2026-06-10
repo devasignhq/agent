@@ -167,6 +167,33 @@ export async function updatePRComment(
   }
 }
 
+// Dismiss a PR review (our own earlier bodyless APPROVE) — PUT
+// /pulls/{n}/reviews/{id}/dismissals. Used when a later commit fails review: we
+// never submit REQUEST_CHANGES (its required body would render as an extra
+// conversation comment), so withdrawing the stale approval is what keeps branch
+// protection honest. Best-effort: returns whether it succeeded, never throws
+// (404/422 when the review was already dismissed or deleted).
+export async function dismissPRReview(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  reviewId: number,
+  message: string
+): Promise<boolean> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/pulls/${prNumber}/reviews/${reviewId}/dismissals`, {
+      method: "PUT",
+      body: JSON.stringify({ message }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return true;
+  } catch (err) {
+    console.warn(`[github] failed to dismiss review ${reviewId} on ${owner}/${name}#${prNumber}:`, err);
+    return false;
+  }
+}
+
 // Dispatch a GitHub Actions workflow (workflow_dispatch) — powers the optional
 // "Run GitHub Action" node. `workflow` is the file name (e.g. "deploy.yml") or
 // numeric id; `ref` is the branch/tag to run on (the PR head branch). The

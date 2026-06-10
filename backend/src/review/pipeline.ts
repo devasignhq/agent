@@ -6,8 +6,8 @@
 //   e. Eval (LLM-as-judge; out-of-band, not in this hot path)
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
-import { minimalReviewBody, progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
+import { dismissPRReview, dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
@@ -156,25 +156,40 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   setStatus(review.id, { status: "reviewing" });
   log(review.id, "review", "Pipeline started");
 
-  // Drop the "review in progress" placeholder comment the moment a run starts —
-  // after the private-repo gate above, so a blocked review posts nothing. We edit
-  // this exact comment into the verdict in postGithubOutput, and post a *fresh*
-  // one on every run, so each push gets its own announce→verdict comment. The id
-  // is held locally (db.update replaces the row object, so the `review` reference
-  // captured at the top would go stale) and also persisted for durability.
-  // Best-effort: a commenting hiccup must never abort the review.
+  // Surface the "review in progress" placeholder comment the moment a run starts —
+  // after the private-repo gate above, so a blocked review posts nothing. One
+  // comment per commit: a rerun on the SAME head sha (manual rerun, reopen) edits
+  // the existing comment back to "in progress" instead of posting a duplicate;
+  // only a NEW sha (push) gets a fresh comment. postGithubOutput edits this exact
+  // comment into the verdict when the run finishes. The id is held locally
+  // (db.update replaces the row object, so the `review` reference captured at the
+  // top would go stale) and also persisted for durability. Best-effort: a
+  // commenting hiccup must never abort the review.
   let progressCommentId: number | null = null;
   if (install) {
-    progressCommentId = await postPRCommentReturningId(
-      install.installationId,
-      repo.owner,
-      repo.name,
-      review.prNumber,
-      progressCommentBody()
-    );
-    if (progressCommentId !== null) {
-      setStatus(review.id, { progressCommentId });
-      log(review.id, "comment", "Posted 'review in progress' comment");
+    const reusableId =
+      review.progressCommentId != null && review.progressCommentSha === review.headSha
+        ? review.progressCommentId
+        : null;
+    if (
+      reusableId !== null &&
+      (await updatePRComment(install.installationId, repo.owner, repo.name, reusableId, progressCommentBody()))
+    ) {
+      progressCommentId = reusableId;
+      log(review.id, "comment", "Reset 'review in progress' comment (rerun on same commit)");
+    } else {
+      // No reusable comment (new sha, first run, or the old comment was deleted).
+      progressCommentId = await postPRCommentReturningId(
+        install.installationId,
+        repo.owner,
+        repo.name,
+        review.prNumber,
+        progressCommentBody()
+      );
+      if (progressCommentId !== null) {
+        setStatus(review.id, { progressCommentId, progressCommentSha: review.headSha });
+        log(review.id, "comment", "Posted 'review in progress' comment");
+      }
     }
   }
 
@@ -533,8 +548,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       `${repo.owner}/${repo.name} — ${review.prTitle}`
     );
 
-    // d. Output: GitHub Check Run + PR review + broadcast
-    const { reviewPosted } = await postGithubOutput(review, repo, install, status, {
+    // d. Output: GitHub Check Run + the single verdict comment (+ bodyless
+    //    approval / stale-approval dismissal) + broadcast
+    const { verdictPosted } = await postGithubOutput(review, repo, install, status, {
       endGoal: endGoal || "",
       criteria: filledCriteria,
       summary: verdict.summary,
@@ -548,14 +564,15 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       progressCommentId,
       prior: priorVerdicts,
     });
-    // The verdict banner + formal PR review are now posted. Clear the local id so
-    // a later non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit
-    // the catch block and overwrite the success banner with a failure one — the
-    // GitHub output phase is already done. (The row keeps its id for the record.)
+    // The verdict comment is now written. Clear the local id so a later
+    // non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit the
+    // catch block and overwrite the verdict with a failure banner — the GitHub
+    // output phase is already done. (The row keeps its id for the record.)
     progressCommentId = null;
     // Mark the end-goal request as sent so re-reviews on later pushes don't
-    // re-spam the PR conversation.
-    if (includeEndGoalCTA && reviewPosted) {
+    // re-spam the PR conversation. The CTA lives inside the verdict comment, so
+    // "sent" means that comment landed.
+    if (includeEndGoalCTA && verdictPosted) {
       db.update("tasks", (t) => t.id === task.id, { endGoalRequestedAt: Date.now() });
       log(review.id, "comment", "Requested an end goal on spec-less PR");
     }
@@ -586,11 +603,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       review.id,
       "comment",
       postConversationReview
-        ? "Posted Check Run + PR review; updated verdict comment"
+        ? "Posted Check Run; updated verdict comment"
         : "Refreshed Check Run; updated verdict comment",
       {
         meta: {
-          inlineComments: verdict.comments.length,
+          lineNotes: verdict.comments.length,
           suggestions: verdict.suggestions.length,
           event: reviewEvent,
         },
@@ -1118,7 +1135,8 @@ export async function synthesizeCriteriaCore(args: {
         "explicit, checkable claims the PR's own title and description actually make (e.g. \"fixes flaky uploads\", " +
         "\"adds retry on 5xx\"). If the description makes no verifiable promise, return an EMPTY `criteria` array and a " +
         "brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent acceptance criteria " +
-        "just to have something to check, and never turn vague phrasing into a hard requirement."), extraInstructions);
+        "just to have something to check, and never turn vague phrasing into a hard requirement.") +
+    " Never use emoji in any text you output.", extraInstructions);
   const userText =
     `# ${title}\n\n## Context\n` +
     sources
@@ -1450,7 +1468,8 @@ async function reviewDiff(
     "Issue:\n<2-3 sentence concern description>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
-    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk.", extra);
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk. " +
+    "Never use emoji in any text you output.", extra);
   // Keep the head of the diff; mark when we drop the tail so the model reads a
   // missing hunk as "not shown" rather than "not done" (which, combined with the
   // prior-verdict anchoring above, is what stops truncation from regressing a
@@ -1504,7 +1523,7 @@ async function reviewDiff(
 // re-runs the review automatically.
 function buildEndGoalRequestCTA(): string {
   return [
-    "## 🎯 Want a deeper, goal-based review?",
+    "## Want a deeper, goal-based review?",
     'This PR isn\'t linked to an issue, so DevAsign reviewed it for correctness only. To have it checked against a concrete **end goal**, reply on this PR with what "done" looks like — DevAsign will turn it into acceptance criteria and re-review automatically.',
     "",
     "You can provide it as:",
@@ -1516,12 +1535,15 @@ function buildEndGoalRequestCTA(): string {
   ].join("\n");
 }
 
-// Build the markdown body that lands as the GitHub PR Review body. The shape
-// is intentionally scannable: end goal, then a checked/unchecked criteria
-// list with per-criterion evidence, then concrete suggestions the developer
-// can apply in a follow-up commit. For a spec-less PR (no acceptance criteria)
-// it leads with a neutral status instead of a synthesised end goal so we never
-// present invented requirements.
+// Build the markdown body of the single verdict comment. The shape is
+// intentionally scannable: end goal, then a criteria list with per-criterion
+// evidence, then concrete suggestions the developer can apply in a follow-up
+// commit. For a spec-less PR (no acceptance criteria) it leads with a neutral
+// status instead of a synthesised end goal so we never present invented
+// requirements. `lineNotes` are the LLM's line-anchored annotations — with no
+// formal-review body to carry them as native inline comments, they render here
+// as a "Line notes" section so everything lives in this one comment. Emoji-free
+// throughout (product decision).
 function formatReviewBody(
   endGoal: string,
   filledCriteria: Criterion[],
@@ -1529,16 +1551,17 @@ function formatReviewBody(
   summary: string,
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
   context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
-  prior: Map<string, PriorVerdict> = new Map()
+  prior: Map<string, PriorVerdict> = new Map(),
+  lineNotes: Array<{ path: string; line: number; body: string }> = []
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
   const holisticItemCount =
     holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
   if (specless) {
-    // The ✅/🔴 outcome header is supplied by verdictCommentBody, which embeds this
-    // body beneath it — so we lead with just the explanatory paragraph to avoid two
-    // near-identical headers stacked on top of each other.
+    // The outcome header is supplied by verdictCommentBody, which embeds this
+    // body beneath it — so we lead with just the explanatory paragraph to avoid
+    // two near-identical headers stacked on top of each other.
     if (holisticItemCount === 0) {
       lines.push(
         "No blocking bugs, regressions, or security concerns surfaced in this diff. This PR has no linked issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
@@ -1562,7 +1585,7 @@ function formatReviewBody(
   // added new criteria doesn't read as "all of them failed" when most already passed.
   const { regressed, unmet, met } = splitForComment(filledCriteria, prior);
   if (regressed.length) {
-    lines.push("## ⚠️ Previously met — now broken");
+    lines.push("## Previously met — now broken");
     lines.push(
       "These acceptance criteria were satisfied by an earlier commit in this PR, but a later change broke them:",
       ""
@@ -1574,7 +1597,7 @@ function formatReviewBody(
     lines.push("");
   }
   if (unmet.length) {
-    lines.push("## ❌ Acceptance criteria not met");
+    lines.push("## Acceptance criteria not met");
     for (const c of unmet) {
       lines.push(`- **${c.id}** — ${c.text}`);
       if (c.evidence) lines.push(`  _Why it failed:_ ${c.evidence}`);
@@ -1584,8 +1607,8 @@ function formatReviewBody(
   if (met.length) {
     const header =
       unmet.length === 0 && regressed.length === 0
-        ? `## ✅ All ${met.length} acceptance criteria met`
-        : `## ✅ ${met.length} of ${filledCriteria.length} acceptance criteria met`;
+        ? `## All ${met.length} acceptance criteria met`
+        : `## ${met.length} of ${filledCriteria.length} acceptance criteria met`;
     // Collapsed by default: the developer already saw these pass, so they're here
     // for reference, not re-litigation. The blank line after </summary> is what
     // lets GitHub render the list inside the <details>.
@@ -1602,7 +1625,7 @@ function formatReviewBody(
   // the author needs to see before merging. Rendered for both spec'd and
   // spec-less PRs; each item carries its own copyable fix prompt.
   if (holistic.deferrals.length) {
-    lines.push("## 🕓 Deferred / incomplete work");
+    lines.push("## Deferred / incomplete work");
     lines.push(
       "The diff's own comments concede that parts were deferred, stubbed, or only partially implemented. " +
         "These don't block the merge — confirm each was intentional, or use the prompt to finish it:",
@@ -1628,6 +1651,18 @@ function formatReviewBody(
       lines.push("");
     }
   }
+
+  // Line-anchored annotations from the review step. With no formal-review body to
+  // carry them as native inline comments, they live here so the whole verdict
+  // stays in this single comment.
+  if (lineNotes.length) {
+    lines.push("## Line notes");
+    for (const n of lineNotes) {
+      lines.push(`- \`${n.path}:${n.line}\` — ${n.body}`);
+    }
+    lines.push("");
+  }
+
   const holisticItems =
     holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
   if (holisticItems) {
@@ -1644,7 +1679,7 @@ function formatReviewBody(
   // surfaced as nitpicks, each with its own copyable fix prompt.
   const devasignItems = holistic.conventionFindings.length + holistic.docDriftFindings.length;
   if (devasignItems) {
-    lines.push("## 📝 DEVASIGN.md");
+    lines.push("## DEVASIGN.md");
     lines.push(
       "Checked against your repo's DEVASIGN.md conventions. These are nits — they don't block the merge:",
       ""
@@ -1684,7 +1719,7 @@ function formatReviewBody(
     lines.push("---");
     lines.push("");
     lines.push("<details>");
-    lines.push("<summary>📋 One prompt to fix all of this — paste into your AI coding agent</summary>");
+    lines.push("<summary>One prompt to fix all of this — paste into your AI coding agent</summary>");
     lines.push("");
     lines.push(fence);
     lines.push(prompt);
@@ -1828,7 +1863,7 @@ function appendHolisticGroup(
   if (!findings.length) return;
   lines.push(`### ${label}`);
   for (const f of findings) {
-    const sev = f.severity === "blocker" ? "🚫 **Blocker**" : "⚠️ Warn";
+    const sev = f.severity === "blocker" ? "**Blocker**" : "Warn";
     const where = f.path ? `\`${f.path}\` — ` : "";
     lines.push(`- ${sev} — ${where}${f.concern}`);
     appendFixPrompt(lines, f.fixPrompt, /* indented */ true);
@@ -1897,9 +1932,11 @@ async function postGithubOutput(
     comments: Array<{ path: string; line: number; body: string }>;
     diff: string;
     holistic: HolisticVerdict;
-    // GitHub review action. COMMENT (no APPROVE/REQUEST_CHANGES) is used for a
-    // clean spec-less pass so the bot doesn't formally approve a PR it had no
-    // criteria to verify against.
+    // Verdict routing (resolveReviewEvent). The conversation footprint is the
+    // single verdict comment, so the "review event" maps to invisible timeline
+    // actions only: APPROVE → bodyless approval; REQUEST_CHANGES → dismiss our
+    // stale approval (GitHub requires a body — i.e. a visible comment block — on
+    // a REQUEST_CHANGES review, so we never submit one); COMMENT → nothing.
     event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
     // When false, only the Check Run is (re)posted — used on repeat reviews of
     // a still-spec-less PR where we've already asked for an end goal.
@@ -1907,25 +1944,33 @@ async function postGithubOutput(
     // Append the "provide an end goal" call-to-action to the review body.
     endGoalCTA: boolean;
     // Id of this run's "review in progress" placeholder comment, if one was
-    // posted (runReviewJob). We edit it into the verdict banner; null → post a
-    // fresh verdict comment instead.
+    // posted (runReviewJob). We edit it into the verdict; null → post a fresh
+    // verdict comment instead.
     progressCommentId: number | null;
     // Per-criterion verdict from the PREVIOUS run, so the comment body can tell a
     // criterion that's still-open from one an earlier commit met but a later
     // commit broke (a regression). Empty on a first review.
     prior: Map<string, PriorVerdict>;
   }
-): Promise<{ reviewPosted: boolean }> {
-  if (!install) return { reviewPosted: false }; // dev: nothing to post to
+): Promise<{ verdictPosted: boolean }> {
+  if (!install) return { verdictPosted: false }; // dev: nothing to post to
   const installationId = install.installationId; // captured so the closure below keeps the non-null narrowing
   const conclusion = status === "passed" ? "success" : "action_required";
   const specless = args.criteria.length === 0;
 
-  // The single editable conversation comment IS the verdict the developer reads:
-  // the full review body (end goal, criteria, suggestions, feedback) under a ✅/🔴
-  // outcome headline. We edit this run's "review in progress" placeholder into it
-  // (or post a fresh comment if we never captured a placeholder id). The formal PR
-  // review below keeps only the merge-gate event + inline comments.
+  // The LLM's line-anchored annotations. With no formal-review body to carry
+  // them as native inline comments, they render inside the verdict comment as a
+  // "Line notes" section. Keep the diff-path filter so a hallucinated `path`
+  // doesn't put junk in the comment.
+  const validPaths = diffFilePaths(args.diff);
+  const lineNotes = (args.comments || []).filter(
+    (c) => c.path && c.body && Number.isFinite(c.line) && validPaths.has(c.path)
+  );
+
+  // The single editable conversation comment IS the review the developer reads:
+  // the full body (end goal, criteria, suggestions, line notes, feedback) under
+  // an outcome headline. We edit this run's "review in progress" placeholder
+  // into it (or post a fresh comment if we never captured a placeholder id).
   const fullBody = formatReviewBody(
     args.endGoal,
     args.criteria,
@@ -1933,19 +1978,27 @@ async function postGithubOutput(
     args.summary,
     args.holistic,
     { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
-    args.prior
+    args.prior,
+    lineNotes
   );
   const commentBody = verdictCommentBody({ status, specless, reviewBody: fullBody });
-  // Write the verdict into the conversation comment. `editOnly` skips posting a
-  // fresh comment when there's no placeholder to edit — used on the refresh-only
-  // path, where a brand-new standalone comment each run would just be noise.
-  // Best-effort: a commenting hiccup must never abort the review.
-  const writeVerdictComment = async (editOnly = false) => {
+  // Write the verdict into the conversation comment; returns whether it landed.
+  // `editOnly` skips posting a fresh comment when there's no placeholder to edit
+  // — used on the refresh-only path, where a brand-new standalone comment each
+  // run would just be noise. Best-effort: a commenting hiccup must never abort
+  // the review.
+  const writeVerdictComment = async (editOnly = false): Promise<boolean> => {
     if (args.progressCommentId !== null) {
-      await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
-    } else if (!editOnly) {
-      await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
+      return updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
     }
+    if (editOnly) return false;
+    const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
+    if (id !== null) {
+      // Persist so a same-sha rerun reuses this comment even though the
+      // placeholder POST at run start failed.
+      setStatus(review.id, { progressCommentId: id, progressCommentSha: review.headSha });
+    }
+    return id !== null;
   };
 
   // Check Run is keyed to head_sha, so it's always (re)posted — it updates the
@@ -1975,78 +2028,75 @@ async function postGithubOutput(
   }
 
   // Already asked for an end goal on a prior pass: refresh only the Check Run and
-  // update the verdict comment in place (no fresh conversation review). Edit-only
+  // update the verdict comment in place (no fresh conversation comment). Edit-only
   // so a still-spec-less re-review doesn't post a brand-new comment each run.
   if (!args.postConversationReview) {
-    await writeVerdictComment(true);
-    return { reviewPosted: false };
+    return { verdictPosted: await writeVerdictComment(true) };
   }
 
-  // Translate the LLM's inline annotations into GitHub's review-comment shape.
-  // Pre-filter against the file paths actually present in the diff so a bad
-  // `path` from the model doesn't poison the whole review (GitHub rejects the
-  // entire batch on the first invalid comment).
-  const validPaths = diffFilePaths(args.diff);
-  const inline = (args.comments || [])
-    .filter((c) => c.path && c.body && Number.isFinite(c.line) && validPaths.has(c.path))
-    .map((c) => ({ path: c.path, line: c.line, side: "RIGHT" as const, body: c.body }));
-
-  // Formal PR review — kept ONLY for the merge-gate event + inline line comments.
-  // Its body is a one-line pointer (minimalReviewBody); the full verdict lives in
-  // the conversation comment we write just below, so nothing is duplicated.
-  const reviewBody = minimalReviewBody();
-  let reviewPosted = false;
-  try {
-    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
-      method: "POST",
-      body: JSON.stringify({
-        event: args.event,
-        body: reviewBody,
-        ...(inline.length ? { comments: inline } : {}),
-      }),
-      headers: { "Content-Type": "application/json" },
-    });
-    reviewPosted = true;
-  } catch (err) {
-    // The inline batch is the usual culprit when the review POST fails (bad
-    // line numbers, deleted files, etc). Fall back to posting just the body
-    // so the merge-gate event still lands.
-    console.warn("[review] failed to post PR review with inline:", err);
-    if (inline.length) {
-      try {
-        await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+  // Review-event routing — timeline-only signals, never a comment block:
+  // - APPROVE: bodyless approval (GitHub renders just "approved these changes").
+  //   Store its id so a later failing commit can withdraw it.
+  // - REQUEST_CHANGES: never submitted (its required body would render as an
+  //   extra conversation comment). Instead, dismiss our earlier approval so the
+  //   merge gate (branch protection + the action_required Check Run) stays
+  //   honest after a regression.
+  // - COMMENT (spec-less pass / advisory downgrade): nothing to submit.
+  // Best-effort: a failure here must not block the verdict comment below.
+  if (args.event === "APPROVE") {
+    try {
+      const res = await gh<{ id?: number }>(
+        install.installationId,
+        `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`,
+        {
           method: "POST",
-          body: JSON.stringify({
-            event: args.event,
-            body: reviewBody,
-          }),
+          body: JSON.stringify({ event: "APPROVE" }),
           headers: { "Content-Type": "application/json" },
-        });
-        reviewPosted = true;
-      } catch (err2) {
-        console.warn("[review] event-only fallback also failed:", err2);
+        }
+      );
+      if (typeof res?.id === "number") {
+        setStatus(review.id, { approveReviewId: res.id });
       }
+    } catch (err) {
+      console.warn("[review] failed to post approval:", err);
+    }
+  } else if (args.event === "REQUEST_CHANGES" && review.approveReviewId != null) {
+    const dismissed = await dismissPRReview(
+      install.installationId,
+      repo.owner,
+      repo.name,
+      review.prNumber,
+      review.approveReviewId,
+      "A newer commit did not pass the DevAsign review; the earlier approval no longer applies."
+    );
+    if (dismissed) {
+      setStatus(review.id, { approveReviewId: null });
+      log(review.id, "verdict", "Withdrew earlier approval", {
+        detail: "A newer commit did not pass review; the stale approval was dismissed.",
+      });
     }
   }
+
   // Edit the placeholder into the full verdict (or post it fresh if we never
   // captured a placeholder id).
-  await writeVerdictComment();
-  return { reviewPosted };
+  return { verdictPosted: await writeVerdictComment() };
 }
 
 // Lightweight "changes requested" signal that blocks the merge WITHOUT re-running
-// the review pipeline. Refreshes the Check Run and submits a formal review
-// carrying `event`/`body` — no inline comments, no per-criterion findings, and
-// (unlike postGithubOutput) no verdict-banner comment. Used by the maintainer-
-// feedback path, which has already posted the actionable implementation guide as
-// its own comment, so a second detailed verdict would just be noise. `event` is
-// REQUEST_CHANGES in blocking mode and COMMENT in advisory mode (resolved by the
-// caller via resolveReviewEvent). Best-effort: each POST is independently guarded.
+// the review pipeline and WITHOUT adding any conversation comment. Refreshes the
+// Check Run to action_required and — in blocking mode (event=REQUEST_CHANGES) —
+// dismisses our earlier bodyless approval so a stale green review can't keep the
+// merge unlocked. We never submit a REQUEST_CHANGES review here: GitHub requires
+// a body on it, which would render as an extra comment block; the maintainer-
+// feedback path has already posted the implementation guide as the one allowed
+// comment. Advisory mode (event=COMMENT, resolved by the caller via
+// resolveReviewEvent) skips the dismissal so the merge stays unblocked.
+// Best-effort: each call is independently guarded.
 async function postChangesRequestedNotice(
   review: PRReview,
   repo: { owner: string; name: string },
   install: { installationId: number },
-  args: { event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; body: string; summary: string }
+  args: { event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; summary: string }
 ): Promise<void> {
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
@@ -2063,14 +2113,21 @@ async function postChangesRequestedNotice(
   } catch (err) {
     console.warn("[feedback] failed to refresh check run:", err);
   }
-  try {
-    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
-      method: "POST",
-      body: JSON.stringify({ event: args.event, body: args.body }),
-      headers: { "Content-Type": "application/json" },
-    });
-  } catch (err) {
-    console.warn("[feedback] failed to post changes-requested review:", err);
+  if (args.event === "REQUEST_CHANGES" && review.approveReviewId != null) {
+    const dismissed = await dismissPRReview(
+      install.installationId,
+      repo.owner,
+      repo.name,
+      review.prNumber,
+      review.approveReviewId,
+      "Maintainer feedback added new acceptance criteria; the earlier approval no longer applies."
+    );
+    if (dismissed) {
+      setStatus(review.id, { approveReviewId: null });
+      log(review.id, "verdict", "Withdrew earlier approval", {
+        detail: "New acceptance criteria from maintainer feedback; the stale approval was dismissed.",
+      });
+    }
   }
 }
 
@@ -2132,7 +2189,7 @@ async function synthesizeBugFix(args: {
 
 function formatBugFixComment(bug: BugFixSynthesis, videoUrl: string): string {
   const lines: string[] = [
-    `### 🎥 Bug observed in attached video — ${bug.title}`,
+    `### Bug observed in attached video — ${bug.title}`,
     "",
   ];
   if (bug.broken) lines.push("**What's broken**", bug.broken, "");
@@ -2385,7 +2442,8 @@ async function synthesizeImplementationGuide(args: {
     "`title` ≤ 80 chars, commit-subject style. `ask` paraphrases what the maintainer wants in 1–2 sentences. " +
     "`approach` is 1–3 short paragraphs explaining how to implement it, anchored in the current diff where " +
     "possible. `code` is an optional minimal patch snippet — never a full file. `references` echoes any doc " +
-    "URLs the maintainer cited. Never invent requirements the feedback didn't state.";
+    "URLs the maintainer cited. Never invent requirements the feedback didn't state. " +
+    "Never use emoji in any text you output.";
 
   const videoBlock = feedback.videoSummaries
     .map(
@@ -2473,7 +2531,14 @@ export function formatImplementationGuide(
   ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[] }
 ): string {
   const lines: string[] = [
-    `### 🛠️ How to implement ${comment.author}'s feedback — ${guide.title}`,
+    `### How to implement ${comment.author}'s feedback — ${guide.title}`,
+    "",
+    // The changes-requested notice lives here rather than in a formal review:
+    // a REQUEST_CHANGES review requires a body, which GitHub renders as an
+    // extra comment block — this guide is the one comment the feedback gets.
+    "**Changes requested** — this feedback added new acceptance criteria, so the PR's " +
+      "status is changes-requested until they are addressed. The review re-runs " +
+      "automatically when you push a new commit.",
     "",
   ];
   if (guide.ask) lines.push("**What they asked**", guide.ask, "");
@@ -2678,13 +2743,13 @@ export async function runMaintainerFeedbackJob(
     meta: { author: comment.author, refs: guide.references.length },
   });
 
-  // Block merge without re-running the pipeline: submit a lightweight
-  // REQUEST_CHANGES review (no LLM, no per-criterion findings) that points at
-  // the implementation guide above, and refresh the Check Run. Advisory mode
-  // (verdict.blocking=false) downgrades the event to COMMENT so the merge is
-  // never blocked — the policy lives in resolveReviewEvent (decisions.ts).
-  // Submitted as the same bot reviewer, REQUEST_CHANGES supersedes any earlier
-  // APPROVE for branch protection, so no explicit dismiss is needed.
+  // Block merge without re-running the pipeline: refresh the Check Run to
+  // action_required and (in blocking mode) dismiss our stale approval. No new
+  // conversation comment beyond the implementation guide above — the
+  // changes-requested note is folded into the guide itself
+  // (formatImplementationGuide). Advisory mode (verdict.blocking=false)
+  // downgrades the event to COMMENT so the merge is never blocked — the policy
+  // lives in resolveReviewEvent (decisions.ts).
   const wf = effectiveWorkflow(repo);
   const { event: reviewEvent } = resolveReviewEvent({
     status: "changes_requested",
@@ -2692,14 +2757,8 @@ export async function runMaintainerFeedbackJob(
     blocking: wf.verdict.blocking,
     endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
   });
-  const noticeBody =
-    `### 🔧 Changes requested — new acceptance criteria from ${comment.author}\n\n` +
-    `A maintainer's feedback added new acceptance criteria to this PR. See the **implementation guide** ` +
-    `comment for what to change and a copy-paste prompt for your AI agent.\n\n` +
-    `This review re-runs automatically when you push a new commit.`;
   await postChangesRequestedNotice(review, repo, install, {
     event: reviewEvent,
-    body: noticeBody,
     summary: "Maintainer feedback added new acceptance criteria; see the implementation guide.",
   });
   log(review.id, "verdict", "Changes requested — merge blocked; awaiting developer commit", {
