@@ -6,7 +6,8 @@
 //   e. Eval (LLM-as-judge; out-of-band, not in this hot path)
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { dispatchWorkflow, gh } from "../github/app.js";
+import { dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
@@ -149,6 +150,28 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   return withModel(reviewModel, async () => {
   setStatus(review.id, { status: "reviewing" });
   log(review.id, "review", "Pipeline started");
+
+  // Drop the "review in progress" placeholder comment the moment a run starts —
+  // after the private-repo gate above, so a blocked review posts nothing. We edit
+  // this exact comment into the verdict in postGithubOutput, and post a *fresh*
+  // one on every run, so each push gets its own announce→verdict comment. The id
+  // is held locally (db.update replaces the row object, so the `review` reference
+  // captured at the top would go stale) and also persisted for durability.
+  // Best-effort: a commenting hiccup must never abort the review.
+  let progressCommentId: number | null = null;
+  if (install) {
+    progressCommentId = await postPRCommentReturningId(
+      install.installationId,
+      repo.owner,
+      repo.name,
+      review.prNumber,
+      progressCommentBody()
+    );
+    if (progressCommentId !== null) {
+      setStatus(review.id, { progressCommentId });
+      log(review.id, "comment", "Posted 'review in progress' comment");
+    }
+  }
 
   try {
     // Snapshot the previous run's verdict (met/evidence) per criterion before
@@ -507,7 +530,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       event: reviewEvent,
       postConversationReview,
       endGoalCTA: includeEndGoalCTA,
+      progressCommentId,
     });
+    // The verdict banner + formal PR review are now posted. Clear the local id so
+    // a later non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit
+    // the catch block and overwrite the success banner with a failure one — the
+    // GitHub output phase is already done. (The row keeps its id for the record.)
+    progressCommentId = null;
     // Mark the end-goal request as sent so re-reviews on later pushes don't
     // re-spam the PR conversation.
     if (includeEndGoalCTA && reviewPosted) {
@@ -540,7 +569,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     log(
       review.id,
       "comment",
-      postConversationReview ? "Posted Check Run and PR review" : "Refreshed Check Run",
+      postConversationReview
+        ? "Posted Check Run + PR review; updated verdict comment"
+        : "Refreshed Check Run; updated verdict comment",
       {
         meta: {
           inlineComments: verdict.comments.length,
@@ -583,6 +614,17 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     log(review.id, "error", "Pipeline errored", {
       detail: errMsg,
     });
+    // If we posted a "review in progress" comment for this run, edit it to a
+    // failure banner so it never stays stuck on "in progress". Best-effort.
+    if (install && progressCommentId !== null) {
+      await updatePRComment(
+        install.installationId,
+        repo.owner,
+        repo.name,
+        progressCommentId,
+        reviewFailedCommentBody()
+      );
+    }
     // App notification: the analysis failed. `blocker` kind so the bell shows
     // a red dot — same visual weight as "changes_requested".
     notifyForReview(
@@ -1829,11 +1871,35 @@ async function postGithubOutput(
     postConversationReview: boolean;
     // Append the "provide an end goal" call-to-action to the review body.
     endGoalCTA: boolean;
+    // Id of this run's "review in progress" placeholder comment, if one was
+    // posted (runReviewJob). We edit it into the verdict banner; null → post a
+    // fresh verdict comment instead.
+    progressCommentId: number | null;
   }
 ): Promise<{ reviewPosted: boolean }> {
   if (!install) return { reviewPosted: false }; // dev: nothing to post to
+  const installationId = install.installationId; // captured so the closure below keeps the non-null narrowing
   const conclusion = status === "passed" ? "success" : "action_required";
   const specless = args.criteria.length === 0;
+
+  // Edit this run's "review in progress" comment into the concise verdict banner
+  // (or post a fresh verdict comment if we never got a placeholder id). The full
+  // verdict — criteria, suggestions, inline comments, the Approve/Request-changes
+  // event — stays in the formal PR review; this banner links to it. Best-effort.
+  const resolveVerdictComment = async (reviewUrl?: string, hasReview: boolean = true) => {
+    if (!hasReview && args.progressCommentId === null) {
+      // No placeholder to update and no formal review posted this run → posting a
+      // fresh standalone verdict comment would just be conversation noise, which
+      // is exactly what postConversationReview=false is meant to avoid.
+      return;
+    }
+    const banner = verdictCommentBody({ status, specless, summary: args.summary, reviewUrl, hasReview });
+    if (args.progressCommentId !== null) {
+      await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, banner);
+    } else {
+      await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, banner);
+    }
+  };
 
   // Check Run is keyed to head_sha, so it's always (re)posted — it updates the
   // commit status without adding conversation noise.
@@ -1862,7 +1928,13 @@ async function postGithubOutput(
   }
 
   // Already asked for an end goal on a prior pass: refresh only the Check Run.
-  if (!args.postConversationReview) return { reviewPosted: false };
+  // Still turn this run's placeholder into a verdict banner (no review link,
+  // since we're not posting a fresh conversation review) so it doesn't stay
+  // stuck on "in progress".
+  if (!args.postConversationReview) {
+    await resolveVerdictComment(undefined, false);
+    return { reviewPosted: false };
+  }
 
   const body = formatReviewBody(
     args.endGoal,
@@ -1882,10 +1954,12 @@ async function postGithubOutput(
     .filter((c) => c.path && c.body && Number.isFinite(c.line) && validPaths.has(c.path))
     .map((c) => ({ path: c.path, line: c.line, side: "RIGHT" as const, body: c.body }));
 
-  // PR review (single grouped comment so the conversation doesn't get spammy)
+  // PR review (single grouped comment so the conversation doesn't get spammy).
+  // Capture the review's html_url so the verdict banner can link straight to it.
   let reviewPosted = false;
+  let reviewUrl: string | undefined;
   try {
-    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+    const res = await gh<{ html_url?: string }>(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
       method: "POST",
       body: JSON.stringify({
         event: args.event,
@@ -1895,6 +1969,7 @@ async function postGithubOutput(
       headers: { "Content-Type": "application/json" },
     });
     reviewPosted = true;
+    reviewUrl = res?.html_url;
   } catch (err) {
     // The inline batch is the usual culprit when the review POST fails (bad
     // line numbers, deleted files, etc). Fall back to posting just the body
@@ -1902,7 +1977,7 @@ async function postGithubOutput(
     console.warn("[review] failed to post PR review with inline:", err);
     if (inline.length) {
       try {
-        await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+        const res = await gh<{ html_url?: string }>(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
           method: "POST",
           body: JSON.stringify({
             event: args.event,
@@ -1911,11 +1986,15 @@ async function postGithubOutput(
           headers: { "Content-Type": "application/json" },
         });
         reviewPosted = true;
+        reviewUrl = res?.html_url;
       } catch (err2) {
         console.warn("[review] verdict-only fallback also failed:", err2);
       }
     }
   }
+  // Turn the placeholder into the verdict banner, linked to the review we just
+  // posted (when we got its URL).
+  await resolveVerdictComment(reviewUrl, true);
   return { reviewPosted };
 }
 
