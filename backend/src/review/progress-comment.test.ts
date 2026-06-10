@@ -60,6 +60,23 @@ test("verdictCommentBody: links the full review only when a URL is given", () =>
   assert.match(withoutUrl, /See the full review below/);
 });
 
+test("verdictCommentBody: omits the review pointer entirely when hasReview is false", () => {
+  const body = verdictCommentBody({
+    status: "passed",
+    specless: true,
+    summary: "Nothing to flag.",
+    hasReview: false,
+  });
+  // Still a complete banner with the outcome + summary…
+  assert.match(body, /✅/);
+  assert.match(body, /no issues found/i);
+  assert.match(body, /Nothing to flag\./);
+  // …but no pointer to a review we deliberately didn't post (no link, no text).
+  assert.doesNotMatch(body, /See the full review/);
+  assert.doesNotMatch(body, /View the full review/);
+  assert.doesNotMatch(body, /\]\(http/);
+});
+
 test("reviewFailedCommentBody: explains the failure and the auto-retry", () => {
   const body = reviewFailedCommentBody();
   assert.match(body, /review failed/i);

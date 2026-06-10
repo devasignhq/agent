@@ -39,8 +39,12 @@ export function verdictCommentBody(args: {
   specless: boolean;
   summary: string;
   reviewUrl?: string;
+  // Whether a formal PR review was posted this run. When false (e.g. a
+  // refresh-only re-review), the banner omits the "see the full review" pointer
+  // so it doesn't claim a review exists that we deliberately didn't post.
+  hasReview?: boolean;
 }): string {
-  const { status, specless, summary, reviewUrl } = args;
+  const { status, specless, summary, reviewUrl, hasReview = true } = args;
   const headline =
     status === "passed"
       ? specless
@@ -60,11 +64,13 @@ export function verdictCommentBody(args: {
   }
   const trimmed = (summary || "").trim();
   if (trimmed) lines.push(trimmed, "");
-  lines.push(
-    reviewUrl
-      ? `📋 [View the full review](${reviewUrl}) — criteria, suggestions, and inline comments.`
-      : "📋 See the full review below for the criteria, suggestions, and inline comments."
-  );
+
+  if (reviewUrl) {
+    lines.push(`📋 [View the full review](${reviewUrl}) — criteria, suggestions, and inline comments.`);
+  } else if (hasReview) {
+    lines.push("📋 See the full review below for the criteria, suggestions, and inline comments.");
+  }
+
   return lines.join("\n").trim();
 }
 

@@ -532,6 +532,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       endGoalCTA: includeEndGoalCTA,
       progressCommentId,
     });
+    // The verdict banner + formal PR review are now posted. Clear the local id so
+    // a later non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit
+    // the catch block and overwrite the success banner with a failure one — the
+    // GitHub output phase is already done. (The row keeps its id for the record.)
+    progressCommentId = null;
     // Mark the end-goal request as sent so re-reviews on later pushes don't
     // re-spam the PR conversation.
     if (includeEndGoalCTA && reviewPosted) {
@@ -1881,8 +1886,14 @@ async function postGithubOutput(
   // (or post a fresh verdict comment if we never got a placeholder id). The full
   // verdict — criteria, suggestions, inline comments, the Approve/Request-changes
   // event — stays in the formal PR review; this banner links to it. Best-effort.
-  const resolveVerdictComment = async (reviewUrl?: string) => {
-    const banner = verdictCommentBody({ status, specless, summary: args.summary, reviewUrl });
+  const resolveVerdictComment = async (reviewUrl?: string, hasReview: boolean = true) => {
+    if (!hasReview && args.progressCommentId === null) {
+      // No placeholder to update and no formal review posted this run → posting a
+      // fresh standalone verdict comment would just be conversation noise, which
+      // is exactly what postConversationReview=false is meant to avoid.
+      return;
+    }
+    const banner = verdictCommentBody({ status, specless, summary: args.summary, reviewUrl, hasReview });
     if (args.progressCommentId !== null) {
       await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, banner);
     } else {
@@ -1921,7 +1932,7 @@ async function postGithubOutput(
   // since we're not posting a fresh conversation review) so it doesn't stay
   // stuck on "in progress".
   if (!args.postConversationReview) {
-    await resolveVerdictComment();
+    await resolveVerdictComment(undefined, false);
     return { reviewPosted: false };
   }
 
@@ -1983,7 +1994,7 @@ async function postGithubOutput(
   }
   // Turn the placeholder into the verdict banner, linked to the review we just
   // posted (when we got its URL).
-  await resolveVerdictComment(reviewUrl);
+  await resolveVerdictComment(reviewUrl, true);
   return { reviewPosted };
 }
 
