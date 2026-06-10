@@ -7,7 +7,7 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
-import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
+import { minimalReviewBody, progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
@@ -1536,15 +1536,16 @@ function formatReviewBody(
   const holisticItemCount =
     holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
   if (specless) {
+    // The ✅/🔴 outcome header is supplied by verdictCommentBody, which embeds this
+    // body beneath it — so we lead with just the explanatory paragraph to avoid two
+    // near-identical headers stacked on top of each other.
     if (holisticItemCount === 0) {
       lines.push(
-        "## ✅ No issues found",
         "No blocking bugs, regressions, or security concerns surfaced in this diff. This PR has no linked issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
         ""
       );
     } else {
       lines.push(
-        "## Reviewed for correctness",
         "This PR has no linked issue or spec, so no acceptance criteria were checked. The concerns below come from a whole-repo correctness pass.",
         ""
       );
@@ -1920,22 +1921,30 @@ async function postGithubOutput(
   const conclusion = status === "passed" ? "success" : "action_required";
   const specless = args.criteria.length === 0;
 
-  // Edit this run's "review in progress" comment into the concise verdict banner
-  // (or post a fresh verdict comment if we never got a placeholder id). The full
-  // verdict — criteria, suggestions, inline comments, the Approve/Request-changes
-  // event — stays in the formal PR review; this banner links to it. Best-effort.
-  const resolveVerdictComment = async (reviewUrl?: string, hasReview: boolean = true) => {
-    if (!hasReview && args.progressCommentId === null) {
-      // No placeholder to update and no formal review posted this run → posting a
-      // fresh standalone verdict comment would just be conversation noise, which
-      // is exactly what postConversationReview=false is meant to avoid.
-      return;
-    }
-    const banner = verdictCommentBody({ status, specless, summary: args.summary, reviewUrl, hasReview });
+  // The single editable conversation comment IS the verdict the developer reads:
+  // the full review body (end goal, criteria, suggestions, feedback) under a ✅/🔴
+  // outcome headline. We edit this run's "review in progress" placeholder into it
+  // (or post a fresh comment if we never captured a placeholder id). The formal PR
+  // review below keeps only the merge-gate event + inline comments.
+  const fullBody = formatReviewBody(
+    args.endGoal,
+    args.criteria,
+    args.suggestions,
+    args.summary,
+    args.holistic,
+    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
+    args.prior
+  );
+  const commentBody = verdictCommentBody({ status, specless, reviewBody: fullBody });
+  // Write the verdict into the conversation comment. `editOnly` skips posting a
+  // fresh comment when there's no placeholder to edit — used on the refresh-only
+  // path, where a brand-new standalone comment each run would just be noise.
+  // Best-effort: a commenting hiccup must never abort the review.
+  const writeVerdictComment = async (editOnly = false) => {
     if (args.progressCommentId !== null) {
-      await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, banner);
-    } else {
-      await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, banner);
+      await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
+    } else if (!editOnly) {
+      await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
     }
   };
 
@@ -1965,24 +1974,13 @@ async function postGithubOutput(
     console.warn("[review] failed to post check run:", err);
   }
 
-  // Already asked for an end goal on a prior pass: refresh only the Check Run.
-  // Still turn this run's placeholder into a verdict banner (no review link,
-  // since we're not posting a fresh conversation review) so it doesn't stay
-  // stuck on "in progress".
+  // Already asked for an end goal on a prior pass: refresh only the Check Run and
+  // update the verdict comment in place (no fresh conversation review). Edit-only
+  // so a still-spec-less re-review doesn't post a brand-new comment each run.
   if (!args.postConversationReview) {
-    await resolveVerdictComment(undefined, false);
+    await writeVerdictComment(true);
     return { reviewPosted: false };
   }
-
-  const body = formatReviewBody(
-    args.endGoal,
-    args.criteria,
-    args.suggestions,
-    args.summary,
-    args.holistic,
-    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
-    args.prior
-  );
 
   // Translate the LLM's inline annotations into GitHub's review-comment shape.
   // Pre-filter against the file paths actually present in the diff so a bad
@@ -1993,47 +1991,46 @@ async function postGithubOutput(
     .filter((c) => c.path && c.body && Number.isFinite(c.line) && validPaths.has(c.path))
     .map((c) => ({ path: c.path, line: c.line, side: "RIGHT" as const, body: c.body }));
 
-  // PR review (single grouped comment so the conversation doesn't get spammy).
-  // Capture the review's html_url so the verdict banner can link straight to it.
+  // Formal PR review — kept ONLY for the merge-gate event + inline line comments.
+  // Its body is a one-line pointer (minimalReviewBody); the full verdict lives in
+  // the conversation comment we write just below, so nothing is duplicated.
+  const reviewBody = minimalReviewBody();
   let reviewPosted = false;
-  let reviewUrl: string | undefined;
   try {
-    const res = await gh<{ html_url?: string }>(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
       method: "POST",
       body: JSON.stringify({
         event: args.event,
-        body,
+        body: reviewBody,
         ...(inline.length ? { comments: inline } : {}),
       }),
       headers: { "Content-Type": "application/json" },
     });
     reviewPosted = true;
-    reviewUrl = res?.html_url;
   } catch (err) {
     // The inline batch is the usual culprit when the review POST fails (bad
     // line numbers, deleted files, etc). Fall back to posting just the body
-    // so the verdict still lands.
+    // so the merge-gate event still lands.
     console.warn("[review] failed to post PR review with inline:", err);
     if (inline.length) {
       try {
-        const res = await gh<{ html_url?: string }>(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
+        await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`, {
           method: "POST",
           body: JSON.stringify({
             event: args.event,
-            body,
+            body: reviewBody,
           }),
           headers: { "Content-Type": "application/json" },
         });
         reviewPosted = true;
-        reviewUrl = res?.html_url;
       } catch (err2) {
-        console.warn("[review] verdict-only fallback also failed:", err2);
+        console.warn("[review] event-only fallback also failed:", err2);
       }
     }
   }
-  // Turn the placeholder into the verdict banner, linked to the review we just
-  // posted (when we got its URL).
-  await resolveVerdictComment(reviewUrl, true);
+  // Edit the placeholder into the full verdict (or post it fresh if we never
+  // captured a placeholder id).
+  await writeVerdictComment();
   return { reviewPosted };
 }
 

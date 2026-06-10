@@ -3,7 +3,7 @@
 //   node --import tsx/esm --test src/review/progress-comment.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
+import { minimalReviewBody, progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 
 test("progressCommentBody: matches the screenshot placeholder", () => {
   const body = progressCommentBody();
@@ -17,64 +17,39 @@ test("progressCommentBody: matches the screenshot placeholder", () => {
   assert.match(body, /minute or two/);
 });
 
-test("verdictCommentBody: passed + spec → ✅ all criteria met, with summary", () => {
-  const body = verdictCommentBody({
-    status: "passed",
-    specless: false,
-    summary: "Everything checks out.",
-  });
+test("verdictCommentBody: passed + spec → ✅ headline wrapping the full review body", () => {
+  const reviewBody = "## End goal\nShip the widget.\n\n## ✅ All 3 acceptance criteria met";
+  const body = verdictCommentBody({ status: "passed", specless: false, reviewBody });
   assert.match(body, /✅/);
-  assert.match(body, /all acceptance criteria met/i);
-  assert.match(body, /Everything checks out\./);
+  assert.match(body, /^## ✅ DevAsign review — all acceptance criteria met/);
+  // The full review body is embedded verbatim under the headline.
+  assert.ok(body.includes(reviewBody), "the full review body should be embedded");
 });
 
-test("verdictCommentBody: passed + spec-less → ✅ no issues found", () => {
-  const body = verdictCommentBody({ status: "passed", specless: true, summary: "" });
-  assert.match(body, /✅/);
-  assert.match(body, /no issues found/i);
+test("verdictCommentBody: passed + spec-less → ✅ no issues found headline", () => {
+  const reviewBody = "No blocking bugs, regressions, or security concerns surfaced.";
+  const body = verdictCommentBody({ status: "passed", specless: true, reviewBody });
+  assert.match(body, /^## ✅ DevAsign review — no issues found/);
   assert.doesNotMatch(body, /acceptance criteria met/i);
+  assert.ok(body.includes(reviewBody));
 });
 
-test("verdictCommentBody: changes_requested → 🔴 changes requested", () => {
-  const body = verdictCommentBody({
-    status: "changes_requested",
-    specless: false,
-    summary: "Two criteria are unmet.",
-  });
+test("verdictCommentBody: changes_requested → 🔴 changes requested headline", () => {
+  const reviewBody = "## ❌ Acceptance criteria not met\n- **C1** — login still broken";
+  const body = verdictCommentBody({ status: "changes_requested", specless: false, reviewBody });
   assert.match(body, /🔴/);
-  assert.match(body, /changes requested/i);
-  assert.match(body, /Two criteria are unmet\./);
+  assert.match(body, /^## 🔴 DevAsign review — changes requested/);
+  assert.ok(body.includes(reviewBody));
 });
 
-test("verdictCommentBody: links the full review only when a URL is given", () => {
-  const withUrl = verdictCommentBody({
-    status: "passed",
-    specless: false,
-    summary: "ok",
-    reviewUrl: "https://github.com/acme/widgets/pull/1#pullrequestreview-99",
-  });
-  assert.match(withUrl, /\[View the full review\]\(https:\/\/github\.com\/acme\/widgets\/pull\/1#pullrequestreview-99\)/);
-
-  const withoutUrl = verdictCommentBody({ status: "passed", specless: false, summary: "ok" });
-  assert.doesNotMatch(withoutUrl, /\]\(http/);
-  assert.match(withoutUrl, /See the full review below/);
-});
-
-test("verdictCommentBody: omits the review pointer entirely when hasReview is false", () => {
-  const body = verdictCommentBody({
-    status: "passed",
-    specless: true,
-    summary: "Nothing to flag.",
-    hasReview: false,
-  });
-  // Still a complete banner with the outcome + summary…
-  assert.match(body, /✅/);
-  assert.match(body, /no issues found/i);
-  assert.match(body, /Nothing to flag\./);
-  // …but no pointer to a review we deliberately didn't post (no link, no text).
-  assert.doesNotMatch(body, /See the full review/);
-  assert.doesNotMatch(body, /View the full review/);
-  assert.doesNotMatch(body, /\]\(http/);
+test("minimalReviewBody: a short pointer to the comment, not the full verdict", () => {
+  const body = minimalReviewBody();
+  // Non-empty (GitHub requires a body for REQUEST_CHANGES/COMMENT) and points at
+  // the conversation comment that carries the verdict.
+  assert.match(body, /pinned comment/i);
+  // It is NOT the verdict itself — no end goal / per-criterion detail.
+  assert.doesNotMatch(body, /## End goal/);
+  assert.ok(body.length < 300, "should be a one-liner, not the full verdict");
 });
 
 test("reviewFailedCommentBody: explains the failure and the auto-retry", () => {
