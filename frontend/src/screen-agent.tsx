@@ -654,7 +654,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
       ? {
           title: live.title,
           ticket: { id: live.prNumber ? `#${live.prNumber}` : "—", url: "", source: "github", summary: live.endGoal || "(no end-goal synthesised yet)", assignee: "—", reporter: "—" },
-          acceptance: live.criteria.map((c, i) => ({ id: i + 1, text: c.text, met: c.met === true, note: c.evidence || undefined })),
+          acceptance: live.criteria.map((c, i) => ({ id: i + 1, text: c.text, met: c.met === true, regressed: (live.regressedCriteriaIds || []).includes(c.id), note: c.evidence || undefined })),
           // Constraint rows in live mode carry the attachment id + the URL /
           // contentRef so the X click can match the corresponding source
           // entry in "sources analyzed" and hide it in lockstep.
@@ -706,6 +706,12 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
   }
 
   const metCount = goal.acceptance.filter((a) => a.met).length;
+  // Lead with what needs attention: regressions ("was met, now broken") first,
+  // then still-open criteria, then the met ones. Stable sort keeps each group's
+  // own order. Mirrors how the GitHub review comment is structured.
+  const sortedAcceptance = [...goal.acceptance].sort(
+    (a, b) => (a.regressed ? 0 : a.met ? 2 : 1) - (b.regressed ? 0 : b.met ? 2 : 1)
+  );
 
   return (
     <div className="agent-pane">
@@ -810,13 +816,14 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                 </div>
               </div>
             }
-            {goal.acceptance.map((a) =>
-            <div key={a.id} className={`ac-row ${a.met ? "met" : "unmet"}`}>
+            {sortedAcceptance.map((a) =>
+            <div key={a.id} className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"}`}>
                 <div className="ac-check">
-                  {a.met ? <Icon name="check" size={11} /> : <span className="mono">!</span>}
+                  {a.met ? <Icon name="check" size={11} /> : a.regressed ? <Icon name="warn" size={11} /> : <span className="mono">!</span>}
                 </div>
                 <div>
                   <div style={{ fontSize: 13 }}>{a.text}</div>
+                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
                   {a.note && <div className="mute mono" style={{ fontSize: 11, marginTop: 3 }}>{a.note}</div>}
                 </div>
                 <span className="mono mute" style={{ fontSize: 10, justifySelf: "end" }}>AC-{a.id}</span>
@@ -1991,6 +1998,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
             title: detail.review.prTitle,
             endGoal: detail.task?.endGoal,
             criteria: detail.review.criteria,
+            regressedCriteriaIds: detail.review.regressedCriteriaIds,
             taskId: detail.task?.id,
             prNumber: detail.review.prNumber,
             attachments: detail.task?.attachments,

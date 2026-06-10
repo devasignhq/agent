@@ -3298,6 +3298,10 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .ac-row.met .ac-check { background: var(--accent); border-color: var(--accent); color: #052413; }
 .ac-row.unmet .ac-check { color: var(--danger); border-color: rgba(255,90,95,0.4); }
 .ac-row.unmet { background: rgba(255,90,95,0.03); }
+/* Previously met, broken by a later commit — amber so it reads as a regression
+   distinct from a never-met (red) criterion. */
+.ac-row.regressed .ac-check { color: var(--warn); border-color: rgba(245,165,36,0.4); }
+.ac-row.regressed { background: rgba(245,165,36,0.05); }
 
 .constraint-list {
   list-style: none;

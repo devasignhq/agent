@@ -225,6 +225,10 @@ export type PRReview = {
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;
+  // Criterion ids that an earlier commit met but a later commit broke. Lets the
+  // timeline flag a "previously met, now broken" regression instead of just
+  // "unmet" (mirror of backend/src/types.ts). Optional — absent on older rows.
+  regressedCriteriaIds?: string[];
   createdAt: number;
   updatedAt: number;
 };
