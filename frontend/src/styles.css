@@ -4904,42 +4904,16 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 
 /* Left section — repositories. Floats and hugs its content height (capped to
-   the viewport); no shadow and no top/bottom border lines. */
+   the viewport). Its box + rows reuse the agent screen's review-queue layout
+   (`.pr-queue` / `.pr-card`); this rule only positions and sizes it. */
 .wf-rail {
   position: absolute; left: 16px; top: 16px; z-index: 5;
   width: 248px; max-height: calc(100% - 32px);
-  display: flex; flex-direction: column; min-height: 0;
-  box-shadow: none; border-top: none; border-bottom: none;
 }
-.wf-rail-head {
-  padding: 14px 16px 10px;
-  font-family: var(--mono); font-size: 11px; letter-spacing: 0.06em;
-  text-transform: uppercase; color: var(--fg-mute);
-}
-.wf-rail-list { flex: 1; overflow: auto; min-height: 0; padding: 0 8px 12px; }
-/* Repo item — mirrors the Settings submenu: left accent-border active marker. */
-.wf-rail-item {
-  display: flex; align-items: flex-start; gap: 8px;
-  width: 100%; text-align: left;
-  padding: 8px 10px; margin-bottom: 1px;
-  background: transparent; border-left: 2px solid transparent;
-  color: var(--fg-dim); cursor: pointer;
-  font-family: var(--mono); font-size: 12px;
-}
-.wf-rail-item:hover { background: var(--bg-2); color: var(--fg); }
-.wf-rail-item.is-active {
-  background: var(--bg-2); border-left-color: var(--accent); color: var(--fg);
-}
-.wf-rail-item svg { flex: 0 0 auto; color: var(--fg-mute); margin-top: 2px; }
-.wf-rail-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
-.wf-rail-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.wf-rail-stats {
-  display: flex; flex-wrap: wrap; gap: 8px;
-  font-size: 10px; color: var(--fg-mute);
-}
+/* Let the queue list scroll (instead of overflowing) when the rail is capped. */
+.wf-rail .pr-queue-list { min-height: 0; }
 .wf-stat-ok { color: var(--green); }
 .wf-stat-blk { color: var(--warn); }
-.wf-rail-empty { padding: 12px 10px; font-size: 12px; }
 
 /* Repo name + Mode — sit directly on the canvas (no card behind them). */
 .wf-toolbar {
