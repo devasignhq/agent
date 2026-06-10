@@ -9,7 +9,7 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "seed": "tsx scripts/seed.ts",
-    "test": "ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test $(find src -name '*.test.ts')"
+    "test": "ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
