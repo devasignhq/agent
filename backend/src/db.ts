@@ -525,7 +525,7 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);
   const target = opts?.poolOverride ? "injected test pool" : describeDb(config.databaseUrl);
   console.log(
-    `[db] connected to Postgres [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
+    `[db] connected [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
   );
 }
 
