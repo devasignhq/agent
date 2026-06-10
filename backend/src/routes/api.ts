@@ -2,7 +2,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
-import { db } from "../db.js";
+import { db, dbHealth } from "../db.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh } from "../github/app.js";
@@ -76,6 +76,7 @@ api.post("/me/welcome-back/ack", (req, res) => {
 });
 
 api.get("/health", (_req, res) => {
+  const write = dbHealth();
   res.json({
     ok: true,
     llm: isLLMLive() ? "live" : "mock",
@@ -84,6 +85,15 @@ api.get("/health", (_req, res) => {
     // "ephemeral" means DATABASE_URL is unset → all rows (incl. subscriptions)
     // are wiped on every restart/redeploy. Prod must read "postgres".
     db: isDbConfigured() ? "postgres" : "ephemeral",
+    // Write-through health. `writeThrough: "degraded"` (or quarantinedRows > 0,
+    // or a growing pendingWrites) means writes aren't reaching Postgres and the
+    // in-memory snapshot is drifting ahead of it — the next restart will lose
+    // the unpersisted rows. This is the at-a-glance signal that what bit us in
+    // prod is happening again.
+    writeThrough: write.writeThrough,
+    pendingWrites: write.pendingWrites,
+    quarantinedRows: write.quarantinedRows,
+    lastFlushError: write.lastFlushError,
   });
 });
 
