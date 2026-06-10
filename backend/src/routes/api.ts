@@ -449,22 +449,43 @@ api.get("/reviews", (req, res) => {
   res.json(reviews);
 });
 
-api.get("/reviews/:id", (req, res) => {
+// Owner-scoped: 401 if signed out, 404 if the id is unknown, 403 if the review
+// exists but its repo isn't under one of this user's installs. Exported so the
+// auth gate is covered directly in review-auth.test.ts.
+export function getReviewHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const review = db.find("prReviews", (r) => r.id === req.params.id);
   if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!repo || !installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
   const logs = db.filter("reviewLogs", (l) => l.reviewId === review.id).sort((a, b) => a.at - b.at);
   const task = review.taskId ? db.find("tasks", (t) => t.id === review.taskId) : null;
   res.json({ review, logs, task });
-});
+}
+api.get("/reviews/:id", getReviewHandler);
 
 // Re-run a review (e.g. after the user attached a Loom and updated the task).
-api.post("/reviews/:id/rerun", (req, res) => {
+// Same owner-scoped gate as the read above — this re-queues work, so an
+// unauthorized caller must not be able to flip status or enqueue a pipeline run.
+export function rerunReviewHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const review = db.find("prReviews", (r) => r.id === req.params.id);
   if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!repo || !installs.some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
   db.update("prReviews", (r) => r.id === review.id, { status: "queued" });
   enqueueReview(review.id);
   res.json({ ok: true });
-});
+}
+api.post("/reviews/:id/rerun", rerunReviewHandler);
 
 // Pull open PRs from every connected repo and ensure each one has a PRReview
 // row in the queue. Newly-discovered PRs are enqueued for review immediately.
