@@ -355,9 +355,6 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
   return (
     <>
       <div className="wf-panel-head">
-        <span className="wf-node-ico" style={{ color: on ? "var(--accent)" : "var(--fg-mute)" }}>
-          <Icon name={def.icon} size={16} />
-        </span>
         <div style={{ minWidth: 0 }}>
           <div className="wf-panel-title">{def.name}</div>
           <div className="wf-panel-sub mute">{def.tag} · {status}</div>
