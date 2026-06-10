@@ -610,36 +610,46 @@ const WorkflowPage = () => {
         )}
       </div>
 
-      {/* Floating left section — repositories */}
-      <aside className="wf-rail wf-float">
-        <div className="wf-rail-head">Repositories</div>
-        <div className="wf-rail-list">
+      {/* Floating left section — repositories, laid out like the agent's review queue */}
+      <aside className="wf-rail pr-queue">
+        <div className="pr-queue-head">
+          <h3 className="card-title">Repositories</h3>
+        </div>
+        <div className="pr-queue-list">
+          {noRepos && (
+            <div className="mute mono" style={{ padding: 20, fontSize: 12, textAlign: "center" }}>
+              No repositories connected.
+            </div>
+          )}
           {repos.map((r) => {
             const s = r.reviewStats;
             return (
-              <button
+              <div
                 key={r.id}
-                className={`wf-rail-item ${r.id === repoId ? "is-active" : ""}`}
+                className={`pr-card ${r.id === repoId ? "picked" : ""}`}
                 onClick={() => setRepoId(r.id)}
                 title={`${r.owner}/${r.name}`}
               >
-                <Icon name="github" size={13} />
-                <span className="wf-rail-text">
-                  <span className="wf-rail-name">
-                    <span className="mute">{r.owner}/</span>{r.name}
-                  </span>
-                  {s && (
-                    <span className="wf-rail-stats">
-                      <span title="Pull requests reviewed">{s.total} {s.total === 1 ? "review" : "reviews"}</span>
-                      <span className="wf-stat-ok" title="Approved (passed)">✓ {s.approved}</span>
-                      <span className="wf-stat-blk" title="Blocked (changes requested)">✕ {s.blocked}</span>
+                <div className="pr-card-row">
+                  <span className="mono mute" style={{ fontSize: 11 }}>{r.owner}</span>
+                  <Icon name="github" size={12} />
+                </div>
+                <div className="pr-card-title">{r.name}</div>
+                {s && (
+                  <div className="pr-card-row" style={{ marginTop: 6 }}>
+                    <span className="mono mute" style={{ fontSize: 11 }}>
+                      {s.total} {s.total === 1 ? "review" : "reviews"}
                     </span>
-                  )}
-                </span>
-              </button>
+                    <span className="mono" style={{ fontSize: 11 }}>
+                      <span className="wf-stat-ok">✓ {s.approved}</span>
+                      {" · "}
+                      <span className="wf-stat-blk">✕ {s.blocked}</span>
+                    </span>
+                  </div>
+                )}
+              </div>
             );
           })}
-          {noRepos && <div className="wf-rail-empty mute">No repositories connected.</div>}
         </div>
       </aside>
 
