@@ -4938,6 +4938,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-mode-btn.is-active {
   background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
 }
+/* "Custom" is a read-only status (not an applyable preset): it lights up when
+   the workflow has been tweaked off every preset. Non-interactive — no hover. */
+.wf-mode-btn.is-custom { cursor: default; }
+.wf-mode-btn.is-custom:hover { background: transparent; border-color: var(--line-2); color: var(--fg-dim); }
+.wf-mode-btn.is-custom.is-active,
+.wf-mode-btn.is-custom.is-active:hover {
+  background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
+}
 .wf-flow { position: absolute; inset: 0; }
 .wf-canvas-empty {
   position: absolute; inset: 0;
