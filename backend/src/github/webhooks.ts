@@ -580,7 +580,7 @@ function upsertRepoFromInstallEvent(
 // plan. Kept short; the upgrade link lands on the dashboard's billing page.
 function privateRepoNotice(): string {
   return [
-    "### 🔒 DevAsign — private repositories need a paid plan",
+    "### DevAsign — private repositories need a paid plan",
     "",
     "Your current plan reviews **public repositories only**. Upgrade to **Pro** or **Max** to get automated reviews on private repos.",
     "",
@@ -590,7 +590,7 @@ function privateRepoNotice(): string {
 
 function capReachedNotice(limit: number): string {
   return [
-    "### 📊 DevAsign — monthly review limit reached",
+    "### DevAsign — monthly review limit reached",
     "",
     `You've used all **${limit} PR reviews** included in your plan this month, so this PR wasn't reviewed.`,
     "",

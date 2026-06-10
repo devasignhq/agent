@@ -208,11 +208,18 @@ export type PRReview = {
   additions: number | null;
   deletions: number | null;
   changedFiles: number | null;
-  // GitHub issue-comment id for the current run's "review in progress" → verdict
-  // comment. The pipeline posts a fresh "running…" comment at the start of every
-  // review run and edits it into the verdict when done, so this is re-set per run
-  // (one comment per run). Optional so rows written before this existed still load.
+  // GitHub issue-comment id for the "review in progress" → verdict comment, and
+  // the head SHA it was posted for. One comment per commit: a rerun on the SAME
+  // sha edits this comment back through in-progress → verdict, while a new sha
+  // (push) gets a fresh comment. Optional so rows written before this existed
+  // still load.
   progressCommentId?: number | null;
+  progressCommentSha?: string | null;
+  // Id of our latest bodyless APPROVE review on this PR. We never submit
+  // REQUEST_CHANGES (its required body would render as an extra conversation
+  // comment), so when a later commit fails we explicitly dismiss this approval
+  // instead. Cleared after dismissal.
+  approveReviewId?: number | null;
   // Criterion ids that were met by an earlier commit but came back not-met after
   // a code change in this PR — genuine regressions. Drives the "previously met,
   // now broken" callout in the GitHub comment and the in-app timeline. Empty/
