@@ -208,6 +208,11 @@ export type PRReview = {
   additions: number | null;
   deletions: number | null;
   changedFiles: number | null;
+  // GitHub issue-comment id for the current run's "review in progress" → verdict
+  // comment. The pipeline posts a fresh "running…" comment at the start of every
+  // review run and edits it into the verdict when done, so this is re-set per run
+  // (one comment per run). Optional so rows written before this existed still load.
+  progressCommentId?: number | null;
   createdAt: number;
   updatedAt: number;
 };

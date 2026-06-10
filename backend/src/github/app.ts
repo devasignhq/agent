@@ -103,10 +103,37 @@ export async function gh<T>(
   return (await res.json()) as T;
 }
 
-// Post a comment on a PR (the issues API — PRs are issues for commenting).
-// Centralizes the "issues/{n}/comments" POST so plan/limit notices and review
-// comments share one path. Best-effort: logs and swallows on failure so a
-// commenting hiccup never breaks webhook handling.
+// Post a comment on a PR (the issues API — PRs are issues for commenting) and
+// return the created comment's numeric id, or null on failure. Centralizes the
+// "issues/{n}/comments" POST so plan/limit notices, the "review in progress"
+// placeholder, and the verdict comment share one path. Best-effort: logs and
+// swallows on failure so a commenting hiccup never breaks webhook/review handling.
+export async function postPRCommentReturningId(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  body: string
+): Promise<number | null> {
+  try {
+    const res = await gh<{ id: number }>(
+      installationId,
+      `/repos/${owner}/${name}/issues/${prNumber}/comments`,
+      {
+        method: "POST",
+        body: JSON.stringify({ body }),
+        headers: { "Content-Type": "application/json" },
+      }
+    );
+    return typeof res?.id === "number" ? res.id : null;
+  } catch (err) {
+    console.warn(`[github] failed to post PR comment on ${owner}/${name}#${prNumber}:`, err);
+    return null;
+  }
+}
+
+// Fire-and-forget variant for callers that don't need the comment id (plan/cap
+// notices). Delegates to postPRCommentReturningId so the POST lives in one place.
 export async function postPRComment(
   installationId: number,
   owner: string,
@@ -114,14 +141,29 @@ export async function postPRComment(
   prNumber: number,
   body: string
 ): Promise<void> {
+  await postPRCommentReturningId(installationId, owner, name, prNumber, body);
+}
+
+// Edit an existing PR/issue comment in place (the "review in progress" → verdict
+// update). PATCHes /issues/comments/{id} — note this endpoint is keyed by comment
+// id, not PR number. Best-effort: returns whether it succeeded, never throws.
+export async function updatePRComment(
+  installationId: number,
+  owner: string,
+  name: string,
+  commentId: number,
+  body: string
+): Promise<boolean> {
   try {
-    await gh(installationId, `/repos/${owner}/${name}/issues/${prNumber}/comments`, {
-      method: "POST",
+    await gh(installationId, `/repos/${owner}/${name}/issues/comments/${commentId}`, {
+      method: "PATCH",
       body: JSON.stringify({ body }),
       headers: { "Content-Type": "application/json" },
     });
+    return true;
   } catch (err) {
-    console.warn(`[github] failed to post PR comment on ${owner}/${name}#${prNumber}:`, err);
+    console.warn(`[github] failed to update PR comment ${owner}/${name}#${commentId}:`, err);
+    return false;
   }
 }
 
