@@ -51,7 +51,7 @@ type NodeDef = {
 };
 
 const NODE_DEFS: NodeDef[] = [
-  { id: "trigger", name: "New PR", tag: "Trigger", icon: "play", color: "var(--info)", mandatory: true, advanced: true,
+  { id: "trigger", name: "New / updated PR", tag: "Trigger", icon: "play", color: "var(--info)", mandatory: true, advanced: true,
     short: "Fires on PR opened / updated",
     desc: "Runs whenever a pull request is opened or updated." },
   { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", color: "var(--cyan)", mandatory: true,
