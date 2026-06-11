@@ -7,7 +7,17 @@
 //     node --import tsx/esm --test src/statsig.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeMetadata } from "./statsig.js";
+import { normalizeMetadata, track, toStatsigUser } from "./statsig.js";
+import type { User } from "./types.js";
+
+const user: User = {
+  id: "u-123",
+  githubId: 42,
+  githubLogin: "octocat",
+  email: "octo@example.com",
+  plan: "pro",
+  createdAt: 0,
+};
 
 test("stringifies number and boolean values", () => {
   assert.deepEqual(
@@ -36,4 +46,31 @@ test("returns undefined when no metadata is supplied", () => {
 
 test("returns an empty object when every value is dropped", () => {
   assert.deepEqual(normalizeMetadata({ a: null, b: undefined }), {});
+});
+
+// ── track(): no-op while the client is uninitialized ─────────────────────────
+// initStatsig() is never called here, so the module-level client stays null.
+// track() must return without throwing for every call shape — analytics is
+// best-effort and must not break the request path it sits on.
+test("track() is a no-op and never throws when the client is uninitialized", () => {
+  assert.doesNotThrow(() => track(user, "account purged"));
+  assert.doesNotThrow(() => track("u-123", "account deletion requested"));
+  assert.doesNotThrow(() => track(user, "pr opened", { pr_number: 482, is_private: true }));
+  assert.equal(track(user, "noop"), undefined);
+});
+
+// ── toStatsigUser(): User-vs-string mapping ──────────────────────────────────
+test("toStatsigUser() maps a full User onto the StatsigUser fields", () => {
+  const su = toStatsigUser(user);
+  assert.equal(su.userID, user.id);
+  assert.equal(su.email, user.email);
+  assert.equal(su.custom?.github_login, user.githubLogin);
+  assert.equal(su.custom?.plan, user.plan);
+});
+
+test("toStatsigUser() maps a bare userId string with no profile fields", () => {
+  const su = toStatsigUser("webhook-user");
+  assert.equal(su.userID, "webhook-user");
+  assert.equal(su.email, null);
+  assert.equal(su.custom, null);
 });
