@@ -14,6 +14,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import type { Subscription, SubscriptionStatus, User } from "../types.js";
 import { effectivePlan, intervalOf, normalizePlan, priceFor, priceIdToPlanInterval, type Interval } from "./plans.js";
+import { track } from "../statsig.js";
 
 // null when unconfigured so the app still boots; the routes 503 before calling
 // these helpers, so they can assume a live client.
@@ -472,6 +473,12 @@ export async function handleStripeWebhook(req: Request, res: Response): Promise<
           const subId = typeof session.subscription === "string" ? session.subscription : session.subscription.id;
           syncSubscription(await stripe.subscriptions.retrieve(subId), true);
         }
+        if (userId) {
+          track(userId, "subscription activated", {
+            plan: session.metadata?.plan || null,
+            interval: session.metadata?.interval || null,
+          });
+        }
         break;
       }
       case "customer.subscription.created":
@@ -493,6 +500,11 @@ export async function handleStripeWebhook(req: Request, res: Response): Promise<
         // Dunning: past_due → effectivePlan drops them to Free until recovered.
         const failedInvoice = event.data.object as Stripe.Invoice;
         syncFromInvoice(failedInvoice, { status: "past_due" });
+        const failedCustId = customerIdOf(failedInvoice.customer);
+        const failedSub = failedCustId ? db.find("subscriptions", (s) => s.stripeCustomerId === failedCustId) : null;
+        if (failedSub) {
+          track(failedSub.userId, "payment failed", { plan: failedSub.plan });
+        }
         break;
       }
       default:

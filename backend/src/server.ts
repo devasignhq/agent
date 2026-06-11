@@ -9,7 +9,9 @@ import {
   isGithubAppConfigured,
   isLLMLive,
   isSlackEnvConfigured,
+  isStatsigConfigured,
 } from "./config.js";
+import { initStatsig, shutdownStatsig } from "./statsig.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { handleWebhook } from "./github/webhooks.js";
 import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
@@ -103,6 +105,10 @@ try {
   process.exit(1);
 }
 
+// Analytics. Non-fatal by design: initStatsig() swallows its own errors, so a
+// Statsig outage (or an unset key in dev) never blocks boot.
+await initStatsig();
+
 const port = config.port;
 app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
@@ -110,6 +116,7 @@ app.listen(port, () => {
   console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing — webhook will still receive"}`);
   console.log(`  · Slack:      ${isSlackEnvConfigured() ? `env fallback → ${config.integrations.slackBotChannel}` : "per-user only"}`);
   console.log(`  · Discord:    ${isDiscordEnvConfigured() ? `env fallback → ${config.integrations.discordBotChannelId}` : "per-user only"}`);
+  console.log(`  · Statsig:    ${isStatsigConfigured() ? `live (${config.statsig.environment})` : "disabled (no key)"}`);
   console.log(`  · Web origin: ${config.webOrigin}`);
   // Spell out which webhook event types the receiver handles. If a comment
   // posted on GitHub never shows up in stdout (or in the review log), the
@@ -142,7 +149,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     console.log(`\n[server] ${signal} received — flushing pending writes…`);
     try {
-      await shutdownDb();
+      await Promise.all([shutdownDb(), shutdownStatsig()]);
     } catch (err) {
       console.error("[server] error during shutdown", err);
     }

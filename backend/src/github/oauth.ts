@@ -7,6 +7,7 @@ import { db } from "../db.js";
 import type { User } from "../types.js";
 import { isDeletionPending, restoreAccount } from "../account.js";
 import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
+import { track } from "../statsig.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
 const pendingState = new Map<string, number>(); // state -> expiresAt
@@ -147,8 +148,10 @@ export async function finishOAuth(req: Request, res: Response) {
     `${me.login}@users.noreply.github.com`;
 
   // Find-or-create
+  let isNewUser = false;
   let user = db.find("users", (u) => u.githubId === me.id);
   if (!user) {
+    isNewUser = true;
     // Don't mint a duplicate-email row if a verified address already belongs to
     // another account; fall back to the per-login (unique) noreply instead.
     let email = resolvedEmail;
@@ -214,6 +217,14 @@ export async function finishOAuth(req: Request, res: Response) {
     } catch (err) {
       console.error(`[oauth] stripe reconcile failed for user ${user.id}:`, err);
     }
+  }
+
+  if (isNewUser) {
+    track(user, "user signed up", { github_login: user.githubLogin });
+  } else if (restored) {
+    track(user, "account restored", { github_login: user.githubLogin });
+  } else {
+    track(user, "user signed in", { github_login: user.githubLogin });
   }
 
   db.insert("authAudit", {

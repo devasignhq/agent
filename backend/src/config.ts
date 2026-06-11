@@ -83,6 +83,12 @@ export const config = {
     resendApiKey: process.env.RESEND_API_KEY || "",
     from: process.env.EMAIL_FROM || "DevAsign <no-reply@devasign.ai>",
   },
+  // Statsig server-side analytics + feature gates. When the key is unset the
+  // client no-ops, so dev/tests need no provider (same stance as Stripe/email).
+  statsig: {
+    secretKey: process.env.STATSIG_SECRET_KEY || "",
+    environment: process.env.STATSIG_ENVIRONMENT || "development",
+  },
   // Neon/Postgres connection string. Source of truth for all persisted state.
   databaseUrl: process.env.DATABASE_URL || "",
 };
@@ -103,6 +109,8 @@ export const isDiscordEnvConfigured = () =>
   Boolean(config.integrations.discordBotToken && config.integrations.discordBotChannelId);
 // Transactional email. When false, the email helpers log a preview and no-op.
 export const isEmailConfigured = () => Boolean(config.email.resendApiKey);
+// Analytics. When false, track()/initStatsig() no-op and the app runs dark.
+export const isStatsigConfigured = () => Boolean(config.statsig.secretKey);
 // Paid checkout/portal need the secret key + both Price IDs. The webhook secret
 // is checked separately at the webhook receiver.
 export const isStripeConfigured = () =>

@@ -1,6 +1,9 @@
 // @ts-nocheck
 // Main App shell + sidebar + routing
 import React from "react";
+import { StatsigProvider, useClientAsyncInit } from "@statsig/react-bindings";
+import { StatsigAutoCapturePlugin } from "@statsig/web-analytics";
+import { StatsigSessionReplayPlugin } from "@statsig/session-replay";
 import { Icon } from "./icons";
 import { useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio, TweakSelect } from "./tweaks-panel";
 import { Auth, Onboarding } from "./screens-onboarding";
@@ -449,7 +452,7 @@ const WelcomeBackModal = ({ onClose }: { onClose: () => void }) => (
   </div>
 );
 
-const App = () => {
+const AppContent = () => {
   const auth = useAuth();
   // stage = auth | onboarding | app — derived from signed-in state + whether
   // the user has any GitHub App installations linked. `force` lets the user
@@ -739,6 +742,38 @@ const TweaksUI = ({ t, setTweak }) => (
                  onChange={v => setTweak("mono", v)} />
   </TweaksPanel>
 );
+
+const STATSIG_ANON_ID = "a-user";
+
+const App = () => {
+  const auth = useAuth();
+  const { client } = useClientAsyncInit(
+    "client-cBOBwEpbz8xXWVxibGwwth6hoDZFc4TfLNpQlA3BFMw",
+    { userID: STATSIG_ANON_ID },
+    { plugins: [new StatsigAutoCapturePlugin(), new StatsigSessionReplayPlugin()] }
+  );
+
+  // Keep the Statsig identity in sync with the session. useClientAsyncInit
+  // ignores changes to its user argument, so identity moves through
+  // updateUserAsync: the real id once /api/me resolves, the anonymous id
+  // again after sign-out.
+  const statsigUserId = React.useRef(STATSIG_ANON_ID);
+  React.useEffect(() => {
+    if (auth.status === "loading") return;
+    const id = auth.user?.id || STATSIG_ANON_ID;
+    if (id === statsigUserId.current) return;
+    statsigUserId.current = id;
+    client
+      .updateUserAsync({ userID: id })
+      .catch((err) => console.warn("[statsig] updateUser failed:", err));
+  }, [auth.status, auth.user?.id, client]);
+
+  return (
+    <StatsigProvider client={client} loadingComponent={<div>Loading...</div>}>
+      <AppContent />
+    </StatsigProvider>
+  );
+};
 
 export { App };
 export default App;
