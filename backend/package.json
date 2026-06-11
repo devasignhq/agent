@@ -9,10 +9,12 @@
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "seed": "tsx scripts/seed.ts",
+    "dev:ephemeral": "tsx scripts/ephemeral-dev.ts",
     "test": "ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test 'src/**/*.test.ts'"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
+    "@statsig/statsig-node-core": "^0.19.5",
     "cookie-parser": "^1.4.7",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
@@ -22,7 +24,7 @@
     "node-fetch": "^3.3.2",
     "pg": "^8.21.0",
     "stripe": "^22.2.0",
-    "tsx": "^4.19.2",
+    "tsx": "^4.22.4",
     "uuid": "^11.0.3"
   },
   "devDependencies": {

@@ -20,6 +20,7 @@ import {
   notifyForReview,
   unreadCountForUser,
 } from "../notifications.js";
+import { track } from "../statsig.js";
 
 export const api = Router();
 
@@ -627,6 +628,10 @@ api.post("/tasks/:id/attachments", (req, res) => {
   const patch: any = { attachments: [...task.attachments, att] };
   if (kind !== "text") patch.endGoal = null;
   db.update("tasks", (t) => t.id === task.id, patch);
+  const attachmentUser = getSessionUser(req);
+  if (attachmentUser) {
+    track(attachmentUser, "attachment added", { attachment_kind: kind, task_id: task.id });
+  }
 
   // When the user drops a Loom (or any other recognised video link) on a
   // PR-bound task mid-review, post a discrete bug-fix comment to the PR so
@@ -781,6 +786,7 @@ api.post("/integrations", (req, res) => {
     createdAt: Date.now(),
   };
   db.insert("integrations", row);
+  track(user, "integration connected", { integration_type: type });
   res.json({ ok: true, id: row.id });
 });
 
@@ -790,7 +796,14 @@ api.delete("/integrations/:id", (req, res) => {
   // Linear webhooks are app-level (not per-connect), so disconnecting just drops
   // the row; the app keeps delivering but the org no longer resolves to a token,
   // and the webhook handler acknowledges + ignores it.
+  const removedIntegration = db.find(
+    "integrations",
+    (i) => i.id === req.params.id && i.userId === user.id
+  );
   db.remove("integrations", (i) => i.id === req.params.id && i.userId === user.id);
+  if (removedIntegration) {
+    track(user, "integration disconnected", { integration_type: removedIntegration.type });
+  }
   res.json({ ok: true });
 });
 
@@ -889,6 +902,7 @@ api.post("/billing/checkout", async (req, res) => {
   if (!sub) return void res.status(404).json({ error: "no_subscription" });
   try {
     const url = await createCheckoutSession(user, sub, plan, interval);
+    track(user, "checkout initiated", { plan, interval });
     res.json({ url });
   } catch (err) {
     console.error("[billing] checkout failed:", err);
@@ -946,7 +960,16 @@ api.post("/billing/change-plan", async (req, res) => {
     return void res.status(400).json({ error: "already_on_plan" });
   }
   try {
+    const previousPlan = effectivePlan(sub);
+    const previousInterval = intervalOf(sub);
     await changePlan(sub, plan, interval, Boolean(req.body?.immediate));
+    track(user, "plan changed", {
+      from_plan: previousPlan,
+      to_plan: plan,
+      from_interval: previousInterval,
+      to_interval: interval,
+      immediate: Boolean(req.body?.immediate),
+    });
     res.json({ ok: true });
   } catch (err) {
     console.error("[billing] change-plan failed:", err);
