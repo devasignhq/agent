@@ -30,12 +30,39 @@ function verifySignature(rawBody: Buffer, signature: string | undefined): boolea
   }
 }
 
+// GitHub delivers webhooks at-least-once: a slow response, a redelivery from
+// the App's Advanced tab, or a retry after a timeout sends the same event
+// again with the same X-GitHub-Delivery GUID. Remember recent GUIDs and drop
+// repeats so one PR action can't enqueue two reviews. Bounded FIFO (Sets
+// iterate in insertion order) — old entries age out long after GitHub's
+// retry window has passed.
+const seenDeliveries = new Set<string>();
+const SEEN_DELIVERIES_MAX = 1000;
+
+function isDuplicateDelivery(guid: string | undefined): boolean {
+  if (!guid) return false;
+  if (seenDeliveries.has(guid)) return true;
+  seenDeliveries.add(guid);
+  if (seenDeliveries.size > SEEN_DELIVERIES_MAX) {
+    const oldest = seenDeliveries.values().next().value;
+    if (oldest !== undefined) seenDeliveries.delete(oldest);
+  }
+  return false;
+}
+
 export function handleWebhook(req: Request, res: Response) {
   const sig = req.header("X-Hub-Signature-256") || undefined;
   // express.raw() leaves the body on req.body as a Buffer
   const raw = req.body as Buffer;
   if (!verifySignature(raw, sig)) {
     res.status(401).send("invalid signature");
+    return;
+  }
+  // After signature verification, so junk requests can't churn the GUID set.
+  const delivery = req.header("X-GitHub-Delivery") || undefined;
+  if (isDuplicateDelivery(delivery)) {
+    console.log(`[webhook] duplicate delivery ${delivery} dropped`);
+    res.json({ ok: true, duplicate: true });
     return;
   }
   let event: any;
@@ -380,6 +407,12 @@ async function ensurePRReview(
     );
     return null;
   }
+
+  // Re-check after the await: another producer (the `opened` webhook, the
+  // dashboard sync, a second comment event) may have inserted a row for this
+  // PR while we were fetching it. Reuse theirs instead of forking a duplicate.
+  const inserted = findPRReview(repoFullName, prNumber);
+  if (inserted) return inserted;
 
   // Monthly-cap gate for a PR surfaced by a maintainer comment — this path
   // skips the `opened` webhook's cap check. Charge once per unique PR; an
@@ -807,6 +840,59 @@ function handlePullRequest(event: any) {
     // No row yet (race: synchronize arrived before opened, or the user only
     // installed the app after the PR was already open). Fall through to the
     // insert path so we still pick up the work.
+  }
+
+  // One prReview row per PR. `opened` can race the dashboard's /reviews/sync
+  // poll (which inserts first and leaves this handler holding a duplicate),
+  // and `reopened` / `ready_for_review` fire for PRs whose row from `opened`
+  // is still around. Reuse the row: a duplicate insert forks the queue card
+  // AND the GitHub comment thread, since each row posts its own verdict.
+  const existing = db.find(
+    "prReviews",
+    (r) => r.repoId === repo!.id && r.prNumber === pullReq.number
+  );
+  if (existing) {
+    const inFlight = existing.status === "queued" || existing.status === "reviewing";
+    if (inFlight && existing.headSha === newSha) {
+      // Same commit already queued or running — redelivery or sync race.
+      // The in-flight run covers it; just keep the title fresh.
+      db.update("prReviews", (r) => r.id === existing.id, {
+        prTitle: pullReq.title,
+        updatedAt: Date.now(),
+      });
+      console.log(
+        `[webhook] pull_request: ${repoFullName}#${pullReq.number} ${event.action} — already in flight, not duplicated`
+      );
+      return;
+    }
+    const reason =
+      event.action === "reopened"
+        ? "PR reopened"
+        : event.action === "ready_for_review"
+        ? "PR marked ready for review"
+        : "PR opened";
+    db.update("prReviews", (r) => r.id === existing.id, {
+      prTitle: pullReq.title,
+      headSha: newSha,
+      baseSha: pullReq.base.sha,
+      status: "queued",
+      additions: typeof pullReq.additions === "number" ? pullReq.additions : null,
+      deletions: typeof pullReq.deletions === "number" ? pullReq.deletions : null,
+      changedFiles: typeof pullReq.changed_files === "number" ? pullReq.changed_files : null,
+      updatedAt: Date.now(),
+    });
+    db.insert("reviewLogs", {
+      id: uuid(),
+      reviewId: existing.id,
+      kind: "ingest",
+      at: Date.now(),
+      action: "review.requeue",
+      target: newSha.slice(0, 7),
+      detail: `${reason} — review re-queued`,
+      meta: { trigger: event.action, after: newSha, prevHeadSha: existing.headSha, source: "webhook" },
+    });
+    enqueueReview(existing.id);
+    return;
   }
 
   // Monthly-cap gate — charged once per unique PR (chargeForNewPRReview returns
