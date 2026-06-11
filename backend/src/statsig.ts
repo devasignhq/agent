@@ -34,6 +34,24 @@ function toStatsigUser(user: User | string): StatsigUser {
   });
 }
 
+// Statsig event metadata is conventionally string-valued, and the native core
+// serializes whatever it's handed. Call sites pass numbers (pr_number),
+// booleans (is_private), and string|null (workspace_name) for readability, so
+// coerce every surviving value with String() and drop null/undefined rather
+// than letting empty/"null" noise ride along on the event. Exported for unit
+// tests since track() itself no-ops without a live client.
+export function normalizeMetadata(
+  metadata?: Record<string, string | number | boolean | null | undefined>
+): Record<string, string> | undefined {
+  if (!metadata) return undefined;
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (value === null || value === undefined) continue;
+    out[key] = String(value);
+  }
+  return out;
+}
+
 export function track(
   user: User | string,
   event: string,
@@ -41,7 +59,7 @@ export function track(
 ): void {
   if (!client) return;
   try {
-    client.logEvent(toStatsigUser(user), event, null, metadata);
+    client.logEvent(toStatsigUser(user), event, null, normalizeMetadata(metadata));
   } catch (err) {
     console.warn(`[statsig] failed to log "${event}":`, err);
   }

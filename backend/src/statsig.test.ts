@@ -1,0 +1,39 @@
+// normalizeMetadata tests. track()'s metadata accepts numbers/booleans/null for
+// call-site readability, but the Statsig event metadata is string-valued, so the
+// helper stringifies survivors and drops null/undefined. These shapes mirror the
+// real call sites (pr_number: number, is_private: boolean, workspace_name:
+// string|null — see github/webhooks.ts, linear/oauth.ts, billing/stripe.ts). Run:
+//   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= \
+//     node --import tsx/esm --test src/statsig.test.ts
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { normalizeMetadata } from "./statsig.js";
+
+test("stringifies number and boolean values", () => {
+  assert.deepEqual(
+    normalizeMetadata({ pr_number: 482, is_private: true, repo_count: 0, reconnected: false }),
+    { pr_number: "482", is_private: "true", repo_count: "0", reconnected: "false" }
+  );
+});
+
+test("drops null and undefined keys, keeps the rest", () => {
+  assert.deepEqual(
+    normalizeMetadata({ workspace_name: null, interval: undefined, plan: "pro" }),
+    { plan: "pro" }
+  );
+});
+
+test("leaves string values unchanged", () => {
+  assert.deepEqual(
+    normalizeMetadata({ integration_type: "slack", trigger: "opened" }),
+    { integration_type: "slack", trigger: "opened" }
+  );
+});
+
+test("returns undefined when no metadata is supplied", () => {
+  assert.equal(normalizeMetadata(undefined), undefined);
+});
+
+test("returns an empty object when every value is dropped", () => {
+  assert.deepEqual(normalizeMetadata({ a: null, b: undefined }), {});
+});
