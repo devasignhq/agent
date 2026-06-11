@@ -36,6 +36,11 @@ export const config = {
   gemini: {
     apiKey: process.env.GEMINI_API_KEY || "",
     model: process.env.GEMINI_MODEL || "gemini-2.5-pro",
+    // USD per 1M tokens, used only for the est-cost figure attached to analytics
+    // events (Anthropic prices live in a table in llm.ts; Gemini's are env-driven
+    // so a price change needs no code edit). Defaults to the public 2.5-pro rate.
+    inputPerMTok: Number(process.env.GEMINI_INPUT_PER_MTOK || 1.25),
+    outputPerMTok: Number(process.env.GEMINI_OUTPUT_PER_MTOK || 10),
   },
   // Linear OAuth — lets a user connect their whole Linear workspace so DevAsign
   // can ingest tickets (acceptance criteria) and post notification comments.

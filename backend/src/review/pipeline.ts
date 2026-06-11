@@ -8,7 +8,8 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { dismissPRReview, dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
 import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
-import { complete, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, type VideoSummary } from "../llm.js";
+import { complete, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
+import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview } from "../notifications.js";
 import { config } from "../config.js";
@@ -26,7 +27,7 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task } from "../types.js";
+import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User } from "../types.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import {
   appendAddedCriteria,
@@ -55,6 +56,14 @@ function setStatus(reviewId: string, patch: Partial<PRReview>) {
     ...patch,
     updatedAt: Date.now(),
   });
+}
+
+// The Statsig actor for a repo owner: the full User (richer profile) when we can
+// find it, else the bare userId string, else null for an unlinked install (no
+// owner to attribute the event to — callers skip tracking).
+function analyticsUser(userId: string | undefined): User | string | null {
+  if (!userId) return null;
+  return db.find("users", (u) => u.id === userId) ?? userId;
 }
 
 // Per-finding log row. Keeps the timeline render uniform (TimelineFor branches
@@ -147,12 +156,21 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   // Pro/Max → the configured frontier model. withModel scopes it to every
   // complete() call this job makes. Unlinked installs (no userId yet) keep the
   // frontier default rather than being degraded to Haiku before linking.
-  const reviewModel = install?.userId ? modelForPlan(planForUser(install.userId)) : config.llm.model;
+  const plan = install?.userId ? planForUser(install.userId) : null;
+  const reviewModel = plan ? modelForPlan(plan) : config.llm.model;
   // Per-repo workflow config. Defaults reproduce prior behavior, so a repo that
   // was never customised gates exactly as before.
   const wf = effectiveWorkflow(repo);
 
-  return withModel(reviewModel, async () => {
+  // Analytics: capture wall-clock start, the "new commit vs rerun on same sha"
+  // signal (before the progress-comment logic below mutates it), and the actor.
+  // withUsage opens a token/cost accounting scope every complete()/summarizeVideo
+  // call in this job rolls into, read once for the "review completed" event.
+  const t0 = Date.now();
+  const startedNewCommit = review.progressCommentSha !== review.headSha;
+  const reviewUser = analyticsUser(install?.userId);
+
+  return withModel(reviewModel, () => withUsage(async () => {
   setStatus(review.id, { status: "reviewing" });
   log(review.id, "review", "Pipeline started");
 
@@ -335,6 +353,21 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         log(review.id, "criteria", "Video reviewed; end goal unchanged", {
           detail: refined.rationale || "No product-aligned additions from the video.",
           meta: { videoCount: context.videos.length },
+        });
+      }
+      // Analytics: a review that referenced a video. Ties the video model
+      // (Gemini) to the code/text model (Opus/Haiku) on the same review, so we
+      // can see how often — and how reliably — the two-model path fires.
+      if (reviewUser) {
+        track(reviewUser, "video reviewed", {
+          repo: `${repo.owner}/${repo.name}`,
+          pr_number: review.prNumber,
+          video_model: context.videos[0]?.model,
+          review_model: reviewModel,
+          providers: [...new Set(context.videos.map((v) => v.provider))].join(","),
+          video_count: context.videos.length,
+          unreliable_count: context.videos.filter((v) => v.unreliable).length,
+          refined_goal: refined.changed,
         });
       }
     }
@@ -640,6 +673,48 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         }
       }
     }
+
+    // Analytics: the agent finished a review. One event per run — pr_number +
+    // is_first_review answer "every PR reviewed", head_sha + is_new_commit answer
+    // "every new commit reviewed", and the model/findings/token-cost fields say
+    // what the run cost and produced. Emitted after the verdict is posted so a
+    // tracking hiccup can't affect the review itself.
+    if (reviewUser) {
+      const usage = currentUsage();
+      track(reviewUser, "review completed", {
+        repo: `${repo.owner}/${repo.name}`,
+        pr_number: review.prNumber,
+        head_sha: review.headSha,
+        status,
+        is_private: repo.private,
+        plan: plan ?? "unlinked",
+        review_model: reviewModel,
+        criteria_count: filledCriteria.length,
+        criteria_met: filledCriteria.filter((c) => c.met === true).length,
+        regressed_count: regressedCriteriaIds.length,
+        holistic_findings:
+          holisticVerdict.regressions.length +
+          holisticVerdict.criticalErrors.length +
+          holisticVerdict.securityFindings.length,
+        holistic_blockers: hasBlocker,
+        deferrals: holisticVerdict.deferrals.length,
+        convention_nits: holisticVerdict.conventionFindings.length,
+        doc_drift: holisticVerdict.docDriftFindings.length,
+        line_comments: verdict.comments.length,
+        suggestions: verdict.suggestions.length,
+        video_count: context.videos.length,
+        is_first_review: priorVerdicts.size === 0,
+        is_new_commit: startedNewCommit,
+        additions: review.additions,
+        deletions: review.deletions,
+        changed_files: review.changedFiles,
+        duration_ms: Date.now() - t0,
+        input_tokens: usage?.inputTokens ?? 0,
+        output_tokens: usage?.outputTokens ?? 0,
+        cache_read_tokens: usage?.cacheReadTokens ?? 0,
+        est_cost_usd: usage ? Number(usage.costUsd.toFixed(4)) : 0,
+      });
+    }
   } catch (err) {
     console.error(`[review] ${review.id} failed:`, err);
     setStatus(review.id, { status: "errored" });
@@ -666,8 +741,20 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       `PR #${review.prNumber} — Review failed`,
       `${repo.owner}/${repo.name} — ${errMsg.slice(0, 140)}`
     );
+    // Analytics: the run errored. Mirrors "review completed" so a failure shows
+    // up in the same funnel rather than vanishing.
+    if (reviewUser) {
+      track(reviewUser, "review failed", {
+        repo: `${repo.owner}/${repo.name}`,
+        pr_number: review.prNumber,
+        head_sha: review.headSha,
+        review_model: reviewModel,
+        error: errMsg.slice(0, 200),
+        duration_ms: Date.now() - t0,
+      });
+    }
   }
-  });
+  }));
 }
 
 // --- Context ingestion ---
