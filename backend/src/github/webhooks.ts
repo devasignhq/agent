@@ -15,7 +15,6 @@ import {
   chargeForNewPRReview,
   planForUser,
 } from "../billing/plans.js";
-import { posthog } from "../posthog.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) return true; // dev mode: skip verification
@@ -467,29 +466,12 @@ function handleInstallation(event: any) {
       event: "install",
       meta: { account: event.installation.account.login, senderId },
     });
-    if (install.userId) {
-      posthog.capture({
-        distinctId: install.userId,
-        event: "github app installed",
-        properties: {
-          account_login: install.accountLogin,
-          repo_count: (event.repositories || []).length,
-        },
-      });
-    }
   } else if (event.action === "deleted" || event.action === "removed") {
     const install = db.find(
       "installations",
       (i) => i.installationId === event.installation.id
     );
     if (install) {
-      if (install.userId) {
-        posthog.capture({
-          distinctId: install.userId,
-          event: "github app uninstalled",
-          properties: { account_login: install.accountLogin },
-        });
-      }
       db.remove("repositories", (r) => r.installationId === install.id);
     }
     db.remove(
@@ -846,18 +828,6 @@ function handlePullRequest(event: any) {
   };
   db.insert("prReviews", review);
   enqueueReview(review.id);
-  if (ownerUserId) {
-    posthog.capture({
-      distinctId: ownerUserId,
-      event: "pr review queued",
-      properties: {
-        repo: `${repo.owner}/${repo.name}`,
-        pr_number: pullReq.number,
-        is_private: repo.private,
-        trigger: event.action,
-      },
-    });
-  }
   // App notification: a PR was opened (or re-opened) on a tracked repo and
   // we've queued it for review.
   notifyForReview(

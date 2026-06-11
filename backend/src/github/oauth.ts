@@ -7,7 +7,6 @@ import { db } from "../db.js";
 import type { User } from "../types.js";
 import { isDeletionPending, restoreAccount } from "../account.js";
 import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
-import { posthog } from "../posthog.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
 const pendingState = new Map<string, number>(); // state -> expiresAt
@@ -148,10 +147,8 @@ export async function finishOAuth(req: Request, res: Response) {
     `${me.login}@users.noreply.github.com`;
 
   // Find-or-create
-  let isNewUser = false;
   let user = db.find("users", (u) => u.githubId === me.id);
   if (!user) {
-    isNewUser = true;
     // Don't mint a duplicate-email row if a verified address already belongs to
     // another account; fall back to the per-login (unique) noreply instead.
     let email = resolvedEmail;
@@ -217,27 +214,6 @@ export async function finishOAuth(req: Request, res: Response) {
     } catch (err) {
       console.error(`[oauth] stripe reconcile failed for user ${user.id}:`, err);
     }
-  }
-
-  posthog.identify({
-    distinctId: user.id,
-    properties: {
-      $set: {
-        github_login: user.githubLogin,
-        email: user.email,
-        plan: user.plan,
-        avatar_url: user.avatarUrl,
-      },
-      $set_once: { first_seen_at: new Date().toISOString() },
-    },
-  });
-
-  if (isNewUser) {
-    posthog.capture({ distinctId: user.id, event: "user signed up", properties: { github_login: user.githubLogin } });
-  } else if (restored) {
-    posthog.capture({ distinctId: user.id, event: "account restored", properties: { github_login: user.githubLogin } });
-  } else {
-    posthog.capture({ distinctId: user.id, event: "user signed in", properties: { github_login: user.githubLogin } });
   }
 
   db.insert("authAudit", {
