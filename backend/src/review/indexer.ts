@@ -10,8 +10,27 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { gh, installationToken } from "../github/app.js";
-import { complete } from "../llm.js";
-import type { Installation, RepoIndexEntry, Repository, ReviewLogEntry } from "../types.js";
+import { complete, currentUsage, withUsage } from "../llm.js";
+import { track } from "../statsig.js";
+import type { Installation, RepoIndexEntry, Repository, ReviewLogEntry, User } from "../types.js";
+
+// Per-run summary returned by the full/incremental builders so buildRepoIndex can
+// emit one "repo indexed" analytics event with the counts + the rolled-up usage.
+type IndexSummary = {
+  mode: "full" | "incremental";
+  fileCount: number | null; // total indexed files (full only; null for incremental)
+  summarised: number;
+  cacheHits: number;
+  removed: number;
+  commit: string | null;
+};
+
+// Statsig actor for the repo owner — full User when found, else the userId string,
+// else null for an unattached install (nothing to attribute the event to).
+function analyticsUser(userId: string | undefined): User | string | null {
+  if (!userId) return null;
+  return db.find("users", (u) => u.id === userId) ?? userId;
+}
 
 const INDEX_MODEL = "claude-haiku-4-5";
 const MAX_FILE_BYTES = 256_000;
@@ -109,23 +128,53 @@ export async function buildRepoIndex(
     return;
   }
 
+  const t0 = Date.now();
+  const indexUser = analyticsUser(install.userId);
   try {
-    if (opts.full) {
-      await runFullIndex(repo, install);
-    } else {
-      await runIncrementalIndex(repo, install, opts.changedPaths!);
-    }
+    // withUsage scopes token/cost accounting to this build; read it (and emit the
+    // event) inside the scope, since currentUsage() is null once it returns.
+    await withUsage(async () => {
+      const summary = opts.full
+        ? await runFullIndex(repo, install)
+        : await runIncrementalIndex(repo, install, opts.changedPaths!);
+      if (indexUser) {
+        const usage = currentUsage();
+        track(indexUser, "repo indexed", {
+          repo: `${repo.owner}/${repo.name}`,
+          mode: summary.mode,
+          index_model: INDEX_MODEL,
+          file_count: summary.fileCount,
+          summarised: summary.summarised,
+          cache_hits: summary.cacheHits,
+          removed: summary.removed,
+          commit: summary.commit,
+          is_private: repo.private,
+          duration_ms: Date.now() - t0,
+          input_tokens: usage?.inputTokens ?? 0,
+          output_tokens: usage?.outputTokens ?? 0,
+          cache_read_tokens: usage?.cacheReadTokens ?? 0,
+          est_cost_usd: usage ? Number(usage.costUsd.toFixed(4)) : 0,
+        });
+      }
+    });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     console.error(`[indexer] ${repo.owner}/${repo.name} failed:`, err);
     setIndexState(repo.id, { indexState: "errored", indexError: msg });
     log(repoId, "Index errored", "error", { error: msg });
+    if (indexUser) {
+      track(indexUser, "repo index failed", {
+        repo: `${repo.owner}/${repo.name}`,
+        mode: opts.full ? "full" : "incremental",
+        error: msg.slice(0, 200),
+      });
+    }
   }
 }
 
 // ─── Full build ───────────────────────────────────────────────────────────
 
-async function runFullIndex(repo: Repository, install: Installation) {
+async function runFullIndex(repo: Repository, install: Installation): Promise<IndexSummary> {
   const headSha = await fetchHeadSha(repo, install);
 
   // List blobs on the default branch in a single tree call.
@@ -185,11 +234,16 @@ async function runFullIndex(repo: Repository, install: Installation) {
     removed,
     commit: headSha,
   });
+  return { mode: "full", fileCount: seenPaths.size, summarised, cacheHits, removed, commit: headSha };
 }
 
 // ─── Incremental update ───────────────────────────────────────────────────
 
-async function runIncrementalIndex(repo: Repository, install: Installation, changed: ChangedPaths) {
+async function runIncrementalIndex(
+  repo: Repository,
+  install: Installation,
+  changed: ChangedPaths
+): Promise<IndexSummary> {
   const headSha = await fetchHeadSha(repo, install).catch(() => null);
 
   // Removed first so we don't keep stale rows around.
@@ -248,6 +302,14 @@ async function runIncrementalIndex(repo: Repository, install: Installation, chan
     removed,
     commit: headSha || repo.indexedCommit,
   });
+  return {
+    mode: "incremental",
+    fileCount: null,
+    summarised,
+    cacheHits,
+    removed,
+    commit: headSha || repo.indexedCommit || null,
+  };
 }
 
 // ─── Per-file path: fetch raw, summarise, upsert ──────────────────────────

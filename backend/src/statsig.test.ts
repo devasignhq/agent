@@ -74,3 +74,39 @@ test("toStatsigUser() maps a bare userId string with no profile fields", () => {
   assert.equal(su.email, null);
   assert.equal(su.custom, null);
 });
+
+// ── workflow-event payloads are Statsig-safe ─────────────────────────────────
+// The review-pipeline events (review completed / repo indexed / video reviewed)
+// hand track() a mix of numbers, booleans, and null-valued diff stats. This pins
+// the contract every one of them rides on: numbers/booleans stringify, and the
+// nullable fields (additions/deletions/changed_files when GitHub hasn't returned
+// them yet) drop out rather than riding along as "null".
+test("a review-completed payload normalizes to all-string, no-null metadata", () => {
+  const out = normalizeMetadata({
+    repo: "octo/app",
+    pr_number: 7,
+    status: "passed",
+    is_private: false,
+    holistic_blockers: true,
+    is_first_review: true,
+    is_new_commit: false,
+    additions: null,
+    deletions: null,
+    changed_files: null,
+    est_cost_usd: 3.2,
+    input_tokens: 5000,
+  })!;
+  assert.equal(out.pr_number, "7");
+  assert.equal(out.status, "passed");
+  assert.equal(out.is_private, "false");
+  assert.equal(out.holistic_blockers, "true");
+  assert.equal(out.is_first_review, "true");
+  assert.equal(out.is_new_commit, "false");
+  assert.equal(out.est_cost_usd, "3.2");
+  assert.equal(out.input_tokens, "5000");
+  // The nullable diff stats are dropped, not stringified to "null".
+  assert.equal("additions" in out, false);
+  assert.equal("deletions" in out, false);
+  assert.equal("changed_files" in out, false);
+  assert.ok(Object.values(out).every((v) => typeof v === "string"));
+});

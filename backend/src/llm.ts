@@ -15,6 +15,107 @@ export function withModel<T>(model: string, fn: () => T): T {
   return modelContext.run(model, fn);
 }
 
+// ─── Per-job token/cost accounting ───────────────────────────────────────────
+// A review (or index build) fans out into many complete()/summarizeVideo() calls
+// across its whole async call graph. withUsage() opens an AsyncLocalStorage scope
+// that every call below records into, so the job can read one rolled-up
+// input/output/cost figure to attach to its analytics event — without threading
+// a usage arg through the pipeline. Outside a withUsage() scope, recordUsage()
+// no-ops and currentUsage() returns null (e.g. unit tests that call complete()
+// directly), so this never changes existing behaviour.
+export type UsageTotals = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+};
+
+type UsageStore = { total: UsageTotals; byModel: Map<string, UsageTotals> };
+const usageContext = new AsyncLocalStorage<UsageStore>();
+
+function blankTotals(): UsageTotals {
+  return { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0, costUsd: 0 };
+}
+
+export function withUsage<T>(fn: () => T): T {
+  return usageContext.run({ total: blankTotals(), byModel: new Map() }, fn);
+}
+
+// Snapshot of the rolled-up totals for the current job, or null outside a scope.
+export function currentUsage(): UsageTotals | null {
+  const store = usageContext.getStore();
+  return store ? { ...store.total } : null;
+}
+
+// USD per 1M tokens. Anthropic prices are pinned here (Opus 4.7/4.8 and the Haiku
+// index/free-tier model); Gemini's live in config so a price change is env-only.
+// A model absent from both still has its tokens counted — it just contributes $0,
+// which is visible (a $0 cost with non-zero tokens) rather than silently wrong.
+const ANTHROPIC_PRICES: Record<string, { inPerM: number; outPerM: number }> = {
+  "claude-opus-4-8": { inPerM: 5, outPerM: 25 },
+  "claude-opus-4-7": { inPerM: 5, outPerM: 25 },
+  "claude-haiku-4-5": { inPerM: 1, outPerM: 5 },
+};
+
+function priceFor(model: string): { inPerM: number; outPerM: number } {
+  if (ANTHROPIC_PRICES[model]) return ANTHROPIC_PRICES[model];
+  if (model === config.gemini.model) {
+    return { inPerM: config.gemini.inputPerMTok, outPerM: config.gemini.outputPerMTok };
+  }
+  return { inPerM: 0, outPerM: 0 };
+}
+
+// Cost mirrors the API's billing: cache *writes* cost ~1.25x base input, cache
+// *reads* ~0.1x; uncached input and output bill at the table rate.
+export function estimateCostUsd(
+  model: string,
+  u: { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number }
+): number {
+  const p = priceFor(model);
+  return (
+    (u.inputTokens * p.inPerM +
+      u.outputTokens * p.outPerM +
+      u.cacheCreationTokens * p.inPerM * 1.25 +
+      u.cacheReadTokens * p.inPerM * 0.1) /
+    1_000_000
+  );
+}
+
+function recordUsage(
+  model: string,
+  u: {
+    inputTokens?: number | null;
+    outputTokens?: number | null;
+    cacheReadTokens?: number | null;
+    cacheCreationTokens?: number | null;
+  }
+): void {
+  const store = usageContext.getStore();
+  if (!store) return;
+  const delta = {
+    inputTokens: u.inputTokens || 0,
+    outputTokens: u.outputTokens || 0,
+    cacheReadTokens: u.cacheReadTokens || 0,
+    cacheCreationTokens: u.cacheCreationTokens || 0,
+  };
+  const cost = estimateCostUsd(model, delta);
+  const add = (t: UsageTotals) => {
+    t.inputTokens += delta.inputTokens;
+    t.outputTokens += delta.outputTokens;
+    t.cacheReadTokens += delta.cacheReadTokens;
+    t.cacheCreationTokens += delta.cacheCreationTokens;
+    t.costUsd += cost;
+  };
+  add(store.total);
+  let perModel = store.byModel.get(model);
+  if (!perModel) {
+    perModel = blankTotals();
+    store.byModel.set(model, perModel);
+  }
+  add(perModel);
+}
+
 export type LLMMessage = { role: "user" | "assistant"; content: string };
 
 export async function complete(opts: {
@@ -32,11 +133,27 @@ export async function complete(opts: {
       : opts.system
     : undefined;
 
+  const model = opts.model || modelContext.getStore() || config.llm.model;
   const resp = await client.messages.create({
-    model: opts.model || modelContext.getStore() || config.llm.model,
+    model,
     max_tokens: opts.maxTokens ?? 2048,
     system: sys as any,
     messages: opts.messages.map((m) => ({ role: m.role, content: m.content })),
+  });
+
+  // The API returns cache_*_input_tokens at runtime, but the pinned SDK's Usage
+  // type only declares input/output — widen to read the cache fields.
+  const usage = resp.usage as {
+    input_tokens?: number;
+    output_tokens?: number;
+    cache_read_input_tokens?: number | null;
+    cache_creation_input_tokens?: number | null;
+  };
+  recordUsage(model, {
+    inputTokens: usage?.input_tokens,
+    outputTokens: usage?.output_tokens,
+    cacheReadTokens: usage?.cache_read_input_tokens,
+    cacheCreationTokens: usage?.cache_creation_input_tokens,
   });
 
   const text = resp.content
@@ -357,6 +474,10 @@ export async function summarizeVideo(input: {
     });
     if (!res.ok) throw new Error(`gemini ${res.status}: ${await res.text().catch(() => "")}`);
     const body = (await res.json()) as any;
+    recordUsage(config.gemini.model, {
+      inputTokens: body?.usageMetadata?.promptTokenCount,
+      outputTokens: body?.usageMetadata?.candidatesTokenCount,
+    });
     const text: string =
       body?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
     const parsed = safeJSON(text) as Partial<VideoSummary> | null;
