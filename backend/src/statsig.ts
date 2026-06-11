@@ -24,8 +24,9 @@ export async function initStatsig(): Promise<void> {
 // Statsig has no separate identify() call; user properties ride along on each
 // event's user object, so build the fullest one the call site can provide.
 // Webhook/sweep paths only have a userId string — that still attributes the
-// event, just without the profile fields.
-function toStatsigUser(user: User | string): StatsigUser {
+// event, just without the profile fields. Exported for unit tests since track()
+// itself no-ops without a live client.
+export function toStatsigUser(user: User | string): StatsigUser {
   if (typeof user === "string") return StatsigUser.withUserID(user);
   return new StatsigUser({
     userID: user.id,
