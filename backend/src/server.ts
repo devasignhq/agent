@@ -2,7 +2,6 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import morgan from "morgan";
-import { posthog } from "./posthog.js";
 
 import {
   config,
@@ -91,10 +90,6 @@ app.use((req, res) => {
 // Error handler
 app.use((err: any, req: any, res: any, _next: any) => {
   console.error("[server]", err);
-  const user = req.cookies?.devasign_session
-    ? (() => { try { const [id] = Buffer.from(req.cookies.devasign_session, "base64url").toString().split(":"); return id; } catch { return undefined; } })()
-    : undefined;
-  posthog.captureException(err, user);
   res.status(500).json({ error: "internal_error", message: err?.message || String(err) });
 });
 
@@ -147,7 +142,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
     console.log(`\n[server] ${signal} received — flushing pending writes…`);
     try {
-      await Promise.all([shutdownDb(), posthog.shutdown()]);
+      await shutdownDb();
     } catch (err) {
       console.error("[server] error during shutdown", err);
     }

@@ -10,11 +10,9 @@
 //
 // sendEmail never throws (a mail failure must not abort delete/restore) but it
 // no longer fails *silently*: every non-delivery — missing key, unreachable
-// (noreply) recipient, Resend rejection, or network error — is both logged and
-// captured to PostHog as an "email send failed" event, so a production gap
-// surfaces in analytics instead of vanishing into a console.warn.
+// (noreply) recipient, Resend rejection, or network error — is logged via
+// console.warn, so a production gap surfaces in the logs instead of vanishing.
 import { config, isEmailConfigured } from "./config.js";
-import { posthog } from "./posthog.js";
 import type { User } from "./types.js";
 
 const BRAND = "DevAsign";
@@ -27,49 +25,21 @@ const BRAND = "DevAsign";
 const NOREPLY_SUFFIX = "@users.noreply.github.com";
 const isReachable = (to: string): boolean => !!to && !to.endsWith(NOREPLY_SUFFIX);
 
-// Attribution for a send, so a failure event names the user + which mail it was.
-type EmailContext = { userId?: string; type: string };
-
-// Record a non-delivery to PostHog. Best-effort and never throws — observability
-// must not break the (already best-effort) send path. No-ops in dev where the
-// PostHog key is unset, so it adds no local noise.
-function reportEmailFailure(
-  to: string,
-  subject: string,
-  ctx: EmailContext | undefined,
-  reason: string,
-  detail = ""
-): void {
-  try {
-    posthog.capture({
-      distinctId: ctx?.userId ?? "system",
-      event: "email send failed",
-      properties: { to, subject, type: ctx?.type, reason, detail },
-    });
-  } catch {
-    /* analytics is best-effort; swallow so a send is never aborted by it */
-  }
-}
-
 // Best-effort low-level send. Never throws into the caller: a mail failure must
-// not abort account deletion / restore, so we log it, report it to PostHog, and
-// return false instead. `ctx` attributes a failure to a user + mail type.
+// not abort account deletion / restore, so we log it and return false instead.
 export async function sendEmail(
   to: string,
   subject: string,
-  html: string,
-  ctx?: EmailContext
+  html: string
 ): Promise<boolean> {
   // No point calling Resend for an address that can't receive mail — it would
   // accept a noreply recipient and silently bounce. Skip and record instead.
   if (!isReachable(to)) {
     console.warn(`[email] unreachable recipient — skipping "${subject}" to ${to || "<empty>"}`);
-    reportEmailFailure(to, subject, ctx, "unreachable_recipient");
     return false;
   }
   if (!isEmailConfigured()) {
     console.log(`[email] not configured — would send to ${to}: "${subject}"`);
-    reportEmailFailure(to, subject, ctx, "not_configured");
     return false;
   }
   try {
@@ -84,13 +54,11 @@ export async function sendEmail(
     if (!res.ok) {
       const body = await res.text();
       console.warn(`[email] send failed: ${res.status} ${body}`);
-      reportEmailFailure(to, subject, ctx, `http_${res.status}`, body.slice(0, 500));
       return false;
     }
     return true;
   } catch (err) {
     console.warn(`[email] send error for ${to}:`, err);
-    reportEmailFailure(to, subject, ctx, "network_error", String(err));
     return false;
   }
 }
@@ -128,10 +96,7 @@ export function sendDeletionScheduledEmail(user: User, purgeAt: number): Promise
     ${button(config.webOrigin, "Log in to restore my account")}
     <p style="font-size:13px;color:#666">If you meant to delete your account, no action is needed — it'll be removed automatically on ${fmtDate(purgeAt)}.</p>
   `);
-  return sendEmail(user.email, `Your ${BRAND} account is scheduled for deletion`, html, {
-    userId: user.id,
-    type: "deletion_scheduled",
-  });
+  return sendEmail(user.email, `Your ${BRAND} account is scheduled for deletion`, html);
 }
 
 // 2. Reminder near the end of the window (day 12 of 14).
@@ -142,10 +107,7 @@ export function sendDeletionReminderEmail(user: User, purgeAt: number): Promise<
     <p>If you'd like to keep it, just sign in before then — that's all it takes to restore everything and resume code review.</p>
     ${button(config.webOrigin, "Log in to keep my account")}
   `);
-  return sendEmail(user.email, `Reminder: your ${BRAND} account will be deleted on ${fmtDate(purgeAt)}`, html, {
-    userId: user.id,
-    type: "deletion_reminder",
-  });
+  return sendEmail(user.email, `Reminder: your ${BRAND} account will be deleted on ${fmtDate(purgeAt)}`, html);
 }
 
 // 3. Sent after the account is permanently wiped at the end of the window. We
@@ -158,8 +120,5 @@ export function sendAccountPurgedEmail(user: User): Promise<boolean> {
     <p><strong>One last step:</strong> to fully revoke ${BRAND}'s access, open GitHub → <em>Settings → Applications → Authorized GitHub Apps</em> and remove ${BRAND}.</p>
     <p>Thanks for giving us a try — you're always welcome back.</p>
   `);
-  return sendEmail(user.email, `Your ${BRAND} account has been deleted`, html, {
-    userId: user.id,
-    type: "account_purged",
-  });
+  return sendEmail(user.email, `Your ${BRAND} account has been deleted`, html);
 }

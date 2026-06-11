@@ -25,7 +25,6 @@ import {
   sendDeletionScheduledEmail,
 } from "./email.js";
 import { pushNotification } from "./notifications.js";
-import { posthog } from "./posthog.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 // How long a requested-for-deletion account is kept before it's wiped, and when
@@ -103,7 +102,6 @@ export async function requestAccountDeletion(
   }
 
   await deps.sendDeletionScheduledEmail(user, purgeAtFrom(now));
-  posthog.capture({ distinctId: user.id, event: "account deletion requested" });
 }
 
 // Restore a pending-deletion account: clear the flags (logging in is the
@@ -183,7 +181,6 @@ export async function purgeAccount(
   // Final notice while we still have the user's email/login. Best-effort (the
   // email helper never throws), and sent before the wipe for that reason.
   await deps.sendAccountPurgedEmail(user);
-  posthog.capture({ distinctId: user.id, event: "account purged" });
 
   // ── Erase local state, child rows first ─────────────────────────────────────
   db.remove("reviewLogs", (l) => reviewIds.has(l.reviewId));
