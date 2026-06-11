@@ -69,6 +69,14 @@ const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
 
 export function enqueueReview(reviewId: string): ReviewJob {
+  // Idempotent: several producers can ask for the same review (webhook
+  // redelivery, the dashboard sync poll racing the webhook, a reopen). A
+  // second job for a row that's still waiting would run the whole pipeline —
+  // and post GitHub comments — twice, so return the queued job instead.
+  const waiting = pending.reviews.find(
+    (j): j is ReviewJob => j.type === "review" && j.payload.reviewId === reviewId
+  );
+  if (waiting) return waiting;
   const job: ReviewJob = {
     id: uuid(),
     type: "review",

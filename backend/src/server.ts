@@ -18,6 +18,7 @@ import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
 import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
+import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
 import { runDeletionSweep } from "./account.js";
 import { db, initDb, shutdownDb } from "./db.js";
@@ -103,6 +104,13 @@ try {
 } catch (err) {
   console.error("[server] fatal: could not initialize the database\n", err);
   process.exit(1);
+}
+
+// Collapse duplicate review rows from before creation was idempotent — must
+// run before the worker starts so a leftover dupe can't enqueue another run.
+const mergedReviews = dedupePRReviews();
+if (mergedReviews > 0) {
+  console.log(`[server] merged ${mergedReviews} duplicate PR review row${mergedReviews === 1 ? "" : "s"}`);
 }
 
 // Analytics. Non-fatal by design: initStatsig() swallows its own errors, so a
