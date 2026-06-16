@@ -377,8 +377,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // c. Review the diff against the criteria. priorVerdicts anchors criteria an
     // earlier commit already satisfied so a follow-up commit doesn't re-fail them.
     const verdict = await reviewDiff(review, context, criteria, priorVerdicts, wf.prompts?.review);
+    // Match each criterion to its verdict by NORMALIZED id (trim + lowercase).
+    // The review LLM occasionally echoes ids in a different case/whitespace than
+    // synthesis produced ("c1" vs "C1"); a strict === match would silently drop
+    // `met`/`evidence`, dumping every criterion into the "unmet" bucket with no
+    // reason. Normalizing keeps each verdict attached so the reasoning renders.
+    const verdictById = new Map(
+      verdict.criteria.map((vc) => [String(vc.id ?? "").trim().toLowerCase(), vc])
+    );
     const filledCriteria: Criterion[] = criteria.map((c) => {
-      const m = verdict.criteria.find((vc) => vc.id === c.id);
+      const m = verdictById.get(String(c.id ?? "").trim().toLowerCase());
       return { ...c, met: m?.met ?? null, evidence: m?.evidence ?? null };
     });
     const allMet = filledCriteria.every((c) => c.met === true);
@@ -1526,6 +1534,7 @@ async function reviewDiff(
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
     "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
+    "For every criterion you mark met:false, `evidence` MUST be a concrete, non-empty 1-2 sentence explanation of why it is not met: name the function/file and state what the diff currently does (or fails to do) relative to the requirement. Never leave it empty, and never just restate the criterion text back. " +
     // Stateful re-review: each criterion carries the verdict it got on an
     // earlier commit in this same PR. We anchor on that to stop a follow-up
     // commit (e.g. a security fix) from re-failing work earlier commits already
@@ -1553,6 +1562,7 @@ async function reviewDiff(
     "File: <path>\n" +
     "Symbol: <function/class/component name, or 'n/a'>\n\n" +
     "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once fixed so the criterion passes>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
     "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding doesn't map to a specific hunk. " +
@@ -1622,6 +1632,16 @@ function buildEndGoalRequestCTA(): string {
   ].join("\n");
 }
 
+// The reason a criterion failed (or a regressed one broke), for the verdict
+// comment and the consolidated fix prompt. `evidence` is the review step's
+// explanation; the prompt now requires it to be non-empty, but older records
+// (and the rare blank result) would otherwise render a bare "not met" item with
+// no "why". Fall back to a neutral sentence so the reader always gets a reason.
+function reasonOrFallback(evidence: string | null | undefined): string {
+  const text = (evidence || "").trim();
+  return text || "The current diff doesn't yet show this requirement being satisfied.";
+}
+
 // Build the markdown body of the single verdict comment. The shape is
 // intentionally scannable: end goal, then a criteria list with per-criterion
 // evidence, then concrete suggestions the developer can apply in a follow-up
@@ -1631,7 +1651,7 @@ function buildEndGoalRequestCTA(): string {
 // formal-review body to carry them as native inline comments, they render here
 // as a "Line notes" section so everything lives in this one comment. Emoji-free
 // throughout (product decision).
-function formatReviewBody(
+export function formatReviewBody(
   endGoal: string,
   filledCriteria: Criterion[],
   suggestions: ReviewSuggestion[],
@@ -1678,16 +1698,22 @@ function formatReviewBody(
       ""
     );
     for (const c of regressed) {
-      lines.push(`- **${c.id}** — ${c.text}`);
-      if (c.evidence) lines.push(`  _What broke:_ ${c.evidence}`);
+      lines.push(`- **${c.id} — Regressed**`);
+      lines.push(`  - Required: ${c.text}`);
+      lines.push(`  - What broke: ${reasonOrFallback(c.evidence)}`);
     }
     lines.push("");
   }
   if (unmet.length) {
     lines.push("## Acceptance criteria not met");
+    lines.push(
+      "These requirements aren't satisfied by the current diff yet — each shows what was required and why it isn't met.",
+      ""
+    );
     for (const c of unmet) {
-      lines.push(`- **${c.id}** — ${c.text}`);
-      if (c.evidence) lines.push(`  _Why it failed:_ ${c.evidence}`);
+      lines.push(`- **${c.id} — Not met**`);
+      lines.push(`  - Required: ${c.text}`);
+      lines.push(`  - Why it's not met: ${reasonOrFallback(c.evidence)}`);
     }
     lines.push("");
   }
@@ -1875,7 +1901,7 @@ function buildConsolidatedFixPrompt(args: {
 }): string {
   const { prTitle, repoFullName, endGoal, unmetCriteria, suggestions, findings } = args;
   const lines: string[] = [];
-  lines.push(`You are helping fix PR "${prTitle}" in ${repoFullName}. Automated review surfaced the items below — failed acceptance criteria and review findings, each tagged by category and severity. Apply each fix so the item is resolved. Items tagged **Blocker** gate approval; the rest are advisory but worth addressing. Don't introduce changes beyond what's listed.`);
+  lines.push(`You are helping fix PR "${prTitle}" in ${repoFullName}. Automated review surfaced the items below — failed acceptance criteria and review findings. Each item states what was required, what's wrong with the current diff, and how to fix it; the embedded fix blocks include the expected behavior and the relevant diff hunk. Apply each fix so the item is resolved. Items tagged **Blocker** gate approval; the rest are advisory but worth addressing. Don't introduce changes beyond what's listed.`);
   lines.push("");
   if (endGoal) {
     lines.push("## End goal");
@@ -1886,14 +1912,13 @@ function buildConsolidatedFixPrompt(args: {
     lines.push("## Failed acceptance criteria");
     lines.push("");
     unmetCriteria.forEach((c, i) => {
-      lines.push(`### ${i + 1}. ${c.text} (${c.id})`);
-      if (c.evidence) {
-        lines.push(`_Why it failed:_ ${c.evidence}`);
-      }
+      lines.push(`### ${i + 1}. Required: ${c.text} (${c.id})`);
+      lines.push(`What's wrong now: ${reasonOrFallback(c.evidence)}`);
       lines.push("");
+      lines.push("How to fix:");
       const relevant = suggestions.filter((s) => s.criterionId === c.id);
       if (relevant.length === 0) {
-        lines.push("_(No specific patch was suggested for this criterion — use the criterion text and evidence above to plan the fix.)_");
+        lines.push("No specific patch was suggested for this criterion. Implement the change so the Required behavior above holds, using \"What's wrong now\" as the starting point, then verify the criterion passes.");
         lines.push("");
       } else {
         for (const s of relevant) {
@@ -1938,7 +1963,7 @@ function buildConsolidatedFixPrompt(args: {
     });
   }
   lines.push("## Your task");
-  lines.push("Work through every item above — the failed acceptance criteria and each review finding. Use the `Relevant diff` hunks in each fix prompt as the anchor for where to make the change. After each change, re-verify it resolves the item. Treat **Blocker**-tagged items as required (they block approval); address the rest too.");
+  lines.push("Work through every item above — the failed acceptance criteria and each review finding. For each one: understand the gap from \"What's wrong now\", implement the change so the Required behavior holds (each fix block's `Expected behavior` describes the target state), and use the `Relevant diff` hunks as the anchor for where to edit. After each change, re-verify it resolves the item. Treat **Blocker**-tagged items as required (they block approval); address the rest too.");
   return lines.join("\n").trimEnd();
 }
 
@@ -2929,7 +2954,7 @@ type HolisticVerdict = {
   summary: string;
 };
 
-const EMPTY_HOLISTIC: HolisticVerdict = {
+export const EMPTY_HOLISTIC: HolisticVerdict = {
   regressions: [],
   criticalErrors: [],
   securityFindings: [],
@@ -3039,6 +3064,7 @@ async function reviewAgainstRepo(args: {
     "File: <path or 'n/a'>\n" +
     "Symbol: <function/class/component name, or 'n/a'>\n\n" +
     "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once fixed>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff in the user message>\n```\n" +
     "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when the finding genuinely doesn't map to a hunk in the PR diff.", args.extraInstructions);
@@ -3315,6 +3341,7 @@ export async function detectDeferredWork(args: {
     "File: <path or 'n/a'>\n" +
     "Symbol: <function/class/component name, or 'n/a'>\n\n" +
     "Issue:\n<2-3 sentences: what was deferred and what it undercuts>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once the deferred part is implemented>\n\n" +
     "Suggested approach:\n<concrete steps to actually implement the deferred part>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
     "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.", args.extraInstructions);
