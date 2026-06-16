@@ -24,6 +24,17 @@ import { runDeletionSweep } from "./account.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
 
+// Session cookies are JWTs signed with SESSION_SECRET; the default placeholder is
+// public, so signing with it in prod would be no better than not signing at all.
+// secureCookies (an https WEB_ORIGIN) is our prod signal — refuse to boot rather
+// than mint forgeable sessions. Local/ephemeral dev runs over http, so unaffected.
+if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
+  throw new Error(
+    "SESSION_SECRET must be set to a real secret in production (WEB_ORIGIN is https). " +
+      "Refusing to boot with the 'dev-secret-replace-me' placeholder."
+  );
+}
+
 const app = express();
 
 // Render (and most PaaS) terminate TLS at a proxy and forward over http with

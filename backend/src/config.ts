@@ -19,6 +19,14 @@ export const config = {
   // local dev WEB_ORIGIN is http://localhost, so cookies stay SameSite=Lax.
   secureCookies: (process.env.WEB_ORIGIN || "").startsWith("https://"),
   sessionSecret: process.env.SESSION_SECRET || "dev-secret-replace-me",
+  // Old session secrets, accepted for verification only (never for signing) so
+  // rotating SESSION_SECRET doesn't invalidate every live session at once. Set
+  // SESSION_SECRET to the new key and SESSION_SECRET_PREVIOUS to the old one(s),
+  // comma-separated; drop the old entry after one session lifetime (7 days).
+  sessionSecretPrevious: (process.env.SESSION_SECRET_PREVIOUS || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean),
   github: {
     oauthClientId: process.env.GITHUB_OAUTH_CLIENT_ID || "",
     oauthClientSecret: process.env.GITHUB_OAUTH_CLIENT_SECRET || "",

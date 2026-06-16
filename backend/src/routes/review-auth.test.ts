@@ -3,7 +3,7 @@
 // hide unknown ids (404), and reject a signed-in caller who doesn't own the
 // review's repo (403) — for rerun, a rejected caller must not flip status or
 // enqueue a run. We drive the exported handlers directly with a fake session
-// req/res (same base64url `id:ts` cookie getSessionUser decodes), so this runs
+// req/res (a signed-JWT cookie minted via signSession, as in prod), so this runs
 // in-memory with no network. enqueueReview only appends to the queue (no worker
 // is started here), so the happy path is side-effect-free. Run:
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= \
@@ -12,6 +12,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import { signSession } from "../github/oauth.js";
 import { getReviewHandler, rerunReviewHandler } from "./api.js";
 
 function fakeRes() {
@@ -21,11 +22,10 @@ function fakeRes() {
   return res;
 }
 
-// A signed-in request for `userId` hitting review `id` — mirrors the base64url
-// `id:ts` session oauth.ts mints and getSessionUser() decodes.
+// A signed-in request for `userId` hitting review `id` — mints the same signed-JWT
+// session cookie oauth.ts issues, so getSessionUser() verifies it as it does in prod.
 function authedReq(userId: string, id: string): any {
-  const session = Buffer.from(`${userId}:${Date.now()}`).toString("base64url");
-  return { cookies: { devasign_session: session }, params: { id } };
+  return { cookies: { devasign_session: signSession(userId) }, params: { id } };
 }
 
 function anonReq(id: string): any {
