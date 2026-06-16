@@ -5,7 +5,8 @@ import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
-import { appJWT, gh } from "../github/app.js";
+import { appJWT, gh, getOrgMembership } from "../github/app.js";
+import type { User } from "../types.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
@@ -225,33 +226,78 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
   );
 }
 
+// Authorize a claim of `account`'s installation by `user`. Personal installs
+// require the account to *be* the user (account.id === their GitHub id); org
+// installs require an active org membership that resolves back to the user's
+// GitHub id (so a since-changed login now belonging to someone else can't
+// pass). `fetchMembership` is injected so this is unit-testable without network.
+// Anything we can't positively verify returns false (→ 403).
+export async function authorizeInstallationClaim(
+  user: User,
+  account: { id?: number; login?: string; type?: string } | null | undefined,
+  fetchMembership: (
+    org: string,
+    username: string
+  ) => Promise<{ state: string; role: string; userId: number } | null>
+): Promise<boolean> {
+  if (!account || typeof account.id !== "number") return false; // can't verify → deny
+  // Personal: the installation is on the caller's own account.
+  if (account.id === user.githubId) return true;
+  // Org: caller must be an *active* member (member or admin) whose membership
+  // resolves to their GitHub id.
+  if (account.type === "Organization" && account.login && user.githubLogin) {
+    const m = await fetchMembership(account.login, user.githubLogin);
+    return !!m && m.state === "active" && m.userId === user.githubId;
+  }
+  return false;
+}
+
 // Used by the onboarding GitHub-install screen to link a pending install to
 // the signed-in user. Normally the install webhook lands first and leaves
 // userId="" — but the popup-handshake can outrace the webhook (especially via
 // smee in dev), so we also pull live install + repo data from GitHub here
 // using the App's installation token. That way the onboarding repo browser
 // never has to wait for a webhook to arrive.
-api.post("/installations/:installationId/link", async (req, res) => {
+//
+// Claiming is ownership-gated (authorizeInstallationClaim): only the personal
+// owner, or a verified active org member, may link an installation. Without
+// this, any signed-in user could claim any installation id by enumeration and
+// read its private-repo reviews / change its settings.
+export async function linkInstallationHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const id = Number(req.params.installationId);
 
   let install = db.find("installations", (i) => i.installationId === id);
 
-  // Fetch install metadata + repo list from GitHub. This works even when the
-  // webhook hasn't landed yet, and self-corrects stale rows from a prior install.
+  // Fetch live install metadata from GitHub — its `account` is what we verify
+  // ownership against, so we can't proceed without it. (Also self-corrects
+  // stale rows from a prior install.)
   let liveInstall: any = null;
-  let liveRepos: Array<any> = [];
   try {
     liveInstall = await gh<any>(id, `/app/installations/${id}`);
   } catch (err) {
-    // Couldn't reach GitHub (e.g. app not configured in dev). If we don't
-    // have a webhook-created row either, surface 404 like before.
-    if (!install) {
-      console.warn("[link] couldn't reach GitHub and no webhook row:", err);
-      return void res.status(404).json({ error: "install_not_found" });
-    }
+    // Couldn't reach GitHub. Without live account data we can't verify
+    // ownership, so fail closed: 404 when there's no row at all (as before),
+    // 502 when a row exists but we can't re-verify the claim right now.
+    console.warn("[link] couldn't reach GitHub:", err);
+    return void res
+      .status(install ? 502 : 404)
+      .json({ error: install ? "verification_unavailable" : "install_not_found" });
   }
+
+  // Ownership gate — reject anyone who isn't the personal owner or a verified
+  // active org member of the account behind this installation.
+  const authorized = await authorizeInstallationClaim(
+    user,
+    liveInstall?.account,
+    (org, username) => getOrgMembership(id, org, username)
+  );
+  if (!authorized) return void res.status(403).json({ error: "forbidden" });
+
+  // Authorized — now pull the repo list (skipped above so we never hit GitHub
+  // for, or leak the existence of, repos belonging to a caller we'd reject).
+  let liveRepos: Array<any> = [];
   try {
     const reposResp = await gh<any>(id, "/installation/repositories?per_page=100");
     liveRepos = reposResp?.repositories || [];
@@ -317,7 +363,8 @@ api.post("/installations/:installationId/link", async (req, res) => {
   }
 
   res.json({ ok: true, installation: install, repoCount: liveRepos.length });
-});
+}
+api.post("/installations/:installationId/link", linkInstallationHandler);
 
 api.get("/repositories", (req, res) => {
   const user = getSessionUser(req);
