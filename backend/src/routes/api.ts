@@ -275,7 +275,19 @@ export async function linkInstallationHandler(req: Request, res: Response) {
   // stale rows from a prior install.)
   let liveInstall: any = null;
   try {
-    liveInstall = await gh<any>(id, `/app/installations/${id}`);
+    // /app/installations/{id} is an App-level endpoint: it requires the App JWT
+    // (Bearer), NOT an installation token, so we fetch directly rather than via
+    // gh() (same pattern as reconcileInstallsForUser / uninstallApp).
+    const resp = await fetch(`https://api.github.com/app/installations/${id}`, {
+      headers: {
+        Authorization: `Bearer ${appJWT()}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "devasign-app",
+      },
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+    liveInstall = await resp.json();
   } catch (err) {
     // Couldn't reach GitHub. Without live account data we can't verify
     // ownership, so fail closed: 404 when there's no row at all (as before),
@@ -298,9 +310,11 @@ export async function linkInstallationHandler(req: Request, res: Response) {
   // Authorized — now pull the repo list (skipped above so we never hit GitHub
   // for, or leak the existence of, repos belonging to a caller we'd reject).
   let liveRepos: Array<any> = [];
+  let reposFetched = false;
   try {
     const reposResp = await gh<any>(id, "/installation/repositories?per_page=100");
     liveRepos = reposResp?.repositories || [];
+    reposFetched = true;
   } catch (err) {
     console.warn("[link] couldn't list repos:", err);
   }
@@ -316,12 +330,17 @@ export async function linkInstallationHandler(req: Request, res: Response) {
     };
     db.insert("installations", install);
   } else {
-    db.update("installations", (i) => i.id === install!.id, {
+    // db.update returns the fresh row (it replaces, doesn't mutate in place), so
+    // reassign — otherwise the JSON response below echoes the stale object. Only
+    // overwrite repoIds when the list actually came back: reposFetched
+    // distinguishes "fetch failed" from "succeeded with zero repos" (so removing
+    // every repo correctly clears the row instead of keeping stale ids).
+    install = db.update("installations", (i) => i.id === install!.id, {
       userId: user.id,
       accountId: liveInstall?.account?.id ?? install.accountId,
       accountLogin: liveInstall?.account?.login ?? install.accountLogin,
-      repoIds: liveRepos.length ? liveRepos.map((r) => r.id) : install.repoIds,
-    });
+      repoIds: reposFetched ? liveRepos.map((r) => r.id) : install.repoIds,
+    }) ?? install;
   }
 
   // Materialise Repository rows for everything we can see.
