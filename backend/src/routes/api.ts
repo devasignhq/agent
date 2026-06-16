@@ -607,17 +607,42 @@ api.post("/reviews/sync", async (req, res) => {
 
 // --- Tasks + Message-Agent ---
 
-api.get("/tasks/:id", (req, res) => {
+// Owner-scoped: 401 if signed out, 404 if the id is unknown, 403 if the task
+// exists but isn't the caller's. Ownership resolves task → review → repo →
+// installation → user, or directly via task.userId for Linear tasks that have
+// no linked review yet. Exported so the gate is covered in task-auth.test.ts.
+export function getTaskHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id
+  const review = db.find("prReviews", (r) => r.taskId === task.id);
+  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   res.json(task);
-});
+}
+api.get("/tasks/:id", getTaskHandler);
 
 // Adds an attachment (Loom link, Figma URL, image, PDF, plain text) to a task.
 // Mirrors the Message-agent screen in the design.
-api.post("/tasks/:id/attachments", (req, res) => {
+export function addTaskAttachmentHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id
+  const review = db.find("prReviews", (r) => r.taskId === task.id);
+  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   const { kind, url, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
   const att = { id: uuid(), kind, url, note, createdAt: Date.now() };
@@ -628,10 +653,7 @@ api.post("/tasks/:id/attachments", (req, res) => {
   const patch: any = { attachments: [...task.attachments, att] };
   if (kind !== "text") patch.endGoal = null;
   db.update("tasks", (t) => t.id === task.id, patch);
-  const attachmentUser = getSessionUser(req);
-  if (attachmentUser) {
-    track(attachmentUser, "attachment added", { attachment_kind: kind, task_id: task.id });
-  }
+  track(user, "attachment added", { attachment_kind: kind, task_id: task.id });
 
   // When the user drops a Loom (or any other recognised video link) on a
   // PR-bound task mid-review, post a discrete bug-fix comment to the PR so
@@ -657,12 +679,11 @@ api.post("/tasks/:id/attachments", (req, res) => {
     const reviews = db
       .filter("prReviews", (r) => r.taskId === task.id)
       .sort((a, b) => b.updatedAt - a.updatedAt);
-    const review = reviews[0];
-    if (review) {
-      const user = getSessionUser(req);
+    const latestReview = reviews[0];
+    if (latestReview) {
       const comment = {
         body: note.trim(),
-        author: user?.githubLogin || "user",
+        author: user.githubLogin || "user",
         authorAssociation: "OWNER",
         sourceUrl: "",
         sourceEvent: "in_app_message" as const,
@@ -672,7 +693,7 @@ api.post("/tasks/:id/attachments", (req, res) => {
       // `comment.received` on every maintainer-comment ingest.
       db.insert("reviewLogs", {
         id: uuid(),
-        reviewId: review.id,
+        reviewId: latestReview.id,
         kind: "ingest",
         at: Date.now(),
         action: "comment.received",
@@ -680,22 +701,33 @@ api.post("/tasks/:id/attachments", (req, res) => {
         detail: comment.body.slice(0, 240),
         meta: { sourceEvent: comment.sourceEvent },
       });
-      enqueueMaintainerFeedback(review.id, comment);
+      enqueueMaintainerFeedback(latestReview.id, comment);
     }
   }
 
   res.json({ ok: true, attachment: att });
-});
+}
+api.post("/tasks/:id/attachments", addTaskAttachmentHandler);
 
 // Removes an attachment from a task's end-goal. We do more than just splice
 // the array: we also invalidate `task.endGoal` and clear `review.criteria`
 // on any linked PR review, then re-queue the review. That undoes the context
 // (synthesised end goal + per-criterion checks) that this attachment seeded.
-api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
+export function removeTaskAttachmentHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.taskId);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id.
+  // Checked before attachment_not_found so we don't leak attachment existence on
+  // a task the caller doesn't own.
+  const review = db.find("prReviews", (r) => r.taskId === task.id);
+  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   const removed = task.attachments.find((a) => a.id === req.params.attachmentId);
   if (!removed) return void res.status(404).json({ error: "attachment_not_found" });
   const remaining = task.attachments.filter((a) => a.id !== req.params.attachmentId);
@@ -755,7 +787,8 @@ api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
     enqueueReview(rev.id);
   }
   res.json({ ok: true, removed });
-});
+}
+api.delete("/tasks/:taskId/attachments/:attachmentId", removeTaskAttachmentHandler);
 
 // --- Integrations ---
 
