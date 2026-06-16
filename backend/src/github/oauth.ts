@@ -218,15 +218,29 @@ export async function finishOAuth(req: Request, res: Response) {
       pendingPlan: null,
       scheduleId: null,
     });
-  } else if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
-    // Backfill returning users whose stored email is stale/noreply — but never
-    // downgrade a good address to a noreply fallback (isRealEmail guards that),
-    // and never duplicate an address another account already holds.
-    if (emailTakenByOther(resolvedEmail, user.id)) {
-      console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
-    } else {
-      user = db.update("users", (u) => u.id === user!.id, { email: resolvedEmail }) ?? user;
-      await syncStripeEmail(user);
+  } else {
+    // Returning user: refresh fields that drift on GitHub's side. Batch into one
+    // update so we only touch Stripe when the email actually changed.
+    const updates: Partial<User> = {};
+    if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
+      // Backfill stale/noreply emails — but never downgrade a good address to a
+      // noreply fallback (isRealEmail guards that), and never duplicate an
+      // address another account already holds.
+      if (emailTakenByOther(resolvedEmail, user.id)) {
+        console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
+      } else {
+        updates.email = resolvedEmail;
+      }
+    }
+    // Keep githubLogin fresh — a GitHub rename would otherwise leave it
+    // permanently stale, which breaks org-membership checks that look the user
+    // up by login (see authorizeInstallationClaim).
+    if (me.login && me.login !== user.githubLogin) {
+      updates.githubLogin = me.login;
+    }
+    if (Object.keys(updates).length > 0) {
+      user = db.update("users", (u) => u.id === user!.id, updates) ?? user;
+      if (updates.email) await syncStripeEmail(user);
     }
   }
 
