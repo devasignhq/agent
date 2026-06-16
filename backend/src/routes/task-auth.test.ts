@@ -114,6 +114,34 @@ test("GET /tasks/:id: 200 for the owner of a review-less Linear task (task.userI
   assert.equal(res.body.id, linearTaskId);
 });
 
+// Regression for the multi-PR ownership bug: a task (e.g. a Linear task) linked
+// to several reviews across different repos. The caller owns the repo behind the
+// *second* linked review; the first belongs to a stranger. The old `db.find`
+// check stopped at the stranger's review and 403'd — ownership must consider
+// every linked review. The stranger's review is inserted first so a first-match
+// check would pick it. The same resolved check backs POST and DELETE.
+test("GET /tasks/:id: 200 when the owner owns any one of several linked reviews' repos", () => {
+  const ownerId = uuid();
+  const ownerInst = uuid(), strangerInst = uuid();
+  const ownerRepo = uuid(), strangerRepo = uuid();
+  const taskId = uuid();
+  const gh = Math.floor(Math.random() * 1e9);
+  db.insert("users", { id: ownerId, githubId: gh, githubLogin: "multi", email: "m@x.z", plan: "pro", createdAt: Date.now() } as any);
+  db.insert("installations", { id: ownerInst, userId: ownerId, accountId: 1, accountLogin: "multi", installationId: gh, repoIds: [] } as any);
+  db.insert("installations", { id: strangerInst, userId: uuid(), accountId: 2, accountLogin: "x", installationId: gh + 1, repoIds: [] } as any);
+  db.insert("repositories", { id: strangerRepo, installationId: strangerInst, owner: "s", name: "r", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true } as any);
+  db.insert("repositories", { id: ownerRepo, installationId: ownerInst, owner: "o", name: "r", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true } as any);
+  // Stranger's review inserted FIRST so a first-match check would have stopped here.
+  db.insert("prReviews", { id: uuid(), repoId: strangerRepo, prNumber: 1, prTitle: "t", headSha: "a", baseSha: "b", status: "passed", verdict: null, criteria: [], taskId, additions: null, deletions: null, changedFiles: null, createdAt: Date.now(), updatedAt: Date.now() } as any);
+  db.insert("prReviews", { id: uuid(), repoId: ownerRepo, prNumber: 2, prTitle: "t", headSha: "a", baseSha: "b", status: "passed", verdict: null, criteria: [], taskId, additions: null, deletions: null, changedFiles: null, createdAt: Date.now(), updatedAt: Date.now() } as any);
+  db.insert("tasks", { id: taskId, source: "github", externalId: uuid(), title: "t", endGoal: null, attachments: [], createdAt: Date.now() } as any);
+
+  const res = fakeRes();
+  getTaskHandler(authedReq(ownerId, { id: taskId }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.id, taskId);
+});
+
 // --- POST /tasks/:id/attachments ---
 
 test("POST /tasks/:id/attachments: 401 signed-out, task untouched", () => {

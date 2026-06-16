@@ -617,11 +617,12 @@ export function getTaskHandler(req: Request, res: Response) {
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
   // task → review → repo → installation → user.id, OR Linear task.userId === user.id
-  const review = db.find("prReviews", (r) => r.taskId === task.id);
-  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
   const installs = db.filter("installations", (i) => i.userId === user.id);
   const owns =
-    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
   if (!owns) return void res.status(403).json({ error: "forbidden" });
   res.json(task);
@@ -636,11 +637,12 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
   // task → review → repo → installation → user.id, OR Linear task.userId === user.id
-  const review = db.find("prReviews", (r) => r.taskId === task.id);
-  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
   const installs = db.filter("installations", (i) => i.userId === user.id);
   const owns =
-    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
   if (!owns) return void res.status(403).json({ error: "forbidden" });
   const { kind, url, note } = req.body || {};
@@ -676,10 +678,7 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
     // One task is 1:1 with a review in practice; if the PR was closed and
     // reopened we may have several, in which case refine the most recently
     // updated one (the one the user is looking at in the agent page).
-    const reviews = db
-      .filter("prReviews", (r) => r.taskId === task.id)
-      .sort((a, b) => b.updatedAt - a.updatedAt);
-    const latestReview = reviews[0];
+    const latestReview = linkedReviews.sort((a, b) => b.updatedAt - a.updatedAt)[0];
     if (latestReview) {
       const comment = {
         body: note.trim(),
@@ -721,11 +720,12 @@ export function removeTaskAttachmentHandler(req: Request, res: Response) {
   // task → review → repo → installation → user.id, OR Linear task.userId === user.id.
   // Checked before attachment_not_found so we don't leak attachment existence on
   // a task the caller doesn't own.
-  const review = db.find("prReviews", (r) => r.taskId === task.id);
-  const repo = review ? db.find("repositories", (r) => r.id === review.repoId) : null;
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
   const installs = db.filter("installations", (i) => i.userId === user.id);
   const owns =
-    (!!repo && installs.some((i) => i.id === repo.installationId)) ||
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
   if (!owns) return void res.status(403).json({ error: "forbidden" });
   const removed = task.attachments.find((a) => a.id === req.params.attachmentId);
@@ -743,7 +743,6 @@ export function removeTaskAttachmentHandler(req: Request, res: Response) {
   const removedUrls = new Set<string>(
     [removed.url, removed.contentRef].filter((s): s is string => typeof s === "string" && s.length > 0)
   );
-  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
   if (removedUrls.size > 0) {
     const linkedReviewIds = new Set(linkedReviews.map((r) => r.id));
     const videoLogs = db.filter("reviewLogs", (l) =>
