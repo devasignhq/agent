@@ -5,8 +5,8 @@
 // caller must not mutate the task. Ownership resolves task → review → repo →
 // installation → user, OR directly via task.userId for Linear tasks that have no
 // linked review yet; both paths are covered below. We drive the exported
-// handlers directly with a fake session req/res (same base64url `id:ts` cookie
-// getSessionUser decodes), so this runs in-memory with no network. track()
+// handlers directly with a fake session req/res (a signed-JWT cookie minted via
+// signSession, as in prod), so this runs in-memory with no network. track()
 // no-ops without a live Statsig client and enqueueReview/enqueueMaintainerFeedback
 // only append to the in-process queue (no worker is started here), so the happy
 // paths are side-effect-free. Run:
@@ -16,6 +16,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import { signSession } from "../github/oauth.js";
 import {
   getTaskHandler,
   addTaskAttachmentHandler,
@@ -29,11 +30,11 @@ function fakeRes() {
   return res;
 }
 
-// A signed-in request for `userId` — mirrors the base64url `id:ts` session
-// oauth.ts mints and getSessionUser() decodes. `params`/`body` vary per route.
+// A signed-in request for `userId` — mints the same signed-JWT session cookie
+// oauth.ts issues, so getSessionUser() verifies it as in prod. `params`/`body`
+// vary per route.
 function authedReq(userId: string, params: any, body?: any): any {
-  const session = Buffer.from(`${userId}:${Date.now()}`).toString("base64url");
-  return { cookies: { devasign_session: session }, params, body };
+  return { cookies: { devasign_session: signSession(userId) }, params, body };
 }
 
 function anonReq(params: any, body?: any): any {

@@ -12,6 +12,7 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { config } from "../config.js";
 import { db } from "../db.js";
+import { signSession } from "../github/oauth.js";
 import { deleteAccountHandler } from "./api.js";
 import {
   REMINDER_DAY,
@@ -44,11 +45,10 @@ function fakeRes() {
   return res;
 }
 
-// A signed-in request for `userId` — mirrors the base64url `id:ts` session that
-// oauth.ts mints and getSessionUser() decodes.
+// A signed-in request for `userId` — mints the same signed-JWT session cookie
+// oauth.ts issues, so getSessionUser() verifies it exactly as it does in prod.
 function reqFor(userId: string): any {
-  const session = Buffer.from(`${userId}:${Date.now()}`).toString("base64url");
-  return { cookies: { devasign_session: session } };
+  return { cookies: { devasign_session: signSession(userId) } };
 }
 
 // Lifecycle deps that record their calls into `calls`. Overrides win (and can

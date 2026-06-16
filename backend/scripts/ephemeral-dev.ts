@@ -35,4 +35,10 @@ db.insert("installations", {
   installationId: 1,
   repoIds: [],
 });
-console.log("[ephemeral] seeded user ephemeral-user-1 — cookie: base64url('ephemeral-user-1:<ts>')");
+// Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the
+// cookie through the same helper the server verifies — a hand-rolled value won't
+// pass getSessionUser anymore. Print it ready to paste into a curl Cookie header.
+const { signSession } = await import("../src/github/oauth.js");
+console.log(
+  `[ephemeral] seeded user ephemeral-user-1 — cookie: devasign_session=${signSession("ephemeral-user-1")}`
+);
