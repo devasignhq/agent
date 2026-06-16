@@ -1139,7 +1139,7 @@ const SUPPORT_CHANNELS = [
   { name: "Discord community", desc: "Join the community · #help channel", cta: "Join Discord", href: "https://discord.com/invite/GtvqA4UPwT", i: "discord" },
   {
     name: "Email support", i: "send",
-    desc: <>Send us an email at <a className="mono" style={{ color: "var(--accent)", textDecoration: "none" }} href="mailto:bethel@devasign.com">bethel@devasign.com</a> and we'll reply within an hour.</>,
+    desc: <>Send us an email at <a className="mono" style={{ color: "var(--accent)", textDecoration: "none" }} href="mailto:support@devasign.com">support@devasign.com</a> and we'll reply within an hour.</>,
   },
 ];
 
