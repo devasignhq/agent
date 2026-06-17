@@ -12,9 +12,22 @@
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test src/review/progress-comment-flow.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { generateKeyPairSync } from "node:crypto";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import { config } from "../config.js";
 import { runReviewJob } from "./pipeline.js";
+
+// Every GitHub call in the pipeline authenticates through appJWT(), which refuses
+// to sign unless the App is configured (github/app.ts). To keep this suite "fully
+// offline" (above) without leaning on a real backend/.env, hand it a throwaway App
+// id + RSA key: the signed JWT is never sent (fetch is stubbed below), it only has
+// to sign without throwing. Without this the suite silently depends on ambient App
+// creds and fails in a clean checkout / CI.
+config.github.appId = "123456";
+config.github.privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+  .privateKey.export({ type: "pkcs8", format: "pem" })
+  .toString();
 
 type Call = { method: string; url: string; body: any; accept: string };
 
