@@ -14,6 +14,7 @@ import {
 } from "./config.js";
 import { initStatsig, shutdownStatsig } from "./statsig.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
+import { enforceSameOrigin } from "./csrf.js";
 import { handleWebhook } from "./github/webhooks.js";
 import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
 import { handleLinearWebhook } from "./linear/webhooks.js";
@@ -111,6 +112,14 @@ app.post(
 );
 
 app.use(express.json({ limit: "1mb" }));
+
+// CSRF mitigation. The session cookie is SameSite=None in prod, so it rides
+// cross-site requests; reject state-changing requests whose Origin/Referer isn't
+// our own web origin. Registered AFTER the webhook receivers above — those
+// terminate without next() and carry no browser Origin — so only the
+// browser-facing identity + /api routes are gated. See csrf.ts for the full
+// rationale (incl. why it only enforces when the cookie is cross-site).
+app.use(enforceSameOrigin);
 
 // Identity routes. authLimiter caps the unauthenticated OAuth handshake (each
 // callback does a token exchange) well above any human sign-in cadence.

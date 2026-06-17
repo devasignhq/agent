@@ -80,6 +80,21 @@ export function startOAuth(req: Request, res: Response) {
   pruneState();
   const state = uuid();
   pendingState.set(state, Date.now() + STATE_TTL_MS);
+  // Bind the state to *this* browser (login-CSRF defense). The pending-state map
+  // alone can't distinguish the browser that started the flow from a victim's:
+  // an attacker could start the flow, capture a valid (code, state), and replay
+  // it in a victim's session to log them into the attacker's account. The cookie
+  // lands in the attacker's browser, not the victim's, so finishOAuth's
+  // state-must-equal-cookie check rejects the replay. SameSite=Lax is sufficient
+  // and correct — the GitHub callback is a top-level GET navigation, which still
+  // sends Lax cookies, while keeping the cookie off cross-site subrequests.
+  res.cookie("github_oauth_state", state, {
+    httpOnly: true,
+    secure: config.secureCookies,
+    sameSite: "lax",
+    path: "/",
+    maxAge: STATE_TTL_MS,
+  });
   const redirect = `${req.protocol}://${req.get("host")}/api/auth/github/callback`;
   const u = new URL("https://github.com/login/oauth/authorize");
   u.searchParams.set("client_id", config.github.oauthClientId);
@@ -140,11 +155,23 @@ const emailTakenByOther = (email: string, selfId: string | null): boolean =>
 
 export async function finishOAuth(req: Request, res: Response) {
   const { code, state } = req.query as { code?: string; state?: string };
-  if (!code || !state || !pendingState.has(state)) {
+  // Login-CSRF guard: the state must be live in our map AND equal the cookie we
+  // set on the browser that started the flow (see startOAuth). The map check
+  // alone can't tell the victim's browser from the attacker's.
+  const cookieState = req.cookies?.github_oauth_state;
+  if (!code || !state || !pendingState.has(state) || state !== cookieState) {
     res.status(400).send("Invalid OAuth state");
     return;
   }
   pendingState.delete(state);
+  // One-shot: clear the state cookie (same attributes as set, minus maxAge, or
+  // the browser won't overwrite it) so a stale value can't linger.
+  res.clearCookie("github_oauth_state", {
+    httpOnly: true,
+    secure: config.secureCookies,
+    sameSite: "lax",
+    path: "/",
+  });
 
   const tokenRes = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
