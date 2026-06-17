@@ -2,6 +2,7 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import morgan from "morgan";
+import helmet from "helmet";
 
 import {
   config,
@@ -24,6 +25,7 @@ import { startWorker } from "./worker.js";
 import { runDeletionSweep } from "./account.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
+import { authLimiter, globalLimiter } from "./rate-limit.js";
 
 // Session cookies are JWTs signed with SESSION_SECRET; the default placeholder is
 // public, so signing with it in prod would be no better than not signing at all.
@@ -39,14 +41,47 @@ if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
 const app = express();
 
 // Render (and most PaaS) terminate TLS at a proxy and forward over http with
-// X-Forwarded-* headers. Trusting the proxy makes req.protocol/req.secure report
-// https, so the OAuth redirect_uri is built as https and Secure cookies are
-// emitted correctly.
-app.set("trust proxy", true);
+// X-Forwarded-* headers. Trusting the first hop makes req.protocol report https
+// (from X-Forwarded-Proto), so the OAuth redirect_uri is built as https.
+//
+// Pinned to exactly 1 hop — NOT `true`. `true` trusts the whole X-Forwarded-For
+// chain and takes its leftmost (client-supplied) entry as req.ip, which an
+// attacker can forge to dodge the per-IP rate limiters. With a fixed hop count
+// Express resolves req.ip from the address Render actually appended, which the
+// client can't control. This doesn't affect https detection (the immediate hop
+// is still trusted, so X-Forwarded-Proto is still honoured) or Secure cookies
+// (those key off config.secureCookies, not req). Assumes a single proxy hop in
+// front of the app, which is Render's standard web-service topology.
+app.set("trust proxy", 1);
+
+// Security headers on every response (HSTS, nosniff, frameguard, referrer
+// policy, …). Two deviations from helmet's defaults, both because this is a
+// JSON API consumed cross-origin by the SPA at WEB_ORIGIN (e.g. www.devasign.ai):
+//   · contentSecurityPolicy off — a CSP belongs on the HTML host, not a JSON
+//     API; helmet's default policy is meaningless here and only invites
+//     confusion.
+//   · crossOriginResourcePolicy: cross-origin — the default `same-origin` is the
+//     wrong signal for a separate-origin client; relax it so the SPA is never
+//     blocked from reading a response.
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
 
 app.use(morgan("dev"));
 app.use(cors({ origin: config.webOrigin, credentials: true }));
 app.use(cookieParser());
+
+// Broad per-IP flood shield, applied after CORS so handled preflights don't burn
+// budget and before the webhook receivers below so they're covered too. This is
+// the only throttle in front of the (HMAC-gated, but otherwise unauthenticated)
+// webhook endpoints; per-IP is deliberately the right grain there — a flood
+// comes from one source, while legitimate GitHub/Linear/Stripe deliveries arrive
+// across many provider IPs and won't individually trip it. LLM-triggering routes
+// get a much tighter bucket of their own (see rate-limit.ts / api.ts).
+app.use(globalLimiter);
 
 // Webhook receiver needs the raw body for HMAC verification, so register it
 // BEFORE express.json() takes over the body. Both paths are accepted because
@@ -78,23 +113,16 @@ app.post(
 
 app.use(express.json({ limit: "1mb" }));
 
-// CSRF mitigation. The session cookie is SameSite=None in prod, so it rides
-// cross-site requests; reject state-changing requests whose Origin/Referer isn't
-// our own web origin. Registered AFTER the webhook receivers above — those
-// terminate without next() and carry no browser Origin — so only the
-// browser-facing identity + /api routes are gated. See csrf.ts for the full
-// rationale (incl. why it only enforces when the cookie is cross-site).
-app.use(enforceSameOrigin);
-
-// Identity routes
-app.get("/api/auth/github", startOAuth);
-app.get("/api/auth/github/callback", finishOAuth);
-app.post("/api/auth/signout", signOut);
+// Identity routes. authLimiter caps the unauthenticated OAuth handshake (each
+// callback does a token exchange) well above any human sign-in cadence.
+app.get("/api/auth/github", authLimiter, startOAuth);
+app.get("/api/auth/github/callback", authLimiter, finishOAuth);
+app.post("/api/auth/signout", authLimiter, signOut);
 
 // Linear workspace connect (OAuth). Connects an already-signed-in user's Linear
 // workspace and registers the ticket webhook; see linear/oauth.ts.
-app.get("/api/auth/linear", startLinearOAuth);
-app.get("/api/auth/linear/callback", finishLinearOAuth);
+app.get("/api/auth/linear", authLimiter, startLinearOAuth);
+app.get("/api/auth/linear/callback", authLimiter, finishLinearOAuth);
 
 // API
 app.use("/api", api);

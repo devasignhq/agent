@@ -158,6 +158,22 @@ export type RepoWorkflowView = {
   advancedLocked: boolean; // true when the user's plan can't edit advanced fields
 };
 
+// Repo-scoped guidance materials attached on the Workflow "Ingest context" node
+// (mirror of backend RepoGuidanceItem). Each is distilled once on add and then
+// injected into every review on the repo. `status` drives the list UI.
+export type RepoGuidanceItem = {
+  id: string;
+  kind: "video" | "doc" | "pdf";
+  title: string;
+  url?: string;
+  status: "indexing" | "ready" | "errored";
+  summary?: string;
+  error?: string | null;
+  addedAt: number;
+  indexedAt?: number;
+  addedBy?: string;
+};
+
 export type IntegrationType = "slack" | "linear" | "discord";
 
 export type IntegrationView = {
@@ -328,6 +344,25 @@ export const api = {
     request<{ workflows: ActionWorkflow[]; error?: string }>(
       `/api/repositories/${id}/actions/workflows`
     ),
+  // Per-repo guidance materials on the "Ingest context" node. Adding a link or
+  // PDF kicks off immediate indexing (item starts `status:"indexing"`); poll
+  // repoGuidance() until items settle to ready/errored.
+  repoGuidance: (id: string) =>
+    request<{ items: RepoGuidanceItem[] }>(`/api/repositories/${id}/guidance`),
+  addRepoGuidanceLink: (id: string, kind: "video" | "doc", url: string) =>
+    request<{ ok: true; item: RepoGuidanceItem }>(`/api/repositories/${id}/guidance`, {
+      method: "POST",
+      body: JSON.stringify({ kind, url }),
+    }),
+  // Sent as a raw application/pdf body (the route reads req.body as a Buffer);
+  // the filename rides on the query string.
+  uploadRepoGuidancePdf: (id: string, file: File) =>
+    request<{ ok: true; item: RepoGuidanceItem }>(
+      `/api/repositories/${id}/guidance/pdf?filename=${encodeURIComponent(file.name)}`,
+      { method: "POST", body: file, headers: { "Content-Type": "application/pdf" } }
+    ),
+  deleteRepoGuidance: (id: string, itemId: string) =>
+    request<{ ok: true }>(`/api/repositories/${id}/guidance/${itemId}`, { method: "DELETE" }),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>

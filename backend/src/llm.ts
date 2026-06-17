@@ -575,3 +575,55 @@ export async function summarizeLinearFile(input: {
     return null;
   }
 }
+
+// ─── Guidance distillation (Workflow "Ingest context" materials) ─────────────
+// Shared instruction for turning a maintainer-attached material (PDF, doc page,
+// or video) into durable, checkable PR-review guidelines. review/guidance.ts
+// reuses this for the text + video paths (via complete()); the PDF path below
+// reads the file directly with Claude's document block, like summarizeLinearFile.
+export const GUIDANCE_EXTRACT_SYSTEM =
+  "You are DevAsign's guidance-indexing step. A repository maintainer attached a document or video to steer how their repo's pull requests are reviewed. " +
+  "Distil it into a concise, self-contained list of concrete, checkable review guidelines a PR reviewer must enforce — conventions, requirements, do/don'ts, and acceptance signals. " +
+  "Output a Markdown bullet list only, no preamble or closing remarks. Drop anything not actionable for reviewing code changes. Keep it under ~400 words.";
+
+// Distil an uploaded PDF into review guidelines. Best-effort: returns null on any
+// error so the ingest job can mark the item errored. Falls back to a deterministic
+// mock with no API key.
+export async function extractGuidanceFromPdf(input: {
+  base64: string;
+  title?: string;
+}): Promise<string | null> {
+  if (!client) {
+    return (
+      `[mock] Guidance distilled from PDF${input.title ? ` "${input.title}"` : ""}. ` +
+      "Real extraction requires ANTHROPIC_API_KEY.\n- Follow the conventions described in the attached document."
+    );
+  }
+  try {
+    const resp = await client.messages.create({
+      model: config.llm.model,
+      max_tokens: 1024,
+      system: GUIDANCE_EXTRACT_SYSTEM,
+      messages: [
+        {
+          role: "user",
+          content: [
+            { type: "document", source: { type: "base64", media_type: "application/pdf", data: input.base64 } },
+            {
+              type: "text",
+              text: `Distil this document${input.title ? ` ("${input.title}")` : ""} into review guidelines per the system instruction.`,
+            },
+          ] as any,
+        },
+      ],
+    });
+    const text = resp.content
+      .filter((b): b is Anthropic.TextBlock => b.type === "text")
+      .map((b) => b.text)
+      .join("\n");
+    return text.trim() || null;
+  } catch (err) {
+    console.warn("[llm] extractGuidanceFromPdf failed:", err);
+    return null;
+  }
+}

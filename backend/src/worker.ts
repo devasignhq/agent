@@ -2,6 +2,7 @@
 import { onJob } from "./queue.js";
 import { runLinearIngestJob, runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
 import { buildRepoIndex } from "./review/indexer.js";
+import { runGuidanceIngestJob } from "./review/guidance.js";
 import { reviewOwnerPendingDeletion } from "./account.js";
 
 export function startWorker() {
@@ -37,6 +38,10 @@ export function startWorker() {
           full: job.payload.full,
           changedPaths: job.payload.changedPaths,
         });
+        return;
+      case "guidance_ingest":
+        console.log(`[worker] guidance_ingest ${job.payload.repoId}/${job.payload.itemId}`);
+        await runGuidanceIngestJob(job.payload);
         return;
     }
   });

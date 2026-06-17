@@ -8,7 +8,11 @@ for how this file is used and scoped.
 ## Backend (`backend/`)
 - Imports use explicit `.js` extensions on relative paths (TypeScript NodeNext ESM).
 - All Claude / LLM calls go through `complete()` in `backend/src/llm.ts`; pass
-  `cacheSystem: true` when the system prompt is static.
+  `cacheSystem: true` when the system prompt is static. The documented exceptions
+  are calls `complete()` can't express: PDF/image reads that need a `document`/
+  `image` content block (`summarizeLinearFile`, `extractGuidanceFromPdf`) and
+  non-Anthropic provider calls (`summarizeVideo`, which uses Gemini) — these call
+  the SDK/provider directly.
 - GitHub REST calls go through the `gh()` helper in `backend/src/github/app.ts`;
   the documented exceptions are raw blob reads via `installationToken`, the
   OAuth user-token identity calls (`/user`, `/user/emails`) in
