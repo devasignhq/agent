@@ -153,6 +153,24 @@ test("doc redirecting to a metadata/private address is blocked", async () => {
   }
 });
 
+// The absolute-timeout AbortSignal must reach the transport, or a slow-drip
+// server could hang the (serial) worker. Lock the threading in.
+test("doc fetch threads an AbortSignal to the transport", async () => {
+  let seen: unknown = "MISSING";
+  __setDocTransportForTests(async (_url, _addrs, signal) => {
+    seen = signal;
+    return { status: 200, location: null, contentType: "text/html", body: Buffer.from("<p>- ok</p>") };
+  });
+  try {
+    const d = item("doc", "http://93.184.216.34/");
+    const repoId = seedRepo([d]);
+    await runGuidanceIngestJob({ repoId, itemId: d.id });
+    assert.ok(seen instanceof AbortSignal, "transport should receive an AbortSignal");
+  } finally {
+    __setDocTransportForTests(null);
+  }
+});
+
 test("doc returning 200 indexes to ready", async () => {
   __setDocTransportForTests(async () => ({
     status: 200,

@@ -104,7 +104,19 @@ async function guidanceFromVideo(url: string): Promise<string> {
 async function guidanceFromDoc(url: string, title: string): Promise<string> {
   if (!url) throw new Error("missing document URL");
 
-  const { buf, contentType } = await fetchGuardedDoc(url);
+  // Absolute deadline over the WHOLE fetch (connect + headers + every redirect
+  // hop + body read). req.setTimeout alone is only a per-socket *idle* timeout,
+  // which a slow-drip server resets forever (Slowloris) — and the worker drains
+  // serially, so one stalled fetch would block all reviews. The AbortSignal caps it.
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  let result: { buf: Buffer; contentType: string };
+  try {
+    result = await fetchGuardedDoc(url, controller.signal);
+  } finally {
+    clearTimeout(timer);
+  }
+  const { buf, contentType } = result;
 
   // A documentation link can itself point at a PDF — distil it the same way.
   if (contentType.includes("application/pdf") || isPdfBytes(buf)) {
@@ -165,18 +177,21 @@ function isPdfBytes(buf: Buffer): boolean {
 type PinnedAddr = { address: string; family: number };
 type DocResult = { status: number; location: string | null; contentType: string; body: Buffer };
 // One request to an already-validated, IP-pinned host. Overridable for tests.
-type DocTransport = (url: URL, addrs: PinnedAddr[]) => Promise<DocResult>;
+type DocTransport = (url: URL, addrs: PinnedAddr[], signal: AbortSignal) => Promise<DocResult>;
 
 // Fetch a documentation URL behind the SSRF guard, following redirects manually
 // and re-validating every hop. The decisive anti-SSRF control is that each hop
 // resolves+validates the host ONCE and then pins the socket to exactly those
 // IPs (see nodeHttpTransport), so neither a redirect to a private/metadata
 // address nor a DNS-rebind between validation and connect can reach it.
-async function fetchGuardedDoc(initialUrl: string): Promise<{ buf: Buffer; contentType: string }> {
+async function fetchGuardedDoc(
+  initialUrl: string,
+  signal: AbortSignal
+): Promise<{ buf: Buffer; contentType: string }> {
   let current = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const { url, addrs } = await resolvePublicUrl(current);
-    const res = await docTransport(url, addrs);
+    const res = await docTransport(url, addrs, signal);
     if (res.status >= 300 && res.status < 400 && res.status !== 304) {
       if (!res.location) throw new Error(`redirect with no location (HTTP ${res.status})`);
       // Resolve relative redirects against the URL we just requested, then loop
@@ -204,14 +219,18 @@ export function pinnedLookup(addrs: PinnedAddr[]) {
 // `lookup` option (so there is no second DNS resolution to rebind), with SNI +
 // cert validation still keyed off the URL hostname. `Accept-Encoding: identity`
 // keeps the body uncompressed so we can read it without a decompressor.
-const nodeHttpTransport: DocTransport = (url, addrs) =>
+const nodeHttpTransport: DocTransport = (url, addrs, signal) =>
   new Promise<DocResult>((resolve, reject) => {
+    if (signal.aborted) return reject(new Error("request timed out"));
     const mod = url.protocol === "https:" ? https : http;
     const req = mod.request(
       url,
       {
         method: "GET",
         lookup: pinnedLookup(addrs),
+        // Absolute deadline (set by the caller) — aborts connect, headers AND
+        // the body read, so a slow-drip server can't hold the socket open.
+        signal,
         headers: {
           "User-Agent": "devasign-guidance",
           Accept: "text/html,application/pdf,text/plain,*/*",
@@ -225,13 +244,19 @@ const nodeHttpTransport: DocTransport = (url, addrs) =>
         // Read the (capped) body even on redirects so the socket drains/frees.
         readCappedNodeStream(res, MAX_DOC_BYTES)
           .then((body) => resolve({ status, location, contentType, body }))
-          .catch(reject);
+          .catch((err) => reject(asTimeoutOnAbort(err)));
       }
     );
-    req.on("error", reject);
-    req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error("request timed out")));
+    req.on("error", (err) => reject(asTimeoutOnAbort(err)));
     req.end();
   });
+
+// Map Node's AbortError (fired when our absolute-timeout signal trips) onto the
+// existing "request timed out" message so the errored item reads consistently.
+function asTimeoutOnAbort(err: any): Error {
+  if (err?.name === "AbortError" || err?.code === "ABORT_ERR") return new Error("request timed out");
+  return err instanceof Error ? err : new Error(String(err));
+}
 
 // Indirection so tests can stand in a fake transport without real sockets.
 let docTransport: DocTransport = nodeHttpTransport;
