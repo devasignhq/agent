@@ -1916,7 +1916,17 @@ function buildConsolidatedFixPrompt(args: {
       lines.push(`What's wrong now: ${reasonOrFallback(c.evidence)}`);
       lines.push("");
       lines.push("How to fix:");
-      const relevant = suggestions.filter((s) => s.criterionId === c.id);
+      // Match suggestions to this criterion by NORMALIZED id (trim + lowercase),
+      // mirroring the verdict→criterion merge in runReviewJob. The review LLM can
+      // echo `criterionId` in a different case/whitespace than the criterion's id
+      // ("C1" vs "c1"); a strict === would drop the patch and fall back to the
+      // generic "no specific patch" line. Normalize at the comparison only — not
+      // on the stored suggestion — so the "## Suggested changes" heading keeps the
+      // LLM's original casing.
+      const cid = String(c.id ?? "").trim().toLowerCase();
+      const relevant = suggestions.filter(
+        (s) => String(s.criterionId ?? "").trim().toLowerCase() === cid
+      );
       if (relevant.length === 0) {
         lines.push("No specific patch was suggested for this criterion. Implement the change so the Required behavior above holds, using \"What's wrong now\" as the starting point, then verify the criterion passes.");
         lines.push("");
@@ -3151,6 +3161,7 @@ async function reviewAgainstDevasignDocs(args: {
     "File: <path or 'n/a'>\n" +
     "Symbol: <function/class/component name, or 'n/a'>\n\n" +
     "Issue:\n<2-3 sentence description: the rule or statement, and the conflict the diff creates>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once fixed or updated>\n\n" +
     "Suggested approach:\n<concrete steps to fix the code, or to update the DEVASIGN.md>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this refers to, copied verbatim from the PR diff>\n```\n" +
     "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the item doesn't map to a hunk.", args.extraInstructions);
@@ -3473,6 +3484,7 @@ async function reviewSpeclessPR(args: {
     "File: <path or 'n/a'>\n" +
     "Symbol: <function/class/component name, or 'n/a'>\n\n" +
     "Issue:\n<2-3 sentence concern description>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once fixed>\n\n" +
     "Suggested approach:\n<concrete steps to fix>\n\n" +
     "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
     "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.";

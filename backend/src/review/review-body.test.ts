@@ -79,3 +79,30 @@ test("consolidated fix prompt: Required → What's wrong now → How to fix, no-
   assert.match(body, /Implement the change so the Required behavior above holds/);
   assert.doesNotMatch(body, EMOJI);
 });
+
+test("consolidated fix prompt: suggestion attaches across criterionId case mismatch (C1 vs c1)", () => {
+  // Synthesis ids are often uppercase ("C1") while the review LLM echoes the
+  // suggestion's criterionId lowercase ("c1"). The match must be case-insensitive
+  // so the specific patch lands instead of the generic "no specific patch" line.
+  const c = crit({ id: "C1", evidence: "no ownership comparison is performed." });
+  const suggestion = {
+    criterionId: "c1",
+    title: "Gate the claim on verified ownership",
+    rationale: "Compare account.id to the caller's githubId before linking.",
+    fixPrompt: "Fix: gate claim on ownership\n\nExpected behavior:\nReject with 403 unless account.id === caller.githubId.",
+  };
+  const body = formatReviewBody(
+    "Gate installation claiming on ownership.",
+    [c],
+    [suggestion],
+    "",
+    EMPTY_HOLISTIC,
+    { prTitle: "Gate installation claiming", repoFullName: "devasign/app" }
+  );
+  // The suggestion's fixPrompt is embedded under the criterion...
+  assert.match(body, /Fix: gate claim on ownership/);
+  assert.match(body, /Expected behavior:/);
+  // ...and the generic fallback is NOT used.
+  assert.doesNotMatch(body, /No specific patch was suggested for this criterion/);
+  assert.doesNotMatch(body, EMOJI);
+});
