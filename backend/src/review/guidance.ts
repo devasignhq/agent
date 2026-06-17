@@ -117,6 +117,7 @@ async function guidanceFromDoc(url: string, title: string): Promise<string> {
   if (!text) throw new Error("the linked page had no readable text");
   const summary = await complete({
     system: GUIDANCE_EXTRACT_SYSTEM,
+    cacheSystem: true, // static system prompt (DEVASIGN.md convention)
     maxTokens: 1024,
     messages: [{ role: "user", content: `Document title: ${title}\nSource URL: ${url}\n\n${text}` }],
   });
