@@ -117,7 +117,15 @@ function decodeFromLoad<T>(name: keyof DB, data: T): T {
     }
     return data;
   }
-  return { ...r, [field]: open(val) } as T;
+  try {
+    return { ...r, [field]: open(val) } as T;
+  } catch (err) {
+    console.error(
+      `[db] Failed to decrypt '${field}' for ${name} row ${rowId(data) || "unknown"} — keeping sealed envelope:`,
+      err
+    );
+    return data;
+  }
 }
 
 // One-shot migration on load: assign an id (and createdAt) to any
