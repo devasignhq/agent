@@ -1676,7 +1676,6 @@ export function formatReviewBody(
   endGoal: string,
   filledCriteria: Criterion[],
   suggestions: ReviewSuggestion[],
-  summary: string,
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
   context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
   prior: Map<string, PriorVerdict> = new Map(),
@@ -1821,9 +1820,6 @@ export function formatReviewBody(
     appendHolisticGroup(lines, "Convention nits", holistic.conventionFindings);
     appendHolisticGroup(lines, "Docs to update", holistic.docDriftFindings);
     lines.push("");
-  }
-  if (summary) {
-    lines.push("---", summary);
   }
 
   // Consolidated "fix everything in one paste" prompt for an external AI
@@ -2118,7 +2114,6 @@ async function postGithubOutput(
     args.endGoal,
     args.criteria,
     args.suggestions,
-    args.summary,
     args.holistic,
     { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
     args.prior,

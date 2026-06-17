@@ -38,8 +38,9 @@ export function progressCommentBody(): string {
 export function verdictCommentBody(args: {
   status: PRReviewStatus;
   specless: boolean;
-  // The full review body (formatReviewBody output). The one-line summary already
-  // lives at the bottom of it, so we don't repeat it here.
+  // The full review body (formatReviewBody output): end goal, criteria, and any
+  // suggestions/feedback. No trailing prose recap — the outcome headline below
+  // and the criteria sections carry the verdict, so the body doesn't repeat it.
   reviewBody: string;
 }): string {
   const { status, specless, reviewBody } = args;
