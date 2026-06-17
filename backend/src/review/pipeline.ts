@@ -777,6 +777,12 @@ type Context = {
   // re-review understands the diff is the cumulative result of every commit,
   // not just the latest push. Empty when the fetch is unavailable.
   commits: string;
+  // Full commit messages (subject + body) for the PR, fed to criteria synthesis
+  // as a fallback spec: when the PR description is thin or empty, the commit
+  // messages are often the only place the author stated the intent. Distinct
+  // from `commits` (subject-only narrative for the review step). Empty when the
+  // fetch is unavailable.
+  commitMessages: string;
   // PR head branch (pr.head.ref) — the ref a "Run GitHub Action" dispatch uses.
   branch: string;
   videos: VideoSummary[];
@@ -802,6 +808,7 @@ async function ingestContext(
   const sources: IngestedSource[] = [];
   let diff = "";
   let commits = "";
+  let commitMessages = "";
   let prBody = "";
   let prBranch = "";
   let linkedLinearIssue: { id: string; identifier: string; url: string } | null = null;
@@ -878,6 +885,14 @@ async function ingestContext(
               ? `This PR is the cumulative result of ${total} commits (first ${prCommits.length} shown); the diff above already contains all of them:`
               : `This PR is the cumulative result of these ${prCommits.length} commit${prCommits.length === 1 ? "" : "s"}; the diff above already contains all of them:`;
           commits = `${preamble}\n${lines.join("\n")}`;
+          // Full commit messages (subject + body), for criteria synthesis to fall
+          // back on when the PR description is thin or empty: the commits are then
+          // the clearest statement of what the change set out to do. The review
+          // step uses the subject-only `commits` narrative above; this richer
+          // block is synthesis-only and bounded by per-commit/total caps.
+          commitMessages = formatPrCommitMessages(
+            prCommits.map((c) => ({ sha: c.sha, message: c.commit?.message || "" }))
+          );
         }
       } catch (err) {
         console.warn(`[ingest] commits fetch failed:`, err);
@@ -1045,6 +1060,7 @@ async function ingestContext(
     sources,
     diff,
     commits,
+    commitMessages,
     branch: prBranch,
     videos,
     primaryIssues,
@@ -1213,23 +1229,32 @@ async function synthesizeCriteria(
     title: `PR ${review.prTitle}`,
     sources: context.sources,
     hasAuthoritativeSpec,
+    commits: context.commitMessages,
     extraInstructions: extra,
   });
 }
 
-// Source-agnostic core of criteria synthesis. Shared by the PR pipeline (above)
-// and the Linear ticket-ingestion job (runLinearIngestJob), so an opened Linear
-// issue and a PR that fixes it run through identical logic. Keep the literal
-// "criteria synthesis" marker in the system prompt — the offline LLM mock keys
-// off it.
-export async function synthesizeCriteriaCore(args: {
-  title: string;
-  sources: IngestedSource[];
-  hasAuthoritativeSpec: boolean;
-  extraInstructions?: string;
-}): Promise<{ endGoal: string; criteria: Criterion[] }> {
-  const { title, sources, hasAuthoritativeSpec, extraInstructions } = args;
-  const system = withMaintainerInstructions(
+// Format a PR's commit messages (subject + body) for criteria synthesis. Pure
+// so it can be unit-tested. Per-commit and total caps keep the synthesis prompt
+// bounded when a PR carries a long or chatty history.
+export function formatPrCommitMessages(
+  commits: Array<{ sha: string; message: string }>
+): string {
+  const PER_COMMIT_CAP = 2_000;
+  const TOTAL_CAP = 12_000;
+  const blocks = commits.map((c) => {
+    const sha = c.sha.slice(0, 7);
+    const msg = (c.message || "").trim();
+    return `### ${sha}\n${msg ? msg.slice(0, PER_COMMIT_CAP) : "(no commit message)"}`;
+  });
+  return blocks.join("\n\n").slice(0, TOTAL_CAP);
+}
+
+// System prompt for criteria synthesis. Pure/exported so the prompt contract can
+// be unit-tested. Keep the literal "criteria synthesis" marker — the offline LLM
+// mock keys off it.
+export function criteriaSynthesisSystemPrompt(hasAuthoritativeSpec: boolean): string {
+  return (
     "You are DevAsign's criteria synthesis step. Read the ticket and surrounding context, then emit a JSON object: " +
     "{\"endGoal\": string, \"criteria\": [{\"id\": string, \"text\": string}]}. " +
     "The endGoal is one sentence summarising what success looks like. Each criterion is independently checkable. " +
@@ -1240,21 +1265,46 @@ export async function synthesizeCriteriaCore(args: {
     "`linear_project_update` rows are project-status background. `github_issue` rows are secondary " +
     "background. `video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague. " +
     "`repo_guidance` rows are binding review guidelines the maintainer attached to this repository — treat them as " +
-    "authoritative requirements and fold every applicable point into the criteria." +
+    "authoritative requirements and fold every applicable point into the criteria. " +
+    "A `Commit messages` section, when present, lists the messages of the commits that make up the PR; when the PR's own " +
+    "description is thin or empty, treat the commit messages as the author's statement of intent and use them to understand " +
+    "what the change set out to do." +
     (hasAuthoritativeSpec
       ? ""
       : " IMPORTANT: This PR has NO linked issue and NO attached specification. Derive acceptance criteria ONLY from " +
-        "explicit, checkable claims the PR's own title and description actually make (e.g. \"fixes flaky uploads\", " +
-        "\"adds retry on 5xx\"). If the description makes no verifiable promise, return an EMPTY `criteria` array and a " +
-        "brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent acceptance criteria " +
-        "just to have something to check, and never turn vague phrasing into a hard requirement.") +
-    " Never use emoji in any text you output.", extraInstructions);
+        "explicit, checkable claims the PR's own title, description, and commit messages actually make (e.g. \"fixes flaky " +
+        "uploads\", \"adds retry on 5xx\"). When the description is thin or empty, fall back to the commit messages for the " +
+        "PR's intent. If neither the description nor the commit messages make any verifiable promise, return an EMPTY " +
+        "`criteria` array and a brief, neutral one-sentence `endGoal` describing what the PR appears to do. Never invent " +
+        "acceptance criteria just to have something to check, and never turn vague phrasing into a hard requirement.") +
+    " Never use emoji in any text you output."
+  );
+}
+
+// Source-agnostic core of criteria synthesis. Shared by the PR pipeline (above)
+// and the Linear ticket-ingestion job (runLinearIngestJob), so an opened Linear
+// issue and a PR that fixes it run through identical logic. `commits` is the
+// PR's full commit messages, used as a fallback spec when the description is
+// thin (the Linear job leaves it empty).
+export async function synthesizeCriteriaCore(args: {
+  title: string;
+  sources: IngestedSource[];
+  hasAuthoritativeSpec: boolean;
+  commits?: string;
+  extraInstructions?: string;
+}): Promise<{ endGoal: string; criteria: Criterion[] }> {
+  const { title, sources, hasAuthoritativeSpec, commits, extraInstructions } = args;
+  const system = withMaintainerInstructions(
+    criteriaSynthesisSystemPrompt(hasAuthoritativeSpec),
+    extraInstructions
+  );
   const userText =
     `# ${title}\n\n## Context\n` +
     sources
       .filter((s) => s.kind !== "diff")
       .map((s) => `### ${s.kind} (${s.ref})\n${s.text}`)
-      .join("\n\n");
+      .join("\n\n") +
+    (commits ? `\n\n## Commit messages\n${commits}` : "");
   const raw = await complete({
     system,
     cacheSystem: true,
