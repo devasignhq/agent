@@ -74,6 +74,18 @@ export async function finishLinearOAuth(req: Request, res: Response) {
     res.status(400).send("Invalid OAuth state");
     return;
   }
+  // Defense in depth on top of the server-side userId binding below: if a session
+  // is present, it must be the same user who started the flow. This rejects a
+  // logged-in victim who's been lured to an attacker's callback URL. We only gate
+  // when a session exists — the workspace is attached to entry.userId (the
+  // authenticated initiator captured at start), never the caller — so a dropped
+  // cookie on the cross-site hop still completes, preserving the robustness noted
+  // where pendingState is declared above.
+  const sessionUser = getSessionUser(req);
+  if (sessionUser && sessionUser.id !== entry.userId) {
+    res.status(403).send("OAuth state mismatch");
+    return;
+  }
   pendingState.delete(state);
   const userId = entry.userId;
   const redirect = `${req.protocol}://${req.get("host")}/api/auth/linear/callback`;
