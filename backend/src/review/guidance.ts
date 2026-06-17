@@ -8,6 +8,9 @@
 
 import { lookup } from "node:dns/promises";
 import net from "node:net";
+import http from "node:http";
+import https from "node:https";
+import type { IncomingMessage } from "node:http";
 
 import { db } from "../db.js";
 import type { RepoGuidanceItem, Repository } from "../types.js";
@@ -101,21 +104,10 @@ async function guidanceFromVideo(url: string): Promise<string> {
 async function guidanceFromDoc(url: string, title: string): Promise<string> {
   if (!url) throw new Error("missing document URL");
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
-  let res: Response;
-  try {
-    res = await fetchGuardedPublic(url, controller.signal);
-  } finally {
-    clearTimeout(timer);
-  }
-  if (!res.ok) throw new Error(`fetch failed (HTTP ${res.status})`);
-
-  const buf = await readCappedBytes(res, MAX_DOC_BYTES);
-  const ctype = (res.headers.get("content-type") || "").toLowerCase();
+  const { buf, contentType } = await fetchGuardedDoc(url);
 
   // A documentation link can itself point at a PDF — distil it the same way.
-  if (ctype.includes("application/pdf") || isPdfBytes(buf)) {
+  if (contentType.includes("application/pdf") || isPdfBytes(buf)) {
     const summary = await extractGuidanceFromPdf({ base64: buf.toString("base64"), title });
     if (!summary) throw new Error("could not extract guidance from the linked PDF");
     return summary;
@@ -169,91 +161,133 @@ function isPdfBytes(buf: Buffer): boolean {
   return buf.length >= 5 && buf.toString("latin1", 0, 5) === "%PDF-";
 }
 
-// Read a fetch body but stop (and abort) once it exceeds maxBytes, so a
-// surprise multi-GB response can't blow up memory.
-async function readCappedBytes(res: Response, maxBytes: number): Promise<Buffer> {
-  const reader = res.body?.getReader();
-  if (!reader) return Buffer.alloc(0);
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for (;;) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    if (value) {
-      total += value.byteLength;
-      if (total > maxBytes) {
-        await reader.cancel().catch(() => {});
-        throw new Error("document is too large");
-      }
-      chunks.push(Buffer.from(value));
-    }
-  }
-  return Buffer.concat(chunks);
-}
+type PinnedAddr = { address: string; family: number };
+type DocResult = { status: number; location: string | null; contentType: string; body: Buffer };
+// One request to an already-validated, IP-pinned host. Overridable for tests.
+type DocTransport = (url: URL, addrs: PinnedAddr[]) => Promise<DocResult>;
 
-// Fetch a public URL, re-validating the SSRF guard on every redirect hop.
-// `fetch(redirect:"follow")` would let a public host 3xx to a private/loopback/
-// metadata address (e.g. 169.254.169.254) that fetch follows unchecked, so we
-// follow manually and assertPublicUrl each Location before requesting it.
-//
-// Node's fetch (undici) exposes the real status + Location header under
-// `redirect:"manual"` (unlike browsers, which opaque-filter them), which makes
-// this possible. Note: assertPublicUrl resolves DNS and fetch resolves again,
-// so a sub-second DNS-rebinding TOCTOU window remains per hop — acceptable here
-// (authenticated Pro/Max-only input); closing it fully needs connection pinning.
-async function fetchGuardedPublic(initialUrl: string, signal: AbortSignal): Promise<Response> {
+// Fetch a documentation URL behind the SSRF guard, following redirects manually
+// and re-validating every hop. The decisive anti-SSRF control is that each hop
+// resolves+validates the host ONCE and then pins the socket to exactly those
+// IPs (see nodeHttpTransport), so neither a redirect to a private/metadata
+// address nor a DNS-rebind between validation and connect can reach it.
+async function fetchGuardedDoc(initialUrl: string): Promise<{ buf: Buffer; contentType: string }> {
   let current = initialUrl;
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    await assertPublicUrl(current);
-    const res = await fetch(current, {
-      redirect: "manual",
-      signal,
-      headers: { "User-Agent": "devasign-guidance", Accept: "text/html,application/pdf,text/plain,*/*" },
-    });
+    const { url, addrs } = await resolvePublicUrl(current);
+    const res = await docTransport(url, addrs);
     if (res.status >= 300 && res.status < 400 && res.status !== 304) {
-      const loc = res.headers.get("location");
-      if (!loc) throw new Error(`redirect with no location (HTTP ${res.status})`);
+      if (!res.location) throw new Error(`redirect with no location (HTTP ${res.status})`);
       // Resolve relative redirects against the URL we just requested, then loop
-      // back to re-validate. Drain the redirect body so the socket can close.
-      current = new URL(loc, current).toString();
-      await res.body?.cancel().catch(() => {});
+      // back so the new host is itself validated + pinned before we connect.
+      current = new URL(res.location, url).toString();
       continue;
     }
-    return res;
+    if (res.status < 200 || res.status >= 300) throw new Error(`fetch failed (HTTP ${res.status})`);
+    return { buf: res.body, contentType: res.contentType };
   }
   throw new Error("too many redirects");
 }
 
+// Lock a connection's DNS resolution to the pre-validated addresses, so the
+// socket cannot be steered to a different (private) IP than the one we checked.
+// Matches the net.connect `lookup` contract (dns.lookup-style, with `all`).
+export function pinnedLookup(addrs: PinnedAddr[]) {
+  return (_hostname: string, options: any, cb: any) => {
+    if (options && options.all) cb(null, addrs);
+    else cb(null, addrs[0].address, addrs[0].family);
+  };
+}
+
+// The real transport: a GET over node:http/https, pinned to `addrs` via the
+// `lookup` option (so there is no second DNS resolution to rebind), with SNI +
+// cert validation still keyed off the URL hostname. `Accept-Encoding: identity`
+// keeps the body uncompressed so we can read it without a decompressor.
+const nodeHttpTransport: DocTransport = (url, addrs) =>
+  new Promise<DocResult>((resolve, reject) => {
+    const mod = url.protocol === "https:" ? https : http;
+    const req = mod.request(
+      url,
+      {
+        method: "GET",
+        lookup: pinnedLookup(addrs),
+        headers: {
+          "User-Agent": "devasign-guidance",
+          Accept: "text/html,application/pdf,text/plain,*/*",
+          "Accept-Encoding": "identity",
+        },
+      },
+      (res: IncomingMessage) => {
+        const status = res.statusCode || 0;
+        const location = res.headers.location ?? null;
+        const contentType = String(res.headers["content-type"] || "").toLowerCase();
+        // Read the (capped) body even on redirects so the socket drains/frees.
+        readCappedNodeStream(res, MAX_DOC_BYTES)
+          .then((body) => resolve({ status, location, contentType, body }))
+          .catch(reject);
+      }
+    );
+    req.on("error", reject);
+    req.setTimeout(FETCH_TIMEOUT_MS, () => req.destroy(new Error("request timed out")));
+    req.end();
+  });
+
+// Indirection so tests can stand in a fake transport without real sockets.
+let docTransport: DocTransport = nodeHttpTransport;
+export function __setDocTransportForTests(t: DocTransport | null): void {
+  docTransport = t || nodeHttpTransport;
+}
+
+// Read a Node response stream, stopping (and destroying it) once it exceeds
+// maxBytes so a surprise multi-GB body can't blow up memory.
+async function readCappedNodeStream(res: IncomingMessage, maxBytes: number): Promise<Buffer> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of res) {
+    const buf = chunk as Buffer;
+    total += buf.length;
+    if (total > maxBytes) {
+      res.destroy();
+      throw new Error("document is too large");
+    }
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks);
+}
+
 // SSRF guard: only fetch public http(s) hosts. Rejects non-http(s) schemes,
-// obvious internal names, and any hostname that resolves to a private,
-// loopback, link-local (incl. cloud metadata 169.254.169.254) or ULA address.
-async function assertPublicUrl(raw: string): Promise<void> {
-  let u: URL;
+// obvious internal names, and any hostname that resolves to a private, loopback,
+// link-local (incl. cloud metadata 169.254.169.254) or ULA address. Returns the
+// validated addresses so the caller can pin the connection to them.
+export async function resolvePublicUrl(raw: string): Promise<{ url: URL; addrs: PinnedAddr[] }> {
+  let url: URL;
   try {
-    u = new URL(raw);
+    url = new URL(raw);
   } catch {
     throw new Error("invalid URL");
   }
-  if (u.protocol !== "http:" && u.protocol !== "https:") {
+  if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("only http(s) URLs are allowed");
   }
-  const host = u.hostname;
+  const host = url.hostname;
   if (net.isIP(host)) {
     if (isPrivateIp(host)) throw new Error("URL points at a private address");
-    return;
+    return { url, addrs: [{ address: host, family: net.isIPv6(host) ? 6 : 4 }] };
   }
   if (/^(localhost|.*\.local|.*\.internal)$/i.test(host)) {
     throw new Error("URL host is not public");
   }
-  let addrs: Array<{ address: string }>;
+  let addrs: PinnedAddr[];
   try {
     addrs = await lookup(host, { all: true });
   } catch {
     throw new Error("could not resolve host");
   }
+  if (!addrs.length) throw new Error("could not resolve host");
   for (const a of addrs) {
     if (isPrivateIp(a.address)) throw new Error("URL resolves to a private address");
   }
+  return { url, addrs };
 }
 
 function isPrivateIp(ip: string): boolean {

@@ -6,7 +6,13 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import type { RepoGuidanceItem } from "../types.js";
-import { buildGuidanceSection, runGuidanceIngestJob } from "./guidance.js";
+import {
+  __setDocTransportForTests,
+  buildGuidanceSection,
+  pinnedLookup,
+  resolvePublicUrl,
+  runGuidanceIngestJob,
+} from "./guidance.js";
 
 function seedRepo(guidance: RepoGuidanceItem[]): string {
   const id = uuid();
@@ -86,13 +92,55 @@ test("buildGuidanceSection is empty when nothing is ready", () => {
   assert.equal(buildGuidanceSection(repoOf(repoId)), "");
 });
 
+// resolvePublicUrl is the SSRF gate run on the initial URL AND every redirect
+// hop. Prove it rejects the addresses an SSRF would target, and accepts public.
+test("resolvePublicUrl rejects private, loopback, metadata, schemes; allows public", async () => {
+  const blocked = [
+    "http://127.0.0.1/",            // loopback
+    "http://169.254.169.254/latest", // cloud metadata
+    "http://10.1.2.3/",             // private
+    "http://192.168.0.1/",          // private
+    "http://[::1]/",                // ipv6 loopback
+    "http://localhost/",            // internal name
+    "file:///etc/passwd",           // non-http scheme
+    "not-a-url",                    // unparseable
+  ];
+  for (const u of blocked) {
+    await assert.rejects(resolvePublicUrl(u), new RegExp("."), `expected ${u} to be rejected`);
+  }
+  // A public IP literal resolves without DNS and is pinned to itself.
+  const ok = await resolvePublicUrl("http://93.184.216.34/");
+  assert.deepEqual(ok.addrs, [{ address: "93.184.216.34", family: 4 }]);
+});
+
+// The pin: whatever hostname the connector asks to resolve, it gets back ONLY
+// the pre-validated address — so the socket can't be rebound to another IP.
+test("pinnedLookup returns the validated address regardless of hostname", () => {
+  const addrs = [{ address: "93.184.216.34", family: 4 }];
+  const lookupFn = pinnedLookup(addrs);
+  // all:true → array form
+  lookupFn("attacker-controlled.example", { all: true }, (err: any, res: any) => {
+    assert.equal(err, null);
+    assert.deepEqual(res, addrs);
+  });
+  // single form
+  lookupFn("attacker-controlled.example", {}, (err: any, addr: any, family: any) => {
+    assert.equal(err, null);
+    assert.equal(addr, "93.184.216.34");
+    assert.equal(family, 4);
+  });
+});
+
 // A public host that 3xx-redirects to a private/metadata address must NOT be
-// followed (the SSRF guard re-validates every hop). The start is a public IP
-// literal so assertPublicUrl needs no DNS; fetch is stubbed to redirect.
+// followed: the loop re-validates the Location before requesting it. The start
+// is a public IP literal (no DNS); the transport is stubbed to redirect.
 test("doc redirecting to a metadata/private address is blocked", async () => {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () =>
-    new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } })) as any;
+  __setDocTransportForTests(async () => ({
+    status: 302,
+    location: "http://169.254.169.254/latest/meta-data/",
+    contentType: "",
+    body: Buffer.alloc(0),
+  }));
   try {
     const d = item("doc", "http://93.184.216.34/"); // public IP literal
     const repoId = seedRepo([d]);
@@ -101,23 +149,23 @@ test("doc redirecting to a metadata/private address is blocked", async () => {
     assert.equal(after.status, "errored");
     assert.match(after.error || "", /private/i);
   } finally {
-    globalThis.fetch = realFetch;
+    __setDocTransportForTests(null);
   }
 });
 
-test("doc returning 200 still indexes to ready (manual redirect handling)", async () => {
-  const realFetch = globalThis.fetch;
-  globalThis.fetch = (async () =>
-    new Response("<html><body><h1>Style</h1><p>- Use camelCase for exports.</p></body></html>", {
-      status: 200,
-      headers: { "content-type": "text/html" },
-    })) as any;
+test("doc returning 200 indexes to ready", async () => {
+  __setDocTransportForTests(async () => ({
+    status: 200,
+    location: null,
+    contentType: "text/html",
+    body: Buffer.from("<html><body><h1>Style</h1><p>- Use camelCase for exports.</p></body></html>"),
+  }));
   try {
     const d = item("doc", "http://93.184.216.34/");
     const repoId = seedRepo([d]);
     await runGuidanceIngestJob({ repoId, itemId: d.id });
     assert.equal(itemOf(repoId, d.id).status, "ready");
   } finally {
-    globalThis.fetch = realFetch;
+    __setDocTransportForTests(null);
   }
 });
