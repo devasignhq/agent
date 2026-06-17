@@ -36,6 +36,7 @@ import {
   type PriorVerdict,
 } from "./criteria-format.js";
 import { effectiveWorkflow } from "./workflow.js";
+import { buildGuidanceSection } from "./guidance.js";
 import { resolveReviewEvent, withMaintainerInstructions } from "./decisions.js";
 
 function log(reviewId: string, kind: ReviewLogKind, action: string, extra: Partial<ReviewLogEntry> = {}) {
@@ -779,6 +780,10 @@ type Context = {
   // review without re-synthesizing. Empty when nothing was cached.
   linearSeedCriteria: Criterion[];
   linearSeedEndGoal: string | null;
+  // Repo-scoped guidance materials (Workflow "Ingest context" node), distilled
+  // to one authoritative block and injected into the criteria + review steps.
+  // Empty string when the repo has none ready.
+  guidance: string;
 };
 
 async function ingestContext(
@@ -1019,6 +1024,15 @@ async function ingestContext(
     }
   }
 
+  // Repo-scoped guidance materials the maintainer attached on the Workflow
+  // "Ingest context" node. Distilled once at add-time; injected here as one
+  // authoritative block (threaded into the criteria + review prompts) and also
+  // pushed as a source so it shows up in the "sources analyzed" log.
+  const guidance = buildGuidanceSection(repo);
+  if (guidance) {
+    sources.push({ kind: "repo_guidance", ref: "repository guidance", text: guidance });
+  }
+
   return {
     sources,
     diff,
@@ -1030,6 +1044,7 @@ async function ingestContext(
     linkedLinearIssue,
     linearSeedCriteria,
     linearSeedEndGoal,
+    guidance,
   };
 }
 
@@ -1215,7 +1230,9 @@ export async function synthesizeCriteriaCore(args: {
     "`linear_comment` rows are discussion on it — treat both as authoritative detail. `linear_attachment` rows are linked " +
     "resources (Figma, docs, the PR); `linear_file` rows summarise files attached to the ticket (PDFs/images); " +
     "`linear_project_update` rows are project-status background. `github_issue` rows are secondary " +
-    "background. `video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague." +
+    "background. `video_summary` rows describe what a Loom/YouTube/Vimeo showed; use them when the issue/PR text was vague. " +
+    "`repo_guidance` rows are binding review guidelines the maintainer attached to this repository — treat them as " +
+    "authoritative requirements and fold every applicable point into the criteria." +
     (hasAuthoritativeSpec
       ? ""
       : " IMPORTANT: This PR has NO linked issue and NO attached specification. Derive acceptance criteria ONLY from " +
@@ -1526,6 +1543,8 @@ async function reviewDiff(
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
     "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
+    "If a '# Review guidelines' section is present, it holds binding guidelines the repository maintainer attached to this repo — " +
+    "treat every applicable point as a hard requirement: flag violations as unmet criteria, or, when no criterion maps, as a concrete comment or suggestion. " +
     // Stateful re-review: each criterion carries the verdict it got on an
     // earlier commit in this same PR. We anchor on that to stop a follow-up
     // commit (e.g. a security fix) from re-failing work earlier commits already
@@ -1572,9 +1591,13 @@ async function reviewDiff(
     `# Criteria\n${buildCriteriaSection(criteria, prior)}\n\n` +
     (context.commits ? `# Commits in this PR\n${context.commits}\n\n` : "") +
     `# Diff\n\`\`\`diff\n${diffBody}\n\`\`\`\n\n` +
+    // Maintainer guidance gets its own untruncated section up top so it can't be
+    // squeezed out by the 6-source supporting-context cap below; it's already
+    // filtered out of that slice to avoid showing it twice.
+    (context.guidance ? `# Review guidelines (binding — maintainer-attached)\n${context.guidance}\n\n` : "") +
     `# Supporting context\n` +
     context.sources
-      .filter((s) => s.kind !== "diff")
+      .filter((s) => s.kind !== "diff" && s.kind !== "repo_guidance")
       .slice(0, 6)
       .map((s) => `## ${s.kind}\n${s.text.slice(0, 2000)}`)
       .join("\n\n");
