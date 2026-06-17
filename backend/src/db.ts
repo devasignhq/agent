@@ -91,6 +91,9 @@ function encodeForStore<T>(name: keyof DB, row: T): T {
 // Legacy plaintext rows pass through unchanged (and are recorded for migration).
 // A sealed row with no key configured can't be opened — warn once and leave the
 // envelope in place (the integration is inert but no token leaks either way).
+// A sealed row that a *configured* key fails to open (corruption / rotated key)
+// is blanked to an empty secret: the boot load survives and consumers read it as
+// "not connected" rather than receiving the raw envelope as a credential.
 function decodeFromLoad<T>(name: keyof DB, data: T): T {
   const field = ENCRYPTED_FIELDS[name];
   if (!field || !data || typeof data !== "object") return data;
@@ -117,7 +120,22 @@ function decodeFromLoad<T>(name: keyof DB, data: T): T {
     }
     return data;
   }
-  return { ...r, [field]: open(val) } as T;
+  try {
+    return { ...r, [field]: open(val) } as T;
+  } catch (err) {
+    // A configured key that still can't open the envelope means the row is
+    // corrupt/tampered (or was sealed with a since-rotated key). Don't crash the
+    // boot load — but don't hand callers the raw envelope either: they read this
+    // field as a plaintext secret (e.g. an integration token) and would otherwise
+    // treat the SealedSecret object as a credential. Blank it to an empty record
+    // so every consumer sees "no token / not connected" (they read `tokens.*`
+    // unguarded, so a `null` here would throw a TypeError instead).
+    console.error(
+      `[db] Failed to decrypt '${field}' for ${name} row ${rowId(data) || "unknown"} — treating its secret as unavailable:`,
+      err
+    );
+    return { ...r, [field]: {} } as T;
+  }
 }
 
 // One-shot migration on load: assign an id (and createdAt) to any

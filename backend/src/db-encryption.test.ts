@@ -92,6 +92,40 @@ test("migrates legacy plaintext rows by re-encrypting them on boot", async () =>
   assert.equal(JSON.stringify(stored!.data).includes("legacy-plain"), false);
 });
 
+test("a sealed row that fails to decrypt loads blanked, not as the envelope", async () => {
+  config.encryption.key = KEY;
+  // Seal a real token, then flip a ciphertext byte so open() fails the GCM auth
+  // tag on load (mimics on-disk corruption or a since-rotated key).
+  const sealed = seal({ accessToken: "will-corrupt" });
+  const raw = Buffer.from(sealed.data, "base64");
+  raw[raw.length - 1] ^= 0xff;
+  const corrupt = integration("int-5", { ...sealed, data: raw.toString("base64") });
+  const { pool } = makeFakePool({ seed: { integrations: [{ data: corrupt }] } });
+
+  // Capture console.error to assert the failure is logged, not swallowed.
+  const logged: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => void logged.push(String(args[0]));
+  try {
+    await initDb({ poolOverride: pool as never });
+  } finally {
+    console.error = origError;
+  }
+
+  const live = db.find("integrations", (i) => i.id === "int-5");
+  assert.ok(live, "row still loaded — boot did not crash on the corrupt secret");
+  assert.deepEqual((live as any).tokens, {}, "undecryptable secret is blanked to an empty record");
+  assert.equal(
+    (live as any).tokens.accessToken,
+    undefined,
+    "no token (and no envelope) surfaces to consumers"
+  );
+  assert.ok(
+    logged.some((m) => m.includes("Failed to decrypt")),
+    "logged the decrypt failure"
+  );
+});
+
 test("without a key, tokens round-trip as plaintext and health reports unconfigured", async () => {
   config.encryption.key = "";
   const { pool, inserts } = makeFakePool();

@@ -83,3 +83,11 @@ export function open(sealed: SealedSecret): unknown {
   const plaintext = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
   return JSON.parse(plaintext.toString("utf8"));
 }
+
+// Validate the key at startup if configured, so a malformed key crashes the app
+// immediately rather than causing silent write failures later. (A present-but-
+// invalid key would otherwise throw on the first seal/open during a DB flush,
+// where persistIsolating treats it as a transient error and retries forever.)
+if (config.encryption.key) {
+  keyBuf();
+}
