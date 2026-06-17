@@ -22,6 +22,7 @@ import {
   unreadCountForUser,
 } from "../notifications.js";
 import { track } from "../statsig.js";
+import { expensiveLimiter } from "../rate-limit.js";
 
 export const api = Router();
 
@@ -412,7 +413,7 @@ api.get("/repositories", (req, res) => {
 
 // Trigger a full repo re-index. Useful when the indexer prompt or allow-list
 // changes, or when QA wants to observe the build without waiting for a webhook.
-api.post("/repositories/:id/reindex", (req, res) => {
+api.post("/repositories/:id/reindex", expensiveLimiter, (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const repo = db.find("repositories", (r) => r.id === req.params.id);
@@ -523,7 +524,7 @@ api.get("/repositories/:id/guidance", (req, res) => {
 });
 
 // Add a video or documentation link. Distils immediately via the queue.
-api.post("/repositories/:id/guidance", (req, res) => {
+api.post("/repositories/:id/guidance", expensiveLimiter, (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   if (guidanceLocked(ctx.user)) return void res.status(403).json({ error: "upgrade_required" });
@@ -564,6 +565,9 @@ api.post("/repositories/:id/guidance", (req, res) => {
 // route-scoped raw parser can take a larger limit than the 1mb global one.
 api.post(
   "/repositories/:id/guidance/pdf",
+  // Throttle before the 20mb raw parser so a flood is rejected without us
+  // buffering the body.
+  expensiveLimiter,
   express.raw({ type: "application/pdf", limit: "20mb" }),
   (req, res) => {
     const ctx = ownedRepo(req, res);
@@ -699,13 +703,13 @@ export function rerunReviewHandler(req: Request, res: Response) {
   enqueueReview(review.id);
   res.json({ ok: true });
 }
-api.post("/reviews/:id/rerun", rerunReviewHandler);
+api.post("/reviews/:id/rerun", expensiveLimiter, rerunReviewHandler);
 
 // Pull open PRs from every connected repo and ensure each one has a PRReview
 // row in the queue. Newly-discovered PRs are enqueued for review immediately.
 // Idempotent: PRs we've already seen are left alone (the user can hit "Re-run"
 // on the card if they want a fresh pass).
-api.post("/reviews/sync", async (req, res) => {
+api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
 
@@ -920,7 +924,7 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
 
   res.json({ ok: true, attachment: att });
 }
-api.post("/tasks/:id/attachments", addTaskAttachmentHandler);
+api.post("/tasks/:id/attachments", expensiveLimiter, addTaskAttachmentHandler);
 
 // Removes an attachment from a task's end-goal. We do more than just splice
 // the array: we also invalidate `task.endGoal` and clear `review.criteria`
@@ -1001,7 +1005,7 @@ export function removeTaskAttachmentHandler(req: Request, res: Response) {
   }
   res.json({ ok: true, removed });
 }
-api.delete("/tasks/:taskId/attachments/:attachmentId", removeTaskAttachmentHandler);
+api.delete("/tasks/:taskId/attachments/:attachmentId", expensiveLimiter, removeTaskAttachmentHandler);
 
 // --- Integrations ---
 
