@@ -24,7 +24,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
-import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow } from "./api";
+import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow, type RepoGuidanceItem } from "./api";
 import { useAuth } from "./auth-context";
 
 type StageKey = "holistic" | "deferrals" | "docs";
@@ -56,7 +56,7 @@ const NODE_DEFS: NodeDef[] = [
     desc: "Runs whenever a pull request is opened or updated." },
   { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", color: "var(--cyan)", mandatory: true,
     short: "Diff, tickets, Looms & frames",
-    desc: "Pull the diff, linked tickets, attached Looms & design frames." },
+    desc: "Pull the diff, linked tickets, attached Looms & design frames. Attach guidance materials below — videos, docs & PDFs the agent indexes and follows on every review of this repo." },
   { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", color: "var(--purple)", mandatory: true, promptKey: "criteria",
     short: "Derive end goal & criteria",
     desc: "Derive the end goal & acceptance criteria the PR must meet." },
@@ -350,6 +350,183 @@ function ActionsEditor({ repoId, actions, locked, onSave }) {
   );
 }
 
+// ── Guidance materials editor (advanced) — on the "Ingest context" node ──────
+// Self-contained like ActionsEditor: fetches the repo's guidance list and lets
+// the user attach a video link, a documentation link, or a PDF. New items index
+// asynchronously (status starts "indexing"), so we poll until everything settles.
+function guidanceErrText(e: any): string {
+  const m = e?.message || "Couldn't add — try again.";
+  switch (m) {
+    case "invalid_url": return "That doesn't look like a valid URL.";
+    case "not_a_pdf": return "That file isn't a PDF.";
+    case "file_too_large": return "PDF is too large (max 15MB).";
+    case "too_many_items": return "You've reached the maximum number of materials.";
+    case "upgrade_required": return "That's a Pro/Max feature.";
+    default: return m;
+  }
+}
+
+function GuidanceStatus({ item }: { item: RepoGuidanceItem }) {
+  if (item.status === "ready")
+    return <span className="pill green"><i className="dot" /> ready</span>;
+  if (item.status === "errored")
+    return <span className="pill danger" title={item.error || ""}><i className="dot" /> failed</span>;
+  return <span className="pill running"><i className="dot" /> indexing…</span>;
+}
+
+function GuidanceEditor({ repoId, locked }) {
+  const [items, setItems] = React.useState<RepoGuidanceItem[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [video, setVideo] = React.useState("");
+  const [doc, setDoc] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const fileRef = React.useRef<HTMLInputElement>(null);
+
+  const reload = React.useCallback(
+    () => api.repoGuidance(repoId).then((r) => setItems(r.items || [])).catch(() => {}),
+    [repoId]
+  );
+
+  React.useEffect(() => {
+    if (locked) return;
+    let alive = true;
+    setLoading(true);
+    api
+      .repoGuidance(repoId)
+      .then((r) => alive && setItems(r.items || []))
+      .catch(() => {})
+      .finally(() => alive && setLoading(false));
+    return () => { alive = false; };
+  }, [repoId, locked]);
+
+  // Poll while anything is still indexing so the status flips to ready/failed.
+  React.useEffect(() => {
+    if (locked || !items.some((i) => i.status === "indexing")) return;
+    const t = setInterval(() => { void reload(); }, 2500);
+    return () => clearInterval(t);
+  }, [items, locked, reload]);
+
+  if (locked) {
+    return (
+      <div className="wf-prompt">
+        <div className="wf-prompt-head">
+          <span className="wf-label">Guidance materials</span>
+          <ProLock />
+        </div>
+        <div className="wf-prompt-locked" onClick={goUpgrade}>
+          <Icon name="lock" size={12} />
+          <span>Attach videos, docs & PDFs the agent must follow on every review — a Pro/Max feature. Upgrade to add →</span>
+        </div>
+      </div>
+    );
+  }
+
+  const addLink = async (kind: "video" | "doc", url: string, clear: () => void) => {
+    const u = url.trim();
+    if (!u || busy) return;
+    setBusy(true); setErr(null);
+    try {
+      const { item } = await api.addRepoGuidanceLink(repoId, kind, u);
+      setItems((cur) => [...cur, item]);
+      clear();
+    } catch (e) { setErr(guidanceErrText(e)); }
+    finally { setBusy(false); }
+  };
+
+  const onPick = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (fileRef.current) fileRef.current.value = "";
+    if (!file) return;
+    if (file.size > 15 * 1024 * 1024) { setErr("PDF is too large (max 15MB)."); return; }
+    setBusy(true); setErr(null);
+    try {
+      const { item } = await api.uploadRepoGuidancePdf(repoId, file);
+      setItems((cur) => [...cur, item]);
+    } catch (e) { setErr(guidanceErrText(e)); }
+    finally { setBusy(false); }
+  };
+
+  const remove = async (id: string) => {
+    const prev = items;
+    setItems((cur) => cur.filter((i) => i.id !== id));
+    try { await api.deleteRepoGuidance(repoId, id); }
+    catch { setItems(prev); }
+  };
+
+  const iconFor = (k: string) => (k === "video" ? "play" : k === "pdf" ? "doc" : "link");
+
+  return (
+    <div className="wf-guidance">
+      <div className="wf-field">
+        <span className="wf-label">Guidance materials</span>
+        <div className="wf-prompt-foot mute" style={{ textAlign: "left", marginTop: 0 }}>
+          Indexed immediately, then used as a guide on every review of this repo.
+        </div>
+      </div>
+
+      {loading ? (
+        <div className="mute mono" style={{ fontSize: 12 }}>loading…</div>
+      ) : items.length === 0 ? (
+        <div className="mute mono" style={{ fontSize: 12 }}>No materials yet.</div>
+      ) : (
+        <ul className="wf-guidance-list">
+          {items.map((it) => (
+            <li key={it.id} className="wf-guidance-item">
+              <Icon name={iconFor(it.kind)} size={12} />
+              <div className="wf-guidance-meta">
+                <div className="wf-guidance-title" title={it.url || it.title}>{it.title}</div>
+                <GuidanceStatus item={it} />
+              </div>
+              <button className="wf-guidance-x" onClick={() => remove(it.id)} title="Remove" aria-label="Remove">
+                <Icon name="x" size={11} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+
+      <div className="wf-field">
+        <span className="wf-label">Video link</span>
+        <div className="wf-guidance-add">
+          <input
+            className="input"
+            placeholder="YouTube, Loom, Vimeo…"
+            value={video}
+            onChange={(e) => setVideo(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addLink("video", video, () => setVideo(""))}
+          />
+          <button className="btn sm" disabled={busy || !video.trim()} onClick={() => addLink("video", video, () => setVideo(""))}>Add</button>
+        </div>
+      </div>
+
+      <div className="wf-field">
+        <span className="wf-label">Documentation link</span>
+        <div className="wf-guidance-add">
+          <input
+            className="input"
+            placeholder="https://…"
+            value={doc}
+            onChange={(e) => setDoc(e.target.value)}
+            onKeyDown={(e) => e.key === "Enter" && addLink("doc", doc, () => setDoc(""))}
+          />
+          <button className="btn sm" disabled={busy || !doc.trim()} onClick={() => addLink("doc", doc, () => setDoc(""))}>Add</button>
+        </div>
+      </div>
+
+      <div className="wf-field">
+        <span className="wf-label">PDF</span>
+        <input ref={fileRef} type="file" accept="application/pdf" style={{ display: "none" }} onChange={onPick} />
+        <button className="btn ghost sm" disabled={busy} onClick={() => fileRef.current?.click()}>
+          <Icon name="doc" size={12} /> Upload PDF
+        </button>
+      </div>
+
+      {err && <div className="wf-guidance-err">{err}</div>}
+    </div>
+  );
+}
+
 // ── Right-hand detail / edit panel for the selected node ─────────────────────
 function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleTrigger, onToggleBlocking, onSavePrompt, onSaveActions }) {
   const on = nodeOn(def, wf);
@@ -420,6 +597,11 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
           <span className="pill" style={{ color: "var(--fg-mute)" }}>
             <i className="dot" /> always on
           </span>
+        )}
+
+        {/* Ingest node: repo-scoped guidance materials (ADVANCED). */}
+        {def.id === "ingest" && (
+          <GuidanceEditor key={repoId} repoId={repoId} locked={advancedLocked} />
         )}
 
         {/* AI stage: custom prompt (ADVANCED). */}

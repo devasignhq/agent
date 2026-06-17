@@ -98,6 +98,28 @@ export type Repository = {
   indexedCommit?: string;
   indexedFileCount?: number;
   indexError?: string | null;
+  // Maintainer-attached, repo-scoped guidance materials (videos, doc links,
+  // PDFs). Each is distilled to text once on add (see review/guidance.ts) and
+  // injected as authoritative guidance into every review on this repo. Optional
+  // so rows written before this feature load unchanged; treat undefined as [].
+  guidance?: RepoGuidanceItem[];
+}
+
+// A repo-scoped guidance material attached on the Workflow "Ingest context"
+// node. `summary` is the distilled, checkable review guidelines extracted from
+// the material once at add-time — we never persist raw PDF bytes (no object
+// storage). Mirrors the indexer's "summarize, don't embed" approach.
+export type RepoGuidanceItem = {
+  id: string;
+  kind: "video" | "doc" | "pdf";
+  title: string;                 // filename (PDF) or URL host / page title (link)
+  url?: string;                  // video & doc links (absent for PDFs)
+  status: "indexing" | "ready" | "errored";
+  summary?: string;              // distilled guidance text injected into reviews
+  error?: string | null;
+  addedAt: number;
+  indexedAt?: number;
+  addedBy?: string;              // githubLogin, for display
 };
 
 export type RepoIndexState =

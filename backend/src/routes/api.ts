@@ -1,12 +1,12 @@
 // REST API for the frontend.
-import { Router } from "express";
+import express, { Router } from "express";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
-import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import type { RepoGuidanceItem, Repository, User } from "../types.js";
+import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
-import type { User } from "../types.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
@@ -465,6 +465,154 @@ api.put("/repositories/:id/workflow", (req, res) => {
   }
   db.update("repositories", (r) => r.id === repo.id, { workflow: next });
   res.json({ ok: true, workflow: next });
+});
+
+// --- Per-repo guidance materials (Workflow "Ingest context" node) ---
+//
+// Maintainer-attached videos, doc links and uploaded PDFs that steer every
+// review on the repo. Each add distils the material once (review/guidance.ts);
+// we store only the distilled text, never raw PDF bytes. Owner-scoped; mutations
+// are Pro/Max (gated like custom prompts / advanced workflow controls).
+
+const MAX_GUIDANCE_ITEMS = 20;
+const MAX_PDF_BYTES = 15 * 1024 * 1024; // 15 MB
+
+// Resolve an owner-scoped repo for a guidance request. On any failure it writes
+// the response and returns null, so callers just early-return.
+function ownedRepo(req: Request, res: Response): { repo: Repository; user: User } | null {
+  const user = getSessionUser(req);
+  if (!user) {
+    res.status(401).json({ error: "not_signed_in" });
+    return null;
+  }
+  const repo = db.find("repositories", (r) => r.id === req.params.id);
+  if (!repo) {
+    res.status(404).json({ error: "repo_not_found" });
+    return null;
+  }
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  if (!installs.some((i) => i.id === repo.installationId)) {
+    res.status(403).json({ error: "forbidden" });
+    return null;
+  }
+  return { repo, user };
+}
+
+// Pro/Max backstop for guidance mutations (the UI also locks the controls).
+function guidanceLocked(user: User): boolean {
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  return effectivePlan(sub) === "free";
+}
+
+// Friendly display title from a link's host + last path segment.
+function guidanceTitleFromUrl(url: string): string {
+  try {
+    const u = new URL(url);
+    const seg = u.pathname.split("/").filter(Boolean).pop();
+    return seg ? `${u.hostname}/${decodeURIComponent(seg)}`.slice(0, 120) : u.hostname;
+  } catch {
+    return url.slice(0, 120);
+  }
+}
+
+// List a repo's guidance materials. Owner-scoped (read is not plan-gated, so a
+// downgraded user can still see/manage what they added).
+api.get("/repositories/:id/guidance", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  res.json({ items: ctx.repo.guidance ?? [] });
+});
+
+// Add a video or documentation link. Distils immediately via the queue.
+api.post("/repositories/:id/guidance", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  if (guidanceLocked(ctx.user)) return void res.status(403).json({ error: "upgrade_required" });
+
+  const kind = req.body?.kind;
+  const url = typeof req.body?.url === "string" ? req.body.url.trim() : "";
+  if (kind !== "video" && kind !== "doc") return void res.status(400).json({ error: "invalid_kind" });
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return void res.status(400).json({ error: "invalid_url" });
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return void res.status(400).json({ error: "invalid_url" });
+  }
+  const existing = ctx.repo.guidance ?? [];
+  if (existing.length >= MAX_GUIDANCE_ITEMS) return void res.status(400).json({ error: "too_many_items" });
+
+  const item: RepoGuidanceItem = {
+    id: uuid(),
+    kind,
+    title: guidanceTitleFromUrl(url),
+    url,
+    status: "indexing",
+    addedAt: Date.now(),
+    addedBy: ctx.user.githubLogin,
+    error: null,
+  };
+  db.update("repositories", (r) => r.id === ctx.repo.id, { guidance: [...existing, item] });
+  enqueueGuidanceIngest({ repoId: ctx.repo.id, itemId: item.id });
+  track(ctx.user, "guidance added", { kind, repo: `${ctx.repo.owner}/${ctx.repo.name}` });
+  res.json({ ok: true, item });
+});
+
+// Upload a PDF directly. Sent as a raw `application/pdf` body (the global
+// express.json parser passes it through on content-type mismatch), so this
+// route-scoped raw parser can take a larger limit than the 1mb global one.
+api.post(
+  "/repositories/:id/guidance/pdf",
+  express.raw({ type: "application/pdf", limit: "20mb" }),
+  (req, res) => {
+    const ctx = ownedRepo(req, res);
+    if (!ctx) return;
+    if (guidanceLocked(ctx.user)) return void res.status(403).json({ error: "upgrade_required" });
+
+    const buf: Buffer = Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0);
+    if (buf.length === 0) return void res.status(400).json({ error: "data_required" });
+    if (buf.length > MAX_PDF_BYTES) return void res.status(413).json({ error: "file_too_large" });
+    if (buf.toString("latin1", 0, 5) !== "%PDF-") return void res.status(400).json({ error: "not_a_pdf" });
+
+    const existing = ctx.repo.guidance ?? [];
+    if (existing.length >= MAX_GUIDANCE_ITEMS) return void res.status(400).json({ error: "too_many_items" });
+
+    const rawName = typeof req.query.filename === "string" ? req.query.filename : "";
+    const item: RepoGuidanceItem = {
+      id: uuid(),
+      kind: "pdf",
+      title: (rawName || "document.pdf").slice(0, 120),
+      status: "indexing",
+      addedAt: Date.now(),
+      addedBy: ctx.user.githubLogin,
+      error: null,
+    };
+    db.update("repositories", (r) => r.id === ctx.repo.id, { guidance: [...existing, item] });
+    // Bytes ride along on the in-memory job; we never persist them to the DB.
+    enqueueGuidanceIngest({
+      repoId: ctx.repo.id,
+      itemId: item.id,
+      pdfBase64: buf.toString("base64"),
+      pdfMediaType: "application/pdf",
+    });
+    track(ctx.user, "guidance added", { kind: "pdf", repo: `${ctx.repo.owner}/${ctx.repo.name}` });
+    res.json({ ok: true, item });
+  }
+);
+
+// Remove a guidance material. Not plan-gated, so a downgraded user can clean up.
+api.delete("/repositories/:id/guidance/:itemId", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const existing = ctx.repo.guidance ?? [];
+  const item = existing.find((g) => g.id === req.params.itemId);
+  if (!item) return void res.status(404).json({ error: "item_not_found" });
+  db.update("repositories", (r) => r.id === ctx.repo.id, {
+    guidance: existing.filter((g) => g.id !== item.id),
+  });
+  res.json({ ok: true });
 });
 
 // List the repo's GitHub Actions workflows — populates the "Run GitHub Action"
