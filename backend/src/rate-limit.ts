@@ -4,14 +4,10 @@
 // especially any route that kicks off an LLM job — and run Anthropic/Gemini
 // spend up at will. These buckets put a ceiling on that.
 //
-// Accuracy caveat: server.ts sets `trust proxy: true` (required so Render's
-// TLS-terminating proxy is believed about https — see the comment there). That
-// also means req.ip is read from the client-supplied X-Forwarded-For and can be
-// spoofed to dodge a per-IP limit. So these limiters stop naive floods, not a
-// determined attacker rotating XFF; the durable fix is pinning the proxy hop
-// count, which we avoid here so as not to disturb secure-cookie detection. We
-// disable express-rate-limit's own permissive-trust-proxy warning, having
-// acknowledged the trade-off, to keep the logs clean.
+// Keying: server.ts pins `trust proxy` to 1 hop, so req.ip resolves to the
+// address Render appended (the real client) rather than a client-supplied
+// X-Forwarded-For value — the per-IP buckets below can't be sidestepped by
+// spoofing that header.
 //
 // Note: the default MemoryStore is per-process. On a single Render instance
 // that's the whole picture; if the API is ever scaled out, each instance keeps
@@ -22,9 +18,6 @@ import rateLimit, { type Options } from "express-rate-limit";
 const shared: Partial<Options> = {
   standardHeaders: "draft-7",
   legacyHeaders: false,
-  // We knowingly run behind a permissive `trust proxy` (see above); silence the
-  // library's warning rather than have it fire on every boot.
-  validate: { trustProxy: false },
   message: { error: "rate_limited" },
 };
 
@@ -37,9 +30,19 @@ export const globalLimiter = rateLimit({
   ...shared,
   windowMs: 60_000,
   limit: 600,
-  // Never throttle health/uptime probes: Render (and any external monitor) hits
-  // these far more often than a human would and must not get locked out.
-  skip: (req) => req.path === "/api/health" || req.path === "/health",
+  // Skip health/uptime probes and the webhook receivers.
+  //   · Health: Render (and any external monitor) hits these far more often than
+  //     a human would and must never be locked out.
+  //   · Webhooks: GitHub/Stripe/Linear deliver from a small pool of shared egress
+  //     IPs, so a per-IP cap would start dropping legitimate events as traffic
+  //     grows. They're HMAC-gated, so an unauthenticated flood fails signature
+  //     verification before it can enqueue any LLM work — the cost we actually
+  //     care about. (The residual exposure is CPU on the HMAC check + the raw
+  //     body parse, both bounded by the 5mb body limit set in server.ts.)
+  skip: (req) =>
+    req.path === "/api/health" ||
+    req.path === "/health" ||
+    req.path.startsWith("/api/webhooks/"),
 });
 
 // Auth handshakes: OAuth start + callback and sign-out. Unauthenticated entry

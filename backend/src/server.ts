@@ -40,10 +40,18 @@ if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
 const app = express();
 
 // Render (and most PaaS) terminate TLS at a proxy and forward over http with
-// X-Forwarded-* headers. Trusting the proxy makes req.protocol/req.secure report
-// https, so the OAuth redirect_uri is built as https and Secure cookies are
-// emitted correctly.
-app.set("trust proxy", true);
+// X-Forwarded-* headers. Trusting the first hop makes req.protocol report https
+// (from X-Forwarded-Proto), so the OAuth redirect_uri is built as https.
+//
+// Pinned to exactly 1 hop — NOT `true`. `true` trusts the whole X-Forwarded-For
+// chain and takes its leftmost (client-supplied) entry as req.ip, which an
+// attacker can forge to dodge the per-IP rate limiters. With a fixed hop count
+// Express resolves req.ip from the address Render actually appended, which the
+// client can't control. This doesn't affect https detection (the immediate hop
+// is still trusted, so X-Forwarded-Proto is still honoured) or Secure cookies
+// (those key off config.secureCookies, not req). Assumes a single proxy hop in
+// front of the app, which is Render's standard web-service topology.
+app.set("trust proxy", 1);
 
 // Security headers on every response (HSTS, nosniff, frameguard, referrer
 // policy, …). Two deviations from helmet's defaults, both because this is a

@@ -1005,7 +1005,7 @@ export function removeTaskAttachmentHandler(req: Request, res: Response) {
   }
   res.json({ ok: true, removed });
 }
-api.delete("/tasks/:taskId/attachments/:attachmentId", removeTaskAttachmentHandler);
+api.delete("/tasks/:taskId/attachments/:attachmentId", expensiveLimiter, removeTaskAttachmentHandler);
 
 // --- Integrations ---
 
