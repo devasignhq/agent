@@ -63,7 +63,24 @@ export type LinearIngestJob = {
   attempts: number;
 };
 
-export type Job = ReviewJob | MaintainerFeedbackJob | IndexJob | LinearIngestJob;
+// Distill a maintainer-attached guidance material (video/doc link or uploaded
+// PDF) into review guidelines, immediately on add. Drains in the index bucket
+// alongside repo indexing. For PDFs the base64 rides along on the payload —
+// the in-memory queue holds the bytes so we never persist them to the DB.
+export type GuidanceIngestJob = {
+  id: string;
+  type: "guidance_ingest";
+  payload: { repoId: string; itemId: string; pdfBase64?: string; pdfMediaType?: string };
+  enqueuedAt: number;
+  attempts: number;
+};
+
+export type Job =
+  | ReviewJob
+  | MaintainerFeedbackJob
+  | IndexJob
+  | LinearIngestJob
+  | GuidanceIngestJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -122,6 +139,21 @@ export function enqueueIndex(payload: IndexJobPayload): IndexJob {
   const job: IndexJob = {
     id: uuid(),
     type: "index",
+    payload,
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.index.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueGuidanceIngest(
+  payload: GuidanceIngestJob["payload"]
+): GuidanceIngestJob {
+  const job: GuidanceIngestJob = {
+    id: uuid(),
+    type: "guidance_ingest",
     payload,
     enqueuedAt: Date.now(),
     attempts: 0,
