@@ -22,9 +22,20 @@ export type User = {
 
 export type Installation = {
   id: string;
+  // The original installer / primary owner. Kept for back-compat and to identify
+  // who first set the App up (drives the "shared org install" banner). May be ""
+  // when the install webhook landed before the installer signed in.
   userId: string;
+  // All DevAsign users linked to this installation: the personal owner, or the
+  // org owners/admins who adopted it at signup, plus anyone who explicitly linked
+  // it. Optional so rows written before this existed still load — read via
+  // installMembers() (github/installations.ts), which falls back to [userId].
+  userIds?: string[];
   accountId: number;
   accountLogin: string;
+  // GitHub account kind behind the install. Drives org-only logic (owner-adoption,
+  // the shared-install banner). Optional/backfilled lazily on reconcile/link.
+  accountType?: "User" | "Organization";
   installationId: number;
   repoIds: number[];
 };
@@ -247,6 +258,11 @@ export type PRReview = {
   // now broken" callout in the GitHub comment and the in-app timeline. Empty/
   // absent on a clean run.
   regressedCriteriaIds?: string[];
+  // The single DevAsign user this review's monthly quota counts against — the PR
+  // author for auto-reviews, or the member who commented to trigger it. Resolved
+  // via attributedUserFor() (github/installations.ts). Optional/null on rows
+  // written before per-user attribution, and when no member could be attributed.
+  attributedUserId?: string | null;
   createdAt: number;
   updatedAt: number;
 };

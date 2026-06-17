@@ -6,6 +6,7 @@ import { v4 as uuid } from "uuid";
 import { config, isGithubOAuthConfigured, isStripeConfigured } from "../config.js";
 import { db } from "../db.js";
 import type { User } from "../types.js";
+import { addInstallMember } from "./installations.js";
 import { isDeletionPending, restoreAccount } from "../account.js";
 import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
 import { track } from "../statsig.js";
@@ -295,6 +296,16 @@ export async function finishOAuth(req: Request, res: Response) {
     }
   }
 
+  // Adopt installations this user can access: their personal account, and any org
+  // where they're an owner/admin — so an org install set up by another owner shows
+  // up on their account automatically. Uses the OAuth token (not persisted), which
+  // is only in scope here. Best-effort: never block sign-in.
+  try {
+    await adoptUserInstallations(user, tokenBody.access_token);
+  } catch (err) {
+    console.warn(`[oauth] install adoption failed for user ${user.id}:`, err);
+  }
+
   if (isNewUser) {
     track(user, "user signed up", { github_login: user.githubLogin });
   } else if (restored) {
@@ -321,6 +332,84 @@ export async function finishOAuth(req: Request, res: Response) {
   // welcome_back=1 lets a top-level restore show the pop-up; the durable signal
   // for the popup-login path is the welcomeBack flag on /api/me.
   res.redirect(`${config.webOrigin}/?auth=ok${restored ? "&welcome_back=1" : ""}`);
+}
+
+// GitHub API call with the user-to-server OAuth token. Returns the parsed JSON,
+// or null on any non-2xx / network error (callers degrade gracefully).
+async function ghUser<T>(accessToken: string, path: string): Promise<T | null> {
+  try {
+    const resp = await fetch(`https://api.github.com${path}`, {
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "devasign-app",
+      },
+    });
+    if (!resp.ok) {
+      // 404 on a membership check just means "not an admin / not visible" — quiet.
+      if (resp.status !== 404) console.warn(`[oauth] GET ${path} → ${resp.status}`);
+      return null;
+    }
+    return (await resp.json()) as T;
+  } catch (err) {
+    console.warn(`[oauth] GET ${path} failed:`, err);
+    return null;
+  }
+}
+
+// Is `user` an active owner/admin of `org`? Owners adopt org installs at signup.
+async function isOrgAdmin(accessToken: string, org: string): Promise<boolean> {
+  const m = await ghUser<{ state?: string; role?: string }>(
+    accessToken,
+    `/user/memberships/orgs/${encodeURIComponent(org)}`
+  );
+  return !!m && m.state === "active" && m.role === "admin";
+}
+
+// Link the signed-in user to every installation they can access: their personal
+// account, plus any org where they're an owner/admin. Adding to the membership
+// set (addInstallMember) never displaces the original installer. Repos are
+// materialized lazily by the next /api/installations reconcile, so this stays a
+// few quick API calls and keeps sign-in fast.
+async function adoptUserInstallations(user: User, accessToken: string): Promise<void> {
+  const body = await ghUser<{ installations?: any[] }>(
+    accessToken,
+    "/user/installations?per_page=100"
+  );
+  const installs = body?.installations || [];
+  for (const inst of installs) {
+    const account = inst.account || {};
+    const accountType: "User" | "Organization" =
+      account.type === "Organization" ? "Organization" : "User";
+
+    let eligible = false;
+    if (accountType === "User") {
+      eligible = account.id === user.githubId; // their own personal account
+    } else if (account.login) {
+      eligible = await isOrgAdmin(accessToken, account.login); // org owner/admin only
+    }
+    if (!eligible) continue;
+
+    const row = db.find("installations", (i) => i.installationId === inst.id);
+    if (!row) {
+      db.insert("installations", {
+        id: uuid(),
+        userId: user.id,
+        userIds: [user.id],
+        accountId: account.id,
+        accountLogin: account.login,
+        accountType,
+        installationId: inst.id,
+        repoIds: [],
+      });
+    } else {
+      if (row.accountType !== accountType) {
+        db.update("installations", (i) => i.id === row.id, { accountType });
+      }
+      addInstallMember(row.id, user.id);
+    }
+  }
 }
 
 export function getSessionUser(req: Request): User | null {

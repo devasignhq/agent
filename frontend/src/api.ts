@@ -418,10 +418,10 @@ export const api = {
 
   // billing
   subscription: () => request<SubscriptionView>("/api/billing/subscription"),
-  checkout: (plan: "pro" | "max", interval: Interval = "month") =>
+  checkout: (plan: "pro" | "max", interval: Interval = "month", opts?: { onboarding?: boolean }) =>
     request<{ url: string }>("/api/billing/checkout", {
       method: "POST",
-      body: JSON.stringify({ plan, interval }),
+      body: JSON.stringify({ plan, interval, onboarding: Boolean(opts?.onboarding) }),
     }),
   portal: (opts?: { cancel?: boolean }) =>
     request<{ url: string }>("/api/billing/portal", {

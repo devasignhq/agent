@@ -6,6 +6,7 @@ import { v4 as uuid } from "uuid";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
+import { addInstallMember, attributedUserFor } from "./installations.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { triggerOutcome } from "../review/decisions.js";
@@ -419,7 +420,10 @@ function findPRReview(repoFullName: string | undefined, prNumber: number | undef
 async function ensurePRReview(
   repoFullName: string,
   prNumber: number | undefined,
-  ghInstallationId: number | undefined
+  ghInstallationId: number | undefined,
+  // GitHub id of whoever triggered this (comment / review author). The review is
+  // counted against them when they're a DevAsign install-member.
+  triggerActorGithubId?: number
 ) {
   const existing = findPRReview(repoFullName, prNumber);
   if (existing) return existing;
@@ -470,13 +474,36 @@ async function ensurePRReview(
   const inserted = findPRReview(repoFullName, prNumber);
   if (inserted) return inserted;
 
-  // Monthly-cap gate for a PR surfaced by a maintainer comment — this path
-  // skips the `opened` webhook's cap check. Charge once per unique PR; an
-  // over-cap owner's new PR is dropped rather than reviewed past their limit.
-  // (The private-repo gate is enforced centrally in runReviewJob.)
-  const ownerUserId =
-    db.find("installations", (i) => i.id === repo.installationId)?.userId || "";
-  const cap = chargeForNewPRReview(ownerUserId, repo, prNumber);
+  // Attribute this comment-triggered review to the commenter (when they're a
+  // DevAsign install-member). A linked install enforces attribution; an unlinked
+  // install keeps the onboarding grace window — review now, attribute nobody.
+  const install = db.find("installations", (i) => i.id === repo.installationId);
+  const ownerUserId = install?.userId || "";
+  const attributedUserId = attributedUserFor(install, triggerActorGithubId);
+  if (ownerUserId) {
+    // If the commenter isn't a DevAsign install-member — an outside collaborator,
+    // or a member who never adopted the install — there's no quota to count it
+    // against, so we don't materialize a review.
+    if (!attributedUserId) {
+      console.log(
+        `[webhook] ensurePRReview: ${repoFullName}#${prNumber} skipped — trigger actor isn't an install-member`
+      );
+      return null;
+    }
+    // Private-repo gate on the commenter's plan: a free member can't review
+    // private repos, so don't even queue the row. (runReviewJob also enforces.)
+    if (repo.private && !PLAN_LIMITS[planForUser(attributedUserId)].privateRepos) {
+      console.log(
+        `[webhook] ensurePRReview: ${repoFullName}#${prNumber} skipped — private repo not on commenter's plan`
+      );
+      return null;
+    }
+  }
+  // Monthly-cap gate for a PR surfaced by a maintainer comment — this path skips
+  // the `opened` webhook's cap check. Charge once per unique PR to the commenter
+  // (or nobody during the grace window); an over-cap member's new PR is dropped
+  // rather than reviewed past their limit.
+  const cap = chargeForNewPRReview(attributedUserId || ownerUserId, repo, prNumber);
   if (cap && !cap.allowed) {
     console.log(
       `[webhook] ensurePRReview: ${repoFullName}#${prNumber} skipped — monthly review cap reached`
@@ -498,6 +525,7 @@ async function ensurePRReview(
     additions: typeof pr.additions === "number" ? pr.additions : null,
     deletions: typeof pr.deletions === "number" ? pr.deletions : null,
     changedFiles: typeof pr.changed_files === "number" ? pr.changed_files : null,
+    attributedUserId,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
@@ -537,8 +565,12 @@ function handleInstallation(event: any) {
     const install = {
       id: uuid(),
       userId: owner?.id || "",
+      userIds: owner ? [owner.id] : [],
       accountId: event.installation.account.id,
       accountLogin: event.installation.account.login,
+      accountType: (event.installation.account.type === "Organization"
+        ? "Organization"
+        : "User") as "User" | "Organization",
       installationId: event.installation.id,
       repoIds: (event.repositories || []).map((r: any) => r.id),
     };
@@ -602,9 +634,11 @@ function handleInstallationRepos(event: any) {
     (i) => i.id === install.id,
     {
       repoIds: [...install.repoIds.filter((id) => !removedIds.has(id)), ...added],
-      ...(claimedUserId ? { userId: claimedUserId } : {}),
     }
   );
+  // Claim a still-unlinked install for whoever triggered this event — adds them
+  // to the membership set (and sets the primary userId, since it was empty).
+  if (claimedUserId) addInstallMember(install.id, claimedUserId);
   // Same as on initial install: materialise Repository rows for the newly
   // granted repos so the UI can show them right away.
   for (const r of event.repositories_added || []) {
@@ -795,9 +829,17 @@ function handlePullRequest(event: any) {
   // Resolve the owning user's effective plan. An unlinked install (webhook
   // landed before onboarding linked it) has no userId — skip gating there
   // rather than risk false-blocking a paying user; gates apply once linked.
-  const ownerUserId =
-    db.find("installations", (i) => i.id === repo!.installationId)?.userId || "";
-  const plan = ownerUserId ? planForUser(ownerUserId) : null;
+  const install = db.find("installations", (i) => i.id === repo!.installationId);
+  const ownerUserId = install?.userId || "";
+  // The DevAsign user this review counts against: the PR author, when they're an
+  // install-member (org owner / personal owner). External contributors and org
+  // members who never adopted the install resolve to null — handled at the
+  // insert path below (we don't auto-review those).
+  const attributedUserId = attributedUserFor(install, pullReq.user?.id);
+  // Gating plan: the attributed user's, falling back to the install owner for
+  // re-pushes whose author is no longer a resolvable member.
+  const gateUserId = attributedUserId || ownerUserId;
+  const plan = gateUserId ? planForUser(gateUserId) : null;
   // Only nudge the author on a fresh open/reopen, so re-pushes never re-comment.
   const notifiable = event.action === "opened" || event.action === "reopened";
 
@@ -999,13 +1041,14 @@ function handlePullRequest(event: any) {
     additions: typeof pullReq.additions === "number" ? pullReq.additions : null,
     deletions: typeof pullReq.deletions === "number" ? pullReq.deletions : null,
     changedFiles: typeof pullReq.changed_files === "number" ? pullReq.changed_files : null,
+    attributedUserId,
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
   db.insert("prReviews", review);
   enqueueReview(review.id);
-  if (ownerUserId) {
-    track(ownerUserId, "pr review queued", {
+  if (chargeUserId) {
+    track(chargeUserId, "pr review queued", {
       repo: `${repo.owner}/${repo.name}`,
       pr_number: pullReq.number,
       is_private: repo.private,
