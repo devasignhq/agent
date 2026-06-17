@@ -18,7 +18,10 @@ import {
 import { track } from "../statsig.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
-  if (!config.github.webhookSecret) return true; // dev mode: skip verification
+  // No secret ⇒ skip verification. The boot guard in server.ts refuses to start
+  // in production (https WEB_ORIGIN) without GITHUB_APP_WEBHOOK_SECRET, so this
+  // permissive branch is reachable only in local dev.
+  if (!config.github.webhookSecret) return true;
   if (!signature) return false;
   const expected =
     "sha256=" +

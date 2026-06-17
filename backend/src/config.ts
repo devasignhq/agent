@@ -113,6 +113,11 @@ export const isGithubOAuthConfigured = () =>
   Boolean(config.github.oauthClientId && config.github.oauthClientSecret);
 export const isGithubAppConfigured = () =>
   Boolean(config.github.appId && config.github.privateKey);
+// Inbound GitHub webhooks are HMAC-signed with this secret; without it the
+// receiver can't verify signatures and falls open. Enforced at boot (refuse in
+// prod, warn in dev) in server.ts — separate from App config above, which is
+// about the *outbound* App credentials.
+export const isGithubWebhookConfigured = () => Boolean(config.github.webhookSecret);
 export const isLinearOAuthConfigured = () =>
   Boolean(config.linear.oauthClientId && config.linear.oauthClientSecret);
 export const isLinearWebhookConfigured = () => Boolean(config.linear.webhookSigningSecret);

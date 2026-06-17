@@ -7,6 +7,7 @@ import {
   config,
   isDiscordEnvConfigured,
   isGithubAppConfigured,
+  isGithubWebhookConfigured,
   isLLMLive,
   isSlackEnvConfigured,
   isStatsigConfigured,
@@ -32,6 +33,26 @@ if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
   throw new Error(
     "SESSION_SECRET must be set to a real secret in production (WEB_ORIGIN is https). " +
       "Refusing to boot with the 'dev-secret-replace-me' placeholder."
+  );
+}
+
+// GitHub signs every webhook with GITHUB_APP_WEBHOOK_SECRET, and the receiver
+// verifies that HMAC before trusting an event (github/webhooks.ts). With no
+// secret the receiver — and the catch-all POST / it shares a handler with —
+// would accept forged, unsigned installs/PR events from anyone. Same prod
+// signal as the session guard above (https WEB_ORIGIN): refuse to boot rather
+// than run wide open. In local dev (http) we only warn — verification is off,
+// which is fine offline but must never reach prod.
+if (config.secureCookies && !isGithubWebhookConfigured()) {
+  throw new Error(
+    "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https). " +
+      "Refusing to boot: without it the GitHub webhook receiver would accept forged, unsigned events."
+  );
+}
+if (!config.secureCookies && !isGithubWebhookConfigured()) {
+  console.warn(
+    "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset — GitHub webhook signature " +
+      "verification is DISABLED. Fine for local dev; never run production this way."
   );
 }
 
@@ -132,7 +153,8 @@ const port = config.port;
 app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
   console.log(`  · LLM:        ${isLLMLive() ? "live (Anthropic)" : "mock"}`);
-  console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing — webhook will still receive"}`);
+  console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing (outbound App credentials unset)"}`);
+  console.log(`  · Webhook:    ${isGithubWebhookConfigured() ? "signature verified (HMAC)" : "UNVERIFIED — no secret (dev only)"}`);
   console.log(`  · Slack:      ${isSlackEnvConfigured() ? `env fallback → ${config.integrations.slackBotChannel}` : "per-user only"}`);
   console.log(`  · Discord:    ${isDiscordEnvConfigured() ? `env fallback → ${config.integrations.discordBotChannelId}` : "per-user only"}`);
   console.log(`  · Statsig:    ${isStatsigConfigured() ? `live (${config.statsig.environment})` : "disabled (no key)"}`);
