@@ -524,7 +524,7 @@ api.get("/repositories/:id/guidance", (req, res) => {
 });
 
 // Add a video or documentation link. Distils immediately via the queue.
-api.post("/repositories/:id/guidance", (req, res) => {
+api.post("/repositories/:id/guidance", expensiveLimiter, (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   if (guidanceLocked(ctx.user)) return void res.status(403).json({ error: "upgrade_required" });
@@ -565,6 +565,9 @@ api.post("/repositories/:id/guidance", (req, res) => {
 // route-scoped raw parser can take a larger limit than the 1mb global one.
 api.post(
   "/repositories/:id/guidance/pdf",
+  // Throttle before the 20mb raw parser so a flood is rejected without us
+  // buffering the body.
+  expensiveLimiter,
   express.raw({ type: "application/pdf", limit: "20mb" }),
   (req, res) => {
     const ctx = ownedRepo(req, res);
