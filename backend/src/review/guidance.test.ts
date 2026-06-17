@@ -85,3 +85,39 @@ test("buildGuidanceSection is empty when nothing is ready", () => {
   const repoId = seedRepo([{ ...item("video", "https://youtube.com/x"), status: "indexing" }]);
   assert.equal(buildGuidanceSection(repoOf(repoId)), "");
 });
+
+// A public host that 3xx-redirects to a private/metadata address must NOT be
+// followed (the SSRF guard re-validates every hop). The start is a public IP
+// literal so assertPublicUrl needs no DNS; fetch is stubbed to redirect.
+test("doc redirecting to a metadata/private address is blocked", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response(null, { status: 302, headers: { location: "http://169.254.169.254/latest/meta-data/" } })) as any;
+  try {
+    const d = item("doc", "http://93.184.216.34/"); // public IP literal
+    const repoId = seedRepo([d]);
+    await runGuidanceIngestJob({ repoId, itemId: d.id });
+    const after = itemOf(repoId, d.id);
+    assert.equal(after.status, "errored");
+    assert.match(after.error || "", /private/i);
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});
+
+test("doc returning 200 still indexes to ready (manual redirect handling)", async () => {
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = (async () =>
+    new Response("<html><body><h1>Style</h1><p>- Use camelCase for exports.</p></body></html>", {
+      status: 200,
+      headers: { "content-type": "text/html" },
+    })) as any;
+  try {
+    const d = item("doc", "http://93.184.216.34/");
+    const repoId = seedRepo([d]);
+    await runGuidanceIngestJob({ repoId, itemId: d.id });
+    assert.equal(itemOf(repoId, d.id).status, "ready");
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+});

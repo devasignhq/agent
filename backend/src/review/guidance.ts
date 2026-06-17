@@ -22,6 +22,7 @@ import {
 // small; anything past this is almost certainly not a guidance doc.
 const MAX_DOC_BYTES = 10 * 1024 * 1024; // 10 MB
 const FETCH_TIMEOUT_MS = 15_000;
+const MAX_REDIRECTS = 5;
 
 // Run by the worker on a `guidance_ingest` job. Distils the material, then flips
 // the item to ready/errored. Best-effort and fully self-contained: any failure
@@ -99,17 +100,12 @@ async function guidanceFromVideo(url: string): Promise<string> {
 
 async function guidanceFromDoc(url: string, title: string): Promise<string> {
   if (!url) throw new Error("missing document URL");
-  await assertPublicUrl(url);
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   let res: Response;
   try {
-    res = await fetch(url, {
-      redirect: "follow",
-      signal: controller.signal,
-      headers: { "User-Agent": "devasign-guidance", Accept: "text/html,application/pdf,text/plain,*/*" },
-    });
+    res = await fetchGuardedPublic(url, controller.signal);
   } finally {
     clearTimeout(timer);
   }
@@ -193,6 +189,39 @@ async function readCappedBytes(res: Response, maxBytes: number): Promise<Buffer>
     }
   }
   return Buffer.concat(chunks);
+}
+
+// Fetch a public URL, re-validating the SSRF guard on every redirect hop.
+// `fetch(redirect:"follow")` would let a public host 3xx to a private/loopback/
+// metadata address (e.g. 169.254.169.254) that fetch follows unchecked, so we
+// follow manually and assertPublicUrl each Location before requesting it.
+//
+// Node's fetch (undici) exposes the real status + Location header under
+// `redirect:"manual"` (unlike browsers, which opaque-filter them), which makes
+// this possible. Note: assertPublicUrl resolves DNS and fetch resolves again,
+// so a sub-second DNS-rebinding TOCTOU window remains per hop — acceptable here
+// (authenticated Pro/Max-only input); closing it fully needs connection pinning.
+async function fetchGuardedPublic(initialUrl: string, signal: AbortSignal): Promise<Response> {
+  let current = initialUrl;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    await assertPublicUrl(current);
+    const res = await fetch(current, {
+      redirect: "manual",
+      signal,
+      headers: { "User-Agent": "devasign-guidance", Accept: "text/html,application/pdf,text/plain,*/*" },
+    });
+    if (res.status >= 300 && res.status < 400 && res.status !== 304) {
+      const loc = res.headers.get("location");
+      if (!loc) throw new Error(`redirect with no location (HTTP ${res.status})`);
+      // Resolve relative redirects against the URL we just requested, then loop
+      // back to re-validate. Drain the redirect body so the socket can close.
+      current = new URL(loc, current).toString();
+      await res.body?.cancel().catch(() => {});
+      continue;
+    }
+    return res;
+  }
+  throw new Error("too many redirects");
 }
 
 // SSRF guard: only fetch public http(s) hosts. Rejects non-http(s) schemes,
