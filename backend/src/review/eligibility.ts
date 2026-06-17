@@ -38,7 +38,9 @@ export function isAccountOwner(
   const u = db.find("users", (x) => x.id === ownerUserId);
   if (!u) return false;
   if (actorId != null && u.githubId != null) return u.githubId === actorId;
-  return !!actorLogin && u.githubLogin.toLowerCase() === actorLogin.toLowerCase();
+  // githubLogin is typed non-null, but the jsonb store doesn't enforce that —
+  // fail closed (return false) rather than throw on a malformed/legacy row.
+  return !!actorLogin && !!u.githubLogin && u.githubLogin.toLowerCase() === actorLogin.toLowerCase();
 }
 
 // Should an opened PR be auto-reviewed (no "review" comment required)?
