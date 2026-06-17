@@ -56,10 +56,10 @@ function prEvent(repo: any, action: string, pr: Record<string, unknown> = {}) {
   };
 }
 
-function deliver(event: any, opts: { guid?: string } = {}) {
+function deliver(event: any, opts: { guid?: string; type?: string } = {}) {
   const raw = Buffer.from(JSON.stringify(event));
   const headers: Record<string, string> = {
-    "X-GitHub-Event": "pull_request",
+    "X-GitHub-Event": opts.type || "pull_request",
     "X-GitHub-Delivery": opts.guid || uuid(),
   };
   if (config.github.webhookSecret) {
@@ -180,4 +180,171 @@ test("a new commit sha on `opened` redelivery updates the row in place", () => {
   assert.equal(rows.length, 1);
   assert.equal(rows[0].headSha, "fff9999");
   assert.equal(rows[0].status, "queued");
+});
+
+// ── Tier-gated triggering ───────────────────────────────────────────────────
+// The unlinked-install tests above seed `installationId: uuid()` (no install
+// row → onboarding grace → review everything). The tests below seed a *linked*
+// account so the who-opened-it gate actually fires.
+
+let linkSeq = 0;
+function seedLinkedRepo(opts: {
+  plan: "free" | "pro" | "max";
+  ownerLogin: string;
+  ownerGithubId?: number | null;
+}) {
+  const userId = uuid();
+  db.insert("users", {
+    id: userId,
+    githubId: opts.ownerGithubId ?? null,
+    githubLogin: opts.ownerLogin,
+    email: `${opts.ownerLogin}@example.com`,
+    plan: opts.plan,
+    createdAt: Date.now(),
+  } as any);
+  db.insert("subscriptions", {
+    id: uuid(),
+    userId,
+    plan: opts.plan,
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    status: opts.plan === "free" ? null : "active",
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    reviewsUsed: 0,
+    usagePeriodStart: Date.now(),
+    pendingPlan: null,
+    scheduleId: null,
+  } as any);
+  const instId = uuid();
+  db.insert("installations", {
+    id: instId,
+    userId,
+    accountId: 1000 + linkSeq,
+    accountLogin: "acme",
+    installationId: 999,
+    repoIds: [],
+  } as any);
+  const repo = db.insert("repositories", {
+    id: uuid(),
+    installationId: instId,
+    owner: "acme",
+    name: `linked-${linkSeq++}`,
+    defaultBranch: "main",
+    private: false,
+    defaultModel: "claude-haiku-4-5-20251001",
+    modelOverrides: {},
+    reviewsEnabled: true,
+    indexState: "none",
+  } as any);
+  return { userId, repo };
+}
+
+function commentEvent(repo: any, opts: {
+  body: string;
+  authorLogin: string;
+  authorId?: number;
+  authorAssociation?: string;
+  prNumber?: number;
+}) {
+  return {
+    action: "created",
+    repository: { full_name: `${repo.owner}/${repo.name}` },
+    installation: { id: 999 },
+    sender: { type: "User", login: opts.authorLogin },
+    issue: {
+      number: opts.prNumber ?? 7,
+      pull_request: { url: `https://api.github.com/repos/${repo.owner}/${repo.name}/pulls/7` },
+    },
+    comment: {
+      body: opts.body,
+      user: { login: opts.authorLogin, id: opts.authorId },
+      author_association: opts.authorAssociation ?? "MEMBER",
+      html_url: `https://github.com/${repo.owner}/${repo.name}/pull/7#issuecomment-1`,
+    },
+  };
+}
+
+test("Free: a PR the owner opened is reviewed; anyone else's is not", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+
+  // Owner-authored → materialized + queued.
+  deliver(prEvent(repo, "opened", { user: { login: "alice", type: "User" } }));
+  assert.equal(rowsFor(repo, 7).length, 1);
+
+  // Someone else's PR on the same repo → no row, no checkout.
+  deliver(prEvent(repo, "opened", { number: 8, user: { login: "bob", type: "User" } }));
+  assert.equal(rowsFor(repo, 8).length, 0);
+});
+
+test("Max: a team member's PR is reviewed; an outsider's is not", () => {
+  const { repo } = seedLinkedRepo({ plan: "max", ownerLogin: "alice" });
+
+  // Org member (author_association MEMBER) → reviewed even though not the owner.
+  deliver(prEvent(repo, "opened", {
+    number: 10,
+    user: { login: "teammate", type: "User" },
+    author_association: "MEMBER",
+  }));
+  assert.equal(rowsFor(repo, 10).length, 1);
+
+  // Outside contributor → not auto-reviewed (awaits a "review" comment).
+  for (const [n, assoc] of [[11, "CONTRIBUTOR"], [12, "NONE"]] as const) {
+    deliver(prEvent(repo, "opened", {
+      number: n,
+      user: { login: "stranger", type: "User" },
+      author_association: assoc,
+    }));
+    assert.equal(rowsFor(repo, n).length, 0, `assoc=${assoc}`);
+  }
+});
+
+test("issue_comment: no review starts unless the owner comments the trigger word", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+
+  // Owner comments something that isn't the trigger → ignored, no checkout.
+  deliver(
+    commentEvent(repo, { body: "looks good", authorLogin: "alice", authorAssociation: "OWNER" }),
+    { type: "issue_comment" }
+  );
+  assert.equal(rowsFor(repo, 7).length, 0);
+
+  // A non-owner maintainer comments the trigger word → still ignored.
+  deliver(
+    commentEvent(repo, { body: "review", authorLogin: "bob", authorAssociation: "MEMBER" }),
+    { type: "issue_comment" }
+  );
+  assert.equal(rowsFor(repo, 7).length, 0);
+});
+
+test("issue_comment: a comment on a PR already under review still enqueues feedback", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+  const review = db.insert("prReviews", {
+    id: uuid(),
+    repoId: repo.id,
+    prNumber: 7,
+    prTitle: "Add widget",
+    headSha: "abc1234",
+    baseSha: "def5678",
+    status: "passed",
+    verdict: "passed",
+    criteria: [],
+    taskId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  } as any);
+
+  const before = queueSnapshot().reviews;
+  deliver(
+    commentEvent(repo, { body: "please also check the error path", authorLogin: "carol", authorAssociation: "COLLABORATOR" }),
+    { type: "issue_comment" }
+  );
+  // Feedback enqueued onto the existing review; the comment is logged.
+  assert.equal(queueSnapshot().reviews, before + 1);
+  assert.equal(rowsFor(repo, 7).length, 1); // no duplicate row
+  const received = db.filter(
+    "reviewLogs",
+    (l) => l.reviewId === review.id && l.action === "comment.received"
+  );
+  assert.equal(received.length, 1);
 });
