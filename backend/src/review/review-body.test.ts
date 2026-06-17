@@ -23,7 +23,7 @@ test("unmet criterion WITH evidence: status + required + why", () => {
     evidence:
       "linkInstallationHandler links the installation without comparing account.id to the caller's githubId.",
   });
-  const body = formatReviewBody("Gate installation claiming on ownership.", [c], [], "");
+  const body = formatReviewBody("Gate installation claiming on ownership.", [c], []);
   assert.match(body, /## Acceptance criteria not met/);
   assert.match(body, /\*\*C1 — Not met\*\*/);
   assert.match(body, /- Required: Personal claims succeed when account\.id/);
@@ -32,7 +32,7 @@ test("unmet criterion WITH evidence: status + required + why", () => {
 });
 
 test("unmet criterion WITHOUT evidence: still gets a status, requirement, and a fallback reason", () => {
-  const body = formatReviewBody("Gate installation claiming on ownership.", [crit()], [], "");
+  const body = formatReviewBody("Gate installation claiming on ownership.", [crit()], []);
   assert.match(body, /\*\*C1 — Not met\*\*/);
   assert.match(body, /- Required: Personal claims succeed/);
   // reasonOrFallback fills the gap so the item is never bare.
@@ -50,7 +50,6 @@ test("regressed criterion: rendered under 'Previously met — now broken' with R
     "Gate installation claiming on ownership.",
     [c],
     [],
-    "",
     EMPTY_HOLISTIC,
     undefined,
     prior
@@ -67,7 +66,6 @@ test("consolidated fix prompt: Required → What's wrong now → How to fix, no-
     "Gate installation claiming on ownership.",
     [c],
     [],
-    "",
     EMPTY_HOLISTIC,
     { prTitle: "Gate installation claiming", repoFullName: "devasign/app" }
   );
@@ -95,7 +93,6 @@ test("consolidated fix prompt: suggestion attaches across criterionId case misma
     "Gate installation claiming on ownership.",
     [c],
     [suggestion],
-    "",
     EMPTY_HOLISTIC,
     { prTitle: "Gate installation claiming", repoFullName: "devasign/app" }
   );
@@ -104,5 +101,18 @@ test("consolidated fix prompt: suggestion attaches across criterionId case misma
   assert.match(body, /Expected behavior:/);
   // ...and the generic fallback is NOT used.
   assert.doesNotMatch(body, /No specific patch was suggested for this criterion/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("clean pass: no trailing prose recap or stray '---' divider after the met-criteria block", () => {
+  // All criteria met, no holistic findings — the body should end at the collapsed
+  // "Show met criteria" block. The old verdict-summary recap (a final `---` + prose
+  // paragraph) is gone; the headline and criteria sections carry the verdict.
+  const met = crit({ met: true, evidence: "the ownership check is present." });
+  const body = formatReviewBody("Gate installation claiming on ownership.", [met], []);
+  assert.match(body, /## All 1 acceptance criteria met/);
+  assert.match(body, /<details><summary>Show met criteria<\/summary>/);
+  assert.doesNotMatch(body, /---/);
+  assert.match(body.trimEnd(), /<\/details>$/);
   assert.doesNotMatch(body, EMOJI);
 });
