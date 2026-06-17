@@ -13,9 +13,10 @@ import { planForUser } from "../billing/plans.js";
 import { track } from "../statsig.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
-// state -> the DevAsign user who started the connect. Binding the userId here
-// (rather than relying on the session cookie surviving the redirect) makes the
-// callback robust even if the browser drops the cookie on the cross-site hop.
+// state -> the DevAsign user who started the connect. The callback both files the
+// integration under this userId AND requires a live session matching it, so a
+// captured state can't be replayed in another (or no) session to link a victim's
+// workspace to the initiator's account — see finishLinearOAuth.
 const pendingState = new Map<string, { userId: string; expiresAt: number }>();
 
 function pruneState() {
@@ -74,15 +75,18 @@ export async function finishLinearOAuth(req: Request, res: Response) {
     res.status(400).send("Invalid OAuth state");
     return;
   }
-  // Defense in depth on top of the server-side userId binding below: if a session
-  // is present, it must be the same user who started the flow. This rejects a
-  // logged-in victim who's been lured to an attacker's callback URL. We only gate
-  // when a session exists — the workspace is attached to entry.userId (the
-  // authenticated initiator captured at start), never the caller — so a dropped
-  // cookie on the cross-site hop still completes, preserving the robustness noted
-  // where pendingState is declared above.
+  // Strict session binding (OAuth account-linking CSRF defense, RFC 6749 §10.12):
+  // the callback must be completed by the same logged-in user who started the
+  // flow. Without this, an attacker could start a connect (state bound to
+  // entry.userId = attacker), then lure a *logged-out* victim to Linear's
+  // authorize URL; the victim's approval yields a code for the victim's
+  // workspace, and a callback that found no session would file that workspace
+  // under the attacker's account — handing the attacker the victim's Linear data.
+  // Requiring a session that equals entry.userId closes both the logged-out and
+  // the wrong-user cases. The session cookie rides the top-level callback
+  // navigation, so this doesn't reject legitimate connects.
   const sessionUser = getSessionUser(req);
-  if (sessionUser && sessionUser.id !== entry.userId) {
+  if (!sessionUser || sessionUser.id !== entry.userId) {
     res.status(403).send("OAuth state mismatch");
     return;
   }

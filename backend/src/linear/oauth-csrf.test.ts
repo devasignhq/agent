@@ -1,11 +1,10 @@
-// Defense-in-depth session binding on the Linear connect callback. The workspace
-// is attached to the user who STARTED the flow (entry.userId, captured from the
-// authenticated session at start), so finishLinearOAuth additionally refuses a
-// caller whose live session belongs to a DIFFERENT user — a logged-in victim
-// lured to an attacker's callback URL. The 403 path returns before any network
-// call, so this runs fully offline. A caller with NO session still completes
-// (attaches to entry.userId), preserving the cross-site-hop robustness documented
-// where pendingState is declared.
+// Strict session binding on the Linear connect callback (OAuth account-linking
+// CSRF defense). finishLinearOAuth requires a live session that equals the user
+// who STARTED the flow (entry.userId), so it rejects both a DIFFERENT logged-in
+// user and a LOGGED-OUT caller — the latter being the attacker-lures-the-victim
+// case, where a no-session callback would otherwise file the victim's workspace
+// under the attacker's account. The 403 paths return before any network call, so
+// this runs fully offline.
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= \
 //     node --import tsx/esm --test src/linear/oauth-csrf.test.ts
 import { test } from "node:test";
@@ -83,6 +82,20 @@ test("finishLinearOAuth: 403 when a DIFFERENT user's session hits the callback",
   // Nothing was attached to either account (returns before any db write).
   assert.ok(!db.find("integrations", (i) => i.userId === starter && i.type === "linear"));
   assert.ok(!db.find("integrations", (i) => i.userId === victim && i.type === "linear"));
+});
+
+test("finishLinearOAuth: 403 when NO session is present (logged-out victim)", async () => {
+  // The attacker-lures-victim case: a valid (code, state) hitting the callback
+  // with no DevAsign session must not link the workspace to entry.userId.
+  const starter = seedProUser();
+  const state = startFor(starter);
+
+  const res = fakeRes();
+  await finishLinearOAuth(req({}, { code: "c", state }), res);
+
+  assert.equal(res.statusCode, 403);
+  assert.equal(res.body, "OAuth state mismatch");
+  assert.ok(!db.find("integrations", (i) => i.userId === starter && i.type === "linear"));
 });
 
 test("finishLinearOAuth: 400 for an unknown state (base guard unchanged)", async () => {
