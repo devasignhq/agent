@@ -1,6 +1,7 @@
 // GitHub OAuth — identifies the human user (separate from the GitHub App which
 // holds repo permissions). See devasign.md §4: "OAuth ≠ GitHub App".
 import type { Request, Response } from "express";
+import jwt from "jsonwebtoken";
 import { v4 as uuid } from "uuid";
 import { config, isGithubOAuthConfigured, isStripeConfigured } from "../config.js";
 import { db } from "../db.js";
@@ -23,6 +24,10 @@ function pruneState() {
 // stays first-party. Locally we're on http://localhost where None/Secure is
 // invalid, so fall back to Lax. Setting and clearing must use identical
 // attributes or the browser won't overwrite the existing cookie.
+// A session lives 7 days. Both the JWT's exp claim and the cookie's maxAge are
+// derived from this one constant so the token and the cookie can't drift apart.
+const SESSION_TTL_SECONDS = 7 * 24 * 60 * 60;
+
 function sessionCookieOptions() {
   const secure = config.secureCookies;
   return {
@@ -30,8 +35,38 @@ function sessionCookieOptions() {
     sameSite: (secure ? "none" : "lax") as "none" | "lax",
     secure,
     path: "/",
-    maxAge: 7 * 24 * 60 * 60 * 1000,
+    maxAge: SESSION_TTL_SECONDS * 1000,
   };
+}
+
+// The session cookie's value is a JWT signed with SESSION_SECRET (HS256). The
+// signature makes it unforgeable, and the exp claim makes expiry tamper-proof —
+// a client can't extend its own session by editing a timestamp the way the old
+// plain `userId:ts` cookie allowed. Exported so the tests and the ephemeral-dev
+// script mint cookies through the same path the server verifies.
+export function signSession(userId: string): string {
+  return jwt.sign({ sub: userId }, config.sessionSecret, {
+    algorithm: "HS256",
+    expiresIn: SESSION_TTL_SECONDS,
+  });
+}
+
+// The user id from a valid, unexpired token, or null. Verifies against the
+// current secret first, then any SESSION_SECRET_PREVIOUS entry, so a secret
+// rotation doesn't drop live sessions. algorithms is pinned to HS256 so a
+// forged `alg: none` (or algorithm-confusion) token can never verify.
+function verifySession(token: string): string | null {
+  for (const secret of [config.sessionSecret, ...config.sessionSecretPrevious]) {
+    try {
+      const { sub } = jwt.verify(token, secret, { algorithms: ["HS256"] }) as {
+        sub?: string;
+      };
+      if (typeof sub === "string" && sub) return sub;
+    } catch {
+      // wrong/old secret, or an expired or forged token — try the next secret
+    }
+  }
+  return null;
 }
 
 export function startOAuth(req: Request, res: Response) {
@@ -183,15 +218,29 @@ export async function finishOAuth(req: Request, res: Response) {
       pendingPlan: null,
       scheduleId: null,
     });
-  } else if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
-    // Backfill returning users whose stored email is stale/noreply — but never
-    // downgrade a good address to a noreply fallback (isRealEmail guards that),
-    // and never duplicate an address another account already holds.
-    if (emailTakenByOther(resolvedEmail, user.id)) {
-      console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
-    } else {
-      user = db.update("users", (u) => u.id === user!.id, { email: resolvedEmail }) ?? user;
-      await syncStripeEmail(user);
+  } else {
+    // Returning user: refresh fields that drift on GitHub's side. Batch into one
+    // update so we only touch Stripe when the email actually changed.
+    const updates: Partial<User> = {};
+    if (isRealEmail(resolvedEmail) && resolvedEmail !== user.email) {
+      // Backfill stale/noreply emails — but never downgrade a good address to a
+      // noreply fallback (isRealEmail guards that), and never duplicate an
+      // address another account already holds.
+      if (emailTakenByOther(resolvedEmail, user.id)) {
+        console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
+      } else {
+        updates.email = resolvedEmail;
+      }
+    }
+    // Keep githubLogin fresh — a GitHub rename would otherwise leave it
+    // permanently stale, which breaks org-membership checks that look the user
+    // up by login (see authorizeInstallationClaim).
+    if (me.login && me.login !== user.githubLogin) {
+      updates.githubLogin = me.login;
+    }
+    if (Object.keys(updates).length > 0) {
+      user = db.update("users", (u) => u.id === user!.id, updates) ?? user;
+      if (updates.email) await syncStripeEmail(user);
     }
   }
 
@@ -235,8 +284,9 @@ export async function finishOAuth(req: Request, res: Response) {
     meta: { via: "github_oauth" },
   });
 
-  // Trivial session cookie (signed in dev; replace with real session store in prod)
-  const session = Buffer.from(`${user.id}:${Date.now()}`).toString("base64url");
+  // Session cookie: a JWT signed with SESSION_SECRET (HS256), unforgeable and
+  // self-expiring — see signSession/verifySession above.
+  const session = signSession(user.id);
   res.cookie("devasign_session", session, sessionCookieOptions());
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
@@ -249,12 +299,9 @@ export async function finishOAuth(req: Request, res: Response) {
 export function getSessionUser(req: Request): User | null {
   const raw = req.cookies?.devasign_session;
   if (!raw) return null;
-  try {
-    const [userId] = Buffer.from(raw, "base64url").toString("utf8").split(":");
-    return db.find("users", (u) => u.id === userId);
-  } catch {
-    return null;
-  }
+  const userId = verifySession(raw);
+  if (!userId) return null;
+  return db.find("users", (u) => u.id === userId);
 }
 
 // Clear the session cookie. clearCookie only overwrites the cookie when

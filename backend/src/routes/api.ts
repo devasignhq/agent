@@ -6,7 +6,8 @@ import { db, dbHealth } from "../db.js";
 import type { RepoGuidanceItem, Repository, User } from "../types.js";
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
-import { appJWT, gh } from "../github/app.js";
+import { appJWT, gh, getOrgMembership } from "../github/app.js";
+import type { User } from "../types.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
@@ -226,36 +227,95 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
   );
 }
 
+// Authorize a claim of `account`'s installation by `user`. Personal installs
+// require the account to *be* the user (account.id === their GitHub id); org
+// installs require an active org membership that resolves back to the user's
+// GitHub id (so a since-changed login now belonging to someone else can't
+// pass). `fetchMembership` is injected so this is unit-testable without network.
+// Anything we can't positively verify returns false (→ 403).
+export async function authorizeInstallationClaim(
+  user: User,
+  account: { id?: number; login?: string; type?: string } | null | undefined,
+  fetchMembership: (
+    org: string,
+    username: string
+  ) => Promise<{ state: string; role: string; userId: number } | null>
+): Promise<boolean> {
+  if (!account || typeof account.id !== "number") return false; // can't verify → deny
+  // Personal: the installation is on the caller's own account.
+  if (account.id === user.githubId) return true;
+  // Org: caller must be an *active* member (member or admin) whose membership
+  // resolves to their GitHub id.
+  if (account.type === "Organization" && account.login && user.githubLogin) {
+    const m = await fetchMembership(account.login, user.githubLogin);
+    return !!m && m.state === "active" && m.userId === user.githubId;
+  }
+  return false;
+}
+
 // Used by the onboarding GitHub-install screen to link a pending install to
 // the signed-in user. Normally the install webhook lands first and leaves
 // userId="" — but the popup-handshake can outrace the webhook (especially via
 // smee in dev), so we also pull live install + repo data from GitHub here
 // using the App's installation token. That way the onboarding repo browser
 // never has to wait for a webhook to arrive.
-api.post("/installations/:installationId/link", async (req, res) => {
+//
+// Claiming is ownership-gated (authorizeInstallationClaim): only the personal
+// owner, or a verified active org member, may link an installation. Without
+// this, any signed-in user could claim any installation id by enumeration and
+// read its private-repo reviews / change its settings.
+export async function linkInstallationHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const id = Number(req.params.installationId);
 
   let install = db.find("installations", (i) => i.installationId === id);
 
-  // Fetch install metadata + repo list from GitHub. This works even when the
-  // webhook hasn't landed yet, and self-corrects stale rows from a prior install.
+  // Fetch live install metadata from GitHub — its `account` is what we verify
+  // ownership against, so we can't proceed without it. (Also self-corrects
+  // stale rows from a prior install.)
   let liveInstall: any = null;
-  let liveRepos: Array<any> = [];
   try {
-    liveInstall = await gh<any>(id, `/app/installations/${id}`);
+    // /app/installations/{id} is an App-level endpoint: it requires the App JWT
+    // (Bearer), NOT an installation token, so we fetch directly rather than via
+    // gh() (same pattern as reconcileInstallsForUser / uninstallApp).
+    const resp = await fetch(`https://api.github.com/app/installations/${id}`, {
+      headers: {
+        Authorization: `Bearer ${appJWT()}`,
+        Accept: "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+        "User-Agent": "devasign-app",
+      },
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status} ${await resp.text()}`);
+    liveInstall = await resp.json();
   } catch (err) {
-    // Couldn't reach GitHub (e.g. app not configured in dev). If we don't
-    // have a webhook-created row either, surface 404 like before.
-    if (!install) {
-      console.warn("[link] couldn't reach GitHub and no webhook row:", err);
-      return void res.status(404).json({ error: "install_not_found" });
-    }
+    // Couldn't reach GitHub. Without live account data we can't verify
+    // ownership, so fail closed: 404 when there's no row at all (as before),
+    // 502 when a row exists but we can't re-verify the claim right now.
+    console.warn("[link] couldn't reach GitHub:", err);
+    return void res
+      .status(install ? 502 : 404)
+      .json({ error: install ? "verification_unavailable" : "install_not_found" });
   }
+
+  // Ownership gate — reject anyone who isn't the personal owner or a verified
+  // active org member of the account behind this installation.
+  const authorized = await authorizeInstallationClaim(
+    user,
+    liveInstall?.account,
+    (org, username) => getOrgMembership(id, org, username)
+  );
+  if (!authorized) return void res.status(403).json({ error: "forbidden" });
+
+  // Authorized — now pull the repo list (skipped above so we never hit GitHub
+  // for, or leak the existence of, repos belonging to a caller we'd reject).
+  let liveRepos: Array<any> = [];
+  let reposFetched = false;
   try {
     const reposResp = await gh<any>(id, "/installation/repositories?per_page=100");
     liveRepos = reposResp?.repositories || [];
+    reposFetched = true;
   } catch (err) {
     console.warn("[link] couldn't list repos:", err);
   }
@@ -271,12 +331,17 @@ api.post("/installations/:installationId/link", async (req, res) => {
     };
     db.insert("installations", install);
   } else {
-    db.update("installations", (i) => i.id === install!.id, {
+    // db.update returns the fresh row (it replaces, doesn't mutate in place), so
+    // reassign — otherwise the JSON response below echoes the stale object. Only
+    // overwrite repoIds when the list actually came back: reposFetched
+    // distinguishes "fetch failed" from "succeeded with zero repos" (so removing
+    // every repo correctly clears the row instead of keeping stale ids).
+    install = db.update("installations", (i) => i.id === install!.id, {
       userId: user.id,
       accountId: liveInstall?.account?.id ?? install.accountId,
       accountLogin: liveInstall?.account?.login ?? install.accountLogin,
-      repoIds: liveRepos.length ? liveRepos.map((r) => r.id) : install.repoIds,
-    });
+      repoIds: reposFetched ? liveRepos.map((r) => r.id) : install.repoIds,
+    }) ?? install;
   }
 
   // Materialise Repository rows for everything we can see.
@@ -318,7 +383,8 @@ api.post("/installations/:installationId/link", async (req, res) => {
   }
 
   res.json({ ok: true, installation: install, repoCount: liveRepos.length });
-});
+}
+api.post("/installations/:installationId/link", linkInstallationHandler);
 
 api.get("/repositories", (req, res) => {
   const user = getSessionUser(req);
@@ -756,17 +822,44 @@ api.post("/reviews/sync", async (req, res) => {
 
 // --- Tasks + Message-Agent ---
 
-api.get("/tasks/:id", (req, res) => {
+// Owner-scoped: 401 if signed out, 404 if the id is unknown, 403 if the task
+// exists but isn't the caller's. Ownership resolves task → review → repo →
+// installation → user, or directly via task.userId for Linear tasks that have
+// no linked review yet. Exported so the gate is covered in task-auth.test.ts.
+export function getTaskHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   res.json(task);
-});
+}
+api.get("/tasks/:id", getTaskHandler);
 
 // Adds an attachment (Loom link, Figma URL, image, PDF, plain text) to a task.
 // Mirrors the Message-agent screen in the design.
-api.post("/tasks/:id/attachments", (req, res) => {
+export function addTaskAttachmentHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.id);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   const { kind, url, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
   const att = { id: uuid(), kind, url, note, createdAt: Date.now() };
@@ -777,10 +870,7 @@ api.post("/tasks/:id/attachments", (req, res) => {
   const patch: any = { attachments: [...task.attachments, att] };
   if (kind !== "text") patch.endGoal = null;
   db.update("tasks", (t) => t.id === task.id, patch);
-  const attachmentUser = getSessionUser(req);
-  if (attachmentUser) {
-    track(attachmentUser, "attachment added", { attachment_kind: kind, task_id: task.id });
-  }
+  track(user, "attachment added", { attachment_kind: kind, task_id: task.id });
 
   // When the user drops a Loom (or any other recognised video link) on a
   // PR-bound task mid-review, post a discrete bug-fix comment to the PR so
@@ -803,15 +893,11 @@ api.post("/tasks/:id/attachments", (req, res) => {
     // One task is 1:1 with a review in practice; if the PR was closed and
     // reopened we may have several, in which case refine the most recently
     // updated one (the one the user is looking at in the agent page).
-    const reviews = db
-      .filter("prReviews", (r) => r.taskId === task.id)
-      .sort((a, b) => b.updatedAt - a.updatedAt);
-    const review = reviews[0];
-    if (review) {
-      const user = getSessionUser(req);
+    const latestReview = linkedReviews.sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (latestReview) {
       const comment = {
         body: note.trim(),
-        author: user?.githubLogin || "user",
+        author: user.githubLogin || "user",
         authorAssociation: "OWNER",
         sourceUrl: "",
         sourceEvent: "in_app_message" as const,
@@ -821,7 +907,7 @@ api.post("/tasks/:id/attachments", (req, res) => {
       // `comment.received` on every maintainer-comment ingest.
       db.insert("reviewLogs", {
         id: uuid(),
-        reviewId: review.id,
+        reviewId: latestReview.id,
         kind: "ingest",
         at: Date.now(),
         action: "comment.received",
@@ -829,22 +915,34 @@ api.post("/tasks/:id/attachments", (req, res) => {
         detail: comment.body.slice(0, 240),
         meta: { sourceEvent: comment.sourceEvent },
       });
-      enqueueMaintainerFeedback(review.id, comment);
+      enqueueMaintainerFeedback(latestReview.id, comment);
     }
   }
 
   res.json({ ok: true, attachment: att });
-});
+}
+api.post("/tasks/:id/attachments", addTaskAttachmentHandler);
 
 // Removes an attachment from a task's end-goal. We do more than just splice
 // the array: we also invalidate `task.endGoal` and clear `review.criteria`
 // on any linked PR review, then re-queue the review. That undoes the context
 // (synthesised end goal + per-criterion checks) that this attachment seeded.
-api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
+export function removeTaskAttachmentHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const task = db.find("tasks", (t) => t.id === req.params.taskId);
   if (!task) return void res.status(404).json({ error: "task_not_found" });
+  // task → review → repo → installation → user.id, OR Linear task.userId === user.id.
+  // Checked before attachment_not_found so we don't leak attachment existence on
+  // a task the caller doesn't own.
+  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
+  const repoIds = new Set(linkedReviews.map((r) => r.repoId));
+  const repos = db.filter("repositories", (r) => repoIds.has(r.id));
+  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const owns =
+    repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
+    (!!task.userId && task.userId === user.id);
+  if (!owns) return void res.status(403).json({ error: "forbidden" });
   const removed = task.attachments.find((a) => a.id === req.params.attachmentId);
   if (!removed) return void res.status(404).json({ error: "attachment_not_found" });
   const remaining = task.attachments.filter((a) => a.id !== req.params.attachmentId);
@@ -860,7 +958,6 @@ api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
   const removedUrls = new Set<string>(
     [removed.url, removed.contentRef].filter((s): s is string => typeof s === "string" && s.length > 0)
   );
-  const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
   if (removedUrls.size > 0) {
     const linkedReviewIds = new Set(linkedReviews.map((r) => r.id));
     const videoLogs = db.filter("reviewLogs", (l) =>
@@ -904,7 +1001,8 @@ api.delete("/tasks/:taskId/attachments/:attachmentId", (req, res) => {
     enqueueReview(rev.id);
   }
   res.json({ ok: true, removed });
-});
+}
+api.delete("/tasks/:taskId/attachments/:attachmentId", removeTaskAttachmentHandler);
 
 // --- Integrations ---
 

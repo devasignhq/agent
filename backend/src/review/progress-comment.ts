@@ -16,8 +16,6 @@ export function progressCommentBody(): string {
   return [
     "## PR Review In Progress",
     "",
-    "---",
-    "",
     "A review of this pull request has been triggered and is currently running. " +
       "This comment will be updated automatically once the analysis is complete.",
     "",

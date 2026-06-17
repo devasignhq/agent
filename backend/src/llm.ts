@@ -227,6 +227,8 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
             "Issue:\n" +
             "The submit button still reads 'Submit' but the ticket specifies the user-facing copy as 'Send for review'. " +
             "Update the JSX label to match.\n\n" +
+            "Expected behavior:\n" +
+            "The submit button should display 'Send for review' so it matches the ticket's specified user-facing copy.\n\n" +
             "Suggested approach:\n" +
             "Open src/handler.ts, locate the submit button JSX, and replace the inner text with 'Send for review'. " +
             "If a translation key is used, update the en-US copy as well.\n\n" +
@@ -248,6 +250,8 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
             "Issue:\n" +
             "The empty-state path described in the ticket is not handled in the new branch. " +
             "When items is empty, the handler currently falls through to the main path and may throw.\n\n" +
+            "Expected behavior:\n" +
+            "The handler should return an empty payload early when items is empty, avoiding a crash and matching the ticket's contract.\n\n" +
             "Suggested approach:\n" +
             "Return early with the empty payload before the main path runs, so the empty branch matches the ticket's contract.\n\n" +
             "Relevant diff:\n" +
@@ -347,6 +351,8 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
             "Issue:\n" +
             "A code comment concedes pagination was deferred to a follow-up, but the end goal required the full " +
             "query API including limit/offset. The PR ships without it.\n\n" +
+            "Expected behavior:\n" +
+            "The list endpoint should accept and honor limit/offset so the full query API agreed in the end goal works.\n\n" +
             "Suggested approach:\n" +
             "Parse `limit` and `offset` from the query string, validate them, and apply them to the query before " +
             "returning so the API matches what was agreed.\n\n" +
@@ -381,6 +387,8 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
                 "Issue:\n" +
                 "This is a deterministic mock finding emitted because WARN_FLAKY=1 was set. " +
                 "Treat as a no-op example of the copy-prompt UI.\n\n" +
+                "Expected behavior:\n" +
+                "No real change is expected — this mock finding exists only to exercise the copy-prompt UI.\n\n" +
                 "Suggested approach:\n" +
                 "No action required — disable WARN_FLAKY to silence.\n\n" +
                 "Relevant diff:\n" +

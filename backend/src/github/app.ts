@@ -103,6 +103,31 @@ export async function gh<T>(
   return (await res.json()) as T;
 }
 
+// Look up a user's membership in an org via the installation token. Returns the
+// role + state + the member's GitHub id, or null when the user isn't a member
+// (404) or we can't see membership (403 — usually the App lacks the "Members"
+// org read permission). Never throws; callers fail closed on null. The echoed
+// `user.id` lets callers guard against a since-changed login that now maps to a
+// different person.
+export async function getOrgMembership(
+  installationId: number,
+  org: string,
+  username: string
+): Promise<{ state: string; role: string; userId: number } | null> {
+  try {
+    const m = await gh<any>(
+      installationId,
+      `/orgs/${encodeURIComponent(org)}/memberships/${encodeURIComponent(username)}`
+    );
+    return { state: m?.state, role: m?.role, userId: m?.user?.id };
+  } catch (err) {
+    if (String(err).includes(" 403 ")) {
+      console.warn(`[github] org membership check forbidden for ${org} — App may lack Members:read`, err);
+    }
+    return null;
+  }
+}
+
 // Post a comment on a PR (the issues API — PRs are issues for commenting) and
 // return the created comment's numeric id, or null on failure. Centralizes the
 // "issues/{n}/comments" POST so plan/limit notices, the "review in progress"
