@@ -55,3 +55,25 @@ test("isSealed rejects plaintext objects, non-objects, and wrong versions", () =
   assert.equal(isSealed("string"), false);
   assert.equal(isSealed({ __enc: "aes-256-gcm", v: 2, data: "x" }), false);
 });
+
+// Startup validation: the module validates a *present* key at load time so a
+// misconfiguration crashes the app immediately instead of failing later inside a
+// DB flush. Re-import with a cache-busting query so the module body re-runs
+// against the current config (the static `secret-box` import already loaded once).
+test("module load throws when a present key is malformed", async () => {
+  config.encryption.key = "abc"; // present but not 64 hex chars
+  await assert.rejects(
+    () => import(`./secret-box.js?malformed=${Date.now()}`),
+    /INTEGRATION_ENCRYPTION_KEY/
+  );
+});
+
+test("module load succeeds with a valid key", async () => {
+  config.encryption.key = KEY;
+  await assert.doesNotReject(() => import(`./secret-box.js?valid=${Date.now()}`));
+});
+
+test("module load does not validate when no key is configured", async () => {
+  config.encryption.key = ""; // absent — degrades to plaintext, no validation
+  await assert.doesNotReject(() => import(`./secret-box.js?absent=${Date.now()}`));
+});
