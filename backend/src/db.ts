@@ -12,8 +12,9 @@
 // write-through-cache behaviour, just durably and off-box.
 import { v4 as uuid } from "uuid";
 import pg from "pg";
-import { config } from "./config.js";
+import { config, isEncryptionConfigured } from "./config.js";
 import { isUnstorableDataError, sanitizeForJsonb } from "./db-sanitize.js";
+import { isSealed, open, seal } from "./crypto/secret-box.js";
 import type { DB } from "./types.js";
 
 const { Pool } = pg;
@@ -55,6 +56,69 @@ const COLLECTIONS = Object.keys(TABLES) as (keyof DB)[];
 
 let state: DB = structuredClone(empty);
 let pool: PgPool | null = null;
+
+// ---------------------------------------------------------------------------
+// At-rest secret encryption
+//
+// The store is otherwise schema-agnostic (every collection is a `(id, jsonb)`
+// row), so this registry is the one place that knows a field holds secrets we
+// must not write in plaintext. Encryption is applied transparently at the
+// persistence boundary: rows are sealed on the way to Postgres and opened on
+// load, so the in-memory snapshot — and every read site — keeps seeing
+// plaintext, and nothing else in the codebase needs to change.
+// ---------------------------------------------------------------------------
+const ENCRYPTED_FIELDS: Partial<Record<keyof DB, string>> = { integrations: "tokens" };
+
+// Ids of rows that loaded with their secret field still in legacy plaintext
+// form (pre-encryption). initDb() re-stages exactly these so the one-shot
+// migration only rewrites what's actually unencrypted. Reset each loadAll().
+let legacyPlaintextIds = new Map<keyof DB, Set<string>>();
+let warnedSealedNoKey = false;
+
+// Shallow-copy `row` with its secret field sealed for storage. Never mutates the
+// in-memory row (read sites depend on plaintext). No-op when encryption is off,
+// the collection has no secret field, the value is absent, or it's already sealed.
+function encodeForStore<T>(name: keyof DB, row: T): T {
+  const field = ENCRYPTED_FIELDS[name];
+  if (!field || !isEncryptionConfigured() || !row || typeof row !== "object") return row;
+  const r = row as Record<string, unknown>;
+  const val = r[field];
+  if (val == null || isSealed(val)) return row;
+  return { ...r, [field]: seal(val) } as T;
+}
+
+// Shallow-copy loaded `data` with its secret field opened back to plaintext.
+// Legacy plaintext rows pass through unchanged (and are recorded for migration).
+// A sealed row with no key configured can't be opened — warn once and leave the
+// envelope in place (the integration is inert but no token leaks either way).
+function decodeFromLoad<T>(name: keyof DB, data: T): T {
+  const field = ENCRYPTED_FIELDS[name];
+  if (!field || !data || typeof data !== "object") return data;
+  const r = data as Record<string, unknown>;
+  const val = r[field];
+  if (!isSealed(val)) {
+    if (val != null) {
+      const id = rowId(data);
+      if (id) {
+        let s = legacyPlaintextIds.get(name);
+        if (!s) legacyPlaintextIds.set(name, (s = new Set()));
+        s.add(id);
+      }
+    }
+    return data; // legacy plaintext (or empty) — used as-is, migrated on boot
+  }
+  if (!isEncryptionConfigured()) {
+    if (!warnedSealedNoKey) {
+      warnedSealedNoKey = true;
+      console.warn(
+        "[db] encrypted secrets found but INTEGRATION_ENCRYPTION_KEY is not set — " +
+          "affected integrations will not work until the key is restored."
+      );
+    }
+    return data;
+  }
+  return { ...r, [field]: open(val) } as T;
+}
 
 // One-shot migration on load: assign an id (and createdAt) to any
 // TaskAttachment that was persisted before the `id` field existed. Without
@@ -191,6 +255,9 @@ export function dbHealth() {
     mode: pool ? "postgres" : "ephemeral",
     writeThrough:
       !pool || (consecutiveFlushFailures === 0 && quarantinedRows === 0) ? "ok" : "degraded",
+    // "unconfigured" once a real DB is connected but no encryption key is set —
+    // integration tokens are being written in plaintext until the key is added.
+    encryption: pool && !isEncryptionConfigured() ? "unconfigured" : "ok",
     pendingWrites: pendingCount(),
     consecutiveFlushFailures,
     quarantinedRows,
@@ -253,8 +320,10 @@ async function persistBatch(
         const slice = rows.slice(i, i + CHUNK);
         const params: unknown[] = [];
         const tuples = slice.map((row, j) => {
-          // Scrub NUL / lone surrogates that jsonb would reject (see db-sanitize).
-          params.push(rowId(row), sanitizeForJsonb(row));
+          // Seal secret fields, then scrub NUL / lone surrogates that jsonb would
+          // reject (see db-sanitize). The sealed blob is clean base64, so the
+          // scrub is a no-op on it — encode before sanitize is safe.
+          params.push(rowId(row), sanitizeForJsonb(encodeForStore(name, row)));
           return `($${j * 2 + 1}, $${j * 2 + 2})`;
         });
         await client.query(
@@ -338,7 +407,7 @@ async function persistIsolating(
           await client.query(
             `insert into "${t}" (id, data) values ($1, $2) ` +
               `on conflict (id) do update set data = excluded.data`,
-            [rowId(row), sanitizeForJsonb(row)]
+            [rowId(row), sanitizeForJsonb(encodeForStore(name, row))]
           );
         } catch (err) {
           if (isUnstorableDataError(err)) {
@@ -469,9 +538,10 @@ async function ensureSchema(): Promise<void> {
 
 async function loadAll(): Promise<void> {
   const fresh = structuredClone(empty);
+  legacyPlaintextIds = new Map(); // recomputed below by decodeFromLoad
   for (const name of COLLECTIONS) {
     const { rows } = await pool!.query<{ data: unknown }>(`select data from "${TABLES[name]}"`);
-    (fresh[name] as unknown[]) = rows.map((r) => r.data);
+    (fresh[name] as unknown[]) = rows.map((r) => decodeFromLoad(name, r.data));
   }
   state = fresh;
 }
@@ -491,6 +561,7 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
   lastFlushError = null;
   lastFlushErrorAt = null;
   quarantinedRows = 0;
+  warnedSealedNoKey = false;
   if (opts?.poolOverride) {
     pool = opts.poolOverride;
   } else if (!config.databaseUrl) {
@@ -520,6 +591,30 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
     for (const r of state.repositories) stageUpsert("repositories", r);
     await flushPending();
     console.log("[db] migrated plans/subscriptions/repos for paywall");
+  }
+
+  // One-shot: encrypt any secret field still stored in plaintext. decodeFromLoad
+  // recorded the rows that loaded unencrypted; re-staging them seals on the next
+  // flush. Idempotent — once sealed at rest, later boots record nothing.
+  if (isEncryptionConfigured()) {
+    let migrated = 0;
+    for (const [name, ids] of legacyPlaintextIds) {
+      for (const row of state[name] as unknown as Array<{ id?: string }>) {
+        if (row.id && ids.has(row.id)) {
+          stageUpsert(name, row);
+          migrated++;
+        }
+      }
+    }
+    if (migrated) {
+      await flushPending();
+      console.log(`[db] encrypted ${migrated} integration secret(s) at rest`);
+    }
+  } else if (pool) {
+    console.warn(
+      "[db] INTEGRATION_ENCRYPTION_KEY is not set — integration tokens are stored in " +
+        "PLAINTEXT at rest. Set the key to encrypt them (see .env.example)."
+    );
   }
 
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);

@@ -104,9 +104,20 @@ export const config = {
   },
   // Neon/Postgres connection string. Source of truth for all persisted state.
   databaseUrl: process.env.DATABASE_URL || "",
+  // App-level encryption for secrets stored at rest (integration tokens). 64 hex
+  // chars = 32 bytes for AES-256-GCM. When unset the store degrades to plaintext
+  // (the same graceful stance as Stripe/email/Statsig) and /api/health reports
+  // the integrations column as "unconfigured". Generate one with:
+  //   node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+  encryption: {
+    key: process.env.INTEGRATION_ENCRYPTION_KEY || "",
+  },
 };
 
 export const isDbConfigured = () => Boolean(config.databaseUrl);
+// At-rest encryption for integration tokens. When false, seal/open no-op and
+// tokens are stored in plaintext (dev/tests run this way).
+export const isEncryptionConfigured = () => Boolean(config.encryption.key);
 export const isLLMLive = () => Boolean(config.llm.apiKey);
 export const isGeminiLive = () => Boolean(config.gemini.apiKey);
 export const isGithubOAuthConfigured = () =>
