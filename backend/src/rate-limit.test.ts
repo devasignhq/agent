@@ -39,8 +39,10 @@ before(async () => {
   app.get("/auth", authLimiter, (_req, res) => { res.json({ ok: true }); });
   app.post("/expensive", expensiveLimiter, (_req, res) => { res.json({ ok: true }); });
 
-  await new Promise<void>((resolve) => {
+  await new Promise<void>((resolve, reject) => {
     server = app.listen(0, "127.0.0.1", () => resolve());
+    // Fail fast instead of hanging until the test timeout if the listen fails.
+    server.on("error", reject);
   });
   const port = (server.address() as AddressInfo).port;
   base = `http://127.0.0.1:${port}`;
