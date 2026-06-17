@@ -64,9 +64,19 @@ export async function createCheckoutSession(
   user: User,
   sub: Subscription,
   plan: "pro" | "max",
-  interval: Interval
+  interval: Interval,
+  // When the checkout is launched from the onboarding pricing step, return to a
+  // distinct marker so the app resumes onboarding (at the repository step) rather
+  // than opening Settings → Billing (the default `?billing=...` flow).
+  onboarding = false
 ): Promise<string> {
   const customerId = await getOrCreateCustomer(user, sub);
+  const successUrl = onboarding
+    ? `${config.webOrigin}/?ob=billing`
+    : `${config.webOrigin}/?billing=success`;
+  const cancelUrl = onboarding
+    ? `${config.webOrigin}/?ob=cancel`
+    : `${config.webOrigin}/?billing=cancel`;
   const session = await client().checkout.sessions.create({
     mode: "subscription",
     customer: customerId,
@@ -80,8 +90,8 @@ export async function createCheckoutSession(
     ...(interval === "year"
       ? { discounts: [{ coupon: config.stripe.annualCouponId }] }
       : { allow_promotion_codes: true }),
-    success_url: `${config.webOrigin}/?billing=success`,
-    cancel_url: `${config.webOrigin}/?billing=cancel`,
+    success_url: successUrl,
+    cancel_url: cancelUrl,
   });
   if (!session.url) throw new Error("Stripe did not return a Checkout URL");
   return session.url;

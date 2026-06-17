@@ -539,6 +539,21 @@ const AppContent = () => {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
+  // Return from an onboarding-initiated Stripe Checkout. Unlike `?billing=...`
+  // (which opens Settings → Billing), `?ob=billing` keeps the user in onboarding:
+  // we just reload the session so the now-paid plan is reflected, and the
+  // Onboarding component auto-advances from pricing to the repository step.
+  // `?ob=cancel` returns them to the pricing step (still on Free).
+  React.useEffect(() => {
+    const url = new URL(window.location.href);
+    const ob = url.searchParams.get("ob");
+    if (ob !== "billing" && ob !== "cancel") return;
+    url.searchParams.delete("ob");
+    window.history.replaceState({}, "", url.pathname + url.search);
+    if (ob === "billing") auth.reload();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   // Popup-completion listener: main.tsx postMessages us when an OAuth or
   // install popup finishes. We close the popup window from the opener side
   // (the popup itself can't reliably window.close() after navigating through

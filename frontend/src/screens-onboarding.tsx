@@ -5,6 +5,7 @@ import { Icon } from "./icons";
 import { api, installRedirectUrl, linearConnectUrl } from "./api";
 import { registerPopup, closePopup } from "./popup-registry";
 import { useAuth } from "./auth-context";
+import { PLANS } from "./screens-rest";
 
 const Auth = ({ onSignIn }) => (
   <div className="auth-shell">
@@ -79,18 +80,30 @@ export { Auth };
 
 // ─── Onboarding ──────────────────────────────────────────────────────────────
 
-const OB_STEPS = [
-  { key: "github",  title: "Install GitHub App",  sub: "1 of 2 · required" },
-  { key: "integ",   title: "Connect integrations", sub: "2 of 2 · optional" },
-];
+// Onboarding stages. Pricing comes first; integrations only exist for paid plans
+// (free users skip straight to the app after configuring repositories). The
+// visible list is built per-plan in Onboarding, so the "N of M" labels and the
+// step rail stay correct whether the user has 2 (free) or 3 (paid) steps.
+const STEP_DEFS = {
+  pricing:      { title: "Choose your plan",       note: "required" },
+  repository:   { title: "Configure repositories", note: "required" },
+  integrations: { title: "Connect integrations",   note: "optional" },
+};
 
 const Onboarding = ({ onDone }) => {
+  const { user } = useAuth();
+  const plan = user?.plan || "free";
+  const isPaid = plan !== "free";
+  // Visible steps depend on plan: free skips the (Pro/Max-only) integrations step.
+  const stepKeys = isPaid ? ["pricing", "repository", "integrations"] : ["pricing", "repository"];
+
   const [step, setStep] = React.useState(0);
+  const stepKey = stepKeys[Math.min(step, stepKeys.length - 1)];
   // GitHub App installation state — populated from /api/installations and
   // /api/repositories the moment the user returns from github.com.
   const [ghInstall, setGhInstall] = React.useState({
     status: "idle", // idle | connecting | installed
-    accounts: [],   // [{ login, kind, avatar, repos: [{ name, lang, prs, branch, visibility }] }]
+    accounts: [],   // [{ login, kind, shared, avatar, repos: [{ name, lang, prs, branch, visibility }] }]
   });
 
   // Load installations on mount and whenever onboarding becomes visible.
@@ -113,14 +126,18 @@ const Onboarding = ({ onDone }) => {
       }
       const accounts = [...byInstall.values()].map(({ inst, repos }) => ({
         login: inst.accountLogin,
-        kind: inst.accountLogin === inst.accountLogin.toLowerCase() ? "org" : "personal",
+        kind: inst.accountType === "Organization" ? "org" : "personal",
+        // `shared` (set by GET /api/installations) means another org owner
+        // installed the App — surfaced as a banner so the user isn't confused to
+        // find it already installed on their org.
+        shared: !!inst.shared,
         avatar: inst.accountLogin.charAt(0).toUpperCase(),
         repos: repos.map((r) => ({
           name: `${r.owner}/${r.name}`,
           lang: "—",
           prs: 0,
           branch: r.defaultBranch,
-          visibility: "private",
+          visibility: r.private ? "private" : "public",
         })),
       }));
       setGhInstall({ status: "installed", accounts });
@@ -128,24 +145,8 @@ const Onboarding = ({ onDone }) => {
       console.warn("[onboarding] refresh installs failed", err);
     }
   }, []);
-  // On mount: snapshot the initial install state so we can distinguish
-  // "user already had an install" (don't auto-advance) from "install just
-  // happened" (do auto-advance).
-  const initialInstallRef = React.useRef<null | boolean>(null);
-  React.useEffect(() => {
-    refreshInstalls().then(() => {
-      if (initialInstallRef.current === null) {
-        // populated by the setState in refreshInstalls — read it back next tick
-        initialInstallRef.current = false; // overwritten below if installed
-      }
-    });
-  }, [refreshInstalls]);
-  // Track the initial install state once it's known.
-  React.useEffect(() => {
-    if (initialInstallRef.current === null && ghInstall.status !== "idle") {
-      initialInstallRef.current = ghInstall.status === "installed";
-    }
-  }, [ghInstall.status]);
+  // Load installations on mount (and after the user returns from GitHub).
+  React.useEffect(() => { refreshInstalls(); }, [refreshInstalls]);
 
   // Poll briefly after the user is sent to GitHub so install webhooks have a
   // chance to land while the user is choosing repos. ALSO when the popup
@@ -199,27 +200,24 @@ const Onboarding = ({ onDone }) => {
   const [integ, setInteg] = React.useState({ linear: false });
 
   const ghReady = ghInstall.status === "installed";
-  const canAdvance = step !== 0 || ghReady;
+  // Pricing advances via its own plan CTAs; repository needs an install; the
+  // optional integrations step can always advance.
+  const canAdvance = stepKey === "pricing" ? false : stepKey === "repository" ? ghReady : true;
 
-  // Auto-advance step 0 → 1 the moment an install lands, but only if the user
-  // didn't already have one when they arrived (otherwise we'd jerk them past
-  // step 0 every time they revisit it via the Back button).
-  const advancedRef = React.useRef(false);
+  // Auto-advance pricing → repository once a paid plan is detected. Covers the
+  // return from Stripe Checkout (auth reloaded → plan is now pro/max) and a cold
+  // return after subscribing — a paid user should never be shown pricing again.
+  const billingAdvancedRef = React.useRef(false);
   React.useEffect(() => {
-    if (advancedRef.current) return;
-    if (step !== 0) return;
-    if (ghInstall.status !== "installed") return;
-    if (initialInstallRef.current === true) return; // they already had one
-    advancedRef.current = true;
-    // Tiny delay so the user sees the "installed" state flip before the step
-    // transition — feels less abrupt than instant.
-    const id = setTimeout(() => setStep(1), 600);
-    return () => clearTimeout(id);
-  }, [ghInstall.status, step]);
+    if (billingAdvancedRef.current) return;
+    if (stepKey !== "pricing" || !isPaid) return;
+    billingAdvancedRef.current = true;
+    setStep(1);
+  }, [isPaid, stepKey]);
 
   const next = () => {
     if (!canAdvance) return;
-    step < 1 ? setStep(step + 1) : onDone();
+    step < stepKeys.length - 1 ? setStep(step + 1) : onDone();
   };
   const back = () => step > 0 && setStep(step - 1);
 
@@ -229,12 +227,12 @@ const Onboarding = ({ onDone }) => {
         <div className="auth-logo" style={{ marginBottom: 32 }}>
           <img src={(typeof window !== "undefined" && window.__resources && window.__resources.logo) || "devasign-logo.svg"} alt="DevAsign" className="auth-logo-img" />
         </div>
-        {OB_STEPS.map((s, i) => (
-          <div key={s.key} className={`ob-step ${i < step ? "done" : ""} ${i === step ? "current" : ""}`}>
+        {stepKeys.map((key, i) => (
+          <div key={key} className={`ob-step ${i < step ? "done" : ""} ${i === step ? "current" : ""}`}>
             <div className="ob-bullet">{i < step ? <Icon name="check" size={12}/> : i + 1}</div>
             <div>
-              <div className="ob-step-title">{s.title}</div>
-              <div className="ob-step-sub">{s.sub}</div>
+              <div className="ob-step-title">{STEP_DEFS[key].title}</div>
+              <div className="ob-step-sub">{i + 1} of {stepKeys.length} · {STEP_DEFS[key].note}</div>
             </div>
           </div>
         ))}
@@ -244,8 +242,9 @@ const Onboarding = ({ onDone }) => {
       </div>
 
       <div className="ob-main">
-        {step === 0 && <OBGitHub install={ghInstall} setInstall={setGhInstall} refreshInstalls={refreshInstalls} />}
-        {step === 1 && <OBInteg integ={integ} setInteg={setInteg} />}
+        {stepKey === "pricing" && <OBPricing onChooseFree={() => setStep(1)} />}
+        {stepKey === "repository" && <OBGitHub install={ghInstall} setInstall={setGhInstall} refreshInstalls={refreshInstalls} isPaid={isPaid} />}
+        {stepKey === "integrations" && <OBInteg integ={integ} setInteg={setInteg} />}
 
         <div className="ob-foot">
           <button className="btn ghost" onClick={back} disabled={step === 0} style={step === 0 ? { opacity: 0.4 } : {}}>
@@ -253,24 +252,27 @@ const Onboarding = ({ onDone }) => {
           </button>
           <div className="flex gap-3 items-center">
             <span className="mono" style={{ fontSize: 11, color: "var(--fg-mute)" }}>
-              step {step + 1} / 2
+              step {step + 1} / {stepKeys.length}
             </span>
-            {step === 0 && !ghReady && (
+            {stepKey === "repository" && !ghReady && (
               <span className="mono" style={{ fontSize: 11, color: "var(--warn)" }}>
                 · install the GitHub App to continue
               </span>
             )}
-            {step !== 0 && (
+            {stepKey === "integrations" && (
               <button className="btn ghost" onClick={next}>Skip</button>
             )}
-            <button
-              className="btn primary"
-              onClick={next}
-              disabled={!canAdvance}
-              style={!canAdvance ? { opacity: 0.4, cursor: "not-allowed" } : {}}
-            >
-              {step === 1 ? "Finish setup" : "Continue"} <Icon name="chevron-r" size={14}/>
-            </button>
+            {/* Pricing has no Continue — the plan cards drive that choice. */}
+            {stepKey !== "pricing" && (
+              <button
+                className="btn primary"
+                onClick={next}
+                disabled={!canAdvance}
+                style={!canAdvance ? { opacity: 0.4, cursor: "not-allowed" } : {}}
+              >
+                {step === stepKeys.length - 1 ? "Finish setup" : "Continue"} <Icon name="chevron-r" size={14}/>
+              </button>
+            )}
           </div>
         </div>
       </div>
@@ -278,6 +280,92 @@ const Onboarding = ({ onDone }) => {
   );
 };
 export { Onboarding };
+
+// Step 0 — plan selection. Reuses the PLANS data + plan-card styles from
+// Settings → Billing. Free advances in-app (no backend call, the user is already
+// on Free); Pro/Max launch Stripe Checkout with the 14-day trial and the
+// onboarding return marker (?ob=billing → resume at the repository step).
+const OBPricing = ({ onChooseFree }) => {
+  const [billInterval, setBillInterval] = React.useState("month");
+  const [annualAvailable, setAnnualAvailable] = React.useState(false);
+  const [busy, setBusy] = React.useState(null);
+  const [err, setErr] = React.useState(null);
+
+  React.useEffect(() => {
+    api.subscription().then((v) => setAnnualAvailable(!!v?.annualAvailable)).catch(() => {});
+  }, []);
+
+  const choose = async (id) => {
+    setErr(null);
+    if (id === "free") { onChooseFree(); return; }
+    setBusy(id);
+    try {
+      const { url } = await api.checkout(id, billInterval, { onboarding: true });
+      window.location.href = url;
+    } catch (e) {
+      setErr(e?.message || "Couldn't start checkout. Is billing configured?");
+      setBusy(null);
+    }
+  };
+
+  return (
+    <>
+      <div className="ob-eyebrow">step 01 / plan</div>
+      <h1 className="ob-title">Choose the plan that fits your team.</h1>
+      <p className="ob-desc">
+        Every paid plan starts with a 14-day free trial — full access now, no charge until day 14,
+        cancel anytime. You can change or cancel your plan later in Settings.
+      </p>
+
+      {annualAvailable && (
+        <div className="flex items-center" style={{ gap: 10, marginBottom: 16, flexWrap: "wrap" }}>
+          <div style={{ display: "inline-flex", gap: 4, padding: 4, border: "1px solid var(--border)", borderRadius: 10 }}>
+            <button className={`btn ${billInterval === "month" ? "" : "ghost"}`}
+              style={{ padding: "6px 14px" }} onClick={() => setBillInterval("month")}>Monthly</button>
+            <button className={`btn ${billInterval === "year" ? "" : "ghost"}`}
+              style={{ padding: "6px 14px" }} onClick={() => setBillInterval("year")}>Annual</button>
+          </div>
+          <span className="pill ok"><i className="dot"></i> Save 20% with annual billing</span>
+        </div>
+      )}
+
+      <div className="plan-grid">
+        {PLANS.map((p) => {
+          const annual = billInterval === "year" && p.annual ? p.annual : null;
+          const price = annual ? annual.price : p.price;
+          const unit = annual ? annual.unit : p.unit;
+          const note = annual ? annual.note : (p.reassure || "");
+          const cta = p.id === "free" ? "Continue with Free" : "Start 14-day trial";
+          return (
+            <div key={p.id} className={`plan${p.featured ? " featured" : ""}`}>
+              {p.featured ? <span className="pill purple plan-badge">popular</span> : null}
+              <div className="plan-icon"><Icon name={p.icon} size={18} /></div>
+              <div className="plan-name">{p.name}</div>
+              <div className="plan-tag">{p.tagline}</div>
+              <div className="plan-price">
+                {annual && <span style={{ textDecoration: "line-through", opacity: 0.55, marginRight: 6, fontWeight: 400 }}>{annual.original}</span>}
+                <b>{price}</b><span className="plan-unit">{unit}</span>
+              </div>
+              <div className="plan-note">{note}</div>
+              <button
+                className={`btn lg plan-cta ${p.id === "free" ? "ghost" : "primary"}`}
+                disabled={busy === p.id}
+                onClick={() => choose(p.id)}
+              >
+                {busy === p.id ? "Starting…" : cta}
+              </button>
+              <ul className="plan-feats">
+                {p.features.map((f) =>
+                  <li key={f} className="plan-feat"><Icon name="check" size={13} /><span>{f}</span></li>)}
+              </ul>
+            </div>
+          );
+        })}
+      </div>
+      {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12, marginTop: 12 }}>{err}</div>}
+    </>
+  );
+};
 
 
 // Simulates what the GitHub App's installation webhook would deliver back to
@@ -308,7 +396,7 @@ const GH_INSTALL_RESULT = {
   ],
 };
 
-const OBGitHub = ({ install, setInstall, refreshInstalls }) => {
+const OBGitHub = ({ install, setInstall, refreshInstalls, isPaid }) => {
   const { status, accounts } = install;
 
   const launchGitHub = () => {
@@ -353,12 +441,18 @@ const OBGitHub = ({ install, setInstall, refreshInstalls }) => {
 
   return (
     <>
-      <div className="ob-eyebrow">step 01 / github</div>
-      <h1 className="ob-title">Install the DevAsign GitHub App.</h1>
+      <div className="ob-eyebrow">step 02 / github</div>
+      <h1 className="ob-title">Configure the DevAsign GitHub App.</h1>
       <p className="ob-desc">
         DevAsign reads PR diffs and posts inline review comments through a GitHub App you
         install on your personal account or organization. Pick which repositories the app
         can see on GitHub — that's the source of truth.
+      </p>
+
+      <p className="mono" style={{ fontSize: 12, marginBottom: 14, lineHeight: 1.6, color: isPaid ? "var(--fg-mute)" : "var(--warn)" }}>
+        {isPaid
+          ? "Your plan reviews public and private repositories."
+          : "Free reviews public repositories only — private repos need Pro. You can still grant private repos, but they won't be reviewed until you upgrade."}
       </p>
 
       {status !== "installed" ? (
@@ -368,6 +462,7 @@ const OBGitHub = ({ install, setInstall, refreshInstalls }) => {
           accounts={accounts}
           onReconfigure={launchGitHub}
           totalRepos={totalRepos}
+          isPaid={isPaid}
         />
       )}
     </>
@@ -433,7 +528,7 @@ const GHInstallPanel = ({ status, onLaunch }) => {
   );
 };
 
-const GHRepoBrowser = ({ accounts, onReconfigure, totalRepos }) => (
+const GHRepoBrowser = ({ accounts, onReconfigure, totalRepos, isPaid }) => (
   <>
     <div className="gh-installed-banner">
       <div className="gh-installed-icon">
@@ -472,18 +567,35 @@ const GHRepoBrowser = ({ accounts, onReconfigure, totalRepos }) => (
             <span className="mono gh-account-count">{acct.repos.length} repo{acct.repos.length === 1 ? "" : "s"}</span>
           </div>
 
+          {acct.shared && (
+            // Another org owner already installed DevAsign on this org — tell the
+            // user up front so they're not confused to find it already there.
+            <div className="mono" style={{ fontSize: 11, lineHeight: 1.6, color: "var(--fg-mute)", padding: "8px 12px", borderRadius: 8, background: "var(--bg-2)", margin: "0 0 8px" }}>
+              <Icon name="check" size={11} color="var(--accent)"/>{" "}
+              DevAsign is already installed on <b>{acct.login}</b> by an organization owner — you have
+              access to these repositories.
+            </div>
+          )}
+
           <ul className="gh-repo-list">
-            {acct.repos.map((r) => (
-              <li key={r.name} className="gh-repo-row">
-                <Icon name="git" size={11} color="var(--fg-faint)"/>
-                <span className="mono gh-repo-name">{r.name}</span>
-                <span className="gh-repo-meta mono">
-                  {r.lang} · {r.prs.toLocaleString()} PRs
-                </span>
-                <span className="flex-1"></span>
-                <span className={`gh-repo-vis mono ${r.visibility}`}>{r.visibility}</span>
-              </li>
-            ))}
+            {acct.repos.map((r) => {
+              const noReview = !isPaid && r.visibility === "private";
+              return (
+                <li key={r.name} className="gh-repo-row">
+                  <Icon name="git" size={11} color="var(--fg-faint)"/>
+                  <span className="mono gh-repo-name">{r.name}</span>
+                  <span className="gh-repo-meta mono">
+                    {r.lang} · {r.prs.toLocaleString()} PRs
+                  </span>
+                  <span className="flex-1"></span>
+                  {noReview ? (
+                    <span className="pill warn mono" style={{ fontSize: 10 }}>private · won't review on Free</span>
+                  ) : (
+                    <span className={`gh-repo-vis mono ${r.visibility}`}>{r.visibility}</span>
+                  )}
+                </li>
+              );
+            })}
           </ul>
         </div>
       ))}

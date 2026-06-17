@@ -649,7 +649,7 @@ const SetInstall = () => {
 
 };
 
-const PLANS = [
+export const PLANS = [
 {
   id: "free", name: "Free", icon: "terminal",
   tagline: "Automated review on public repos",

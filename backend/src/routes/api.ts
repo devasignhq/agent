@@ -7,6 +7,7 @@ import type { RepoGuidanceItem, Repository, User } from "../types.js";
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
+import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
@@ -14,7 +15,7 @@ import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { defaultDeletionDeps, requestAccountDeletion, type DeletionDeps } from "../account.js";
-import { chargeForNewPRReview, effectivePlan, intervalOf, PLAN_LIMITS, type Interval } from "../billing/plans.js";
+import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMITS, type Interval } from "../billing/plans.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -123,7 +124,16 @@ api.get("/installations", async (req, res) => {
       console.warn("[installations] reconcile failed:", err)
     );
   }
-  res.json(db.filter("installations", (i) => i.userId === user.id));
+  // `shared` flags an org install the current user didn't originally create —
+  // they have access because another org owner installed it. The onboarding repo
+  // browser surfaces a banner for these so a new owner isn't confused to find the
+  // App already installed.
+  res.json(
+    installationsForUser(user.id).map((i) => ({
+      ...i,
+      shared: i.userId !== user.id && i.accountType === "Organization",
+    }))
+  );
 });
 
 // Pulls all installations the App can see from GitHub and:
@@ -153,28 +163,42 @@ async function reconcileInstallsForUser(user: { id: string; githubId: number | n
     return;
   }
 
-  // Only auto-claim installs on the user's personal account; org installs
-  // require explicit linking via the popup-handshake (to avoid claiming
-  // someone else's org).
-  const owned = apps.filter((inst) => inst?.account?.id === user.githubId);
+  // Materialize installs the user can access: their personal account, plus any
+  // org install they already belong to (adopted at signup in finishOAuth, or
+  // linked explicitly). Org installs they DON'T yet belong to are left alone —
+  // adoption is gated on owner/admin role at signin, not discovered here.
+  const eligible = apps.filter((inst) => {
+    if (inst?.account?.id === user.githubId) return true; // personal
+    const row = db.find("installations", (i) => i.installationId === inst?.id);
+    return row ? userInInstall(row, user.id) : false; // already a member
+  });
 
-  // Up-front DB writes for each owned install — single-threaded reads/writes
+  // Up-front DB writes for each eligible install — single-threaded reads/writes
   // against the in-memory DB stay deterministic this way. The slow part —
   // /installation/repositories — runs in parallel below.
-  const rows = owned.map((inst) => {
+  const rows = eligible.map((inst) => {
     let row = db.find("installations", (i) => i.installationId === inst.id);
+    const accountType: "User" | "Organization" =
+      inst.account?.type === "Organization" ? "Organization" : "User";
     if (!row) {
       row = {
         id: uuid(),
         userId: user.id,
+        userIds: [user.id],
         accountId: inst.account.id,
         accountLogin: inst.account.login,
+        accountType,
         installationId: inst.id,
         repoIds: [],
       };
       db.insert("installations", row);
-    } else if (!row.userId) {
-      db.update("installations", (i) => i.id === row!.id, { userId: user.id });
+    } else {
+      // Ensure membership + backfill accountType on the existing row.
+      addInstallMember(row.id, user.id);
+      if (row.accountType !== accountType) {
+        db.update("installations", (i) => i.id === row!.id, { accountType });
+      }
+      row = db.find("installations", (i) => i.id === row!.id) || row;
     }
     return { inst, row };
   });
@@ -320,28 +344,35 @@ export async function linkInstallationHandler(req: Request, res: Response) {
     console.warn("[link] couldn't list repos:", err);
   }
 
+  const accountType: "User" | "Organization" =
+    liveInstall?.account?.type === "Organization" ? "Organization" : "User";
   if (!install) {
     install = {
       id: uuid(),
       userId: user.id,
+      userIds: [user.id],
       accountId: liveInstall?.account?.id ?? 0,
       accountLogin: liveInstall?.account?.login ?? "unknown",
+      accountType,
       installationId: id,
       repoIds: liveRepos.map((r) => r.id),
     };
     db.insert("installations", install);
   } else {
-    // db.update returns the fresh row (it replaces, doesn't mutate in place), so
-    // reassign — otherwise the JSON response below echoes the stale object. Only
-    // overwrite repoIds when the list actually came back: reposFetched
+    // Add this user to the membership set rather than overwriting userId — a
+    // second org owner linking the same install must not displace the first.
+    // Only overwrite repoIds when the list actually came back: reposFetched
     // distinguishes "fetch failed" from "succeeded with zero repos" (so removing
     // every repo correctly clears the row instead of keeping stale ids).
-    install = db.update("installations", (i) => i.id === install!.id, {
-      userId: user.id,
+    db.update("installations", (i) => i.id === install!.id, {
       accountId: liveInstall?.account?.id ?? install.accountId,
       accountLogin: liveInstall?.account?.login ?? install.accountLogin,
+      accountType,
       repoIds: reposFetched ? liveRepos.map((r) => r.id) : install.repoIds,
-    }) ?? install;
+    });
+    // addInstallMember sets userId when empty, dedupes into userIds, and returns
+    // the fresh row (db.update replaces rather than mutating in place).
+    install = addInstallMember(install.id, user.id) ?? install;
   }
 
   // Materialise Repository rows for everything we can see.
@@ -389,7 +420,7 @@ api.post("/installations/:installationId/link", linkInstallationHandler);
 api.get("/repositories", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const installIds = new Set(installs.map((i) => i.id));
   const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
   // Attach per-repo review counts for the Workflow rail cards. One pass over the
@@ -419,7 +450,7 @@ api.post("/repositories/:id/reindex", expensiveLimiter, (req, res) => {
   const repo = db.find("repositories", (r) => r.id === req.params.id);
   if (!repo) return void res.status(404).json({ error: "repo_not_found" });
   // Owner-scoped: refuse if the repo doesn't belong to this user's installs.
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!installs.some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
@@ -437,7 +468,7 @@ api.get("/repositories/:id/workflow", (req, res) => {
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const repo = db.find("repositories", (r) => r.id === req.params.id);
   if (!repo) return void res.status(404).json({ error: "repo_not_found" });
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!installs.some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
@@ -454,7 +485,7 @@ api.put("/repositories/:id/workflow", (req, res) => {
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const repo = db.find("repositories", (r) => r.id === req.params.id);
   if (!repo) return void res.status(404).json({ error: "repo_not_found" });
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!installs.some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
@@ -490,7 +521,7 @@ function ownedRepo(req: Request, res: Response): { repo: Repository; user: User 
     res.status(404).json({ error: "repo_not_found" });
     return null;
   }
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!installs.some((i) => i.id === repo.installationId)) {
     res.status(403).json({ error: "forbidden" });
     return null;
@@ -627,7 +658,7 @@ api.get("/repositories/:id/actions/workflows", async (req, res) => {
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const repo = db.find("repositories", (r) => r.id === req.params.id);
   if (!repo) return void res.status(404).json({ error: "repo_not_found" });
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const install = installs.find((i) => i.id === repo.installationId);
   if (!install) return void res.status(403).json({ error: "forbidden" });
   try {
@@ -656,9 +687,14 @@ api.get("/reviews", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const status = req.query.status as string | undefined;
-  const installs = db.filter("installations", (i) => i.userId === user.id);
-  const repos = db.filter("repositories", (r) =>
-    installs.some((i) => i.id === r.installationId)
+  const installs = installationsForUser(user.id);
+  // Plan-based visibility: free (and lapsed) users only see public-repo reviews;
+  // paid plans see public + private. Same private-repo entitlement as the review
+  // gate (PLAN_LIMITS.privateRepos).
+  const canPrivate = PLAN_LIMITS[planForUser(user.id)].privateRepos;
+  const repos = db.filter(
+    "repositories",
+    (r) => installs.some((i) => i.id === r.installationId) && (canPrivate || !r.private)
   );
   const repoIds = new Set(repos.map((r) => r.id));
   let reviews = db.filter("prReviews", (r) => repoIds.has(r.repoId));
@@ -676,7 +712,7 @@ export function getReviewHandler(req: Request, res: Response) {
   const review = db.find("prReviews", (r) => r.id === req.params.id);
   if (!review) return void res.status(404).json({ error: "review_not_found" });
   const repo = db.find("repositories", (r) => r.id === review.repoId);
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!repo || !installs.some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
@@ -695,7 +731,7 @@ export function rerunReviewHandler(req: Request, res: Response) {
   const review = db.find("prReviews", (r) => r.id === req.params.id);
   if (!review) return void res.status(404).json({ error: "review_not_found" });
   const repo = db.find("repositories", (r) => r.id === review.repoId);
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   if (!repo || !installs.some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
@@ -713,7 +749,7 @@ api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
 
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const repos = db.filter("repositories", (r) =>
     installs.some((i) => i.id === r.installationId)
   );
@@ -722,9 +758,15 @@ api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
   let enqueued = 0;
   const errors: Array<{ repo: string; message: string }> = [];
 
+  // Sync attributes every discovered review to the signed-in user. Skip private
+  // repos their plan can't review (free → public only), matching the queue filter.
+  const plan = planForUser(user.id);
+  const canPrivate = PLAN_LIMITS[plan].privateRepos;
+
   for (const repo of repos) {
     const install = installs.find((i) => i.id === repo.installationId);
     if (!install) continue;
+    if (repo.private && !canPrivate) continue;
     let openPRs: Array<any> = [];
     try {
       openPRs = await gh<any[]>(
@@ -800,6 +842,7 @@ api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
         additions: null,
         deletions: null,
         changedFiles: null,
+        attributedUserId: user.id,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       };
@@ -838,7 +881,7 @@ export function getTaskHandler(req: Request, res: Response) {
   const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
   const repoIds = new Set(linkedReviews.map((r) => r.repoId));
   const repos = db.filter("repositories", (r) => repoIds.has(r.id));
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const owns =
     repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
@@ -858,7 +901,7 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
   const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
   const repoIds = new Set(linkedReviews.map((r) => r.repoId));
   const repos = db.filter("repositories", (r) => repoIds.has(r.id));
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const owns =
     repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
@@ -941,7 +984,7 @@ export function removeTaskAttachmentHandler(req: Request, res: Response) {
   const linkedReviews = db.filter("prReviews", (r) => r.taskId === task.id);
   const repoIds = new Set(linkedReviews.map((r) => r.repoId));
   const repos = db.filter("repositories", (r) => repoIds.has(r.id));
-  const installs = db.filter("installations", (i) => i.userId === user.id);
+  const installs = installationsForUser(user.id);
   const owns =
     repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
@@ -1150,9 +1193,10 @@ api.post("/billing/checkout", async (req, res) => {
   }
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   if (!sub) return void res.status(404).json({ error: "no_subscription" });
+  const onboarding = Boolean(req.body?.onboarding);
   try {
-    const url = await createCheckoutSession(user, sub, plan, interval);
-    track(user, "checkout initiated", { plan, interval });
+    const url = await createCheckoutSession(user, sub, plan, interval, onboarding);
+    track(user, "checkout initiated", { plan, interval, onboarding });
     res.json({ url });
   } catch (err) {
     console.error("[billing] checkout failed:", err);
