@@ -222,7 +222,12 @@ function handleIssueComment(event: any) {
       );
       return;
     }
-    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    const review = await ensurePRReview(
+      repoFullName,
+      prNumber,
+      event.installation?.id,
+      event.comment?.user?.id
+    );
     if (!review) {
       console.log(
         `[webhook] issue_comment: could not start review for ${repoFullName}#${prNumber}`
@@ -1019,7 +1024,7 @@ function handlePullRequest(event: any) {
   // null for re-reviews: re-pushes take the synchronize path above and re-opens
   // reuse the prior row, so neither re-charges). Max's unlimited allowance always
   // passes.
-  const cap = chargeForNewPRReview(ownerUserId, repo, pullReq.number);
+  const cap = chargeForNewPRReview(gateUserId, repo, pullReq.number);
   if (cap && !cap.allowed) {
     if (notifiable && installationId) {
       void postPRComment(installationId, owner, name, pullReq.number, capReachedNotice(cap.limit));
@@ -1047,8 +1052,8 @@ function handlePullRequest(event: any) {
   };
   db.insert("prReviews", review);
   enqueueReview(review.id);
-  if (chargeUserId) {
-    track(chargeUserId, "pr review queued", {
+  if (gateUserId) {
+    track(gateUserId, "pr review queued", {
       repo: `${repo.owner}/${repo.name}`,
       pr_number: pullReq.number,
       is_private: repo.private,

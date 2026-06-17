@@ -15,7 +15,7 @@ import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { defaultDeletionDeps, requestAccountDeletion, type DeletionDeps } from "../account.js";
-import { chargeForNewPRReview, effectivePlan, intervalOf, PLAN_LIMITS, type Interval } from "../billing/plans.js";
+import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMITS, type Interval } from "../billing/plans.js";
 import { shouldAutoReviewOpenedPR } from "../review/eligibility.js";
 import {
   markAllRead,
