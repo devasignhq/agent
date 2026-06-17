@@ -15,6 +15,11 @@ import {
   chargeForNewPRReview,
   planForUser,
 } from "../billing/plans.js";
+import {
+  isAccountOwner,
+  isReviewTriggerComment,
+  shouldAutoReviewOpenedPR,
+} from "../review/eligibility.js";
 import { track } from "../statsig.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
@@ -163,26 +168,74 @@ function handleIssueComment(event: any) {
   // Async tail: GitHub round-trips can take a beat, so respond 200 immediately
   // and do the lookup / materialize / enqueue off the request thread.
   void (async () => {
-    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
-    if (!review) {
+    const existing = findPRReview(repoFullName, prNumber);
+    if (existing) {
+      // PR already in scope → any maintainer comment is feedback to fold into
+      // the review. Immediate log so the Agent page surfaces the comment within
+      // ~3s of arrival, independent of how many jobs sit ahead in the worker.
+      // The review's status is irrelevant — even a "passed" PR should reflect
+      // that a maintainer commented.
+      db.insert("reviewLogs", {
+        id: uuid(),
+        reviewId: existing.id,
+        kind: "ingest",
+        at: Date.now(),
+        action: "comment.received",
+        target: author,
+        detail: body.length > 200 ? body.slice(0, 200) + "…" : body,
+        meta: {
+          author,
+          authorAssociation,
+          sourceEvent: "issue_comment",
+          sourceUrl: event.comment?.html_url || "",
+        },
+      });
+      enqueueMaintainerFeedback(existing.id, {
+        body,
+        author,
+        authorAssociation,
+        sourceUrl: event.comment?.html_url || "",
+        sourceEvent: "issue_comment",
+      });
+      console.log(`[webhook] issue_comment: enqueued feedback for review ${existing.id}`);
+      return;
+    }
+
+    // No review row yet → this comment is the only way an un-reviewed PR enters
+    // scope, and only the account owner may do it, by commenting the trigger
+    // word "review". Anything else is ignored — we don't even check the PR out.
+    if (!isReviewTriggerComment(body)) {
       console.log(
-        `[webhook] issue_comment: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+        `[webhook] issue_comment: ${repoFullName}#${prNumber} not under review and comment is not a "review" trigger — ignored`
       );
       return;
     }
-    // Immediate log so the Agent page surfaces the comment within ~3s of
-    // arrival, independent of how many jobs the worker has queued ahead of
-    // the maintainer-feedback analysis. The status of the underlying review
-    // is irrelevant here — even a "passed" PR should reflect that a
-    // maintainer commented.
+    const [owner, name] = repoFullName.split("/");
+    const repo = db.find("repositories", (r) => r.owner === owner && r.name === name);
+    const ownerUserId = repo
+      ? db.find("installations", (i) => i.id === repo.installationId)?.userId || ""
+      : "";
+    if (!isAccountOwner(ownerUserId, author, event.comment?.user?.id)) {
+      console.log(
+        `[webhook] issue_comment: "review" trigger on ${repoFullName}#${prNumber} ignored — ${author} is not the account owner`
+      );
+      return;
+    }
+    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    if (!review) {
+      console.log(
+        `[webhook] issue_comment: could not start review for ${repoFullName}#${prNumber}`
+      );
+      return;
+    }
     db.insert("reviewLogs", {
       id: uuid(),
       reviewId: review.id,
       kind: "ingest",
       at: Date.now(),
-      action: "comment.received",
+      action: "review.requested",
       target: author,
-      detail: body.length > 200 ? body.slice(0, 200) + "…" : body,
+      detail: `${author} requested a review`,
       meta: {
         author,
         authorAssociation,
@@ -190,14 +243,9 @@ function handleIssueComment(event: any) {
         sourceUrl: event.comment?.html_url || "",
       },
     });
-    enqueueMaintainerFeedback(review.id, {
-      body,
-      author,
-      authorAssociation,
-      sourceUrl: event.comment?.html_url || "",
-      sourceEvent: "issue_comment",
-    });
-    console.log(`[webhook] issue_comment: enqueued for review ${review.id}`);
+    console.log(
+      `[webhook] issue_comment: review started for ${repoFullName}#${prNumber} by ${author}`
+    );
   })();
 }
 
@@ -229,10 +277,14 @@ function handlePullRequestReview(event: any) {
   }
 
   void (async () => {
-    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    // Feedback channel only — never starts a review. An un-reviewed PR enters
+    // scope solely via auto-review eligibility or the account owner's "review"
+    // comment; a formal review submitted on a PR we aren't tracking is dropped
+    // so it can't bypass the tier gate.
+    const review = findPRReview(repoFullName, prNumber);
     if (!review) {
       console.log(
-        `[webhook] pull_request_review: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+        `[webhook] pull_request_review: ${repoFullName}#${prNumber} not under review — feedback ignored`
       );
       return;
     }
@@ -305,10 +357,11 @@ function handlePullRequestReviewComment(event: any) {
   }
 
   void (async () => {
-    const review = await ensurePRReview(repoFullName, prNumber, event.installation?.id);
+    // Feedback channel only — never starts a review (see handlePullRequestReview).
+    const review = findPRReview(repoFullName, prNumber);
     if (!review) {
       console.log(
-        `[webhook] pull_request_review_comment: dropped, could not resolve PR ${repoFullName}#${prNumber}`
+        `[webhook] pull_request_review_comment: ${repoFullName}#${prNumber} not under review — feedback ignored`
       );
       return;
     }
@@ -895,6 +948,28 @@ function handlePullRequest(event: any) {
       meta: { trigger: event.action, after: newSha, prevHeadSha: existing.headSha, source: "webhook" },
     });
     enqueueReview(existing.id);
+    return;
+  }
+
+  // ── Auto-review eligibility ───────────────────────────────────────────────
+  // Who opened the PR decides whether we review it unprompted. Free/Pro auto-
+  // review only the account owner's own PRs; Max also auto-reviews any team
+  // member's PR (org standing via author_association). Anything else is left
+  // untouched — no row, no checkout — until the account owner comments "review"
+  // (handled in handleIssueComment). Reached only on the new-row path: the
+  // reopen/ready/synchronize branches above reuse an existing row, so a PR
+  // already in scope keeps re-reviewing.
+  if (
+    !shouldAutoReviewOpenedPR({
+      ownerUserId,
+      prAuthorLogin: pullReq.user?.login || "",
+      prAuthorId: pullReq.user?.id,
+      authorAssociation: pullReq.author_association,
+    })
+  ) {
+    console.log(
+      `[webhook] pull_request: ${repoFullName}#${pullReq.number} not auto-reviewed — author ${pullReq.user?.login} not eligible for owner's plan (awaiting "review" comment)`
+    );
     return;
   }
 

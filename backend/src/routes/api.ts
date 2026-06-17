@@ -15,6 +15,7 @@ import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { defaultDeletionDeps, requestAccountDeletion, type DeletionDeps } from "../account.js";
 import { chargeForNewPRReview, effectivePlan, intervalOf, PLAN_LIMITS, type Interval } from "../billing/plans.js";
+import { shouldAutoReviewOpenedPR } from "../review/eligibility.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -778,6 +779,21 @@ api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
         }
         continue;
       }
+      // Auto-review eligibility — mirror the webhook so the dashboard poll only
+      // enqueues PRs we'd review unprompted (own PRs on Free/Pro; own + team PRs
+      // on Max). PRs that need a "review" comment are left untouched here, with
+      // no row, exactly as the webhook leaves them.
+      if (
+        !shouldAutoReviewOpenedPR({
+          ownerUserId: user.id,
+          prAuthorLogin: pr.user?.login || "",
+          prAuthorId: pr.user?.id,
+          authorAssociation: pr.author_association,
+        })
+      ) {
+        continue;
+      }
+
       // Monthly-cap gate for a newly-discovered PR — dashboard sync bypasses the
       // `opened` webhook's cap check. Over-cap owners' new PRs are skipped
       // silently (no row, no comment), matching the webhook's no-row state.
