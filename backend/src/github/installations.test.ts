@@ -206,7 +206,11 @@ test("org-member author without a DevAsign account is not auto-reviewed", () => 
 });
 
 test("two org owners are counted independently", () => {
-  const a = seedUser(3301, "owner-x");
+  // Owner A on Max — the only tier whose gate (shouldAutoReviewOpenedPR) auto-
+  // reviews team members' PRs, so member B's PR enters scope and is counted to
+  // B rather than dropped. Max still meters usage (recordReviewUsage increments
+  // reviewsUsed even at the Infinity cap), so the per-user counts below hold.
+  const a = seedUser(3301, "owner-x", "max");
   const b = seedUser(3302, "owner-y");
   const { install, repo } = seedLinkedRepo(a, { members: [b] });
   // A opens PR #7, B opens PR #8 on the same shared org repo.
