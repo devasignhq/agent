@@ -25,7 +25,7 @@ const SettingsPage = ({ initialSection }) => {
       <div className="page-head">
         <div>
           <h1 className="page-title">Settings</h1>
-          <div className="page-sub">acme org · admin: you</div>
+          <div className="page-sub">admin: you</div>
         </div>
       </div>
 
