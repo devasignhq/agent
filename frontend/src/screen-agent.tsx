@@ -295,9 +295,9 @@ const TERMINAL_BY_PR = {
 };
 
 // ────────────────────────────────────────────────────────────────────────────
-// Repo filter (sits between stats and the queue)
+// Repo selector — lives in the Review queue header; filters the queue by repo
 // ────────────────────────────────────────────────────────────────────────────
-const RepoFilterBar = ({ value, onChange, options, query, onQuery }) => {
+const RepoSelect = ({ value, onChange, options }) => {
   const [open, setOpen] = React.useState(false);
   React.useEffect(() => {
     if (!open) return;
@@ -310,10 +310,8 @@ const RepoFilterBar = ({ value, onChange, options, query, onQuery }) => {
   const totalPRs = options.reduce((s, o) => s + o.count, 0);
   const current = value === "all" ? null : options.find((o) => o.label === value);
   const label = current ? current.label.split("/").pop() : "All repositories";
-  const meta = current ? `${current.count} PR${current.count === 1 ? "" : "s"}` : `${options.length} repo${options.length === 1 ? "" : "s"} · ${totalPRs} PR${totalPRs === 1 ? "" : "s"}`;
   return (
-    <div className="repo-filter-bar">
-      <span className="mute mono" style={{ fontSize: 11 }}>Filter</span>
+    <div className="repo-select">
       <div className="mdl-dd" style={{ position: "relative" }} onClick={(e) => e.stopPropagation()}>
         <button
           className="mdl-dd-trigger"
@@ -359,26 +357,6 @@ const RepoFilterBar = ({ value, onChange, options, query, onQuery }) => {
           </div>
         )}
       </div>
-      <div className="repo-filter-search">
-        <Icon name="search" size={11} color="var(--fg-mute)" />
-        <input
-          type="search"
-          value={query || ""}
-          onChange={(e) => onQuery(e.target.value)}
-          placeholder="Search PRs by title, repo, or number"
-          aria-label="Search the review queue"
-        />
-        {query && (
-          <button
-            className="icon-btn"
-            title="Clear search"
-            onClick={() => onQuery("")}
-          >
-            <Icon name="x" size={10} />
-          </button>
-        )}
-      </div>
-      <span className="mute mono" style={{ fontSize: 11, marginLeft: "auto" }}>{meta}</span>
     </div>
   );
 };
@@ -386,7 +364,7 @@ const RepoFilterBar = ({ value, onChange, options, query, onQuery }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // PR queue (left rail)
 // ────────────────────────────────────────────────────────────────────────────
-const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", onSync, syncing }) => {
+const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", onSync, syncing, repoFilter, onRepoChange, repoOptions = [] }) => {
   const active = reviews.filter((p) => p.status === "running").length;
   const queued = reviews.filter((p) => p.status === "queued").length;
   return (
@@ -411,6 +389,9 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
       <div className="mute mono" style={{ fontSize: 11, marginTop: 6 }}>
         {reviews.length} total · {queued} queued · {workspace}
       </div>
+      {onRepoChange && (
+        <RepoSelect value={repoFilter} onChange={onRepoChange} options={repoOptions} />
+      )}
     </div>
 
     <div className="pr-queue-list">
@@ -1442,8 +1423,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   const [userEvents, setUserEvents] = React.useState({});
   // Repo filter for the queue. "all" → no filter; otherwise the "owner/name" label.
   const [repoFilter, setRepoFilter] = React.useState("all");
-  // Keyword search applied to PR title / repo / number, alongside the repo filter.
-  const [queueQuery, setQueueQuery] = React.useState("");
 
   // Live state
   const [repos, setRepos] = React.useState([]);
@@ -1683,18 +1662,11 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     }
   }, [repoFilter, repoOptions]);
 
-  const filteredReviews = React.useMemo(() => {
-    const byRepo = repoFilter === "all"
+  const filteredReviews = React.useMemo(() => (
+    repoFilter === "all"
       ? mappedReviews
-      : mappedReviews.filter((r) => r.repo === repoFilter);
-    const q = queueQuery.trim().toLowerCase();
-    if (!q) return byRepo;
-    return byRepo.filter((r) =>
-      r.title.toLowerCase().includes(q) ||
-      r.repo.toLowerCase().includes(q) ||
-      String(r.uiId).includes(q)
-    );
-  }, [mappedReviews, repoFilter, queueQuery]);
+      : mappedReviews.filter((r) => r.repo === repoFilter)
+  ), [mappedReviews, repoFilter]);
 
   // If the picked review got filtered out, jump to the first visible one so
   // the right-rail panes don't show stale state.
@@ -1952,15 +1924,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         </div>
       )}
 
-      {/* Repo filter + keyword search — narrows the queue below */}
-      <RepoFilterBar
-        value={repoFilter}
-        onChange={setRepoFilter}
-        options={repoOptions}
-        query={queueQuery}
-        onQuery={setQueueQuery}
-      />
-
       {/* 3-column workspace */}
       <div className={`agent-cols mview-${mobileView}`}>
         <PRQueue
@@ -1970,6 +1933,9 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           workspace={repos[0] ? repos[0].owner : "no repos yet"}
           onSync={syncOpenPRs}
           syncing={syncing}
+          repoFilter={repoFilter}
+          onRepoChange={setRepoFilter}
+          repoOptions={repoOptions}
         />
 
         <div className="agent-pane">

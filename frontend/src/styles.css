@@ -812,44 +812,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .agent-stats .stat-delta { font-size: 10px; margin-top: 2px; }
 
 /* Repo filter bar — slim row that lives between agent-stats and agent-cols. */
-.repo-filter-bar {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  padding: 8px 12px;
-  background: var(--bg-1);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  flex-shrink: 0;
-}
-.repo-filter-bar .mdl-dd { min-width: 220px; }
-.repo-filter-search {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  padding: 4px 8px;
-  background: var(--bg);
-  border: 1px solid var(--line);
-  border-radius: 6px;
-  min-width: 260px;
-  flex: 1;
-  max-width: 420px;
-}
-.repo-filter-search:focus-within { border-color: var(--accent); }
-.repo-filter-search input {
-  flex: 1;
-  min-width: 0;
-  background: transparent;
-  border: 0;
-  outline: 0;
-  color: var(--fg);
-  font: inherit;
-  font-size: 12px;
-  padding: 2px 0;
-}
-.repo-filter-search input::placeholder { color: var(--fg-mute); }
-.repo-filter-search input::-webkit-search-cancel-button { display: none; }
-.repo-filter-search .icon-btn { padding: 2px; }
+.repo-select { margin-top: 10px; }
+.repo-select .mdl-dd { width: 100%; min-width: 0; }
 
 /* Agent page */
 .agent-shell {
