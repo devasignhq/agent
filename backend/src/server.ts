@@ -2,7 +2,7 @@ import express from "express";
 import cors from "cors";
 import cookieParser from "cookie-parser";
 import morgan from "morgan";
-import helmet from "helmet";
+import { securityHeaders } from "./security.js";
 
 import {
   config,
@@ -75,21 +75,10 @@ const app = express();
 // front of the app, which is Render's standard web-service topology.
 app.set("trust proxy", 1);
 
-// Security headers on every response (HSTS, nosniff, frameguard, referrer
-// policy, …). Two deviations from helmet's defaults, both because this is a
-// JSON API consumed cross-origin by the SPA at WEB_ORIGIN (e.g. www.devasign.ai):
-//   · contentSecurityPolicy off — a CSP belongs on the HTML host, not a JSON
-//     API; helmet's default policy is meaningless here and only invites
-//     confusion.
-//   · crossOriginResourcePolicy: cross-origin — the default `same-origin` is the
-//     wrong signal for a separate-origin client; relax it so the SPA is never
-//     blocked from reading a response.
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-  })
-);
+// Security headers on every response (HSTS, nosniff, frameguard, …). Helmet is
+// tuned for a cross-origin JSON API + OAuth redirector (CSP/CORP/COOP all
+// adjusted) — see security.ts for the per-header rationale.
+app.use(securityHeaders);
 
 app.use(morgan("dev"));
 app.use(cors({ origin: config.webOrigin, credentials: true }));
