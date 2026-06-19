@@ -7,7 +7,6 @@ import { config, isGithubOAuthConfigured, isStripeConfigured } from "../config.j
 import { db } from "../db.js";
 import type { User } from "../types.js";
 import { addInstallMember } from "./installations.js";
-import { isDeletionPending, restoreAccount } from "../account.js";
 import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
 import { track } from "../statsig.js";
 
@@ -272,15 +271,6 @@ export async function finishOAuth(req: Request, res: Response) {
     }
   }
 
-  // If this account was pending deletion, logging in is the restore action:
-  // clear the flag, resume billing, and surface the welcome-back pop-up. Code
-  // review resumes automatically once the flag is gone (see account.ts).
-  let restored = false;
-  if (isDeletionPending(user)) {
-    await restoreAccount(user);
-    restored = true;
-  }
-
   // Self-heal billing from Stripe: if our local row says "free" but Stripe has
   // this customer on a trial/active plan (card already on file), promote them now
   // rather than waiting for a webhook that won't replay. Covers a missed webhook
@@ -308,8 +298,6 @@ export async function finishOAuth(req: Request, res: Response) {
 
   if (isNewUser) {
     track(user, "user signed up", { github_login: user.githubLogin });
-  } else if (restored) {
-    track(user, "account restored", { github_login: user.githubLogin });
   } else {
     track(user, "user signed in", { github_login: user.githubLogin });
   }
@@ -329,9 +317,7 @@ export async function finishOAuth(req: Request, res: Response) {
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
   // navigation the frontend just strips the query and renders normally.
-  // welcome_back=1 lets a top-level restore show the pop-up; the durable signal
-  // for the popup-login path is the welcomeBack flag on /api/me.
-  res.redirect(`${config.webOrigin}/?auth=ok${restored ? "&welcome_back=1" : ""}`);
+  res.redirect(`${config.webOrigin}/?auth=ok`);
 }
 
 // GitHub API call with the user-to-server OAuth token. Returns the parsed JSON,

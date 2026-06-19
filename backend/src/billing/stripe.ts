@@ -250,45 +250,6 @@ export async function cancelSubscriptionForDeletion(sub: Subscription): Promise<
   }
 }
 
-// Pause billing when a user *requests* deletion (vs. the hard cancel at purge):
-// schedule the subscription to cancel at period end so no surprise renewal lands
-// during the 14-day restore window, without losing the plan if they come back.
-// Releases any pending schedule first (a schedule blocks subscriptions.update).
-// No-op when Stripe is unconfigured, there's no subscription, or it's already
-// set to cancel — so requesting deletion stays idempotent.
-export async function pauseSubscriptionForDeletion(sub: Subscription): Promise<void> {
-  if (!stripe || !sub.stripeSubscriptionId || sub.cancelAtPeriodEnd) return;
-  await releaseSchedule(sub);
-  try {
-    const updated = await client().subscriptions.update(sub.stripeSubscriptionId, {
-      cancel_at_period_end: true,
-    });
-    syncSubscription(updated); // reflect cancelAtPeriodEnd locally; webhook re-confirms
-  } catch (err) {
-    const e = err as { statusCode?: number; code?: string };
-    if (e?.statusCode === 404 || e?.code === "resource_missing") return;
-    throw err;
-  }
-}
-
-// Reverse pauseSubscriptionForDeletion when the user logs back in to restore:
-// clear the scheduled cancellation so billing continues as before. No-op when
-// Stripe is unconfigured, there's no subscription, or nothing is scheduled to
-// cancel — so restore is safe even if billing was never paused.
-export async function resumeSubscriptionAfterRestore(sub: Subscription): Promise<void> {
-  if (!stripe || !sub.stripeSubscriptionId || !sub.cancelAtPeriodEnd) return;
-  try {
-    const updated = await client().subscriptions.update(sub.stripeSubscriptionId, {
-      cancel_at_period_end: false,
-    });
-    syncSubscription(updated);
-  } catch (err) {
-    const e = err as { statusCode?: number; code?: string };
-    if (e?.statusCode === 404 || e?.code === "resource_missing") return;
-    throw err;
-  }
-}
-
 // ─── Webhook → local sync ───────────────────────────────────────────────────
 
 function mapStatus(s: Stripe.Subscription.Status): SubscriptionStatus {

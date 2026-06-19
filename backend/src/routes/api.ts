@@ -14,7 +14,7 @@ import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
-import { defaultDeletionDeps, requestAccountDeletion, type DeletionDeps } from "../account.js";
+import { defaultDeletionDeps, purgeAccount, type DeletionDeps } from "../account.js";
 import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMITS, type Interval } from "../billing/plans.js";
 import { shouldAutoReviewOpenedPR } from "../review/eligibility.js";
 import {
@@ -40,17 +40,15 @@ api.get("/me", (req, res) => {
   res.json({ user, subscription: sub });
 });
 
-// Soft-delete the signed-in user's account: mark it for deletion (which pauses
-// code review — see worker.ts), pause billing, email a restore link, and clear
-// the session. The account and all its data are KEPT for 14 days — logging back
-// in restores everything (see account.ts: requestAccountDeletion /
-// restoreAccount). Only if the user never returns does the day-14 purge sweep
-// run the full teardown (cancel billing, uninstall the App, wipe rows) and send
-// a final notice. That final notice asks the user to revoke the "Authorized
-// GitHub Apps" OAuth grant themselves — we never store their token, so we can't.
+// Delete the signed-in user's account immediately and permanently: run the full
+// teardown (cancel billing, uninstall the App, wipe every row — see account.ts:
+// purgeAccount) and clear the session. There is no restore window and no
+// confirmation email; once this returns the account is gone. The final "account
+// deleted" notice asks the user to revoke the "Authorized GitHub Apps" OAuth
+// grant themselves — we never store their token, so we can't.
 //
-// Exported with injectable deps so unit tests can assert the soft-delete + email
-// without calling Stripe/email; the route binds the real ones.
+// Exported with injectable deps so unit tests can assert the teardown without
+// calling Stripe/email; the route binds the real ones.
 export async function deleteAccountHandler(
   req: Request,
   res: Response,
@@ -59,10 +57,10 @@ export async function deleteAccountHandler(
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
 
-  await requestAccountDeletion(user, deps);
+  await purgeAccount(user.id, deps);
 
   // Clear the session cookie (same attributes as signOut, or the browser won't
-  // overwrite it). The user is signed out; logging back in is what restores.
+  // overwrite it). The account no longer exists, so the user is signed out.
   clearSessionCookie(res);
   res.json({ ok: true });
 }
@@ -70,14 +68,6 @@ export async function deleteAccountHandler(
 // Wrap so Express's (req, res, next) never leaks `next` into the deps slot —
 // the route always runs with the real implementations.
 api.delete("/me", (req, res) => deleteAccountHandler(req, res));
-
-// Clear the one-shot welcome-back flag once the frontend has shown the pop-up.
-api.post("/me/welcome-back/ack", (req, res) => {
-  const user = getSessionUser(req);
-  if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  if (user.welcomeBack) db.update("users", (u) => u.id === user.id, { welcomeBack: undefined });
-  res.json({ ok: true });
-});
 
 api.get("/health", (_req, res) => {
   const write = dbHealth();

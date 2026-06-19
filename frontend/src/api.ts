@@ -65,10 +65,6 @@ export type User = {
   avatarUrl?: string;
   plan: Plan;
   createdAt: number;
-  // Set while the account is pending deletion (within its 14-day restore window).
-  deletionRequestedAt?: number;
-  // One-shot flag set on restore; drives the welcome-back pop-up, then acked.
-  welcomeBack?: boolean;
 };
 
 export type Plan = "free" | "pro" | "max";
@@ -306,16 +302,11 @@ export const api = {
   health: () => request<Health>("/api/health"),
   signOut: () =>
     request<{ ok: true }>("/api/auth/signout", { method: "POST", body: "{}" }),
-  // Request account deletion: soft-deletes with a 14-day restore window. The
-  // backend marks the account for deletion (which pauses code review), pauses
-  // billing, emails a restore link, and clears the session cookie — so the
-  // caller should sign out afterward. Logging back in within 14 days restores
-  // everything; only after the window does the purge sweep erase the account.
+  // Delete the account immediately and permanently. The backend cancels billing,
+  // uninstalls the GitHub App, wipes every row, and clears the session cookie —
+  // so the caller should sign out afterward. There is no restore window.
   deleteAccount: () =>
     request<{ ok: true }>("/api/me", { method: "DELETE" }),
-  // Clear the one-shot welcome-back flag after the restore pop-up is shown.
-  ackWelcomeBack: () =>
-    request<{ ok: true }>("/api/me/welcome-back/ack", { method: "POST", body: "{}" }),
 
   // installations & repos
   installations: () => request<Installation[]>("/api/installations"),
