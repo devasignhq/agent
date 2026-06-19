@@ -87,7 +87,7 @@ export { Auth };
 const STEP_DEFS = {
   pricing:      { title: "Choose your plan",       note: "required" },
   repository:   { title: "Configure repositories", note: "required" },
-  integrations: { title: "Connect integrations",   note: "optional" },
+  integrations: { title: "Connect Workspace",      note: "optional" },
 };
 
 const Onboarding = ({ onDone }) => {
