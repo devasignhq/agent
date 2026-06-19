@@ -23,7 +23,7 @@ test("progressCommentBody: matches the placeholder copy, no emoji", () => {
 });
 
 test("verdictCommentBody: passed + spec → criteria-met headline wrapping the full review body", () => {
-  const reviewBody = "## End goal\nShip the widget.\n\n## All 3 acceptance criteria met";
+  const reviewBody = "### End goal\nShip the widget.\n\n### All 3 acceptance criteria met";
   const body = verdictCommentBody({ status: "passed", specless: false, reviewBody });
   assert.match(body, /^## DevAsign review — all acceptance criteria met/);
   // The full review body is embedded verbatim under the headline.
@@ -41,7 +41,7 @@ test("verdictCommentBody: passed + spec-less → no-issues headline", () => {
 });
 
 test("verdictCommentBody: changes_requested → changes-requested headline", () => {
-  const reviewBody = "## Acceptance criteria not met\n- **C1** — login still broken";
+  const reviewBody = "### Acceptance criteria not met\n- **C1** — login still broken";
   const body = verdictCommentBody({ status: "changes_requested", specless: false, reviewBody });
   assert.match(body, /^## DevAsign review — changes requested/);
   assert.ok(body.includes(reviewBody));

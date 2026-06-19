@@ -177,8 +177,8 @@ test("single comment per run: placeholder → emoji-free full verdict; no formal
   assert.ok(patchCall, "expected a PATCH editing comment 4242 into the verdict");
   const verdictComment = String(patchCall!.body?.body);
   assert.match(verdictComment, /^## DevAsign review — changes requested/);
-  assert.match(verdictComment, /## End goal|Acceptance criteria/);
-  assert.match(verdictComment, /## Line notes/);
+  assert.match(verdictComment, /### End goal|Acceptance criteria/);
+  assert.match(verdictComment, /### Line notes/);
   assert.match(verdictComment, /`src\/handler\.ts:42`/);
   assert.doesNotMatch(verdictComment, EMOJI);
 
