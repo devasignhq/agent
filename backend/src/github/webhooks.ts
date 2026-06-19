@@ -21,6 +21,7 @@ import {
   isReviewTriggerComment,
   shouldAutoReviewOpenedPR,
 } from "../review/eligibility.js";
+import { purgeAccount } from "../account.js";
 import { track } from "../statsig.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
@@ -109,6 +110,9 @@ export function handleWebhook(req: Request, res: Response) {
       break;
     case "pull_request_review_comment":
       handlePullRequestReviewComment(event);
+      break;
+    case "github_app_authorization":
+      handleAppAuthorization(event);
       break;
     case "ping":
       // GitHub sends this when the webhook is created. Nothing to do.
@@ -553,6 +557,47 @@ async function ensurePRReview(
     `[webhook] ensurePRReview: materialized review ${review.id} for ${repoFullName}#${prNumber}`
   );
   return review;
+}
+
+// `github_app_authorization` fires when a user revokes the App's OAuth grant
+// from GitHub → Settings → Applications → Authorized GitHub Apps. The only
+// action GitHub sends is "revoked". We treat that as an account-deletion
+// request: revoking our access while keeping a working DevAsign account makes no
+// sense, so we wipe the account immediately. This is distinct from uninstalling
+// the App (`installation`/`deleted`), which only drops install + repo rows; the
+// purge here also uninstalls the App, since revoking OAuth leaves it installed.
+function handleAppAuthorization(event: any) {
+  if (event.action !== "revoked") {
+    console.log(`[webhook] github_app_authorization: ignored, action=${event.action}`);
+    return;
+  }
+  const senderId: number | undefined = event.sender?.id;
+  if (!senderId) {
+    console.log("[webhook] github_app_authorization revoked: no sender id — ignored");
+    return;
+  }
+  const user = db.find("users", (u) => u.githubId === senderId);
+  if (!user) {
+    // No account for this GitHub user (never signed up, or already deleted — a
+    // re-delivery after the wipe lands here). Nothing to do.
+    console.log(
+      `[webhook] github_app_authorization revoked: no DevAsign account for github id ${senderId} — ignored`
+    );
+    return;
+  }
+
+  // Wipe off the response thread — purgeAccount makes external calls (Stripe,
+  // GitHub uninstall, email). It's best-effort and never throws, but we still
+  // guard so an unexpected error can't crash the process.
+  console.log(`[webhook] github_app_authorization revoked → deleting account ${user.id}`);
+  void (async () => {
+    try {
+      await purgeAccount(user.id);
+      console.log(`[webhook] github_app_authorization revoked: account ${user.id} deleted`);
+    } catch (err) {
+      console.error(`[webhook] github_app_authorization revoked: delete failed for ${user.id}:`, err);
+    }
+  })();
 }
 
 function handleInstallation(event: any) {

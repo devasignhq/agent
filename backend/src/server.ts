@@ -197,7 +197,7 @@ app.listen(port, () => {
   // first thing to verify is that the matching event here is also subscribed
   // in the GitHub App's settings on github.com → Permissions & events.
   console.log(
-    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, ping`
+    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, github_app_authorization, ping`
   );
   // Self-diagnose: ask GitHub which events the App is actually configured to
   // deliver. A common failure mode is the handler being ready while the App
