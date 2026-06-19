@@ -1751,7 +1751,7 @@ export function formatReviewBody(
       );
     }
   } else if (endGoal) {
-    lines.push("## End goal", endGoal, "");
+    lines.push("### End goal", endGoal, "");
   }
 
   // Lead with what needs attention. `splitForComment` (using the previous run's
@@ -1762,7 +1762,7 @@ export function formatReviewBody(
   // added new criteria doesn't read as "all of them failed" when most already passed.
   const { regressed, unmet, met } = splitForComment(filledCriteria, prior);
   if (regressed.length) {
-    lines.push("## Previously met — now broken");
+    lines.push("### Previously met — now broken");
     lines.push(
       "These acceptance criteria were satisfied by an earlier commit in this PR, but a later change broke them:",
       ""
@@ -1775,7 +1775,7 @@ export function formatReviewBody(
     lines.push("");
   }
   if (unmet.length) {
-    lines.push("## Acceptance criteria not met");
+    lines.push("### Acceptance criteria not met");
     lines.push(
       "These requirements aren't satisfied by the current diff yet — each shows what was required and why it isn't met.",
       ""
@@ -1790,8 +1790,8 @@ export function formatReviewBody(
   if (met.length) {
     const header =
       unmet.length === 0 && regressed.length === 0
-        ? `## All ${met.length} acceptance criteria met`
-        : `## ${met.length} of ${filledCriteria.length} acceptance criteria met`;
+        ? `### All ${met.length} acceptance criteria met`
+        : `### ${met.length} of ${filledCriteria.length} acceptance criteria met`;
     // Collapsed by default: the developer already saw these pass, so they're here
     // for reference, not re-litigation. The blank line after </summary> is what
     // lets GitHub render the list inside the <details>.
@@ -1808,7 +1808,7 @@ export function formatReviewBody(
   // the author needs to see before merging. Rendered for both spec'd and
   // spec-less PRs; each item carries its own copyable fix prompt.
   if (holistic.deferrals.length) {
-    lines.push("## Deferred / incomplete work");
+    lines.push("### Deferred / incomplete work");
     lines.push(
       "The diff's own comments concede that parts were deferred, stubbed, or only partially implemented. " +
         "These don't block the merge — confirm each was intentional, or use the prompt to finish it:",
@@ -1819,11 +1819,11 @@ export function formatReviewBody(
   }
 
   if (suggestions.length) {
-    lines.push("## Suggested changes");
+    lines.push("### Suggested changes");
     for (const s of suggestions) {
       const heading = s.criterionId
-        ? `### For ${s.criterionId} — ${s.title}`
-        : `### ${s.title}`;
+        ? `#### For ${s.criterionId} — ${s.title}`
+        : `#### ${s.title}`;
       lines.push(heading);
       if (s.rationale) lines.push(s.rationale);
       if (s.codeExample) {
@@ -1839,7 +1839,7 @@ export function formatReviewBody(
   // carry them as native inline comments, they live here so the whole verdict
   // stays in this single comment.
   if (lineNotes.length) {
-    lines.push("## Line notes");
+    lines.push("### Line notes");
     for (const n of lineNotes) {
       lines.push(`- \`${n.path}:${n.line}\` — ${n.body}`);
     }
@@ -1849,7 +1849,7 @@ export function formatReviewBody(
   const holisticItems =
     holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
   if (holisticItems) {
-    lines.push("## Repo-wide concerns");
+    lines.push("### Repo-wide concerns");
     if (holistic.summary) lines.push(holistic.summary, "");
     appendHolisticGroup(lines, "Regressions", holistic.regressions);
     appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
@@ -1862,7 +1862,7 @@ export function formatReviewBody(
   // surfaced as nitpicks, each with its own copyable fix prompt.
   const devasignItems = holistic.conventionFindings.length + holistic.docDriftFindings.length;
   if (devasignItems) {
-    lines.push("## DEVASIGN.md");
+    lines.push("### DEVASIGN.md");
     lines.push(
       "Checked against your repo's DEVASIGN.md conventions. These are nits — they don't block the merge:",
       ""
@@ -1988,7 +1988,7 @@ function buildConsolidatedFixPrompt(args: {
       // echo `criterionId` in a different case/whitespace than the criterion's id
       // ("C1" vs "c1"); a strict === would drop the patch and fall back to the
       // generic "no specific patch" line. Normalize at the comparison only — not
-      // on the stored suggestion — so the "## Suggested changes" heading keeps the
+      // on the stored suggestion — so the "### Suggested changes" heading keeps the
       // LLM's original casing.
       const cid = String(c.id ?? "").trim().toLowerCase();
       const relevant = suggestions.filter(
@@ -2050,7 +2050,7 @@ function appendHolisticGroup(
   findings: HolisticFinding[]
 ) {
   if (!findings.length) return;
-  lines.push(`### ${label}`);
+  lines.push(`#### ${label}`);
   for (const f of findings) {
     const sev = f.severity === "blocker" ? "**Blocker**" : "Warn";
     const where = f.path ? `\`${f.path}\` — ` : "";

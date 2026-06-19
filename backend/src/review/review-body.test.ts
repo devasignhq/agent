@@ -24,7 +24,7 @@ test("unmet criterion WITH evidence: status + required + why", () => {
       "linkInstallationHandler links the installation without comparing account.id to the caller's githubId.",
   });
   const body = formatReviewBody("Gate installation claiming on ownership.", [c], []);
-  assert.match(body, /## Acceptance criteria not met/);
+  assert.match(body, /### Acceptance criteria not met/);
   assert.match(body, /\*\*C1 — Not met\*\*/);
   assert.match(body, /- Required: Personal claims succeed when account\.id/);
   assert.match(body, /- Why it's not met: linkInstallationHandler links the installation/);
@@ -54,7 +54,7 @@ test("regressed criterion: rendered under 'Previously met — now broken' with R
     undefined,
     prior
   );
-  assert.match(body, /## Previously met — now broken/);
+  assert.match(body, /### Previously met — now broken/);
   assert.match(body, /\*\*C1 — Regressed\*\*/);
   assert.match(body, /- What broke: the ownership check was removed/);
   assert.doesNotMatch(body, EMOJI);
@@ -110,7 +110,7 @@ test("clean pass: no trailing prose recap or stray '---' divider after the met-c
   // paragraph) is gone; the headline and criteria sections carry the verdict.
   const met = crit({ met: true, evidence: "the ownership check is present." });
   const body = formatReviewBody("Gate installation claiming on ownership.", [met], []);
-  assert.match(body, /## All 1 acceptance criteria met/);
+  assert.match(body, /### All 1 acceptance criteria met/);
   assert.match(body, /<details><summary>Show met criteria<\/summary>/);
   assert.doesNotMatch(body, /---/);
   assert.match(body.trimEnd(), /<\/details>$/);
