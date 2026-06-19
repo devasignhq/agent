@@ -1,12 +1,11 @@
 // Transactional email via Resend's HTTP API — called with fetch in the same
 // style as the GitHub (gh()) and Stripe helpers, so there's no SDK dependency.
-// Powers the account-deletion lifecycle: the "scheduled for deletion" mail on
-// request, a day-12 reminder, and the final "your account was wiped" notice.
+// Sends the final "your account was deleted" notice after a hard delete.
 //
 // When RESEND_API_KEY is unset (local dev / tests) sendEmail logs a one-line
 // preview and returns false instead of calling out — the same graceful
 // degradation the rest of the app uses for Stripe / the GitHub App, so nothing
-// in the delete/restore flow depends on a live mail provider.
+// in the delete flow depends on a live mail provider.
 //
 // sendEmail never throws (a mail failure must not abort delete/restore) but it
 // no longer fails *silently*: every non-delivery — missing key, unreachable
@@ -65,15 +64,7 @@ export async function sendEmail(
 
 // ─── Templates ──────────────────────────────────────────────────────────────
 
-function fmtDate(ms: number): string {
-  return new Date(ms).toLocaleDateString("en-US", {
-    year: "numeric",
-    month: "long",
-    day: "numeric",
-  });
-}
-
-// Minimal, client-safe inline-styled shell shared by every lifecycle mail.
+// Minimal, client-safe inline-styled shell shared by every transactional mail.
 function layout(heading: string, bodyHtml: string): string {
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;line-height:1.5">
   <h1 style="font-size:18px;margin:0 0 16px">${heading}</h1>
@@ -82,37 +73,9 @@ function layout(heading: string, bodyHtml: string): string {
 </div>`;
 }
 
-function button(href: string, label: string): string {
-  return `<p style="margin:24px 0"><a href="${href}" style="display:inline-block;background:#1a1a1a;color:#fff;text-decoration:none;padding:10px 18px;border-radius:8px;font-size:14px">${label}</a></p>`;
-}
-
-// 1. Sent the moment a user requests deletion. purgeAt is when the account will
-//    be wiped if they don't return. Logging in before then restores everything.
-export function sendDeletionScheduledEmail(user: User, purgeAt: number): Promise<boolean> {
-  const html = layout("Your account is scheduled for deletion", `
-    <p>Hi ${user.githubLogin},</p>
-    <p>We received your request to delete your ${BRAND} account. Your data will be kept until <strong>${fmtDate(purgeAt)}</strong> in case you change your mind.</p>
-    <p>Until then, code review is paused — we won't post on your pull requests. Sign in any time before that date to restore your account and resume reviews automatically.</p>
-    ${button(config.webOrigin, "Log in to restore my account")}
-    <p style="font-size:13px;color:#666">If you meant to delete your account, no action is needed — it'll be removed automatically on ${fmtDate(purgeAt)}.</p>
-  `);
-  return sendEmail(user.email, `Your ${BRAND} account is scheduled for deletion`, html);
-}
-
-// 2. Reminder near the end of the window (day 12 of 14).
-export function sendDeletionReminderEmail(user: User, purgeAt: number): Promise<boolean> {
-  const html = layout("Your account will be deleted soon", `
-    <p>Hi ${user.githubLogin},</p>
-    <p>This is a reminder that your ${BRAND} account is still scheduled for permanent deletion on <strong>${fmtDate(purgeAt)}</strong>.</p>
-    <p>If you'd like to keep it, just sign in before then — that's all it takes to restore everything and resume code review.</p>
-    ${button(config.webOrigin, "Log in to keep my account")}
-  `);
-  return sendEmail(user.email, `Reminder: your ${BRAND} account will be deleted on ${fmtDate(purgeAt)}`, html);
-}
-
-// 3. Sent after the account is permanently wiped at the end of the window. We
-//    can't revoke the user's OAuth grant ourselves (we never store their token),
-//    so the mail tells them to remove DevAsign from their authorized apps.
+// Sent right after the account is permanently wiped. We can't revoke the user's
+// OAuth grant ourselves (we never store their token), so the mail tells them to
+// remove DevAsign from their authorized apps.
 export function sendAccountPurgedEmail(user: User): Promise<boolean> {
   const html = layout("Your account has been deleted", `
     <p>Hi ${user.githubLogin},</p>

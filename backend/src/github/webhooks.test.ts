@@ -15,6 +15,14 @@ import { db } from "../db.js";
 import { handleWebhook } from "./webhooks.js";
 import { queueSnapshot } from "../queue.js";
 
+// Keep the github_app_authorization → purgeAccount path hermetic: with the
+// GitHub App / Stripe guards off, purgeAccount skips the real uninstall + cancel
+// network calls (and the email helper no-ops without a key) and only does the
+// local row wipe. The PR-flow tests below don't depend on these being set.
+config.github.appId = "";
+config.github.privateKey = "";
+config.stripe.secretKey = "";
+
 let repoSeq = 0;
 function seedRepo() {
   return db.insert("repositories", {
@@ -347,4 +355,51 @@ test("issue_comment: a comment on a PR already under review still enqueues feedb
     (l) => l.reviewId === review.id && l.action === "comment.received"
   );
   assert.equal(received.length, 1);
+});
+
+// ── github_app_authorization (OAuth grant revoked → delete account) ──────────
+
+function authRevokedEvent(senderId: number | undefined, action = "revoked") {
+  return { action, sender: { id: senderId, login: "someone" } };
+}
+
+// purgeAccount runs in the webhook's async tail, so let it settle before asserting.
+const flush = () => new Promise((r) => setImmediate(r));
+
+test("github_app_authorization revoked: deletes the revoking user's account immediately", async () => {
+  const gh = 50_000 + linkSeq;
+  const { userId } = seedLinkedRepo({ plan: "pro", ownerLogin: "alice", ownerGithubId: gh });
+  // Sanity: the full account graph exists before the revoke.
+  assert.equal(db.filter("users", (u) => u.id === userId).length, 1);
+  assert.equal(db.filter("subscriptions", (s) => s.userId === userId).length, 1);
+  assert.equal(db.filter("installations", (i) => i.userId === userId).length, 1);
+
+  deliver(authRevokedEvent(gh), { type: "github_app_authorization" });
+  await flush();
+
+  assert.equal(db.filter("users", (u) => u.id === userId).length, 0, "user wiped");
+  assert.equal(db.filter("subscriptions", (s) => s.userId === userId).length, 0, "subscription wiped");
+  assert.equal(db.filter("installations", (i) => i.userId === userId).length, 0, "installation wiped");
+});
+
+test("github_app_authorization revoked: unknown sender is a no-op, other accounts untouched", async () => {
+  const gh = 60_000 + linkSeq;
+  const { userId } = seedLinkedRepo({ plan: "pro", ownerLogin: "bob", ownerGithubId: gh });
+
+  // A revoke for a github id we have no user for — must not throw or touch others.
+  deliver(authRevokedEvent(gh + 1), { type: "github_app_authorization" });
+  await flush();
+
+  assert.equal(db.filter("users", (u) => u.id === userId).length, 1, "unrelated account intact");
+});
+
+test("github_app_authorization: a non-revoked action is ignored", async () => {
+  const gh = 70_000 + linkSeq;
+  const { userId } = seedLinkedRepo({ plan: "pro", ownerLogin: "carol", ownerGithubId: gh });
+
+  // GitHub only sends "revoked" for this event, but guard the switch anyway.
+  deliver(authRevokedEvent(gh, "created"), { type: "github_app_authorization" });
+  await flush();
+
+  assert.equal(db.filter("users", (u) => u.id === userId).length, 1, "account untouched");
 });

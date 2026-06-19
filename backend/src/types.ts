@@ -8,16 +8,6 @@ export type User = {
   avatarUrl?: string;
   plan: "free" | "pro" | "max";
   createdAt: number;
-  // ── Account-deletion lifecycle (soft delete with a 14-day restore window) ──
-  // Set when the user requests deletion; its presence means "pending deletion",
-  // which pauses code review. The purge sweep wipes the account 14 days later.
-  // Cleared when they log back in — logging in is what restores the account.
-  deletionRequestedAt?: number;
-  // Guards the one-time day-12 reminder email so the sweep doesn't resend it.
-  reminderSentAt?: number;
-  // One-shot flag set on restore; the frontend shows a "welcome back" pop-up,
-  // then acks it (POST /api/me/welcome-back/ack) to clear it.
-  welcomeBack?: boolean;
 };
 
 export type Installation = {

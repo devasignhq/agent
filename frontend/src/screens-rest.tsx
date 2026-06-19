@@ -982,8 +982,8 @@ const SetBilling = () => {
 
 
 // ─── Account · delete + export ──────────────────────────────────────────
-// Requesting deletion is retry-safe and soft: it schedules deletion with a
-// 14-day restore window rather than erasing anything now. These stay as friendly
+// Deletion is immediate and permanent: the account and all its data are wiped
+// the moment the user confirms — no restore window. These stay as friendly
 // fallbacks for the rare error shapes the request can still surface.
 const DELETE_ERRORS = {
   billing_cancel_failed: "Something went wrong. Please try again.",
@@ -1004,9 +1004,9 @@ const SetAccount = () => {
   const nameOk = !!user?.githubLogin && confirmName.trim().toLowerCase() === user.githubLogin.toLowerCase();
   const phraseOk = confirmText.trim().toLowerCase() === REQUIRED;
 
-  // Request deletion server-side (soft delete + email), then advance to the
-  // confirmation step. On failure nothing changes (retry-safe), so we surface
-  // the error and stay on the confirm step instead of pretending it worked.
+  // Delete the account server-side (immediate, permanent), then advance to the
+  // done step. On failure nothing changes (retry-safe), so we surface the error
+  // and stay on the confirm step instead of pretending it worked.
   const deleteAccount = async () => {
     setErr(null);
     setBusy(true);
@@ -1060,7 +1060,7 @@ const SetAccount = () => {
       <div className="card" style={{ borderColor: "color-mix(in oklch, var(--danger) 35%, var(--line))" }}>
         <div className="card-head">
           <h3 className="card-title" style={{ color: "var(--danger)" }}>Danger zone</h3>
-          <span className="pill danger"><i className="dot"></i> 14-day grace</span>
+          <span className="pill danger"><i className="dot"></i> permanent</span>
         </div>
         <div className="card-body">
           {step === "idle" &&
@@ -1068,8 +1068,8 @@ const SetAccount = () => {
             <div style={{ minWidth: 0, flex: 1 }}>
               <div className="mono" style={{ fontSize: 13 }}>Delete your account</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
-                We'll keep your data for 14 days so you can restore it by signing back in. After that, your
-                profile, agent settings, review history, and GitHub installs are permanently erased.
+                This is immediate and permanent. Your profile, agent settings, review history, and GitHub
+                installs are erased right away — there's no way to undo it or restore later.
               </div>
             </div>
             <button className="btn danger" onClick={() => setStep("confirm")}>Delete account…</button>
@@ -1078,10 +1078,10 @@ const SetAccount = () => {
 
           {step === "confirm" &&
           <div className="col gap-3">
-            <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>You can undo this for 14 days.</div>
+            <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>This can't be undone.</div>
             <div className="mute" style={{ fontSize: 12 }}>
-              We'll email you a confirmation and keep your data for 14 days — sign back in any time before then
-              to restore it. Code review pauses until you do.
+              Your account and all its data are deleted immediately and permanently — there's no grace period
+              and no way to restore it afterward.
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
               Type your username <span className="mono" style={{ color: "var(--fg)" }}>{user?.githubLogin || "—"}</span> to confirm.
@@ -1109,7 +1109,7 @@ const SetAccount = () => {
               className="btn danger"
               disabled={!nameOk || !phraseOk || busy}
               onClick={deleteAccount}>
-                {busy ? "Scheduling…" : "Delete my account"}
+                {busy ? "Deleting…" : "Delete my account"}
               </button>
             </div>
             {err && <div className="mute" style={{ color: "var(--danger)", fontSize: 12 }}>{err}</div>}
@@ -1120,11 +1120,10 @@ const SetAccount = () => {
           <div className="col gap-2">
             <div className="flex items-center gap-2">
               <Icon name="check" size={14} color="var(--accent)" />
-              <span className="mono" style={{ fontSize: 13 }}>Check your email</span>
+              <span className="mono" style={{ fontSize: 13 }}>Account deleted</span>
             </div>
             <div className="mute" style={{ fontSize: 12 }}>
-              We've emailed you a confirmation. Your account is scheduled for deletion in 14 days — sign back in
-              any time before then to restore everything and resume code review. Signing you out…
+              Your account and all its data have been permanently deleted. Signing you out…
             </div>
           </div>
           }

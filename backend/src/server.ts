@@ -23,7 +23,6 @@ import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
-import { runDeletionSweep } from "./account.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
@@ -198,7 +197,7 @@ app.listen(port, () => {
   // first thing to verify is that the matching event here is also subscribed
   // in the GitHub App's settings on github.com → Permissions & events.
   console.log(
-    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, ping`
+    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, github_app_authorization, ping`
   );
   // Self-diagnose: ask GitHub which events the App is actually configured to
   // deliver. A common failure mode is the handler being ready while the App
@@ -209,14 +208,6 @@ app.listen(port, () => {
 
 startWorker();
 backfillRepoIndex();
-
-// Sweep for accounts past their 14-day deletion window (purge) and send the
-// day-12 reminder. Timestamp-driven so it's restart-safe; runs at boot and
-// every 6 hours, with each account isolated in try/catch inside the sweep.
-const DELETION_SWEEP_INTERVAL_MS = 6 * 60 * 60 * 1000;
-void runDeletionSweep();
-setInterval(() => void runDeletionSweep(), DELETION_SWEEP_INTERVAL_MS);
-console.log("[account] deletion sweep scheduled (every 6h, 14-day restore window)");
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost.
