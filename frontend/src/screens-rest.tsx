@@ -654,21 +654,21 @@ export const PLANS = [
   id: "free", name: "Free", icon: "terminal",
   tagline: "Automated review on public repos",
   price: "$0", unit: "/ forever",
-  features: ["Public repositories", "Standard model (Haiku)", "10 PR reviews / month"],
+  features: ["Auto-reviews your own PRs", "Comment \"review\" to review any other PR", "Public repositories", "Standard model (Haiku)", "10 PR reviews / month"],
 },
 {
   id: "pro", name: "Pro", icon: "spark", featured: true,
   tagline: "For developers shipping private code",
   price: "$15", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
   annual: { price: "$144", unit: "USD / year", original: "$180", note: "$12/mo · billed annually" },
-  features: ["Private + public repositories", "Frontier model (Opus)", "50 PR reviews / month", "Linear sync"],
+  features: ["Auto-reviews your own PRs", "Comment \"review\" to review any other PR", "Private + public repositories", "Frontier model (Opus)", "50 PR reviews / month", "Linear sync"],
 },
 {
   id: "max", name: "Max", icon: "brain",
   tagline: "For teams reviewing at scale",
   price: "$45", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
   annual: { price: "$432", unit: "USD / year", original: "$540", note: "$36/mo · billed annually" },
-  features: ["Private + public repositories", "Frontier model (Opus)", "Unlimited PR reviews", "Linear sync"],
+  features: ["Auto-reviews every PR opened in your GitHub org", "Private + public repositories", "Frontier model (Opus)", "Unlimited PR reviews", "Linear sync"],
 }];
 
 const planLabel = (p) => (p === "max" ? "Max" : p === "pro" ? "Pro" : "Free");
