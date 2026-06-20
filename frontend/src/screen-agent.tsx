@@ -396,10 +396,18 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
 
     <div className="pr-queue-list">
       {reviews.length === 0 && (
-        <div className="mute mono" style={{ padding: 20, fontSize: 12, textAlign: "center" }}>
-          {syncing
-            ? "Pulling open PRs from your connected repos…"
-            : "No open PRs found on connected repos. Click Sync to retry, or open a PR on GitHub."}
+        <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
+          <div style={{ textAlign: "center", maxWidth: 280 }}>
+            <Icon name="git" size={20} color="var(--fg-mute)" />
+            <div className="mono" style={{ fontSize: 13, marginTop: 10 }}>
+              {syncing ? "Syncing open PRs…" : "No open PRs to review"}
+            </div>
+            <div className="mute" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>
+              {syncing
+                ? "Pulling open PRs from your connected repos…"
+                : "No open PRs found on connected repos. Click Sync to retry, or open a PR on GitHub."}
+            </div>
+          </div>
         </div>
       )}
       {reviews.map((pr) => {
@@ -1956,10 +1964,18 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
               </button>
             </div>
           </div>
-          <div className="agent-pane-body" ref={logBodyRef}>
+          <div
+            className="agent-pane-body"
+            ref={logBodyRef}
+            style={!pickedId ? { display: "grid", placeItems: "center", padding: 24 } : undefined}
+          >
             {!pickedId && (
-              <div className="mute mono" style={{ padding: 24, textAlign: "center", fontSize: 12 }}>
-                Pick a review from the queue to see its log.
+              <div style={{ textAlign: "center", maxWidth: 280 }}>
+                <Icon name="terminal" size={20} color="var(--fg-mute)" />
+                <div className="mono" style={{ fontSize: 13, marginTop: 10 }}>No review selected</div>
+                <div className="mute" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>
+                  Pick a review from the queue to see its log, timeline, and inline findings.
+                </div>
               </div>
             )}
             {pickedId && <TimelineFor events={events} runningStageIdx={showRunning} />}
