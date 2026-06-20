@@ -806,10 +806,18 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 
 /* Agent page · compact stat-grid variant — sits above the goal bar */
 .agent-stats { flex-shrink: 0; }
-.agent-stats .stat { padding: 12px 16px; }
+/* Label sits on its own row (flex-basis 100%); the value and its hint share
+   the next row, baseline-aligned, instead of stacking vertically. */
+.agent-stats .stat {
+  padding: 12px 16px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  column-gap: 8px;
+}
 .agent-stats .stat-value { font-size: 22px; margin-top: 4px; }
-.agent-stats .stat-label { font-size: 9px; }
-.agent-stats .stat-delta { font-size: 10px; margin-top: 2px; }
+.agent-stats .stat-label { font-size: 9px; flex-basis: 100%; }
+.agent-stats .stat-delta { font-size: 10px; margin-top: 4px; }
 
 /* Repo filter bar — slim row that lives between agent-stats and agent-cols. */
 .repo-select { margin-top: 10px; }
