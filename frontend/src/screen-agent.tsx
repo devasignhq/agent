@@ -722,7 +722,6 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
         <div className="flex gap-2 items-center" style={{ marginBottom: 18, flexWrap: "wrap" }}>
           <span className="pill info"><i className="dot"></i> {goal.ticket.id}</span>
           <span className="pill"><i className="dot"></i> {goal.ticket.source}</span>
-          <span className="mono mute" style={{ fontSize: 11 }}>assignee {goal.ticket.assignee} · reporter {goal.ticket.reporter}</span>
         </div>
 
         <div className="drawer-section">
