@@ -214,6 +214,24 @@ export async function finishOAuth(req: Request, res: Response) {
   let user = db.find("users", (u) => u.githubId === me.id);
   if (!user) {
     isNewUser = true;
+    // Anti-masquerade / self-heal: if this browser still presents a validly-signed
+    // session for a user id that no longer exists, the person isn't actually new —
+    // their row went missing (account deletion, or a store wiped on redeploy).
+    // Recreate them under that ORIGINAL id rather than minting a fresh uuid, so any
+    // user-scoped rows that survived re-link to them instead of being orphaned
+    // behind a brand-new identity. Safe: the id comes from a token we signed
+    // (HS256, httpOnly), so it can only be this browser's own prior id — and if the
+    // store really was wiped there's nothing left to mis-link to anyway.
+    const recoveredId = peekSessionUserId(req);
+    const reuseId = !!recoveredId && !db.find("users", (u) => u.id === recoveredId);
+    const newId = reuseId ? recoveredId! : uuid();
+    if (reuseId) {
+      console.error(
+        `[oauth] ⚠ recreating user ${me.login} (github ${me.id}) under its prior id ${newId} — ` +
+          `a valid session pointed at a missing account. Likely an account deletion, or DATA LOSS ` +
+          `(store wiped on redeploy). Check /api/health rowsLoadedAtBoot.`
+      );
+    }
     // Don't mint a duplicate-email row if a verified address already belongs to
     // another account; fall back to the per-login (unique) noreply instead.
     let email = resolvedEmail;
@@ -222,7 +240,7 @@ export async function finishOAuth(req: Request, res: Response) {
       email = `${me.login}@users.noreply.github.com`;
     }
     user = {
-      id: uuid(),
+      id: newId,
       githubId: me.id,
       githubLogin: me.login,
       email,
@@ -231,20 +249,24 @@ export async function finishOAuth(req: Request, res: Response) {
       createdAt: Date.now(),
     } satisfies User;
     db.insert("users", user);
-    db.insert("subscriptions", {
-      id: uuid(),
-      userId: user.id,
-      plan: "free",
-      stripeCustomerId: null,
-      stripeSubscriptionId: null,
-      status: null,
-      currentPeriodEnd: null,
-      cancelAtPeriodEnd: false,
-      reviewsUsed: 0,
-      usagePeriodStart: Date.now(),
-      pendingPlan: null,
-      scheduleId: null,
-    });
+    // Reuse may re-link a subscription that outlived the user row; only seed a
+    // fresh free subscription when none already exists for this id.
+    if (!db.find("subscriptions", (s) => s.userId === user!.id)) {
+      db.insert("subscriptions", {
+        id: uuid(),
+        userId: user.id,
+        plan: "free",
+        stripeCustomerId: null,
+        stripeSubscriptionId: null,
+        status: null,
+        currentPeriodEnd: null,
+        cancelAtPeriodEnd: false,
+        reviewsUsed: 0,
+        usagePeriodStart: Date.now(),
+        pendingPlan: null,
+        scheduleId: null,
+      });
+    }
   } else {
     // Returning user: refresh fields that drift on GitHub's side. Batch into one
     // update so we only touch Stripe when the email actually changed.
@@ -404,6 +426,19 @@ export function getSessionUser(req: Request): User | null {
   const userId = verifySession(raw);
   if (!userId) return null;
   return db.find("users", (u) => u.id === userId);
+}
+
+// The user id a valid, unexpired session cookie *claims* — even when no matching
+// user row exists. getSessionUser() returns null in both the "no/invalid cookie"
+// and "valid cookie, missing user" cases, which are very different: the latter is
+// a "ghost session", proof this browser held an account that's now gone (a legit
+// deletion, or — the case we must not paper over — a store wiped on a redeploy).
+// Callers use this to tell the two apart instead of funnelling a wipe into a
+// fresh sign-up. Returns null only when there is genuinely no valid session.
+export function peekSessionUserId(req: Request): string | null {
+  const raw = req.cookies?.devasign_session;
+  if (!raw) return null;
+  return verifySession(raw);
 }
 
 // Clear the session cookie. clearCookie only overwrites the cookie when
