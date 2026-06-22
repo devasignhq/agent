@@ -114,7 +114,7 @@ function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
   const bodyParts = [s.rationale];
   if (s.codeExample) {
     const fence = codeFence(s.codeExample);
-    bodyParts.push(`${fence}\n${s.codeExample}\n${fence}`);
+    bodyParts.push(`${fence}${fenceLang(s.language)}\n${s.codeExample}\n${fence}`);
   }
   log(reviewId, "finding", s.title || "Suggested change", {
     detail: s.rationale,
@@ -1576,6 +1576,9 @@ type ReviewSuggestion = {
   title: string;
   rationale: string;
   codeExample?: string;
+  // GitHub-flavored-markdown language identifier for `codeExample`, so the
+  // fenced block renders colored on GitHub (e.g. "typescript", "python").
+  language?: string;
   // Self-contained prompt the user can paste into an external AI coding agent
   // (Cursor / Claude Code / Codex) to land the fix. Includes the relevant
   // diff hunk inline so the prompt is actionable without repo access.
@@ -1599,7 +1602,7 @@ async function reviewDiff(
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
     "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string}], " +
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
-    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"fixPrompt\": string}]}. " +
+    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"language\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
     "For every criterion you mark met:false, `evidence` MUST be a concrete, non-empty 1-2 sentence explanation of why it is not met: name the function/file and state what the diff currently does (or fails to do) relative to the requirement. Never leave it empty, and never just restate the criterion text back. " +
     // Stateful re-review: each criterion carries the verdict it got on an
@@ -1618,6 +1621,7 @@ async function reviewDiff(
     "For every unmet criterion, include one suggestion describing the smallest practical patch the developer " +
     "could ship in a follow-up commit; prefer best-practice idioms already used in the diff. " +
     "`codeExample` is optional and must be a minimal snippet, never a full file. " +
+    "When you include `codeExample`, set `language` to its GitHub-flavored-markdown language identifier (lowercase, e.g. typescript, tsx, python, go, rust, bash, json, yaml); omit `language` if the snippet has no clear language. " +
     "Inline `comments` annotate specific diff lines; only emit them when the comment ties to a concrete line. " +
     // fixPrompt: a copy-pasteable prompt for an external AI coding agent
     // (Cursor / Claude Code / Codex). Self-contained — must include the
@@ -1680,6 +1684,7 @@ async function reviewDiff(
       title: String(s.title || ""),
       rationale: String(s.rationale || ""),
       codeExample: s.codeExample ? String(s.codeExample) : undefined,
+      language: s.language ? String(s.language) : undefined,
       fixPrompt: s.fixPrompt ? String(s.fixPrompt) : undefined,
     })),
   };
@@ -1827,8 +1832,8 @@ export function formatReviewBody(
       lines.push(heading);
       if (s.rationale) lines.push(s.rationale);
       if (s.codeExample) {
-        const fence = codeFence(s.codeExample);
-        lines.push("", fence, s.codeExample, fence);
+        lines.push("");
+        appendCodeBlock(lines, s.codeExample, s.language);
       }
       appendFixPrompt(lines, s.fixPrompt);
       lines.push("");
@@ -2010,11 +2015,8 @@ function buildConsolidatedFixPrompt(args: {
             lines.push(`**${s.title}**`);
             if (s.rationale) lines.push(s.rationale);
             if (s.codeExample) {
-              const fence = codeFence(s.codeExample);
               lines.push("");
-              lines.push(fence);
-              lines.push(s.codeExample);
-              lines.push(fence);
+              appendCodeBlock(lines, s.codeExample, s.language);
             }
           }
           lines.push("");
@@ -2071,6 +2073,29 @@ function codeFence(content: string): string {
   let longest = 0;
   for (const run of content.match(/`+/g) || []) longest = Math.max(longest, run.length);
   return "`".repeat(Math.max(3, longest + 1));
+}
+
+// Validate an LLM-supplied code-fence language token. GitHub/Linguist apply
+// syntax coloring only when the opening fence carries a language (typescript,
+// ts, py, bash, json, diff…); a bare fence renders as uncolored monospace.
+// Reject anything with whitespace/backticks/junk so a malformed value can't
+// corrupt the fence info string; "" means "no language" (bare fence, unchanged
+// behavior).
+function fenceLang(language?: string): string {
+  const t = (language || "").trim().toLowerCase();
+  return /^[a-z0-9+#.-]{1,20}$/.test(t) ? t : "";
+}
+
+// Push a fenced code block (opening fence tagged with the sanitized language so
+// GitHub colors it, bare closing fence) onto a markdown line buffer. The fence
+// length adapts to the content (codeFence) so inner backtick runs can't close
+// it early; `pad` indents the whole block to sit under a list item. Mirrors the
+// appendFixPrompt helper.
+function appendCodeBlock(lines: string[], code: string, language?: string, pad = "") {
+  const fence = codeFence(code);
+  lines.push(`${pad}${fence}${fenceLang(language)}`);
+  for (const ln of code.split("\n")) lines.push(`${pad}${ln}`);
+  lines.push(`${pad}${fence}`);
 }
 
 // Renders the per-finding "prompt for your AI agent" block. The prompt sits in
@@ -2333,6 +2358,9 @@ type BugFixSynthesis = {
   expected: string;
   fix: string;
   code?: string;
+  // GitHub-flavored-markdown language identifier for `code`, so the fenced
+  // block renders colored on GitHub.
+  language?: string;
 };
 
 async function synthesizeBugFix(args: {
@@ -2343,10 +2371,11 @@ async function synthesizeBugFix(args: {
   const { videoSummary, prTitle, diffSlice } = args;
   const system =
     "You are DevAsign's bug-fix synthesis step. The user attached a video showing a bug they want fixed in an " +
-    "open PR. Emit ONLY JSON: {\"title\": string, \"broken\": string, \"expected\": string, \"fix\": string, \"code\"?: string}. " +
+    "open PR. Emit ONLY JSON: {\"title\": string, \"broken\": string, \"expected\": string, \"fix\": string, \"code\"?: string, \"language\"?: string}. " +
     "`title` is ≤ 80 chars and reads like a PR/commit subject. `broken` describes the observed (incorrect) behavior " +
     "from the video. `expected` describes the correct behavior the video implies. `fix` is 1–2 sentences of " +
     "remediation. `code` is an optional minimal code example anchored in the PR diff — never invent a full file. " +
+    "When you include `code`, set `language` to its GitHub-flavored-markdown language identifier (lowercase, e.g. typescript, python, go, bash); omit `language` if the snippet has no clear language. " +
     "Never invent behavior the video did not actually show; if you are uncertain say so in `fix`.";
   const moments = videoSummary.keyMoments.map((k) => `  ${k.t} — ${k.note}`).join("\n");
   const signals = videoSummary.acceptanceSignals.map((s) => `  - ${s}`).join("\n");
@@ -2372,6 +2401,7 @@ async function synthesizeBugFix(args: {
     expected: String(parsed.expected || ""),
     fix: String(parsed.fix || ""),
     code: parsed.code ? String(parsed.code) : undefined,
+    language: parsed.language ? String(parsed.language) : undefined,
   };
 }
 
@@ -2384,8 +2414,8 @@ function formatBugFixComment(bug: BugFixSynthesis, videoUrl: string): string {
   if (bug.expected) lines.push("**Expected**", bug.expected, "");
   if (bug.fix) lines.push("**Suggested fix**", bug.fix, "");
   if (bug.code) {
-    const fence = codeFence(bug.code);
-    lines.push(fence, bug.code, fence, "");
+    appendCodeBlock(lines, bug.code, bug.language);
+    lines.push("");
   }
   lines.push(`_Source: ${videoUrl}_`);
   return lines.join("\n");
@@ -2493,6 +2523,9 @@ type ImplementationGuide = {
   ask: string;
   approach: string;
   code?: string;
+  // GitHub-flavored-markdown language identifier for `code`, so the fenced
+  // block renders colored on GitHub.
+  language?: string;
   references: string[];
 };
 
@@ -2626,10 +2659,12 @@ async function synthesizeImplementationGuide(args: {
   const system =
     "You are DevAsign's implementation guide synthesis step. A maintainer left feedback on a PR; produce a " +
     "concise guide the developer can act on in a follow-up commit. Emit ONLY JSON: " +
-    "{\"title\": string, \"ask\": string, \"approach\": string, \"code\"?: string, \"references\": string[]}. " +
+    "{\"title\": string, \"ask\": string, \"approach\": string, \"code\"?: string, \"language\"?: string, \"references\": string[]}. " +
     "`title` ≤ 80 chars, commit-subject style. `ask` paraphrases what the maintainer wants in 1–2 sentences. " +
     "`approach` is 1–3 short paragraphs explaining how to implement it, anchored in the current diff where " +
-    "possible. `code` is an optional minimal patch snippet — never a full file. `references` echoes any doc " +
+    "possible. `code` is an optional minimal patch snippet — never a full file. When you include `code`, set " +
+    "`language` to its GitHub-flavored-markdown language identifier (lowercase, e.g. typescript, python, go, bash); " +
+    "omit `language` if the snippet has no clear language. `references` echoes any doc " +
     "URLs the maintainer cited. Never invent requirements the feedback didn't state. " +
     "Never use emoji in any text you output.";
 
@@ -2663,6 +2698,7 @@ async function synthesizeImplementationGuide(args: {
     ask: String(parsed.ask || ""),
     approach: String(parsed.approach || ""),
     code: parsed.code ? String(parsed.code) : undefined,
+    language: parsed.language ? String(parsed.language) : undefined,
     references: Array.isArray(parsed.references) ? parsed.references.map(String) : [],
   };
 }
@@ -2692,8 +2728,9 @@ function buildFeedbackFixPrompt(args: {
     lines.push("## Suggested approach", guide.approach, "");
   }
   if (guide.code) {
-    const fence = codeFence(guide.code);
-    lines.push("## Reference snippet", fence, guide.code, fence, "");
+    lines.push("## Reference snippet");
+    appendCodeBlock(lines, guide.code, guide.language);
+    lines.push("");
   }
   if (newCriteria.length) {
     lines.push("## Acceptance criteria to satisfy");
@@ -2732,8 +2769,8 @@ export function formatImplementationGuide(
   if (guide.ask) lines.push("**What they asked**", guide.ask, "");
   if (guide.approach) lines.push("**Suggested approach**", guide.approach, "");
   if (guide.code) {
-    const fence = codeFence(guide.code);
-    lines.push(fence, guide.code, fence, "");
+    appendCodeBlock(lines, guide.code, guide.language);
+    lines.push("");
   }
   if (guide.references.length) {
     lines.push("**References**");
