@@ -104,6 +104,37 @@ test("consolidated fix prompt: suggestion attaches across criterionId case misma
   assert.doesNotMatch(body, EMOJI);
 });
 
+test("suggestion codeExample: opening fence carries the language token so GitHub colors it", () => {
+  // GitHub applies syntax coloring only when the opening fence is tagged with a
+  // language; the closing fence stays bare.
+  const suggestion = {
+    criterionId: "C1",
+    title: "Use a typed guard",
+    rationale: "Add a null check.",
+    codeExample: "const x = 1;",
+    language: "typescript",
+  };
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [suggestion]);
+  assert.match(body, /```typescript\nconst x = 1;\n```/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("suggestion codeExample: a malformed language token is dropped to a bare fence", () => {
+  // fenceLang rejects anything with whitespace/junk so it can't corrupt the
+  // fence info string — we fall back to the prior bare-fence behavior.
+  const suggestion = {
+    criterionId: "C1",
+    title: "Use a typed guard",
+    rationale: "Add a null check.",
+    codeExample: "const x = 1;",
+    language: "ts; rm -rf",
+  };
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [suggestion]);
+  assert.match(body, /```\nconst x = 1;\n```/);
+  assert.doesNotMatch(body, /rm -rf/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
 test("clean pass: no trailing prose recap or stray '---' divider after the met-criteria block", () => {
   // All criteria met, no holistic findings — the body should end at the collapsed
   // "Show met criteria" block. The old verdict-summary recap (a final `---` + prose
