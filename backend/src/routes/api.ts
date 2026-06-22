@@ -103,6 +103,10 @@ api.get("/health", (_req, res) => {
     // "ephemeral" means DATABASE_URL is unset → all rows (incl. subscriptions)
     // are wiped on every restart/redeploy. Prod must read "postgres".
     db: isDbConfigured() ? "postgres" : "ephemeral",
+    // At-rest encryption for integration tokens. "unconfigured" = a real DB is
+    // connected but INTEGRATION_ENCRYPTION_KEY is unset, so tokens are written in
+    // PLAINTEXT. Prod must read "ok" (set the key, then redeploy — see config.ts).
+    encryption: write.encryption,
     // Write-through health. `writeThrough: "degraded"` (or quarantinedRows > 0,
     // or a growing pendingWrites) means writes aren't reaching Postgres and the
     // in-memory snapshot is drifting ahead of it — the next restart will lose
