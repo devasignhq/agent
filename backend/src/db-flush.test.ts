@@ -5,7 +5,7 @@
 //   node --import tsx/esm --test src/db-flush.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { db, dbHealth, flushPending, initDb } from "./db.js";
+import { db, dbHealth, flushPending, initDb, reconcileAll } from "./db.js";
 
 // Minimal pg-pool stand-in. `query` handles the schema/load calls (initDb) and
 // the flush inserts/deletes; an id in `poisonIds` makes its INSERT throw a
@@ -64,6 +64,28 @@ test("quarantines a poison row but still persists the rest (no infinite block)",
   assert.equal(h.quarantinedRows, 1, "poison row counted as quarantined");
   assert.equal(h.pendingWrites, 0, "nothing left stuck in the dirty set");
   assert.equal(h.writeThrough, "degraded", "a dropped write is surfaced as degraded");
+});
+
+test("reconcileAll re-persists the entire in-memory snapshot (recovers silent drift)", async () => {
+  const { pool, stored } = makeFakePool();
+  await initDb({ poolOverride: pool as never }); // resets the snapshot to empty
+
+  db.insert("notifications", row("n1"));
+  db.insert("repositories", row("r1"));
+  await flushPending();
+  assert.equal(stored.has("n1") && stored.has("r1"), true, "initial writes persisted");
+
+  // Simulate Postgres having lost rows that are still live in the snapshot — the
+  // prod failure mode: writes that never landed while reads kept serving memory.
+  stored.clear();
+
+  // The convergence sweep (fired on recovery in onFlushOk) re-stages everything.
+  reconcileAll();
+  await flushPending();
+
+  assert.equal(stored.has("n1"), true, "snapshot row re-persisted by reconcileAll");
+  assert.equal(stored.has("r1"), true, "snapshot row re-persisted by reconcileAll");
+  assert.equal(dbHealth().pendingWrites, 0, "nothing left pending after the re-sync");
 });
 
 test("retries a transient failure and recovers without losing writes", async () => {

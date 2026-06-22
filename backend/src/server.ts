@@ -58,6 +58,20 @@ if (!config.secureCookies && !isGithubWebhookConfigured()) {
   );
 }
 
+// Persistence is non-optional in prod. Unlike the secrets above, initDb() does
+// NOT throw on a missing DATABASE_URL — it silently falls back to an in-memory
+// store (db.ts), which serves reads fine but persists nothing, so EVERYTHING is
+// wiped on the next redeploy. That failure mode has bitten prod before (see the
+// self-heal note in github/oauth.ts). Same prod signal as the guards above
+// (https WEB_ORIGIN): refuse to boot rather than run a production deploy on a
+// throwaway store. Local/ephemeral dev (http origin) is unaffected.
+if (config.secureCookies && !config.databaseUrl) {
+  throw new Error(
+    "DATABASE_URL must be set in production (WEB_ORIGIN is https). Refusing to boot: " +
+      "without it the server runs an in-memory store that is silently wiped on every redeploy."
+  );
+}
+
 const app = express();
 
 // Render (and most PaaS) terminate TLS at a proxy and forward over http with

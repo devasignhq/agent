@@ -599,10 +599,13 @@ const AppContent = () => {
   // Once onboarding is entered it's sticky — we don't jerk the user out of
   // it just because /api/installations starts returning a row mid-flow. The
   // user leaves onboarding by clicking "Finish setup", which sets forceStage.
-  const [stage, setStage] = React.useState<"loading" | "auth" | "onboarding" | "app">("loading");
+  const [stage, setStage] = React.useState<"loading" | "auth" | "unavailable" | "onboarding" | "app">("loading");
   React.useEffect(() => {
     if (auth.status === "loading") { setStage("loading"); return; }
     if (auth.status === "signed_out") { setStage("auth"); return; }
+    // Valid session the backend couldn't resolve (likely data loss on redeploy).
+    // Show a retry screen, NOT sign-in — re-auth here would orphan the account.
+    if (auth.status === "unavailable") { setStage("unavailable"); return; }
     if (forceStage) { setStage(forceStage); return; }
     setStage((s) => {
       // Sticky: once in onboarding or app, stay there until forceStage moves us.
@@ -653,6 +656,25 @@ const AppContent = () => {
         <Auth onSignIn={signInPopup} />
         <TweaksUI t={t} setTweak={setTweak} />
       </>
+    );
+  }
+
+  // Valid session, account temporarily unresolvable (503 account_unavailable).
+  // Deliberately NOT the sign-in screen: signing in again would mint a fresh
+  // account and orphan the real one. Offer a retry; the session is preserved, so
+  // once the backend's store is restored a reload signs the user straight back in.
+  if (stage === "unavailable") {
+    return (
+      <div className="auth-shell" style={{ display: "grid", placeItems: "center", textAlign: "center" }}>
+        <div style={{ maxWidth: 420, padding: 24 }}>
+          <h2 style={{ marginBottom: 8 }}>Your account is temporarily unavailable</h2>
+          <p className="mute" style={{ fontSize: 13, lineHeight: 1.5, marginBottom: 16 }}>
+            You’re still signed in, but we couldn’t load your account just now. This is usually
+            temporary — please try again in a moment. Your data hasn’t been deleted.
+          </p>
+          <button className="btn primary" onClick={() => auth.reload()}>Try again</button>
+        </div>
+      </div>
     );
   }
 

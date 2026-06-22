@@ -56,6 +56,13 @@ const COLLECTIONS = Object.keys(TABLES) as (keyof DB)[];
 
 let state: DB = structuredClone(empty);
 let pool: PgPool | null = null;
+// Diagnostics for the "store wiped on redeploy" failure mode. Surfaced via
+// dbHealth() -> /api/health so a wipe is visible in one request right after a
+// deploy: `rowsLoadedAtBoot` is how many rows loadAll() pulled back from
+// Postgres at boot (a sudden 0 on a DB that had data is the smoking gun), and
+// `bootedAt` confirms the process actually restarted.
+let rowsLoadedAtBoot = 0;
+let bootedAt = 0;
 
 // ---------------------------------------------------------------------------
 // At-rest secret encryption
@@ -233,6 +240,16 @@ let quarantinedRows = 0;
 const MAX_TRANSIENT_RETRIES = 5;
 const backoffMs = (attempt: number) => Math.min(500 * 2 ** (attempt - 1), 5_000);
 
+// Background retry. A single runFlush pass gives up after MAX_TRANSIENT_RETRIES so
+// it can't hot-spin or hang a shutdown — but if it gives up, the parked writes
+// must NOT wait for a new mutation to be retried (a wedged Neon connection on an
+// idle box would otherwise never re-flush, and the backlog dies on the next
+// redeploy — exactly the prod data-loss we're fixing). This heartbeat keeps
+// draining the backlog on its own, self-stops once it's empty, and restarts on
+// the next give-up / pool 'error'. Unref'd so it never holds the process open.
+let heartbeatTimer: NodeJS.Timeout | null = null;
+const HEARTBEAT_MS = 15_000;
+
 function pendingCount(): number {
   let n = 0;
   for (const m of dirty.values()) n += m.size;
@@ -241,8 +258,17 @@ function pendingCount(): number {
 }
 
 function onFlushOk(): void {
+  const wasFailing = consecutiveFlushFailures > 0;
   consecutiveFlushFailures = 0;
   lastFlushError = null;
+  // The instant a wedged connection comes back, re-stage the FULL in-memory
+  // snapshot so Postgres reconverges to memory — not just the last dirty set.
+  // This recovers anything the give-up path parked AND anything that drifted
+  // while persistence was down, so a redeploy can't reload a stale DB.
+  if (wasFailing) {
+    console.warn("[db] write-through recovered — re-syncing full snapshot to Postgres");
+    reconcileAll();
+  }
 }
 
 function recordFlushFailure(message: string): void {
@@ -281,6 +307,8 @@ export function dbHealth() {
     quarantinedRows,
     lastFlushError,
     lastFlushErrorAt,
+    rowsLoadedAtBoot,
+    bootedAt,
   };
 }
 
@@ -321,6 +349,35 @@ function schedule(): void {
     flushTimer = null;
     void runFlush();
   }, 50);
+}
+
+// Keep retrying parked writes in the background until the backlog drains, so
+// recovery never depends on a new mutation arriving. Idempotent to start.
+function startHeartbeat(): void {
+  if (!pool || heartbeatTimer) return;
+  heartbeatTimer = setInterval(() => {
+    if (!pool || !hasPending()) {
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = null;
+      return;
+    }
+    void runFlush();
+  }, HEARTBEAT_MS);
+  heartbeatTimer.unref?.();
+}
+
+// Convergence safety net: re-stage every row in the in-memory snapshot so a
+// healthy connection rewrites the entire dataset (idempotent upsert-by-id).
+// Called from onFlushOk on recovery; exported so an operator/endpoint can force a
+// full re-sync. Deletes aren't replayed here — a re-appearing stale row is far
+// less harmful than the data loss this guards against.
+export function reconcileAll(): void {
+  if (!pool) return;
+  for (const name of COLLECTIONS) {
+    for (const row of state[name] as unknown as Array<{ id?: string }>) {
+      if (row && typeof row.id === "string") stageUpsert(name, row);
+    }
+  }
 }
 
 async function persistBatch(
@@ -486,10 +543,11 @@ async function runFlush(): Promise<void> {
         recordFlushFailure(`transient write failure (attempt ${transientRetries}/${MAX_TRANSIENT_RETRIES})`);
         if (transientRetries >= MAX_TRANSIENT_RETRIES) {
           console.error(
-            `[db] giving up after ${transientRetries} transient failures; ` +
-              `${pendingCount()} write(s) remain in memory and will retry on the next ` +
-              `mutation or flushPending().`
+            `[db] giving up this pass after ${transientRetries} transient failures; ` +
+              `${pendingCount()} write(s) remain in memory — a background heartbeat will keep ` +
+              `retrying every ${HEARTBEAT_MS / 1000}s until the database is reachable again.`
           );
+          startHeartbeat();
           break;
         }
         await new Promise((r) => setTimeout(r, backoffMs(transientRetries)));
@@ -580,6 +638,8 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
   lastFlushErrorAt = null;
   quarantinedRows = 0;
   warnedSealedNoKey = false;
+  rowsLoadedAtBoot = 0;
+  bootedAt = Date.now();
   if (opts?.poolOverride) {
     pool = opts.poolOverride;
   } else if (!config.databaseUrl) {
@@ -592,6 +652,23 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
       connectionString: sanitizeUrl(config.databaseUrl),
       ssl: { rejectUnauthorized: true },
       max: 5,
+      // Keep TCP alive through Neon/Render proxies so idle pooled connections
+      // aren't silently reaped between flushes (the trigger for the prod wipe).
+      keepAlive: true,
+      // Bound a connect attempt so a suspended/unreachable Neon endpoint can't
+      // hang a flush (or the shutdown drain) — the retry/heartbeat handle waiting.
+      connectionTimeoutMillis: 10_000,
+    });
+    // node-postgres emits 'error' on an idle client failing (Neon dropping an
+    // idle connection, a network blip). With NO listener Node escalates it to an
+    // uncaught exception that can kill the process — which then silently restarts
+    // and reloads the stale DB: precisely the data loss we're fixing. Swallow it
+    // (the bad client is already evicted; the next query gets a fresh one) and
+    // make sure the heartbeat is draining any parked writes once connectivity
+    // returns. Real pool only — the test poolOverride is a bare stub with no .on.
+    pool.on("error", (err) => {
+      console.error("[db] idle pool client error (pool reconnects on next query):", err.message);
+      startHeartbeat();
     });
   }
   await ensureSchema();
@@ -636,6 +713,7 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
   }
 
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);
+  rowsLoadedAtBoot = total;
   const target = opts?.poolOverride ? "injected test pool" : describeDb(config.databaseUrl);
   console.log(
     `[db] connected [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
@@ -644,6 +722,10 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
 
 /** Flush pending writes and close the pool. Call on graceful shutdown. */
 export async function shutdownDb(): Promise<void> {
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
   await flushPending();
   if (pool) {
     await pool.end();

@@ -5,7 +5,7 @@ import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
 import type { RepoGuidanceItem, Repository, User } from "../types.js";
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
-import { clearSessionCookie, getSessionUser } from "../github/oauth.js";
+import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
@@ -30,15 +30,39 @@ export const api = Router();
 
 // --- Identity ---
 
-api.get("/me", (req, res) => {
+// Exported for unit tests (the ghost-session / data-loss branch below); the
+// route binds it directly. See deleteAccountHandler for the same pattern.
+export function meHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) {
+    // Distinguish a genuine sign-out from a "ghost session": a validly-signed,
+    // unexpired cookie whose user row is gone. If the entire users table is empty
+    // we almost certainly lost data (a store wiped on redeploy), so surface it as
+    // a temporary outage (503) rather than letting it masquerade as "signed out".
+    // Masquerading sends the user to the sign-in screen, where re-auth would mint
+    // a fresh account and orphan everything we're trying to recover. Keep the
+    // cookie so the session re-resolves itself once the store is back.
+    const ghostId = peekSessionUserId(req);
+    if (ghostId && db.table("users").length === 0) {
+      console.error(
+        `[me] ghost session for user ${ghostId} but the users table is EMPTY — likely DATA LOSS ` +
+          `(store wiped on redeploy). Returning 503 (account_unavailable), NOT signing the user out. ` +
+          `Check /api/health rowsLoadedAtBoot.`
+      );
+      res.status(503).json({ error: "account_unavailable" });
+      return;
+    }
+    // No valid token, or a healthy store where only this row is gone (e.g. the
+    // account was deleted on another device): a genuine signed-out state. Clear
+    // any stale ghost cookie so it can't keep resolving to nothing.
+    if (ghostId) clearSessionCookie(res);
     res.status(401).json({ error: "not_signed_in" });
     return;
   }
   const sub = db.find("subscriptions", (s) => s.userId === user.id);
   res.json({ user, subscription: sub });
-});
+}
+api.get("/me", meHandler);
 
 // Delete the signed-in user's account immediately and permanently: run the full
 // teardown (cancel billing, uninstall the App, wipe every row — see account.ts:
@@ -88,6 +112,12 @@ api.get("/health", (_req, res) => {
     pendingWrites: write.pendingWrites,
     quarantinedRows: write.quarantinedRows,
     lastFlushError: write.lastFlushError,
+    // How many rows loadAll() pulled from Postgres when this process booted, and
+    // when it booted. After a deploy, a `rowsLoadedAtBoot` of 0 (or far below the
+    // prior value) on a DB that should have data is the at-a-glance signal that
+    // the store came up empty — i.e. the "wiped on redeploy" symptom, caught.
+    rowsLoadedAtBoot: write.rowsLoadedAtBoot,
+    bootedAt: write.bootedAt,
   });
 });
 
