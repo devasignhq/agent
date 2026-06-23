@@ -27,7 +27,7 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User } from "../types.js";
+import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User, Vulnerability } from "../types.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import {
   appendAddedCriteria,
@@ -528,17 +528,70 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     }
 
     // c.1b Pre-existing vulnerabilities (advisory): vulns already stored in the
-    // repo index for files this PR touches or depends on. Read-only (no LLM),
-    // runs regardless of the holistic toggle, and never gates the merge — the PR
-    // didn't introduce these, so blocking it would be hostile.
-    const preexistingVulns = collectPreexistingVulns(holistic);
+    // repo index for files this PR touches or depends on. Never gates the merge —
+    // the PR didn't introduce these, so blocking it would be hostile.
+    //
+    // The index is built against the DEFAULT BRANCH and isn't rebuilt for an open
+    // PR, so a vuln this PR fixes would otherwise be re-surfaced verbatim. Split
+    // by whether the PR modifies the file: dependents (the PR doesn't touch them)
+    // keep the read-only index-driven path; touched files are re-verified against
+    // the PR head so a fix is recognized — resolved ones drop and are confirmed
+    // positively. The re-verify is gated on having an install + stored vulns in a
+    // touched file, so a clean PR (or dev with no install) pays nothing.
+    const touchedEntries = holistic.entries.slice(0, holistic.touchedCount);
+    const dependentEntries = holistic.entries.slice(holistic.touchedCount);
+    const dependentVulns = collectPreexistingVulns({
+      ...holistic,
+      entries: dependentEntries,
+      touchedCount: 0,
+      dependentCount: dependentEntries.length,
+    });
+    let touchedVulns: HolisticFinding[];
+    let resolvedVulns: HolisticFinding[] = [];
+    if (install && touchedEntries.some((e) => (e.vulnerabilities?.length ?? 0) > 0)) {
+      const reverified = await reverifyTouchedPreexistingVulns({
+        review,
+        repo,
+        install,
+        touchedEntries,
+        extraInstructions: wf.prompts?.holistic,
+      });
+      touchedVulns = reverified.stillPresent;
+      resolvedVulns = reverified.resolved;
+    } else {
+      touchedVulns = collectPreexistingVulns({
+        ...holistic,
+        entries: touchedEntries,
+        touchedCount: touchedEntries.length,
+        dependentCount: 0,
+      });
+    }
+    // Combine and re-apply the dedupe + cap collectPreexistingVulns enforces on a
+    // single source, now that two sources feed the list.
+    const preexistingVulns = dedupeAndCapFindings([...touchedVulns, ...dependentVulns], 20);
     if (preexistingVulns.length) {
       holisticVerdict = { ...holisticVerdict, preexistingVulns };
       for (const f of preexistingVulns) emitFindingLog(review.id, "preexistingSecurity", f);
-      log(review.id, "holistic", `Surfaced ${preexistingVulns.length} pre-existing security issue(s)`, {
-        detail: "Vulnerabilities already present in files this PR touches — advisory, not introduced by this PR.",
-        meta: { preexisting: preexistingVulns.length },
-      });
+    }
+    if (resolvedVulns.length) {
+      // Cap the rendered list (mirrors the 20-cap on preexistingVulns) so a mass
+      // refactor can't bloat the comment; the log below keeps the true total.
+      holisticVerdict = { ...holisticVerdict, resolvedPreexisting: resolvedVulns.slice(0, 20) };
+    }
+    if (preexistingVulns.length || resolvedVulns.length) {
+      log(
+        review.id,
+        "holistic",
+        resolvedVulns.length
+          ? `Re-verified pre-existing security issues against this PR — ${resolvedVulns.length} resolved, ${preexistingVulns.length} still present`
+          : `Surfaced ${preexistingVulns.length} pre-existing security issue(s)`,
+        {
+          detail: resolvedVulns.length
+            ? "Re-checked stored vulnerabilities in files this PR modifies against the PR head; resolved ones were dropped."
+            : "Vulnerabilities already present in files this PR touches — advisory, not introduced by this PR.",
+          meta: { preexisting: preexistingVulns.length, resolved: resolvedVulns.length },
+        }
+      );
     }
 
     // Carry the new-commit intent review (computed in b.2) into the verdict so it
@@ -2032,6 +2085,22 @@ export function formatReviewBody(
       ""
     );
     appendHolisticGroup(lines, "Pre-existing", holistic.preexistingVulns);
+    lines.push("");
+  }
+
+  // Pre-existing vulnerabilities this PR resolved (re-verified against the PR
+  // head). Positive confirmation that the agent saw the fix — advisory, no fix
+  // prompt (nothing to fix), rendered without a severity tag.
+  if (holistic.resolvedPreexisting.length) {
+    lines.push("### ✅ Resolved in this PR");
+    lines.push(
+      "These previously-flagged vulnerabilities in files this PR touches are no longer present at this commit:",
+      ""
+    );
+    for (const f of holistic.resolvedPreexisting) {
+      const where = f.path ? `\`${f.path}\` — ` : "";
+      lines.push(`- ${where}${f.concern}`);
+    }
     lines.push("");
   }
 
@@ -3681,6 +3750,11 @@ type HolisticVerdict = {
   // diff). Advisory — forced severity "warn", never gate the merge. Surfaced so
   // the author sees latent risk in the code they're working near.
   preexistingVulns: HolisticFinding[];
+  // Pre-existing vulnerabilities this PR RESOLVED: stored vulns in files the PR
+  // modifies that re-verification against the PR head confirmed are gone. Positive
+  // confirmation that the agent saw the fix — advisory, never gates, no fixPrompt.
+  // Empty when nothing was re-verified or nothing was fixed.
+  resolvedPreexisting: HolisticFinding[];
   // New-commit intent review (reviewNewCommits, re-reviews only): per-commit
   // notes on whether the delta diff matches each new commit's stated intent.
   // Advisory (forced "warn") — gating happens via criteria synthesized from that
@@ -3700,6 +3774,7 @@ export const EMPTY_HOLISTIC: HolisticVerdict = {
   conventionFindings: [],
   docDriftFindings: [],
   preexistingVulns: [],
+  resolvedPreexisting: [],
   commitIntentFindings: [],
   commitIntentSummary: "",
   summary: "",
@@ -3927,19 +4002,185 @@ export function collectPreexistingVulns(holistic: HolisticContext): HolisticFind
       const key = `${v.path}::${v.concern}`;
       if (seen.has(key)) continue;
       seen.add(key);
-      const where = v.symbol
-        ? ` (${v.symbol}${v.line ? `:${v.line}` : ""})`
-        : v.line
-        ? ` (line ${v.line})`
-        : "";
-      out.push({
-        path: v.path,
-        concern: `[${v.class}] ${v.concern}${where} — pre-existing in this file, not introduced by this PR.`,
-        severity: "warn",
-        ...(v.fixPrompt ? { fixPrompt: v.fixPrompt } : {}),
-      });
+      out.push(formatPreexistingFinding(v));
       if (out.length >= 20) return out;
     }
+  }
+  return out;
+}
+
+// "symbol:line" / "line N" locator suffix for a stored vuln, or "" when unknown.
+function vulnLocator(v: Vulnerability): string {
+  return v.symbol
+    ? ` (${v.symbol}${v.line ? `:${v.line}` : ""})`
+    : v.line
+    ? ` (line ${v.line})`
+    : "";
+}
+
+// Format one stored Vulnerability into an advisory "pre-existing" finding:
+// "[class] concern (symbol:line) — pre-existing…", forced severity "warn" (the
+// PR didn't introduce it, so it never gates). Pure; reused by both the
+// index-driven collector and the re-verify step. Exported for unit testing.
+export function formatPreexistingFinding(v: Vulnerability): HolisticFinding {
+  return {
+    path: v.path,
+    concern: `[${v.class}] ${v.concern}${vulnLocator(v)} — pre-existing in this file, not introduced by this PR.`,
+    severity: "warn",
+    ...(v.fixPrompt ? { fixPrompt: v.fixPrompt } : {}),
+  };
+}
+
+// Format a stored Vulnerability the PR resolved into a positive note. Same
+// locator, framed as fixed; no fixPrompt (nothing to fix). severity "warn" is
+// just the HolisticFinding shape — it never gates and renders in its own
+// positive section. Pure; exported for unit testing.
+export function formatResolvedFinding(v: Vulnerability): HolisticFinding {
+  return {
+    path: v.path,
+    concern: `[${v.class}] ${v.concern}${vulnLocator(v)} — resolved by this PR.`,
+    severity: "warn",
+  };
+}
+
+// ─── Pre-existing vuln re-verification ──────────────────────────────────────
+//
+// The repo index is built against the DEFAULT BRANCH and is not rebuilt for an
+// open PR's branch, so a vuln a PR fixes is still stored and would be re-surfaced
+// verbatim on the re-review. For files the PR actually modifies (the holistic
+// "touched" slice), re-check each stored vuln against the file at the PR head: a
+// fixed one is dropped (and confirmed positively), a still-present one is kept.
+// Files the PR doesn't touch keep the index-driven path (collectPreexistingVulns).
+
+export type ReverifiedVulns = {
+  // Vulns confirmed still present at the PR head — surfaced as before (advisory).
+  stillPresent: HolisticFinding[];
+  // Vulns the PR resolved — surfaced positively, never gates, nothing to fix.
+  resolved: HolisticFinding[];
+};
+
+// Pure shaper: given the touched entries and the model's per-file verdicts
+// (entry path → array of {index, status}), partition every stored vuln into
+// still-present vs resolved. Safe default: anything not explicitly "resolved"
+// (no verdict for the file, out-of-range index, any non-"resolved" status) stays
+// still-present, so a real vuln is never hidden by a flaky/absent verdict.
+// Deduped by path+concern across entries (mirrors collectPreexistingVulns).
+// Exported for offline testing.
+export function partitionReverifiedVulns(
+  touchedEntries: RepoIndexEntry[],
+  verdictsByPath: Map<string, Array<{ index: number; status: string }>>
+): ReverifiedVulns {
+  const stillPresent: HolisticFinding[] = [];
+  const resolved: HolisticFinding[] = [];
+  const seen = new Set<string>();
+  for (const e of touchedEntries) {
+    const verdicts = verdictsByPath.get(e.path);
+    const vulns = e.vulnerabilities ?? [];
+    for (let i = 0; i < vulns.length; i++) {
+      const v = vulns[i];
+      const key = `${v.path}::${v.concern}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const verdict = verdicts?.find((r) => r.index === i);
+      if (verdict && verdict.status === "resolved") {
+        resolved.push(formatResolvedFinding(v));
+      } else {
+        stillPresent.push(formatPreexistingFinding(v));
+      }
+    }
+  }
+  return { stillPresent, resolved };
+}
+
+const PREEXISTING_REVERIFY_SYSTEM =
+  "You are DevAsign's pre-existing vulnerability re-verification step. A pull request modifies a file the " +
+  "repository's security index previously flagged with one or more known vulnerabilities. You are given the file's " +
+  "CURRENT contents at the PR head and the list of previously-known vulnerabilities (each with an index, class, " +
+  "concern, and optional symbol/line). For EACH known vulnerability, decide whether it is STILL PRESENT in the current " +
+  "file or has been RESOLVED by this PR. Judge only whether that specific vulnerability still exists in the code shown — " +
+  "do not hunt for new issues, and do not invent vulnerabilities not in the provided list. When unsure, answer " +
+  '"present" — never claim a fix you cannot actually see in the code. ' +
+  'Emit ONLY JSON: {"results": [{"index": number, "status": "present"|"resolved", "evidence": string}]}. ' +
+  "`index` must echo the provided vulnerability index. `evidence` is one short phrase citing the code (or its absence) that justifies the call.";
+
+// Re-verify the stored vulnerabilities of the files this PR modifies against the
+// file contents at the PR head. One blob fetch + one LLM call per touched file
+// that carries stored vulns (most PRs touch none). Best-effort throughout: a
+// fetch or LLM failure for a file leaves it out of the verdict map, so
+// partitionReverifiedVulns keeps that file's vulns as still-present.
+async function reverifyTouchedPreexistingVulns(args: {
+  review: PRReview;
+  repo: Repository;
+  install: Installation;
+  touchedEntries: RepoIndexEntry[];
+  extraInstructions?: string;
+}): Promise<ReverifiedVulns> {
+  const { review, repo, install, touchedEntries } = args;
+  const withVulns = touchedEntries.filter((e) => (e.vulnerabilities?.length ?? 0) > 0);
+  if (!withVulns.length) return { stillPresent: [], resolved: [] };
+
+  const system = withMaintainerInstructions(PREEXISTING_REVERIFY_SYSTEM, args.extraInstructions);
+  const verdictsByPath = new Map<string, Array<{ index: number; status: string }>>();
+
+  for (const e of withVulns) {
+    let content: string;
+    try {
+      const encodedPath = e.path.split("/").map(encodeURIComponent).join("/");
+      content = await ghText(
+        install.installationId,
+        `/repos/${repo.owner}/${repo.name}/contents/${encodedPath}?ref=${review.headSha}`,
+        { Accept: "application/vnd.github.raw" }
+      );
+    } catch (err) {
+      console.warn(`[reverify] fetch ${e.path}@${review.headSha.slice(0, 7)} failed:`, err);
+      continue; // leave unset → this file's vulns stay still-present
+    }
+    const vulns = e.vulnerabilities ?? [];
+    const vulnList = vulns
+      .map((v, i) => {
+        const loc = v.symbol ? ` symbol=${v.symbol}` : "";
+        const ln = v.line ? ` line=${v.line}` : "";
+        return `${i}. [${v.class}]${loc}${ln} ${v.concern}`;
+      })
+      .join("\n");
+    const userText =
+      `# File: ${e.path} (current contents at PR head)\n\`\`\`\n${content.slice(0, 40_000)}\n\`\`\`\n\n` +
+      `# Previously-known vulnerabilities in this file\n${vulnList}`;
+    try {
+      const raw = await complete({
+        system,
+        cacheSystem: true,
+        messages: [{ role: "user", content: userText }],
+        maxTokens: 1000,
+      });
+      const parsed = tryParseJSON<{ results?: unknown }>(raw, {});
+      const results = Array.isArray(parsed.results)
+        ? parsed.results
+            .map((r: any) => ({ index: Number(r?.index), status: String(r?.status ?? "").trim().toLowerCase() }))
+            .filter((r) => Number.isInteger(r.index))
+        : [];
+      verdictsByPath.set(e.path, results);
+    } catch (err) {
+      console.warn(`[reverify] llm ${e.path} failed:`, err);
+      // leave unset → this file's vulns stay still-present (safe default)
+    }
+  }
+
+  return partitionReverifiedVulns(withVulns, verdictsByPath);
+}
+
+// Dedupe HolisticFindings by path+concern and cap the count. Merges the
+// re-verified touched-file vulns with the index-driven dependent-file vulns,
+// reproducing the dedupe+cap collectPreexistingVulns applies to a single source.
+function dedupeAndCapFindings(findings: HolisticFinding[], cap: number): HolisticFinding[] {
+  const out: HolisticFinding[] = [];
+  const seen = new Set<string>();
+  for (const f of findings) {
+    const key = `${f.path ?? ""}::${f.concern}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(f);
+    if (out.length >= cap) break;
   }
   return out;
 }
@@ -4012,9 +4253,19 @@ async function fetchIncrementalDelta(
 ): Promise<{ commits: Array<{ sha: string; message: string }>; diff: string } | null> {
   try {
     const cmp = await gh<{
+      status?: string;
       commits?: Array<{ sha: string; commit?: { message?: string } }>;
       files?: Array<{ filename: string; patch?: string }>;
     }>(installationId, `/repos/${repo.owner}/${repo.name}/compare/${base}...${head}`);
+    // Only run the incremental review for fast-forward pushes. A rebase/force-push
+    // makes base and head "diverged"; the compare then walks back to their merge
+    // base and reports the rebased-onto base-branch commits as "new", which the
+    // model would mistake for the author's intent and synthesize criteria the
+    // cumulative diff can't satisfy. Returning null falls back to the cumulative
+    // review with no regression.
+    if (cmp.status !== "ahead") {
+      return null;
+    }
     const commits = (cmp.commits ?? []).map((c) => ({
       sha: c.sha,
       message: c.commit?.message || "",
