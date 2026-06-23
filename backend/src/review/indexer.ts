@@ -9,10 +9,11 @@
 
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import { config } from "../config.js";
 import { gh, installationToken } from "../github/app.js";
 import { complete, currentUsage, withUsage } from "../llm.js";
 import { track } from "../statsig.js";
-import type { Installation, RepoIndexEntry, Repository, ReviewLogEntry, User } from "../types.js";
+import type { Installation, RepoIndexEntry, Repository, ReviewLogEntry, User, Vulnerability, VulnerabilitySeverity } from "../types.js";
 
 // Per-run summary returned by the full/incremental builders so buildRepoIndex can
 // emit one "repo indexed" analytics event with the counts + the rolled-up usage.
@@ -33,6 +34,10 @@ function analyticsUser(userId: string | undefined): User | string | null {
 }
 
 const INDEX_MODEL = "claude-haiku-4-5";
+// The gated security sub-pass uses the configured frontier model, not Haiku:
+// security reasoning is the one place the cheap summariser isn't good enough,
+// and the result is sha-cached so we pay the frontier call once per blob.
+const SECURITY_MODEL = config.llm.model;
 const MAX_FILE_BYTES = 256_000;
 const MAX_PATH_LEN = 256;
 const ALLOWED_JSON_BYTES = 50_000;       // .json files are allowed only when small
@@ -84,6 +89,32 @@ const FILE_SUMMARY_SYSTEM =
   "`securityFlags` are short tags for security-sensitive patterns you observe " +
   '(examples: "reads-env", "writes-env", "raw-sql", "executes-shell", "handles-auth", "parses-user-input", "uses-crypto"). ' +
   "Be terse, factual, and skip narrative. Do not invent symbols or imports that are not in the file.";
+
+// Gated security sub-pass (SECURITY_MODEL). Runs only on files the summariser
+// flagged as security-sensitive. Reports concrete, in-file vulnerabilities —
+// this is the whole-codebase audit's detector, distinct from the PR-time
+// "did this diff introduce a vuln" check in the review pipeline.
+const SECURITY_SCAN_SYSTEM =
+  "You are DevAsign's file security audit step. Read a single source file and report ONLY real, concrete " +
+  "vulnerabilities that are actually present IN THIS FILE. Look for: injection (SQL/command/template), missing or " +
+  "broken authentication/authorization, secrets or credentials committed in source, unsafe deserialization, SSRF, " +
+  "path traversal, XSS, weak or misused cryptography, and unvalidated/untrusted input reaching a dangerous sink. " +
+  'Emit ONLY JSON: {"vulnerabilities": [{"class": string, "severity": "blocker"|"warn", "symbol": string?, ' +
+  '"line": number?, "concern": string, "fixPrompt": string}]}. ' +
+  '`class` is a short taxonomy tag (e.g. "sql-injection", "command-injection", "xss", "ssrf", "path-traversal", ' +
+  '"missing-authz", "hardcoded-secret", "weak-crypto", "unsafe-deserialization"). ' +
+  'Use severity="blocker" only for a directly exploitable vulnerability that exposes data, allows code/command ' +
+  'execution, or bypasses auth; use "warn" for a plausible weakness that needs human review. ' +
+  "Only report issues genuinely present in the provided file — never speculate, never flag style, and prefer an " +
+  "empty array over padding. " +
+  "Each vulnerability MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude " +
+  "Code / Codex). Use this exact template:\n" +
+  "Fix: <one-line summary>\n\n" +
+  "File: <path>\n" +
+  "Symbol: <function/class name, or 'n/a'>\n\n" +
+  "Issue:\n<2-3 sentence description of the vulnerability and how it is exploitable>\n\n" +
+  "Expected behavior:\n<1-2 sentences: the secure behavior once fixed>\n\n" +
+  "Suggested approach:\n<concrete remediation steps>";
 
 export type ChangedPaths = {
   added: string[];
@@ -139,10 +170,16 @@ export async function buildRepoIndex(
         : await runIncrementalIndex(repo, install, opts.changedPaths!);
       if (indexUser) {
         const usage = currentUsage();
+        const idx = db.filter("repoIndex", (e) => e.repoId === repo.id);
+        const vulnFiles = idx.filter((e) => (e.vulnerabilities?.length ?? 0) > 0).length;
+        const vulnCount = idx.reduce((n, e) => n + (e.vulnerabilities?.length ?? 0), 0);
         track(indexUser, "repo indexed", {
           repo: `${repo.owner}/${repo.name}`,
           mode: summary.mode,
           index_model: INDEX_MODEL,
+          security_model: SECURITY_MODEL,
+          vuln_files: vulnFiles,
+          vuln_count: vulnCount,
           file_count: summary.fileCount,
           summarised: summary.summarised,
           cache_hits: summary.cacheHits,
@@ -203,6 +240,9 @@ async function runFullIndex(repo: Repository, install: Installation): Promise<In
     const prior = existingByPath.get(t.path);
     if (prior && prior.sha === t.sha) {
       cacheHits++;
+      // Summary is cached, but a flagged file may still owe a security scan
+      // (legacy row / first run after the pass shipped) — backfill it here.
+      await backfillSecurityScanIfOwed(repo, install, prior);
       processed++;
       return;
     }
@@ -284,6 +324,7 @@ async function runIncrementalIndex(
     const prior = db.find("repoIndex", (e) => e.repoId === repo.id && e.path === path);
     if (prior && prior.sha === sha) {
       cacheHits++;
+      await backfillSecurityScanIfOwed(repo, install, prior);
       return;
     }
     const ok = await summariseAndUpsert(repo, install, path, sha, size, prior || undefined);
@@ -335,6 +376,13 @@ async function summariseAndUpsert(
   if (!summary) return false;
 
   const language = path.split(".").pop()?.toLowerCase() || "";
+  // Gated security sub-pass: only files the summariser flagged as sensitive pay
+  // the frontier call, and we reuse the `content` already in hand (no extra
+  // fetch). securityScannedSha is set to `sha` either way, so an unflagged file
+  // is recorded as evaluated and isn't reconsidered until its content changes.
+  const vulnerabilities = summary.securityFlags.length
+    ? await scanFileSecurity(path, content, sha)
+    : [];
   const row: RepoIndexEntry = {
     id: prior?.id || uuid(),
     repoId: repo.id,
@@ -346,6 +394,8 @@ async function summariseAndUpsert(
     exports: summary.exports,
     imports: summary.imports,
     securityFlags: summary.securityFlags,
+    vulnerabilities,
+    securityScannedSha: sha,
     indexedAt: Date.now(),
     model: INDEX_MODEL,
   };
@@ -422,6 +472,102 @@ async function summariseFile(path: string, content: string): Promise<
     }
   }
   return null;
+}
+
+// ─── Security sub-pass ────────────────────────────────────────────────────
+
+// Run the gated frontier security scan on one file's contents and shape the
+// model output into stored Vulnerability rows. Mirrors summariseFile's retry /
+// 429-backoff handling. Returns [] on any failure so a flaky scan never blocks
+// indexing — the file is simply recorded as scanned with no findings.
+async function scanFileSecurity(path: string, content: string, sha: string): Promise<Vulnerability[]> {
+  const userText = `Path: ${path}\n\n\`\`\`\n${content}\n\`\`\``;
+  for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
+    try {
+      const raw = await complete({
+        system: SECURITY_SCAN_SYSTEM,
+        model: SECURITY_MODEL,
+        cacheSystem: true,
+        messages: [{ role: "user", content: userText }],
+        maxTokens: 1500,
+      });
+      const parsed = tryParseJSON(raw);
+      if (!parsed) continue;
+      return buildVulns(parsed.vulnerabilities, path, sha);
+    } catch (err: any) {
+      const msg = err?.message || String(err);
+      const is429 = /429/.test(msg) || /rate/i.test(msg);
+      if (is429 && attempt < MAX_LLM_RETRIES - 1) {
+        await new Promise((r) => setTimeout(r, 5_000 * (attempt + 1)));
+        continue;
+      }
+      console.warn(`[indexer] security scan ${path} failed:`, msg);
+      return [];
+    }
+  }
+  return [];
+}
+
+// Coerce the model's vulnerability array into stored rows: drop malformed/empty
+// items, clamp severity to blocker|warn, stamp path/sha/model, and cap the count
+// so one noisy file can't balloon the index row. Exported for testing.
+export function buildVulns(input: unknown, path: string, sha: string): Vulnerability[] {
+  if (!Array.isArray(input)) return [];
+  const now = Date.now();
+  const out: Vulnerability[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    const concern = String((item as any).concern || "").trim();
+    if (!concern) continue;
+    const cls = String((item as any).class || "").trim() || "unspecified";
+    const severity: VulnerabilitySeverity = (item as any).severity === "blocker" ? "blocker" : "warn";
+    const symbol = (item as any).symbol;
+    const line = (item as any).line;
+    const fixPrompt = String((item as any).fixPrompt || "").trim();
+    out.push({
+      id: uuid(),
+      class: cls.slice(0, 60),
+      severity,
+      path,
+      ...(typeof symbol === "string" && symbol ? { symbol: symbol.slice(0, 120) } : {}),
+      ...(typeof line === "number" && Number.isFinite(line) ? { line } : {}),
+      concern,
+      fixPrompt,
+      detectedSha: sha,
+      detectedAt: now,
+      model: SECURITY_MODEL,
+    });
+    if (out.length >= 20) break;
+  }
+  return out;
+}
+
+// Backfill the security sub-pass for a flagged file that's a summary cache hit
+// (sha unchanged) but hasn't been scanned at this sha — e.g. a row indexed
+// before the security pass existed, or one whose scan we still owe. Costs one
+// blob fetch + one frontier call, once: afterwards securityScannedSha matches
+// and steady-state cache hits are free again. Returns true if it ran.
+async function backfillSecurityScanIfOwed(
+  repo: Repository,
+  install: Installation,
+  prior: RepoIndexEntry
+): Promise<boolean> {
+  const owed = (prior.securityFlags?.length ?? 0) > 0 && prior.securityScannedSha !== prior.sha;
+  if (!owed) return false;
+  let content: string;
+  try {
+    content = await fetchBlob(repo, install, prior.path, prior.sha);
+  } catch (err) {
+    console.warn(`[indexer] backfill fetch ${prior.path} failed:`, err);
+    return false;
+  }
+  if (!content) return false;
+  const vulnerabilities = await scanFileSecurity(prior.path, content, prior.sha);
+  db.update("repoIndex", (e) => e.id === prior.id, {
+    vulnerabilities,
+    securityScannedSha: prior.sha,
+  });
+  return true;
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────

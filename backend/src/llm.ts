@@ -332,6 +332,20 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     });
   }
 
+  // Per-file security audit sub-pass (frontier model in production). Echo an
+  // empty, structurally-valid result so the indexer's gated scan can run offline
+  // without billing — it only fires when the summariser flagged the file, which
+  // the mock above never does, so this is defensive correctness for dev runs.
+  if (system?.includes("file security audit")) {
+    return JSON.stringify({ vulnerabilities: [] });
+  }
+
+  // PR security review backstop (frontier model in production). Returns no
+  // findings offline so the security pass runs clean without billing.
+  if (system?.includes("PR security review step")) {
+    return JSON.stringify({ securityFindings: [], summary: "[mock] No vulnerabilities surfaced." });
+  }
+
   // Deferred-work detection (Opus in production). Echo one deterministic
   // advisory deferral so the offline path exercises the finding card + the new
   // "Deferred / incomplete work" section end-to-end. The `concern` leads with

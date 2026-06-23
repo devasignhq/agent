@@ -584,6 +584,38 @@ api.get("/repositories/:id/guidance", (req, res) => {
   res.json({ items: ctx.repo.guidance ?? [] });
 });
 
+// Whole-repo security audit: aggregate the vulnerabilities the indexer's
+// security sub-pass stored across this repo's files. Read-only and owner-scoped,
+// with no LLM cost (pure aggregation over the repo index). Empty until the index
+// has been (re)built with the security pass — `indexState` tells the caller
+// whether a build is pending so an empty list reads as "not scanned yet" rather
+// than "clean".
+api.get("/repositories/:id/security", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const entries = db.filter("repoIndex", (e) => e.repoId === ctx.repo.id);
+  const vulnerabilities = entries
+    .flatMap((e) => e.vulnerabilities ?? [])
+    .sort((a, b) => {
+      // Blockers first, then by file path for stable grouping.
+      if (a.severity !== b.severity) return a.severity === "blocker" ? -1 : 1;
+      return a.path.localeCompare(b.path);
+    });
+  const blocker = vulnerabilities.filter((v) => v.severity === "blocker").length;
+  res.json({
+    indexState: ctx.repo.indexState ?? "none",
+    indexedAt: ctx.repo.indexedAt ?? null,
+    indexedCommit: ctx.repo.indexedCommit ?? null,
+    counts: {
+      total: vulnerabilities.length,
+      blocker,
+      warn: vulnerabilities.length - blocker,
+      affectedFiles: new Set(vulnerabilities.map((v) => v.path)).size,
+    },
+    vulnerabilities,
+  });
+});
+
 // Add a video or documentation link. Distils immediately via the queue.
 api.post("/repositories/:id/guidance", expensiveLimiter, (req, res) => {
   const ctx = ownedRepo(req, res);

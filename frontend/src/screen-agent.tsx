@@ -488,6 +488,7 @@ const FINDING_LABEL = {
   regression: "Regression",
   criticalError: "Critical error",
   security: "Security finding",
+  preexistingSecurity: "Pre-existing security",
   consistency: "Consistency",
   deferral: "Deferred work",
   convention: "DEVASIGN.md",

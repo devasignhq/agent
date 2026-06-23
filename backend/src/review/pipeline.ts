@@ -73,6 +73,10 @@ type FindingCategory =
   | "regression"
   | "criticalError"
   | "security"
+  // A vulnerability that already exists in a file this PR touches or depends on
+  // (surfaced from the repo index's security audit). Advisory — the PR didn't
+  // introduce it, so it never gates the merge.
+  | "preexistingSecurity"
   | "consistency"
   | "deferral"
   // DEVASIGN.md findings: a convention the diff newly violates, and a
@@ -90,6 +94,7 @@ function emitFindingLog(
     regression: "Possible regression",
     criticalError: "Critical error",
     security: "Security finding",
+    preexistingSecurity: "Pre-existing security issue",
     consistency: "Consistency deviation",
     deferral: "Deferred / incomplete work",
     convention: "DEVASIGN.md violation",
@@ -251,9 +256,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // anything that imports from them + a short manifest of the rest of the
     // repo. The holistic Opus call below uses this so the verdict reflects
     // whole-repo impact, not just the diff.
-    const holistic = wf.stages.holistic
-      ? gatherHolisticContext(repo, context.diff)
-      : { entries: [], touchedCount: 0, dependentCount: 0, manifest: [] };
+    // Always gathered (pure db reads) so the pre-existing-vuln surfacing and the
+    // security backstop have touched/dependent context even when the heavy
+    // holistic stage is toggled off — the reviewAgainstRepo call itself stays
+    // gated on wf.stages.holistic below.
+    const holistic = gatherHolisticContext(repo, context.diff);
     if (!wf.stages.holistic) {
       log(review.id, "holistic", "Whole-repo review disabled by workflow");
     } else if (holistic.entries.length || holistic.manifest.length) {
@@ -399,14 +406,15 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     );
 
     // c.1 Whole-repo review: ask Opus to check the diff against the repo index
-    // for regressions, critical errors, and security flaws. Skipped when the
-    // index hasn't been built yet (e.g. a PR landed before the initial walk
-    // finished); in that case we fall back to the criteria-only verdict.
+    // for regressions, critical errors, and security flaws. Gated on the
+    // holistic stage AND the index being built (a PR can land before the initial
+    // walk finishes). In either gap, the criteria verdict still stands and the
+    // security backstop in c.1a below keeps security covered.
     let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
-    let hasBlocker = false;
-    if (holistic.entries.length || holistic.manifest.length) {
+    const holisticRan = wf.stages.holistic && (holistic.entries.length > 0 || holistic.manifest.length > 0);
+    if (holisticRan) {
       holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic, extraInstructions: wf.prompts?.holistic });
-      hasBlocker = [
+      const holisticBlocked = [
         ...holisticVerdict.regressions,
         ...holisticVerdict.criticalErrors,
         ...holisticVerdict.securityFindings,
@@ -414,7 +422,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       log(
         review.id,
         "holistic",
-        hasBlocker ? "Holistic review found blockers" : "Holistic review clean",
+        holisticBlocked ? "Holistic review found blockers" : "Holistic review clean",
         {
           detail: holisticVerdict.summary,
           meta: {
@@ -431,6 +439,62 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       for (const f of holisticVerdict.criticalErrors) emitFindingLog(review.id, "criticalError", f);
       for (const f of holisticVerdict.securityFindings) emitFindingLog(review.id, "security", f);
     }
+
+    // c.1a Security backstop: security MUST be analyzed on every review, even
+    // when the holistic stage is toggled off or the index isn't built yet —
+    // otherwise the non-downgradeable security gate would be hollow (a repo
+    // could silently disable security by turning holistic off). The holistic
+    // pass above already owns security when it ran, so this only fires in the
+    // gap, keeping security analyzed exactly once.
+    if (!holisticRan && context.diff) {
+      const sec = await reviewDiffSecurity({
+        review,
+        diff: context.diff,
+        touched: holistic.entries.slice(0, holistic.touchedCount),
+        extraInstructions: wf.prompts?.holistic,
+      });
+      holisticVerdict = {
+        ...holisticVerdict,
+        securityFindings: sec.securityFindings,
+        summary: holisticVerdict.summary || sec.summary,
+      };
+      for (const f of sec.securityFindings) emitFindingLog(review.id, "security", f);
+      log(
+        review.id,
+        "holistic",
+        sec.securityFindings.some((f) => f.severity === "blocker")
+          ? "Security review found blockers"
+          : sec.securityFindings.length
+          ? "Security review found issues"
+          : "Security review clean",
+        { detail: sec.summary, meta: { securityFindings: sec.securityFindings.length } }
+      );
+    }
+
+    // c.1b Pre-existing vulnerabilities (advisory): vulns already stored in the
+    // repo index for files this PR touches or depends on. Read-only (no LLM),
+    // runs regardless of the holistic toggle, and never gates the merge — the PR
+    // didn't introduce these, so blocking it would be hostile.
+    const preexistingVulns = collectPreexistingVulns(holistic);
+    if (preexistingVulns.length) {
+      holisticVerdict = { ...holisticVerdict, preexistingVulns };
+      for (const f of preexistingVulns) emitFindingLog(review.id, "preexistingSecurity", f);
+      log(review.id, "holistic", `Surfaced ${preexistingVulns.length} pre-existing security issue(s)`, {
+        detail: "Vulnerabilities already present in files this PR touches — advisory, not introduced by this PR.",
+        meta: { preexisting: preexistingVulns.length },
+      });
+    }
+
+    // Merge gate: only a blocker-severity finding the DIFF introduces (regression,
+    // critical error, or introduced security vuln) flips the verdict. Pre-existing
+    // vulns are deliberately excluded. hasSecurityBlocker is tracked separately so
+    // verdict routing can hold REQUEST_CHANGES firm even in advisory mode.
+    const hasSecurityBlocker = holisticVerdict.securityFindings.some((f) => f.severity === "blocker");
+    const hasBlocker = [
+      ...holisticVerdict.regressions,
+      ...holisticVerdict.criticalErrors,
+      ...holisticVerdict.securityFindings,
+    ].some((f) => f.severity === "blocker");
     // Per-criterion suggestions land as findings too — same UI affordance, so
     // a user with one unmet criterion gets a copyable prompt to fix it.
     for (const s of verdict.suggestions) emitSuggestionLog(review.id, s);
@@ -544,16 +608,22 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // of REQUEST_CHANGES → COMMENT — lives in a pure helper so it's unit-tested
     // offline (decisions.test.ts). The internal `status` stays as computed; only
     // the GitHub review event is softened.
-    const { event: reviewEvent, postConversationReview, includeEndGoalCTA, downgradedToComment } =
+    const { event: reviewEvent, postConversationReview, includeEndGoalCTA, downgradedToComment, securityBlockerHeld } =
       resolveReviewEvent({
         status,
         specless,
         blocking: wf.verdict.blocking,
         endGoalAlreadyRequested: !!task.endGoalRequestedAt,
+        hasSecurityBlocker,
       });
     if (downgradedToComment) {
       log(review.id, "verdict", "Comment-only mode — merge not blocked", {
         detail: "Workflow set to advisory: posting a COMMENT instead of REQUEST_CHANGES.",
+      });
+    }
+    if (securityBlockerHeld) {
+      log(review.id, "verdict", "Security blocker held — advisory downgrade suppressed", {
+        detail: "Advisory mode would post a COMMENT, but a vulnerability this PR introduces keeps REQUEST_CHANGES firm.",
       });
     }
 
@@ -1862,6 +1932,19 @@ export function formatReviewBody(
     lines.push("");
   }
 
+  // Pre-existing vulnerabilities in files this PR touches (from the repo index's
+  // security audit). Advisory — clearly labelled as NOT introduced by this PR so
+  // a reviewer doesn't read them as a reason to block the merge.
+  if (holistic.preexistingVulns.length) {
+    lines.push("### Pre-existing security issues");
+    lines.push(
+      "These vulnerabilities already exist in files this PR touches — they were not introduced by this PR and don't block the merge, but they're worth fixing while you're here:",
+      ""
+    );
+    appendHolisticGroup(lines, "Pre-existing", holistic.preexistingVulns);
+    lines.push("");
+  }
+
   // DEVASIGN.md nits (advisory). Convention violations the diff newly introduced
   // and DEVASIGN.md statements the diff made outdated. Never block the merge —
   // surfaced as nitpicks, each with its own copyable fix prompt.
@@ -1933,6 +2016,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
     | "regressions"
     | "criticalErrors"
     | "securityFindings"
+    | "preexistingVulns"
     | "consistencyFindings"
     | "deferrals"
     | "conventionFindings"
@@ -1942,6 +2026,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   { key: "regressions", label: "Regression" },
   { key: "criticalErrors", label: "Critical error" },
   { key: "securityFindings", label: "Security" },
+  { key: "preexistingVulns", label: "Pre-existing security" },
   { key: "consistencyFindings", label: "Consistency" },
   { key: "deferrals", label: "Deferred work" },
   { key: "conventionFindings", label: "Convention" },
@@ -3047,9 +3132,9 @@ type HolisticVerdict = {
   regressions: HolisticFinding[];
   criticalErrors: HolisticFinding[];
   securityFindings: HolisticFinding[];
-  // Populated only by the spec-less pass (reviewSpeclessPR): concrete
-  // deviations from how the rest of the codebase / recent merged PRs are
-  // written. Advisory — never blocks a merge. Empty for spec'd reviews.
+  // Legacy advisory bucket for codebase-consistency deviations. No pass
+  // currently populates it (the former spec-less pass was removed); kept so the
+  // verdict shape and its renderers stay stable. Always empty today.
   consistencyFindings: HolisticFinding[];
   // Self-admitted "deferred / incomplete work" the diff's own comments concede
   // — TODOs, stubs, "for now", "deferred to a follow-up", NotImplemented, etc.
@@ -3064,6 +3149,11 @@ type HolisticVerdict = {
   // applicable DEVASIGN.md.
   conventionFindings: HolisticFinding[];
   docDriftFindings: HolisticFinding[];
+  // Vulnerabilities that ALREADY exist in files this PR touches or depends on,
+  // read from the repo index's stored security audit (not introduced by this
+  // diff). Advisory — forced severity "warn", never gate the merge. Surfaced so
+  // the author sees latent risk in the code they're working near.
+  preexistingVulns: HolisticFinding[];
   summary: string;
 };
 
@@ -3075,6 +3165,7 @@ export const EMPTY_HOLISTIC: HolisticVerdict = {
   deferrals: [],
   conventionFindings: [],
   docDriftFindings: [],
+  preexistingVulns: [],
   summary: "",
 };
 
@@ -3159,6 +3250,10 @@ async function reviewAgainstRepo(args: {
     "You are DevAsign's holistic repo-review step. Given (1) a PR diff, (2) summaries of the files the PR touches, " +
     "(3) summaries of files that depend on the touched files, and (4) a manifest of the rest of the repo, decide " +
     "whether the PR introduces regressions, critical errors, or security flaws beyond what the acceptance criteria covered. " +
+    "For securityFindings, look specifically for vulnerabilities this diff introduces: injection (SQL/command/template), " +
+    "missing or broken authentication/authorization, secrets or credentials committed in source, unsafe deserialization, " +
+    "SSRF, path traversal, XSS, weak or misused cryptography, and unvalidated/untrusted input reaching a dangerous sink. " +
+    "Only flag a vulnerability the diff actually creates — never pre-existing code, never speculation. " +
     'Emit ONLY JSON: {"regressions": [{"path": string, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
     '"criticalErrors": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
     '"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
@@ -3222,6 +3317,95 @@ async function reviewAgainstRepo(args: {
     securityFindings: normaliseFindings(parsed.securityFindings),
     summary: String(parsed.summary || ""),
   };
+}
+
+// Security-only review of the diff. The backstop that guarantees a security
+// pass runs on EVERY review even when the heavy holistic stage is toggled off
+// or no repo index exists — without it, "non-downgradeable security blocker"
+// would be hollow, since a repo could silently disable security by turning the
+// holistic stage off. When the holistic stage already ran with an index it owns
+// security and this is skipped, so security is analyzed exactly once. Touched
+// index summaries are passed when available but aren't required (a diff-only
+// security review is valid).
+async function reviewDiffSecurity(args: {
+  review: PRReview;
+  diff: string;
+  touched: RepoIndexEntry[];
+  extraInstructions?: string;
+}): Promise<{ securityFindings: HolisticFinding[]; summary: string }> {
+  const { touched } = args;
+  const system = withMaintainerInstructions(
+    "You are DevAsign's PR security review step. Given a PR diff (and, when available, summaries of the files it " +
+    "touches), find real vulnerabilities the diff INTRODUCES: injection (SQL/command/template), missing or broken " +
+    "authentication/authorization, secrets or credentials committed in source, unsafe deserialization, SSRF, path " +
+    "traversal, XSS, weak or misused cryptography, and unvalidated/untrusted input reaching a dangerous sink. " +
+    'Emit ONLY JSON: {"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], "summary": string}. ' +
+    'Use severity="blocker" only when the vulnerability is directly exploitable — exposes data, allows code/command ' +
+    'execution, or bypasses auth; use "warn" for a plausible weakness that needs human review. ' +
+    "Only flag issues the diff actually creates — never pre-existing code, never speculation. Prefer empty arrays over padding. " +
+    "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
+    "Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence description of the vulnerability and how it is exploitable>\n\n" +
+    "Expected behavior:\n<1-2 sentences: the secure behavior once fixed>\n\n" +
+    "Suggested approach:\n<concrete remediation steps>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.", args.extraInstructions);
+
+  const touchedBlock = touched
+    .map((e) =>
+      `### ${e.path}\n` +
+      `Flags: ${e.securityFlags.join(", ") || "(none)"}\n` +
+      `Summary: ${e.summary}`
+    )
+    .join("\n\n");
+  const userText =
+    `# Diff\n\`\`\`diff\n${args.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    `# Touched files (repo index summaries)\n${touchedBlock || "(none indexed)"}`;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1500,
+  });
+  const parsed = tryParseJSON<{ securityFindings?: unknown; summary?: unknown }>(raw, {});
+  return {
+    securityFindings: normaliseFindings(parsed.securityFindings),
+    summary: String(parsed.summary || ""),
+  };
+}
+
+// Flatten stored vulnerabilities from the files this PR touches or depends on
+// into advisory findings. Forced severity "warn": these are PRE-EXISTING (not
+// introduced by this PR), so they surface as context and never gate the merge.
+// Deduped by path+concern and capped so a vuln-heavy file can't flood the
+// review. Exported for testing alongside the review pipeline.
+export function collectPreexistingVulns(holistic: HolisticContext): HolisticFinding[] {
+  const out: HolisticFinding[] = [];
+  const seen = new Set<string>();
+  for (const e of holistic.entries) {
+    for (const v of e.vulnerabilities ?? []) {
+      const key = `${v.path}::${v.concern}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const where = v.symbol
+        ? ` (${v.symbol}${v.line ? `:${v.line}` : ""})`
+        : v.line
+        ? ` (line ${v.line})`
+        : "";
+      out.push({
+        path: v.path,
+        concern: `[${v.class}] ${v.concern}${where} — pre-existing in this file, not introduced by this PR.`,
+        severity: "warn",
+        ...(v.fixPrompt ? { fixPrompt: v.fixPrompt } : {}),
+      });
+      if (out.length >= 20) return out;
+    }
+  }
+  return out;
 }
 
 // ─── DEVASIGN.md guidance ───────────────────────────────────────────────────
@@ -3295,7 +3479,7 @@ async function reviewAgainstDevasignDocs(args: {
   });
   const parsed = tryParseJSON<{ violations?: unknown; docUpdates?: unknown; summary?: unknown }>(raw, {});
   // Force "nit" regardless of model output — DEVASIGN.md findings are uniformly
-  // advisory (mirrors how reviewSpeclessPR forces consistency findings to warn).
+  // advisory (the same way pre-existing vulns are forced to "warn").
   const toNit = (f: HolisticFinding): HolisticFinding => ({ ...f, severity: "nit" });
   return {
     conventionFindings: normaliseFindings(parsed.violations).map(toNit),
@@ -3422,8 +3606,8 @@ function buildPromiseText(endGoal: string, criteria: Criterion[], context: Conte
 // lines from the pre-scan, decide which candidates are genuine self-admitted
 // deferrals/scope-cuts and whether each contradicts the promise. Returns
 // advisory findings (severity forced to "warn" so they never gate the merge,
-// mirroring how reviewSpeclessPR treats consistencyFindings). Exported for
-// testing alongside scanDeferralCandidates.
+// like the other advisory buckets). Exported for testing alongside
+// scanDeferralCandidates.
 export async function detectDeferredWork(args: {
   diff: string;
   promise: string;
@@ -3479,145 +3663,4 @@ export async function detectDeferredWork(args: {
   // Advisory: force "warn" so a deferral never flips the merge status. The
   // model's contradiction judgment is preserved in the `concern` prefix.
   return normaliseFindings(parsed.deferrals).map((f) => ({ ...f, severity: "warn" as const }));
-}
-
-// --- Spec-less review (security + consistency) ---
-//
-// When a PR has no linked issue / spec / attachment there are no acceptance
-// criteria to check. Rather than inventing some or rubber-stamping the PR, we
-// do two concrete things the diff alone supports: (1) a focused security
-// review, and (2) a consistency check against how the rest of the team's code
-// is written. The conventions baseline prefers the repo index; when the index
-// isn't built yet it falls back to a sample of recent merged PRs.
-
-type MergedPRSample = { number: number; title: string; diff: string };
-
-// Pull the diffs of the most recent merged PRs as a convention baseline.
-// Best-effort: returns [] when there's no install or GitHub is unreachable.
-async function listRecentMergedPRDiffs(
-  install: { installationId: number } | null,
-  repo: { owner: string; name: string },
-  opts: { count?: number; excludePr?: number; maxBytes?: number } = {}
-): Promise<MergedPRSample[]> {
-  if (!install) return [];
-  const count = opts.count ?? 5;
-  const maxBytes = opts.maxBytes ?? 6000;
-  let list: any[] = [];
-  try {
-    list = await gh<any[]>(
-      install.installationId,
-      `/repos/${repo.owner}/${repo.name}/pulls?state=closed&sort=updated&direction=desc&per_page=20`
-    );
-  } catch (err) {
-    console.warn("[specless] listing merged PRs failed:", err);
-    return [];
-  }
-  const merged = list
-    .filter((p) => p && p.merged_at && p.number !== opts.excludePr)
-    .slice(0, count);
-  // Fetch each merged PR's diff in parallel — they're independent network
-  // round-trips and we'd otherwise pay 5× the latency for what is the longest
-  // step on the spec-less path.
-  const results = await Promise.all(
-    merged.map(async (pr): Promise<MergedPRSample | null> => {
-      try {
-        const diff = await ghText(
-          install.installationId,
-          `/repos/${repo.owner}/${repo.name}/pulls/${pr.number}`,
-          { Accept: "application/vnd.github.v3.diff" }
-        );
-        return { number: pr.number, title: String(pr.title || ""), diff: diff.slice(0, maxBytes) };
-      } catch (err) {
-        console.warn(`[specless] diff for merged PR #${pr.number} failed:`, err);
-        return null;
-      }
-    })
-  );
-  return results.filter((r): r is MergedPRSample => r !== null);
-}
-
-async function reviewSpeclessPR(args: {
-  review: PRReview;
-  diff: string;
-  holistic: HolisticContext;
-  priorPRs: MergedPRSample[];
-}): Promise<HolisticVerdict> {
-  const { holistic, priorPRs } = args;
-
-  // Convention baseline: index summaries when available, else merged-PR diffs.
-  const usingIndex = holistic.entries.length > 0 || holistic.manifest.length > 0;
-  const conventionsBlock = usingIndex
-    ? [
-        ...holistic.entries.map(
-          (e) =>
-            `### ${e.path}\n` +
-            `Exports: ${e.exports.join(", ") || "(none)"}\n` +
-            `Imports: ${e.imports.join(", ") || "(none)"}\n` +
-            `Flags: ${e.securityFlags.join(", ") || "(none)"}\n` +
-            `Summary: ${e.summary}`
-        ),
-        ...holistic.manifest.map((m) => `- ${m.path}: ${m.summary}`),
-      ].join("\n\n")
-    : priorPRs
-        .map((p) => `## Merged PR #${p.number} — ${p.title}\n\`\`\`diff\n${p.diff}\n\`\`\``)
-        .join("\n\n");
-  const conventionsLabel = usingIndex
-    ? "how the merged-in codebase is written (repo index summaries)"
-    : "how recent merged PRs in this repo are written (their diffs)";
-
-  const system =
-    "You are DevAsign's spec-less PR review step. This PR has NO linked issue, spec, or attachment, so there are no " +
-    "acceptance criteria. Do two concrete jobs instead, grounded ONLY in the diff:\n" +
-    "1. SECURITY: find real vulnerabilities the diff introduces — injection (SQL/command/template), missing authz/authn, " +
-    "secrets or credentials committed, unsafe deserialization, SSRF, path traversal, XSS, weak crypto, unvalidated input " +
-    "reaching a sink. Only flag issues the diff actually creates; never speculate.\n" +
-    "2. CONSISTENCY: compare the PR against the provided examples of " + conventionsLabel + ". Flag concrete deviations " +
-    "(naming, error handling, logging, module/import structure, test patterns, API shape) where this PR diverges from the " +
-    "established convention. Cite the specific convention you're comparing against. Never invent a rule the examples don't " +
-    "demonstrate, and never flag subjective style.\n" +
-    "Also report any regressions or critical errors the diff plainly introduces.\n" +
-    'Emit ONLY JSON: {"securityFindings": [Finding], "consistencyFindings": [Finding], "regressions": [Finding], ' +
-    '"criticalErrors": [Finding], "summary": string}. ' +
-    'A Finding is {"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}. ' +
-    'severity="blocker" only when an issue would expose data, break a feature, or corrupt state; otherwise "warn". ' +
-    "Consistency findings are advisory — always severity=\"warn\". " +
-    "Return empty arrays when nothing material surfaces — prefer empty over padding. " +
-    "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent. Use this exact template:\n" +
-    "Fix: <one-line summary>\n\n" +
-    "File: <path or 'n/a'>\n" +
-    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
-    "Issue:\n<2-3 sentence concern description>\n\n" +
-    "Expected behavior:\n<1-2 sentences: what should happen once fixed>\n\n" +
-    "Suggested approach:\n<concrete steps to fix>\n\n" +
-    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
-    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.";
-
-  const userText =
-    `# PR ${args.review.prTitle}\n\n` +
-    `# Diff under review\n\`\`\`diff\n${args.diff.slice(0, 40_000)}\n\`\`\`\n\n` +
-    `# Conventions baseline — ${conventionsLabel}\n${conventionsBlock || "(none available)"}`;
-
-  const raw = await complete({
-    system,
-    cacheSystem: true,
-    messages: [{ role: "user", content: userText }],
-    maxTokens: 1800,
-  });
-  const parsed = tryParseJSON<Partial<HolisticVerdict>>(raw, EMPTY_HOLISTIC);
-  // Force consistency findings to advisory severity regardless of model output.
-  const consistencyFindings = normaliseFindings(parsed.consistencyFindings).map((f) => ({
-    ...f,
-    severity: "warn" as const,
-  }));
-  // Spread EMPTY_HOLISTIC so fields this pass doesn't populate (e.g. deferrals,
-  // which are produced by the separate detectDeferredWork pass) get their
-  // canonical default automatically.
-  return {
-    ...EMPTY_HOLISTIC,
-    regressions: normaliseFindings(parsed.regressions),
-    criticalErrors: normaliseFindings(parsed.criticalErrors),
-    securityFindings: normaliseFindings(parsed.securityFindings),
-    consistencyFindings,
-    summary: String(parsed.summary || ""),
-  };
 }

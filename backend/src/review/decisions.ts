@@ -12,18 +12,25 @@ export type ReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 // once) invites the maintainer to supply an end goal. When verdict.blocking is
 // false (advisory mode) a REQUEST_CHANGES is softened to COMMENT so the merge
 // button is never blocked — `downgradedToComment` tells the caller to log it.
+//
+// Security carve-out: a review carrying a security blocker (a vulnerability this
+// PR *introduces*) is NEVER softened, even in advisory mode — `hasSecurityBlocker`
+// suppresses the downgrade so the REQUEST_CHANGES stands. Pre-existing vulns are
+// advisory and don't set this flag, so they don't block an unrelated PR.
 export function resolveReviewEvent(args: {
   status: PRReviewStatus;
   specless: boolean;
   blocking: boolean;
   endGoalAlreadyRequested: boolean;
+  hasSecurityBlocker?: boolean;
 }): {
   event: ReviewEvent;
   postConversationReview: boolean;
   includeEndGoalCTA: boolean;
   downgradedToComment: boolean;
+  securityBlockerHeld: boolean;
 } {
-  const { status, specless, blocking, endGoalAlreadyRequested } = args;
+  const { status, specless, blocking, endGoalAlreadyRequested, hasSecurityBlocker = false } = args;
   let event: ReviewEvent;
   let postConversationReview = true;
   let includeEndGoalCTA = false;
@@ -37,11 +44,17 @@ export function resolveReviewEvent(args: {
     else postConversationReview = false; // already asked → refresh Check Run only
   }
   let downgradedToComment = false;
+  // A security blocker holds REQUEST_CHANGES firm regardless of advisory mode.
+  let securityBlockerHeld = false;
   if (!blocking && event === "REQUEST_CHANGES") {
-    event = "COMMENT";
-    downgradedToComment = true;
+    if (hasSecurityBlocker) {
+      securityBlockerHeld = true;
+    } else {
+      event = "COMMENT";
+      downgradedToComment = true;
+    }
   }
-  return { event, postConversationReview, includeEndGoalCTA, downgradedToComment };
+  return { event, postConversationReview, includeEndGoalCTA, downgradedToComment, securityBlockerHeld };
 }
 
 // Apply the per-repo trigger policy to an incoming pull_request event. Pure: the

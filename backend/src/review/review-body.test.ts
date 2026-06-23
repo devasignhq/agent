@@ -135,6 +135,36 @@ test("suggestion codeExample: a malformed language token is dropped to a bare fe
   assert.doesNotMatch(body, EMOJI);
 });
 
+test("pre-existing vulnerabilities: advisory section, labelled 'not introduced by this PR', not under Repo-wide concerns", () => {
+  const holistic = {
+    ...EMPTY_HOLISTIC,
+    preexistingVulns: [
+      {
+        path: "backend/src/db.ts",
+        concern:
+          "[sql-injection] User input concatenated into a raw query (runQuery:12) — pre-existing in this file, not introduced by this PR.",
+        severity: "warn" as const,
+        fixPrompt: "Fix: parameterize the query\n\nFile: backend/src/db.ts",
+      },
+    ],
+  };
+  const body = formatReviewBody(
+    "Some goal.",
+    [crit({ met: true, evidence: "ok" })],
+    [],
+    holistic,
+    { prTitle: "Touch db.ts", repoFullName: "devasign/app" }
+  );
+  assert.match(body, /### Pre-existing security issues/);
+  assert.match(body, /not introduced by this PR/);
+  assert.match(body, /\[sql-injection\] User input concatenated/);
+  // Advisory: it must NOT be filed under the introduced-findings "Repo-wide concerns".
+  assert.doesNotMatch(body, /### Repo-wide concerns/);
+  // It still rides the consolidated "fix all" prompt (findings.length > 0 even with no unmet criteria).
+  assert.match(body, /One prompt to fix all of this/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
 test("clean pass: no trailing prose recap or stray '---' divider after the met-criteria block", () => {
   // All criteria met, no holistic findings — the body should end at the collapsed
   // "Show met criteria" block. The old verdict-summary recap (a final `---` + prose

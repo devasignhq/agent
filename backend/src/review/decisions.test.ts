@@ -37,6 +37,58 @@ test("resolveReviewEvent: passed + spec-less → COMMENT, CTA once then refresh-
   assert.equal(repeat.postConversationReview, false); // already asked → refresh Check Run only
 });
 
+// ── security blocker is non-downgradeable ───────────────────────────────────
+test("resolveReviewEvent: advisory + security blocker → REQUEST_CHANGES held (not downgraded)", () => {
+  const r = resolveReviewEvent({
+    status: "changes_requested",
+    specless: false,
+    blocking: false, // advisory mode would normally downgrade to COMMENT
+    endGoalAlreadyRequested: false,
+    hasSecurityBlocker: true,
+  });
+  assert.equal(r.event, "REQUEST_CHANGES");
+  assert.equal(r.downgradedToComment, false);
+  assert.equal(r.securityBlockerHeld, true);
+});
+
+test("resolveReviewEvent: advisory + NO security blocker → still downgrades to COMMENT", () => {
+  const r = resolveReviewEvent({
+    status: "changes_requested",
+    specless: false,
+    blocking: false,
+    endGoalAlreadyRequested: false,
+    hasSecurityBlocker: false,
+  });
+  assert.equal(r.event, "COMMENT");
+  assert.equal(r.downgradedToComment, true);
+  assert.equal(r.securityBlockerHeld, false);
+});
+
+test("resolveReviewEvent: blocking mode + security blocker → REQUEST_CHANGES, nothing held (no downgrade to suppress)", () => {
+  const r = resolveReviewEvent({
+    status: "changes_requested",
+    specless: false,
+    blocking: true,
+    endGoalAlreadyRequested: false,
+    hasSecurityBlocker: true,
+  });
+  assert.equal(r.event, "REQUEST_CHANGES");
+  assert.equal(r.downgradedToComment, false);
+  assert.equal(r.securityBlockerHeld, false); // downgrade never triggered, so nothing to hold
+});
+
+test("resolveReviewEvent: passed + security flag is irrelevant when there's nothing to block", () => {
+  const r = resolveReviewEvent({
+    status: "passed",
+    specless: false,
+    blocking: false,
+    endGoalAlreadyRequested: false,
+    hasSecurityBlocker: true,
+  });
+  assert.equal(r.event, "APPROVE");
+  assert.equal(r.securityBlockerHeld, false);
+});
+
 // ── trigger policy → skip / re-review ───────────────────────────────────────
 const wfWith = (t: Partial<typeof WORKFLOW_DEFAULTS.trigger>) => ({
   trigger: { ...WORKFLOW_DEFAULTS.trigger, ...t },
