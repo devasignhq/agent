@@ -406,6 +406,17 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ securityFindings: [], summary: "[mock] No vulnerabilities surfaced." });
   }
 
+  // New-commit intent review (re-reviews only). Echo a deterministic summary and
+  // empty arrays so the offline path renders the "New commits since last review"
+  // section end-to-end without billing or minting spurious criteria.
+  if (system?.includes("new-commit intent review")) {
+    return JSON.stringify({
+      addedCriteria: [],
+      intentFindings: [],
+      summary: "[mock] Reviewed the new commits against their stated intent; no new criteria or concerns.",
+    });
+  }
+
   // Deferred-work detection (Opus in production). Echo one deterministic
   // advisory deferral so the offline path exercises the finding card + the new
   // "Deferred / incomplete work" section end-to-end. The `concern` leads with

@@ -489,6 +489,7 @@ const FINDING_LABEL = {
   criticalError: "Critical error",
   security: "Security finding",
   preexistingSecurity: "Pre-existing security",
+  commitIntent: "New-commit review",
   consistency: "Consistency",
   deferral: "Deferred work",
   convention: "DEVASIGN.md",

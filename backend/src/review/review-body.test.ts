@@ -165,6 +165,37 @@ test("pre-existing vulnerabilities: advisory section, labelled 'not introduced b
   assert.doesNotMatch(body, EMOJI);
 });
 
+test("new commits: 'New commits since last review' section renders summary + intent finding", () => {
+  const holistic = {
+    ...EMPTY_HOLISTIC,
+    commitIntentSummary: "The new commit adds retry-on-5xx to the uploader and a config flag.",
+    commitIntentFindings: [
+      {
+        path: "src/upload.ts",
+        concern: "Commit says 'retry on 5xx' but the new code retries on any error, including 4xx.",
+        severity: "warn" as const,
+        fixPrompt: "Fix: scope retry to 5xx\n\nFile: src/upload.ts",
+      },
+    ],
+  };
+  const body = formatReviewBody(
+    "Some goal.",
+    [crit({ met: true, evidence: "ok" })],
+    [],
+    holistic,
+    { prTitle: "Add retry", repoFullName: "devasign/app" }
+  );
+  assert.match(body, /### New commits since last review/);
+  assert.match(body, /adds retry-on-5xx to the uploader/);
+  assert.match(body, /retries on any error, including 4xx/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("new commits: section is omitted when there's no summary and no intent findings", () => {
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [], EMPTY_HOLISTIC);
+  assert.doesNotMatch(body, /### New commits since last review/);
+});
+
 test("clean pass: no trailing prose recap or stray '---' divider after the met-criteria block", () => {
   // All criteria met, no holistic findings — the body should end at the collapsed
   // "Show met criteria" block. The old verdict-summary recap (a final `---` + prose

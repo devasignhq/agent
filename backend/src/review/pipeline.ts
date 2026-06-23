@@ -77,6 +77,10 @@ type FindingCategory =
   // (surfaced from the repo index's security audit). Advisory — the PR didn't
   // introduce it, so it never gates the merge.
   | "preexistingSecurity"
+  // Intent-vs-implementation note on the new commits in a re-review: where the
+  // delta diff doesn't match a commit message, or the new code introduces a
+  // concern. Advisory — gating happens via the criteria synthesized from intent.
+  | "commitIntent"
   | "consistency"
   | "deferral"
   // DEVASIGN.md findings: a convention the diff newly violates, and a
@@ -95,6 +99,7 @@ function emitFindingLog(
     criticalError: "Critical error",
     security: "Security finding",
     preexistingSecurity: "Pre-existing security issue",
+    commitIntent: "New-commit review",
     consistency: "Consistency deviation",
     deferral: "Deferred / incomplete work",
     convention: "DEVASIGN.md violation",
@@ -174,6 +179,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
   // call in this job rolls into, read once for the "review completed" event.
   const t0 = Date.now();
   const startedNewCommit = review.progressCommentSha !== review.headSha;
+  // Prior criteria count + last-reviewed sha captured up front (before the
+  // criteria below get reassigned / the row is re-persisted): the new-commit
+  // intent stage gates on "this is a re-review of a PR that already had criteria".
+  const priorCriteriaCount = review.criteria.length;
+  const lastReviewedSha = review.lastReviewedSha ?? null;
   const reviewUser = analyticsUser(install?.userId);
 
   return withModel(reviewModel, () => withUsage(async () => {
@@ -380,6 +390,52 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
     }
 
+    // b.2 New-commit intent review. On a re-review triggered by a fresh push of
+    // a PR that already has criteria, evaluate the NEW commits against their own
+    // stated intent — not just the frozen original criteria. We diff only the
+    // delta since the last reviewed sha, synthesize criteria for new checkable
+    // promises (appended so they gate via reviewDiff below), and emit an
+    // intent-vs-implementation assessment that yields fresh feedback even when the
+    // original criteria are unchanged. Skipped on first reviews, same-sha reruns,
+    // and when the delta can't be fetched (force-push / API failure).
+    let commitIntent: CommitIntentReview | null = null;
+    if (
+      install &&
+      shouldReviewNewCommits({ startedNewCommit, lastReviewedSha, headSha: review.headSha, priorCriteriaCount })
+    ) {
+      const delta = await fetchIncrementalDelta(install.installationId, repo, lastReviewedSha!, review.headSha);
+      if (delta && delta.commits.length) {
+        commitIntent = await reviewNewCommits({
+          review,
+          endGoal: endGoal || "",
+          existingCriteria: criteria,
+          newCommits: delta.commits,
+          incrementalDiff: delta.diff,
+          extra: wf.prompts?.review,
+        });
+        if (commitIntent.addedCriteria.length) {
+          // Appended with fresh c{N} ids; prior verdicts (captured above) don't
+          // cover them, so reviewDiff scores them fresh against the cumulative diff.
+          criteria = appendAddedCriteria(criteria, commitIntent.addedCriteria);
+        }
+        for (const f of commitIntent.intentFindings) emitFindingLog(review.id, "commitIntent", f);
+        log(review.id, "criteria", `Reviewed ${delta.commits.length} new commit(s) against their intent`, {
+          detail: commitIntent.summary || "Assessed the new commits against their messages and the delta diff.",
+          meta: {
+            newCommits: delta.commits.length,
+            addedCriteria: commitIntent.addedCriteria.length,
+            intentFindings: commitIntent.intentFindings.length,
+            base: lastReviewedSha!.slice(0, 7),
+            head: review.headSha.slice(0, 7),
+          },
+        });
+      } else {
+        log(review.id, "criteria", "New-commit intent review skipped — no incremental delta", {
+          detail: "Couldn't diff the new commits against the last reviewed commit (force-push or fetch failure); reviewing cumulatively.",
+        });
+      }
+    }
+
     setStatus(review.id, { taskId: task.id, criteria });
 
     // c. Review the diff against the criteria. priorVerdicts anchors criteria an
@@ -483,6 +539,17 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         detail: "Vulnerabilities already present in files this PR touches — advisory, not introduced by this PR.",
         meta: { preexisting: preexistingVulns.length },
       });
+    }
+
+    // Carry the new-commit intent review (computed in b.2) into the verdict so it
+    // renders in the GitHub comment. Advisory: it does NOT feed hasBlocker — any
+    // gating from the new commits happens through the criteria appended above.
+    if (commitIntent) {
+      holisticVerdict = {
+        ...holisticVerdict,
+        commitIntentFindings: commitIntent.intentFindings,
+        commitIntentSummary: commitIntent.summary,
+      };
     }
 
     // Merge gate: only a blocker-severity finding the DIFF introduces (regression,
@@ -681,6 +748,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // catch block and overwrite the verdict with a failure banner — the GitHub
     // output phase is already done. (The row keeps its id for the record.)
     progressCommentId = null;
+    // Stamp the sha this run evaluated as the base for the NEXT push's incremental
+    // delta (b.2). Done only after the GitHub output phase so a run that errored
+    // earlier doesn't advance the base — the next push still diffs from the last
+    // sha we actually reviewed.
+    setStatus(review.id, { lastReviewedSha: review.headSha });
     // Mark the end-goal request as sent so re-reviews on later pushes don't
     // re-spam the PR conversation. The CTA lives inside the verdict comment, so
     // "sent" means that comment landed.
@@ -784,6 +856,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         video_count: context.videos.length,
         is_first_review: priorVerdicts.size === 0,
         is_new_commit: startedNewCommit,
+        new_commits_reviewed: !!commitIntent,
+        added_criteria: commitIntent?.addedCriteria.length ?? 0,
+        intent_findings: commitIntent?.intentFindings.length ?? 0,
         additions: review.additions,
         deletions: review.deletions,
         changed_files: review.changedFiles,
@@ -1878,6 +1953,20 @@ export function formatReviewBody(
     lines.push("", "</details>", "");
   }
 
+  // New commits since the last review — the intent-vs-implementation assessment.
+  // Shown whenever a re-review ingested new commits (even when criteria are
+  // unchanged and nothing was flagged), so the developer always gets fresh
+  // feedback on what the latest push actually did. The summary carries the
+  // narrative; any findings are advisory (gating rides the appended criteria).
+  if (holistic.commitIntentSummary || holistic.commitIntentFindings.length) {
+    lines.push("### New commits since last review");
+    if (holistic.commitIntentSummary) lines.push(holistic.commitIntentSummary, "");
+    if (holistic.commitIntentFindings.length) {
+      appendHolisticGroup(lines, "Intent check", holistic.commitIntentFindings);
+      lines.push("");
+    }
+  }
+
   // Self-admitted deferred / incomplete work the diff's own comments concede.
   // Advisory (never blocks the merge) but surfaced prominently right under the
   // criteria — this is the "the agent quietly punted part of the design" signal
@@ -2018,6 +2107,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
     | "criticalErrors"
     | "securityFindings"
     | "preexistingVulns"
+    | "commitIntentFindings"
     | "consistencyFindings"
     | "deferrals"
     | "conventionFindings"
@@ -2028,6 +2118,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   { key: "criticalErrors", label: "Critical error" },
   { key: "securityFindings", label: "Security" },
   { key: "preexistingVulns", label: "Pre-existing security" },
+  { key: "commitIntentFindings", label: "New-commit review" },
   { key: "consistencyFindings", label: "Consistency" },
   { key: "deferrals", label: "Deferred work" },
   { key: "conventionFindings", label: "Convention" },
@@ -3590,6 +3681,13 @@ type HolisticVerdict = {
   // diff). Advisory — forced severity "warn", never gate the merge. Surfaced so
   // the author sees latent risk in the code they're working near.
   preexistingVulns: HolisticFinding[];
+  // New-commit intent review (reviewNewCommits, re-reviews only): per-commit
+  // notes on whether the delta diff matches each new commit's stated intent.
+  // Advisory (forced "warn") — gating happens via criteria synthesized from that
+  // intent. `commitIntentSummary` is the narrative shown even when no criteria
+  // changed and no findings surfaced. Empty/"" on first reviews and same-sha reruns.
+  commitIntentFindings: HolisticFinding[];
+  commitIntentSummary: string;
   summary: string;
 };
 
@@ -3602,6 +3700,8 @@ export const EMPTY_HOLISTIC: HolisticVerdict = {
   conventionFindings: [],
   docDriftFindings: [],
   preexistingVulns: [],
+  commitIntentFindings: [],
+  commitIntentSummary: "",
   summary: "",
 };
 
@@ -3842,6 +3942,148 @@ export function collectPreexistingVulns(holistic: HolisticContext): HolisticFind
     }
   }
   return out;
+}
+
+// ─── New-commit intent review ───────────────────────────────────────────────
+//
+// On a re-review triggered by a fresh push, the original acceptance criteria are
+// frozen and reviewDiff anchors on prior verdicts, so new work a follow-up commit
+// introduces is never judged against the commit's OWN stated intent. This stage
+// closes that gap: it diffs only the delta since the last reviewed sha, synthesizes
+// acceptance criteria for any new checkable promises (appended so they gate), and
+// produces an intent-vs-implementation assessment that gives fresh feedback even
+// when the original criteria are unchanged.
+
+export type CommitIntentReview = {
+  // New, independently checkable acceptance criteria the new commits promise.
+  // Appended via appendAddedCriteria so reviewDiff scores them and unmet ones gate.
+  addedCriteria: string[];
+  // Advisory per-commit notes (forced "warn"): where the delta doesn't match a
+  // commit message or the new code introduces a concern.
+  intentFindings: HolisticFinding[];
+  // One-paragraph narrative of what the new commits did and whether they landed.
+  summary: string;
+};
+
+// Shape the (untrusted) intent-review LLM output: trim/drop/cap addedCriteria,
+// force intentFindings to advisory "warn" (gating rides the criteria, not these
+// notes), and coerce the summary. Pure/exported for offline unit testing.
+export function normalizeCommitIntent(parsed: {
+  addedCriteria?: unknown;
+  intentFindings?: unknown;
+  summary?: unknown;
+}): CommitIntentReview {
+  const addedCriteria = Array.isArray(parsed.addedCriteria)
+    ? parsed.addedCriteria.map((t) => String(t || "").trim()).filter(Boolean).slice(0, 10)
+    : [];
+  const intentFindings = normaliseFindings(parsed.intentFindings).map((f) => ({ ...f, severity: "warn" as const }));
+  return { addedCriteria, intentFindings, summary: String(parsed.summary || "") };
+}
+
+// Pure gate: run the new-commit intent review only on a re-review that ingested
+// genuinely new commits (a new head sha) for a PR that already has criteria.
+// Skips first reviews, same-sha reruns (manual rerun/reopen), and rows with no
+// recorded last-reviewed sha (legacy / first pass). Exported for unit testing.
+export function shouldReviewNewCommits(args: {
+  startedNewCommit: boolean;
+  lastReviewedSha?: string | null;
+  headSha: string;
+  priorCriteriaCount: number;
+}): boolean {
+  const { startedNewCommit, lastReviewedSha, headSha, priorCriteriaCount } = args;
+  return (
+    startedNewCommit &&
+    !!lastReviewedSha &&
+    lastReviewedSha !== headSha &&
+    priorCriteriaCount > 0
+  );
+}
+
+// Fetch the incremental delta between the last reviewed sha and the new head:
+// the new commits (messages = author intent) and a diff of ONLY those commits.
+// One compare call carries both `commits[]` and `files[].patch`. Best-effort:
+// returns null on any failure (e.g. force-push where base isn't reachable) so the
+// caller falls back to the cumulative review with no regression.
+async function fetchIncrementalDelta(
+  installationId: number,
+  repo: { owner: string; name: string },
+  base: string,
+  head: string
+): Promise<{ commits: Array<{ sha: string; message: string }>; diff: string } | null> {
+  try {
+    const cmp = await gh<{
+      commits?: Array<{ sha: string; commit?: { message?: string } }>;
+      files?: Array<{ filename: string; patch?: string }>;
+    }>(installationId, `/repos/${repo.owner}/${repo.name}/compare/${base}...${head}`);
+    const commits = (cmp.commits ?? []).map((c) => ({
+      sha: c.sha,
+      message: c.commit?.message || "",
+    }));
+    // Reassemble a unified-diff view from per-file patches, capped like the
+    // holistic pass. GitHub omits `patch` for very large/binary files; list those
+    // by name so the model still sees they changed.
+    const parts = (cmp.files ?? []).map((f) =>
+      f.patch
+        ? `diff --git a/${f.filename} b/${f.filename}\n${f.patch}`
+        : `diff --git a/${f.filename} b/${f.filename}\n(omitted — large or binary file)`
+    );
+    return { commits, diff: parts.join("\n\n").slice(0, 40_000) };
+  } catch (err) {
+    console.warn(`[ingest] compare ${base.slice(0, 7)}...${head.slice(0, 7)} failed:`, err);
+    return null;
+  }
+}
+
+async function reviewNewCommits(args: {
+  review: PRReview;
+  endGoal: string;
+  existingCriteria: Criterion[];
+  newCommits: Array<{ sha: string; message: string }>;
+  incrementalDiff: string;
+  extra?: string;
+}): Promise<CommitIntentReview> {
+  const system = withMaintainerInstructions(
+    "You are DevAsign's new-commit intent review step. A pull request that already has acceptance criteria just " +
+    "received NEW commits. You are given those commits' messages (the author's stated intent), a diff of ONLY those " +
+    "new commits (the delta since the last review), the PR's end goal, and the existing acceptance criteria. Do two jobs:\n" +
+    "1. addedCriteria: derive NEW, independently checkable acceptance criteria for work these commits introduce that the " +
+    "existing criteria don't already cover. Be conservative — only concrete, verifiable promises the commit messages and " +
+    "diff actually make (e.g. \"retries failed uploads on 5xx\"). A pure refactor, cleanup, or commit that makes no new " +
+    "verifiable promise adds nothing. Never restate an existing criterion, and never invent requirements to look thorough.\n" +
+    "2. intentFindings: for each new commit, judge whether the delta diff actually accomplishes what its message says, and " +
+    "flag concrete problems the new code introduces. These are advisory notes — the addedCriteria are what gate the merge.\n" +
+    "Also write a one-paragraph `summary` of what the new commits did and whether they land their stated intent.\n" +
+    'Emit ONLY JSON: {"addedCriteria": [string], "intentFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], "summary": string}. ' +
+    "Quote the commit sha or message when a finding refers to a specific commit. Prefer empty arrays over padding. " +
+    "Each intentFinding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence description: the commit's stated intent and how the diff falls short or what it breaks>\n\n" +
+    "Expected behavior:\n<1-2 sentences: what should happen once fixed>\n\n" +
+    "Suggested approach:\n<concrete steps to fix>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this refers to, copied verbatim from the delta diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code. Omit the 'Relevant diff' section only when the finding doesn't map to a hunk.", args.extra);
+
+  const commitsBlock = args.newCommits
+    .map((c) => `### ${c.sha.slice(0, 7)}\n${(c.message || "(no message)").slice(0, 2000)}`)
+    .join("\n\n");
+  const criteriaBlock = args.existingCriteria.map((c) => `- ${c.id}: ${c.text}`).join("\n") || "(none)";
+  const userText =
+    `# PR\n${args.review.prTitle}\n\n` +
+    `# End goal\n${args.endGoal || "(none)"}\n\n` +
+    `# Existing acceptance criteria\n${criteriaBlock}\n\n` +
+    `# New commits (stated intent)\n${commitsBlock}\n\n` +
+    `# Delta diff (only the new commits)\n\`\`\`diff\n${args.incrementalDiff.slice(0, 40_000)}\n\`\`\``;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 1800,
+  });
+  const parsed = tryParseJSON<{ addedCriteria?: unknown; intentFindings?: unknown; summary?: unknown }>(raw, {});
+  return normalizeCommitIntent(parsed);
 }
 
 // ─── DEVASIGN.md guidance ───────────────────────────────────────────────────
