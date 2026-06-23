@@ -574,7 +574,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       for (const f of preexistingVulns) emitFindingLog(review.id, "preexistingSecurity", f);
     }
     if (resolvedVulns.length) {
-      holisticVerdict = { ...holisticVerdict, resolvedPreexisting: resolvedVulns };
+      // Cap the rendered list (mirrors the 20-cap on preexistingVulns) so a mass
+      // refactor can't bloat the comment; the log below keeps the true total.
+      holisticVerdict = { ...holisticVerdict, resolvedPreexisting: resolvedVulns.slice(0, 20) };
     }
     if (preexistingVulns.length || resolvedVulns.length) {
       log(
