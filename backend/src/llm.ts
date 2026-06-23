@@ -277,32 +277,92 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
   }
 
   if (system?.includes("maintainer-feedback goal refinement")) {
-    // Cheap heuristic for the mock: comments whose body looks like a pure
-    // acknowledgement ("lgtm", "ship it", "looks good") don't actually move
-    // the goal. The production model decides this for itself; here we just
-    // need a deterministic toggle so offline tests can exercise both paths.
+    // Cheap heuristics for the mock so offline tests can exercise every path:
+    //   - pure acknowledgement ("lgtm", "ship it") → no change, dispute, or reopen
+    //   - "false positive" / "already satisfied" → dispute the [currently UNMET] ids
+    //   - "re-open" / "isn't actually done" → reopen the [currently MET] ids
+    //   - new-work language ("add", "please", "validate") → add a criterion
+    // The production model decides all of this itself; this is just a deterministic
+    // toggle. A single comment can add, dispute, and reopen at once.
     const lower = last.toLowerCase();
     const isAck = /\b(lgtm|looks good|ship it|approved|thanks!?|nice)\b/.test(lower);
-    // refineGoalFromFeedback reads `addedCriteria` (the brand-new criteria the
-    // comment introduces) — NOT a full `criteria` list — and derives `changed`
-    // from whether any additions landed. Mirror that production contract here so
-    // the offline changed-path actually fires.
+    const isDispute = /false positive|not (a )?real|already (satisfied|met|handled|covered)/.test(lower);
+    const isReopen =
+      /re-?open|not (actually )?(done|satisfied|met|finished|complete|implemented)|isn'?t (actually )?(done|satisfied|met|finished|complete|implemented)|wrongly passed|passed (it )?wrongly|regress/.test(
+        lower
+      );
+    const wantsAddition = /\b(add|also|please|validate|require|must|need)\b/.test(lower);
+    // The userText renders criteria as "- cN: [currently UNMET|MET|not yet evaluated] ...".
+    const unmetIds = [...last.matchAll(/- (c\d+): \[currently UNMET\]/g)].map((m) => m[1]);
+    const metIds = [...last.matchAll(/- (c\d+): \[currently MET\]/g)].map((m) => m[1]);
+    // Honor ids the comment names explicitly. Scope the search to the maintainer
+    // feedback body (the criteria list above also contains every id), and fall
+    // back to all ids of that state when the body names none.
+    const fb = (last.split("## Maintainer feedback")[1] || last).split("## Referenced")[0];
+    const named = (ids: string[]) => {
+      const inBody = ids.filter((id) => new RegExp(`\\b${id}\\b`, "i").test(fb));
+      return inBody.length ? inBody : ids;
+    };
+    const disputedCriteria = isDispute
+      ? named(unmetIds).map((id) => ({ id, claim: "Maintainer says this is already satisfied by existing code." }))
+      : [];
+    const reopenedCriteria = isReopen
+      ? named(metIds).map((id) => ({ id, claim: "Maintainer says this is not actually satisfied." }))
+      : [];
     if (isAck) {
       return JSON.stringify({
         changed: false,
         endGoal: "",
         addedCriteria: [],
+        disputedCriteria: [],
+        reopenedCriteria: [],
         rationale: "Comment reads as an acknowledgement; no new requirements detected.",
       });
     }
+    // refineGoalFromFeedback reads `addedCriteria` (the brand-new criteria the
+    // comment introduces) and derives `changed` from whether any additions
+    // landed. A pure dispute/reopen (no new-work language) adds nothing.
+    const addedCriteria = (!isDispute && !isReopen) || wantsAddition
+      ? [{ text: "Inputs are validated before persistence, per maintainer request." }]
+      : [];
     return JSON.stringify({
-      changed: true,
-      endGoal:
-        "Deliver the described capability and incorporate the maintainer's request to validate inputs before persisting.",
-      addedCriteria: [
-        { text: "Inputs are validated before persistence, per maintainer request." },
-      ],
-      rationale: "Maintainer asked for an explicit input-validation step before the persistence call.",
+      changed: addedCriteria.length > 0,
+      endGoal: addedCriteria.length
+        ? "Deliver the described capability and incorporate the maintainer's request to validate inputs before persisting."
+        : "",
+      addedCriteria,
+      disputedCriteria,
+      reopenedCriteria,
+      rationale: addedCriteria.length
+        ? "Maintainer asked for an explicit input-validation step before the persistence call."
+        : reopenedCriteria.length
+          ? "Comment re-opens one or more previously-met criteria."
+          : "Comment disputes one or more unmet findings as false positives.",
+    });
+  }
+
+  if (system?.includes("maintainer-dispute re-evaluation")) {
+    // Re-verify the disputed criteria. Deterministic toggle: a claim the comment
+    // backs with no verifiable detail ("trust me", "I can't verify") stays unmet;
+    // otherwise the mock confirms the maintainer (finding was a false positive).
+    // Ids are read from the "- cN:" lines of the disputed-criteria block.
+    const ids = [...new Set([...last.matchAll(/- (c\d+):/g)].map((m) => m[1]))];
+    const unverifiable = /can.?t verify|cannot verify|trust me|no evidence|without checking|not sure/i.test(last);
+    return JSON.stringify({
+      results: ids.map((id) =>
+        unverifiable
+          ? {
+              id,
+              met: false,
+              evidence:
+                "Re-checked the diff and repo index; found no concrete code that satisfies this criterion.",
+            }
+          : {
+              id,
+              met: true,
+              evidence: `Verified against the codebase: existing code satisfies ${id}, as the maintainer noted.`,
+            }
+      ),
     });
   }
 
