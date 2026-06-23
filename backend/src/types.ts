@@ -131,6 +131,27 @@ export type RepoIndexState =
   | "stale"     // PR merged; awaiting incremental refresh
   | "errored";
 
+// A security vulnerability found in a single indexed file by the index-time
+// security sub-pass (indexer.ts). Stored on the file's RepoIndexEntry so it
+// inherits the sha-keyed cache: an unchanged blob keeps its findings and isn't
+// re-scanned. Aggregated read-only by GET /repositories/:id/security and
+// surfaced (advisory) in PR reviews when a PR touches or depends on the file.
+export type VulnerabilitySeverity = "blocker" | "warn";
+
+export type Vulnerability = {
+  id: string;
+  class: string;             // taxonomy tag: "sql-injection", "xss", "ssrf", ...
+  severity: VulnerabilitySeverity;
+  path: string;              // file the vuln lives in (== entry.path)
+  symbol?: string;           // function/class the vuln is in, when known
+  line?: number;             // 1-based line, when the model localizes it
+  concern: string;           // what the vulnerability is and why it's exploitable
+  fixPrompt: string;         // copy-pasteable remediation prompt for an AI agent
+  detectedSha: string;       // blob sha the finding was detected on
+  detectedAt: number;
+  model: string;             // model that produced the finding
+};
+
 export type RepoIndexEntry = {
   id: string;
   repoId: string;            // FK -> Repository.id
@@ -142,6 +163,15 @@ export type RepoIndexEntry = {
   exports: string[];         // top-level symbol names (function/class/const)
   imports: string[];         // module specifiers as written
   securityFlags: string[];   // free-form tags ("reads-env", "raw-sql", ...)
+  // Vulnerabilities found by the index-time security sub-pass. Only populated
+  // for files whose securityFlags are non-empty (the scan gate). Inherits the
+  // sha cache: unchanged blobs keep these and skip re-scanning. Absent on rows
+  // indexed before the security pass existed (backfilled on next re-index).
+  vulnerabilities?: Vulnerability[];
+  // Blob sha the security sub-pass last evaluated. Distinct from `sha` so a
+  // legacy row (or a flagged file not yet scanned at this sha) is recognized as
+  // owing a scan even on a summary cache hit. Absent until first scanned.
+  securityScannedSha?: string;
   indexedAt: number;
   model: string;             // model that produced this entry
 };
