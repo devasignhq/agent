@@ -406,6 +406,14 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ securityFindings: [], summary: "[mock] No vulnerabilities surfaced." });
   }
 
+  // Pre-existing vuln re-verification (frontier model in production). Offline,
+  // report every known vuln as STILL PRESENT — the safe default — so a mocked
+  // run never spuriously drops a stored vuln. The `results` array is intentionally
+  // empty: partitionReverifiedVulns treats "no verdict" as still-present.
+  if (system?.includes("pre-existing vulnerability re-verification step")) {
+    return JSON.stringify({ results: [] });
+  }
+
   // New-commit intent review (re-reviews only). Echo a deterministic summary and
   // empty arrays so the offline path renders the "New commits since last review"
   // section end-to-end without billing or minting spurious criteria.
