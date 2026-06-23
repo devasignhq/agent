@@ -2983,15 +2983,21 @@ function buildFeedbackFixPrompt(args: {
 export function formatImplementationGuide(
   guide: ImplementationGuide,
   comment: { author: string; sourceUrl: string },
-  ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[] }
+  ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[]; hasReopened?: boolean }
 ): string {
+  // Describe accurately what moved the bar: new criteria, re-opened ones, or both.
+  const reason = ctx.newCriteria.length > 0 && ctx.hasReopened
+    ? "added new and re-opened existing acceptance criteria"
+    : ctx.hasReopened
+      ? "re-opened existing acceptance criteria"
+      : "added new acceptance criteria";
   const lines: string[] = [
     `### How to implement ${comment.author}'s feedback — ${guide.title}`,
     "",
     // The changes-requested notice lives here rather than in a formal review:
     // a REQUEST_CHANGES review requires a body, which GitHub renders as an
     // extra comment block — this guide is the one comment the feedback gets.
-    "**Changes requested** — this feedback added new acceptance criteria, so the PR's " +
+    `**Changes requested** — this feedback ${reason}, so the PR's ` +
       "status is changes-requested until they are addressed. The review re-runs " +
       "automatically when you push a new commit.",
     "",
@@ -3124,6 +3130,7 @@ function formatDisputeResolutionComment(args: {
   stillUnmet: Criterion[];
   approved: boolean;
   sourceUrl: string;
+  blockerSummary?: string;
 }): string {
   const lines: string[] = [];
   if (args.approved) {
@@ -3145,6 +3152,13 @@ function formatDisputeResolutionComment(args: {
     lines.push("");
     lines.push("Still open after re-review:");
     for (const c of args.stillUnmet) lines.push(`- **${c.id}** — ${c.evidence || c.text}`);
+  }
+  // All criteria cleared but the security backstop held the merge — explain why,
+  // otherwise the developer sees "criteria met" with no reason for the block.
+  if (!args.approved && args.blockerSummary) {
+    lines.push("");
+    lines.push("**However, changes are still requested:**");
+    lines.push(args.blockerSummary);
   }
   if (args.approved) {
     lines.push("");
@@ -3172,6 +3186,14 @@ export async function runMaintainerFeedbackJob(
   if (!repo) return;
   const install = db.find("installations", (i) => i.id === repo.installationId);
 
+  // Tier the model by the repo owner's plan and open a usage scope, exactly like
+  // runReviewJob: this job makes several LLM calls (refineGoalFromFeedback,
+  // rescoreDisputedCriteria, synthesizeImplementationGuide, detectIntroducedBlockers)
+  // that must respect plan restrictions and roll their token cost into one scope.
+  const plan = install?.userId ? planForUser(install.userId) : null;
+  const reviewModel = plan ? modelForPlan(plan) : config.llm.model;
+
+  return withModel(reviewModel, () => withUsage(async () => {
   // The "comment arrived" log is written synchronously by the webhook
   // handler so the Agent page surfaces the comment before this job even
   // dequeues. Here we mark the start of the analysis phase — the brain
@@ -3363,6 +3385,7 @@ export async function runMaintainerFeedbackJob(
       prTitle: review.prTitle,
       repoFullName: `${repo.owner}/${repo.name}`,
       newCriteria: refined.added,
+      hasReopened: reopened.length > 0,
     });
     try {
       await gh(
@@ -3456,6 +3479,7 @@ export async function runMaintainerFeedbackJob(
                 stillUnmet,
                 approved: false,
                 sourceUrl: comment.sourceUrl,
+                blockerSummary,
               }),
             }),
             headers: { "Content-Type": "application/json" },
@@ -3485,6 +3509,7 @@ export async function runMaintainerFeedbackJob(
   log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
     detail: refined.rationale || "No actionable change inferred from the comment.",
   });
+  }));
 }
 
 // --- Helpers ---
