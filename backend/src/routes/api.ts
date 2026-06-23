@@ -42,8 +42,13 @@ export function meHandler(req: Request, res: Response) {
     // Masquerading sends the user to the sign-in screen, where re-auth would mint
     // a fresh account and orphan everything we're trying to recover. Keep the
     // cookie so the session re-resolves itself once the store is back.
+    // Gate on isDbConfigured(): only treat an empty users table as data loss when
+    // a real DB is meant to persist. In ephemeral mode (no DATABASE_URL, local
+    // dev) the in-memory store is wiped on every restart BY DESIGN, so an empty
+    // table is expected — a 503 there would trap the developer on the "account
+    // unavailable" screen with no path back to sign-in. Then it's a normal 401.
     const ghostId = peekSessionUserId(req);
-    if (ghostId && db.table("users").length === 0) {
+    if (ghostId && db.table("users").length === 0 && isDbConfigured()) {
       console.error(
         `[me] ghost session for user ${ghostId} but the users table is EMPTY — likely DATA LOSS ` +
           `(store wiped on redeploy). Returning 503 (account_unavailable), NOT signing the user out. ` +

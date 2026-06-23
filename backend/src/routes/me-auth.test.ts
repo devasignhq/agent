@@ -10,9 +10,17 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
+import { config } from "../config.js";
 import { db } from "../db.js";
 import { signSession } from "../github/oauth.js";
 import { meHandler } from "./api.js";
+
+// The /me data-loss guard only fires when a real DB is configured (isDbConfigured,
+// which reads config.databaseUrl) — an empty users table is data loss only when
+// persistence is expected. These tests run in-memory (initDb is never called, so
+// the pool stays null) but must look "configured" for the 503 branch to be in
+// scope; pin a placeholder URL. The ephemeral case flips it back to "" locally.
+config.databaseUrl = "postgres://test-me-auth/neondb";
 
 function fakeRes() {
   const res: any = { statusCode: 200, body: undefined, cleared: false };
@@ -61,6 +69,22 @@ test("GET /me: 503 account_unavailable for a ghost session when the users table 
   assert.deepEqual(res.body, { error: "account_unavailable" });
   // Crucially, the session is preserved so it re-resolves once the store is back.
   assert.equal(res.cleared, false);
+});
+
+test("GET /me: ghost session in EPHEMERAL mode (no DB) is a normal sign-out, not a 503", () => {
+  reset(); // empty users table — but in ephemeral mode that's expected, not loss
+  const prev = config.databaseUrl;
+  config.databaseUrl = ""; // isDbConfigured() -> false: data-loss guard out of scope
+  try {
+    const res = fakeRes();
+    meHandler(reqFor(uuid()), res);
+    assert.equal(res.statusCode, 401, "ephemeral empty store is a sign-out, not 503");
+    assert.deepEqual(res.body, { error: "not_signed_in" });
+    // The stale ghost cookie is cleared so the dev can sign in again (not trapped).
+    assert.equal(res.cleared, true);
+  } finally {
+    config.databaseUrl = prev;
+  }
 });
 
 test("GET /me: ghost session with OTHER users present is a genuine sign-out (401 + cookie cleared)", () => {
