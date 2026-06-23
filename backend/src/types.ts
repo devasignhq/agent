@@ -278,6 +278,12 @@ export type PRReview = {
   // now broken" callout in the GitHub comment and the in-app timeline. Empty/
   // absent on a clean run.
   regressedCriteriaIds?: string[];
+  // Head SHA the last COMPLETED review evaluated. Stamped at the end of a
+  // successful run; on the next push it's the base for the incremental delta
+  // (compare(lastReviewedSha...headSha)) that the new-commit intent review
+  // reads. Absent on a first review / legacy rows, in which case the new-commit
+  // stage is skipped and the run proceeds cumulatively as before.
+  lastReviewedSha?: string | null;
   // The single DevAsign user this review's monthly quota counts against — the PR
   // author for auto-reviews, or the member who commented to trigger it. Resolved
   // via attributedUserFor() (github/installations.ts). Optional/null on rows

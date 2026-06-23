@@ -406,6 +406,17 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ securityFindings: [], summary: "[mock] No vulnerabilities surfaced." });
   }
 
+  // New-commit intent review (re-reviews only). Echo a deterministic summary and
+  // empty arrays so the offline path renders the "New commits since last review"
+  // section end-to-end without billing or minting spurious criteria.
+  if (system?.includes("new-commit intent review")) {
+    return JSON.stringify({
+      addedCriteria: [],
+      intentFindings: [],
+      summary: "[mock] Reviewed the new commits against their stated intent; no new criteria or concerns.",
+    });
+  }
+
   // Deferred-work detection (Opus in production). Echo one deterministic
   // advisory deferral so the offline path exercises the finding card + the new
   // "Deferred / incomplete work" section end-to-end. The `concern` leads with
@@ -498,12 +509,36 @@ export type VideoSummary = {
   unreliable: boolean;         // true when we couldn't actually watch it
 };
 
+// Match a parsed hostname against a provider's apex domain and any subdomain.
+// hostMatches("www.youtube.com", "youtube.com") → true, but
+// hostMatches("youtube.com.evil.com", "youtube.com") → false.
+function hostMatches(host: string, apex: string): boolean {
+  return host === apex || host.endsWith("." + apex);
+}
+
+// Classify a video URL by its *parsed hostname*, not a substring match. A raw
+// regex like /youtube\.com\// matches the string anywhere — including a path or
+// query param — so an attacker-controlled URL such as https://internal/?x=youtube.com/
+// would be tagged "youtube" and handed to Gemini as a fileData fileUri to fetch
+// (SSRF / unintended fetch; these URLs come from task attachments and GitHub
+// comments). Requiring an http(s) scheme and an allowlisted hostname means only
+// genuine provider URLs reach the direct-ingest path; everything else returns
+// null and falls back to the conservative inference path. The strict host match
+// also makes private/internal hosts unclassifiable — an attacker can't point an
+// allowlisted domain at an internal address.
 export function detectVideoProvider(url: string): VideoProvider | null {
   if (!url) return null;
-  const u = url.toLowerCase();
-  if (/youtu\.be\/|youtube\.com\//.test(u)) return "youtube";
-  if (/loom\.com\//.test(u)) return "loom";
-  if (/vimeo\.com\//.test(u)) return "vimeo";
+  let host: string;
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "http:" && u.protocol !== "https:") return null;
+    host = u.hostname.toLowerCase();
+  } catch {
+    return null; // unparseable → not a recognized provider
+  }
+  if (hostMatches(host, "youtube.com") || hostMatches(host, "youtu.be")) return "youtube";
+  if (hostMatches(host, "loom.com")) return "loom";
+  if (hostMatches(host, "vimeo.com")) return "vimeo";
   return null;
 }
 
