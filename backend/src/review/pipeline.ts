@@ -1684,6 +1684,7 @@ async function reviewDiff(
     "For a criterion marked '[previously SATISFIED by an earlier commit in this PR]', keep met:true UNLESS the current diff shows that satisfying code was removed, reverted, or broken — only then set met:false, and cite the specific hunk as evidence. " +
     "Never flip a previously-satisfied criterion to unmet merely because it is not the focus of the latest commit, or because you cannot find its evidence in a truncated diff. " +
     "Evaluate criteria marked '[previously NOT met — re-evaluate]' or '[not yet evaluated]' fresh against the full diff. " +
+    "A criterion can be satisfied by code the PR did not change: pre-existing or unchanged code never appears in a diff, so its absence from the diff is NOT evidence the requirement is unmet. Mark a criterion met:false ONLY on positive evidence that it is unsatisfied — the changed code does the wrong thing, or the diff plainly should implement the requirement and does not. When satisfaction plausibly depends on unchanged code you cannot see and the diff gives no positive evidence either way, do not newly fail it; say so in `evidence`. " +
     "If the diff is marked truncated, treat any criterion you cannot verify as unchanged from its previous verdict rather than newly failing it. " +
     "If the criteria list is empty, do NOT invent criteria or acceptance checks — review only for concrete, " +
     "evidence-backed defects in the diff, and if it is sound return empty `comments` and `suggestions` with a brief, " +
@@ -2646,6 +2647,8 @@ async function refineGoalFromFeedback(args: {
   added: Criterion[];
   changed: boolean;
   rationale: string;
+  disputed: Array<{ id: string; claim: string }>;
+  reopened: Array<{ id: string; claim: string }>;
 }> {
   const { review, endGoal, criteria, feedback } = args;
   const system =
@@ -2653,8 +2656,9 @@ async function refineGoalFromFeedback(args: {
     "on an open PR. Decide whether the comment (plus any video summaries or doc references it carries) adds " +
     "any NEW acceptance criteria — concrete, independently checkable requirements that aren't already covered " +
     "by the existing list. Never invent requirements the feedback didn't actually state. " +
-    "Existing acceptance criteria are LOCKED: you must not remove, rephrase, renumber, merge, or restate them. " +
-    "Your job is purely additive — only return brand-new criteria the comment introduces. If the comment is " +
+    "Existing acceptance criteria are LOCKED: you must not remove, rephrase, renumber, merge, or restate them " +
+    "(disputing a verdict, below, is allowed and never changes a criterion's text). " +
+    "Your additive job is to return only brand-new criteria the comment introduces. If the comment is " +
     "conversational, off-topic, asks a question, or only restates something already in the list, return " +
     "`addedCriteria: []` and `changed: false`. " +
     "If there are NO existing acceptance criteria (the criteria list below is empty — the PR had no linked spec) and " +
@@ -2662,8 +2666,23 @@ async function refineGoalFromFeedback(args: {
     "populate `addedCriteria` directly from it (its text plus any video summaries or referenced docs provided). " +
     "You may refine `endGoal` to reflect the new direction, but only when `addedCriteria` is non-empty — otherwise " +
     "echo the original endGoal back unchanged. " +
-    'Emit ONLY JSON: {"changed": boolean, "endGoal": string, "addedCriteria": [{"text": string}], "rationale": string}. ' +
-    "Each `addedCriteria.text` is one independently checkable statement. Do NOT include ids — the system assigns them.";
+    "SEPARATELY from additions, the comment may DISPUTE an existing verdict: claim that a criterion currently marked " +
+    "[currently UNMET] is in fact already satisfied (a false-positive finding), often by pointing to code that lives " +
+    "outside the PR diff. For each disputed criterion, add {id, claim} to `disputedCriteria`, where `claim` is a " +
+    "one-sentence paraphrase of why the maintainer says it is satisfied. Only dispute criteria shown as " +
+    "[currently UNMET]; never dispute a [currently MET] one, and never invent a dispute the comment did not make. " +
+    "Disputing only requests re-verification against the codebase — it does NOT itself mark anything met. A single " +
+    "comment may both add new criteria and dispute existing ones. " +
+    "CONVERSELY, the comment may RE-OPEN a verdict: claim that a criterion currently marked [currently MET] is in " +
+    "fact NOT satisfied (the previous review passed it wrongly, or the maintainer's bar is higher than what shipped). " +
+    "For each such criterion, add {id, claim} to `reopenedCriteria`, where `claim` is a one-sentence paraphrase of " +
+    "why the maintainer says it is not satisfied. Only re-open criteria shown as [currently MET]; never re-open a " +
+    "[currently UNMET] one (it is already open), and never invent a re-open the comment did not make. A re-opened " +
+    "criterion is the maintainer reasserting the bar, so it WILL be marked unmet and block the merge. " +
+    'Emit ONLY JSON: {"changed": boolean, "endGoal": string, "addedCriteria": [{"text": string}], "disputedCriteria": [{"id": string, "claim": string}], "reopenedCriteria": [{"id": string, "claim": string}], "rationale": string}. ' +
+    "Each `addedCriteria.text` is one independently checkable statement. Do NOT include ids on additions — the system " +
+    "assigns them. Each `disputedCriteria[].id` and `reopenedCriteria[].id` MUST be an existing criterion id from the " +
+    "list below; a single criterion must never appear in both.";
 
   const videoBlock = feedback.videoSummaries
     .map((v, i) => {
@@ -2684,7 +2703,7 @@ async function refineGoalFromFeedback(args: {
   const userText =
     `# PR ${review.prTitle}\n\n` +
     `## Existing end goal\n${endGoal || "(none)"}\n\n` +
-    `## Existing criteria\n${criteria.map((c) => `- ${c.id}: ${c.text}`).join("\n") || "(none)"}\n\n` +
+    `## Existing criteria\n${criteria.map((c) => `- ${c.id}: [${c.met === true ? "currently MET" : c.met === false ? "currently UNMET" : "not yet evaluated"}] ${c.text}`).join("\n") || "(none)"}\n\n` +
     `## Maintainer feedback\n` +
     `Author: ${feedback.author} (${feedback.authorAssociation})\n` +
     `Source: ${feedback.sourceUrl}\n\n${feedback.body}\n\n` +
@@ -2700,13 +2719,37 @@ async function refineGoalFromFeedback(args: {
     changed?: boolean;
     endGoal?: string;
     addedCriteria?: Array<{ text?: string }>;
+    disputedCriteria?: Array<{ id?: string; claim?: string }>;
+    reopenedCriteria?: Array<{ id?: string; claim?: string }>;
     rationale?: string;
-  }>(raw, { changed: false, endGoal, addedCriteria: [], rationale: "" });
+  }>(raw, { changed: false, endGoal, addedCriteria: [], disputedCriteria: [], reopenedCriteria: [], rationale: "" });
 
   const addedTexts = (parsed.addedCriteria || [])
     .map((c) => String(c?.text || "").trim())
     .filter(Boolean);
   const rationale = String(parsed.rationale || "");
+
+  // Disputes (currently-unmet → maybe met) and re-opens (currently-met → unmet)
+  // both reference EXISTING criteria by id; the merge never touches text. Each is
+  // filtered to ids that exist AND are in the right starting state, so a
+  // hallucinated id or wrong-direction claim is dropped silently. A criterion
+  // can't be in both. Disputes are re-verified against the codebase before any
+  // flip (high cost of a wrong clear); re-opens are honored on the maintainer's
+  // authority (a re-open only blocks the merge, never unblocks it).
+  const disputed = (parsed.disputedCriteria || [])
+    .map((d) => ({ id: String(d?.id || "").trim(), claim: String(d?.claim || "").trim() }))
+    .filter((d) => d.id && criteria.some((c) => c.id === d.id && c.met !== true));
+  const reopenedIds = new Set<string>();
+  const reopened = (parsed.reopenedCriteria || [])
+    .map((d) => ({ id: String(d?.id || "").trim(), claim: String(d?.claim || "").trim() }))
+    .filter((d) => {
+      if (!d.id || reopenedIds.has(d.id)) return false;
+      // Re-open only a currently-met criterion that isn't also being disputed.
+      if (disputed.some((x) => x.id === d.id)) return false;
+      if (!criteria.some((c) => c.id === d.id && c.met === true)) return false;
+      reopenedIds.add(d.id);
+      return true;
+    });
 
   // The merge is what enforces the additive contract: existing criteria pass
   // through bit-for-bit (so met/evidence from prior reviews survive) and the
@@ -2714,7 +2757,7 @@ async function refineGoalFromFeedback(args: {
   // from whether any additions actually landed — that way the contract stays
   // self-consistent even when the model contradicts itself.
   if (!addedTexts.length) {
-    return { endGoal, criteria, added: [], changed: false, rationale };
+    return { endGoal, criteria, added: [], changed: false, rationale, disputed, reopened };
   }
   const nextCriteria = appendAddedCriteria(criteria, addedTexts);
   return {
@@ -2725,7 +2768,109 @@ async function refineGoalFromFeedback(args: {
     added: nextCriteria.slice(criteria.length),
     changed: true,
     rationale,
+    disputed,
+    reopened,
   };
+}
+
+// When a maintainer disputes a finding (claims a criterion marked unmet is in
+// fact already satisfied), re-verify ONLY the disputed criteria against the full
+// codebase — the PR diff PLUS the repo index slice — not just the changed hunk.
+// This is the path that clears false positives the original review failed only
+// because the satisfying code lived outside the diff. Verify-gated, never
+// authority-gated: a criterion flips to met:true only when the model can cite
+// concrete code that satisfies it AND returns non-empty evidence; an
+// unverifiable claim keeps it unmet. Returns one result per disputed id; the
+// caller's merge ignores ids it doesn't recognise.
+async function rescoreDisputedCriteria(args: {
+  review: PRReview;
+  criteria: Criterion[];
+  disputed: Array<{ id: string; claim: string }>;
+  diff: string;
+  holistic: HolisticContext;
+  feedback: { author: string; authorAssociation: string; body: string };
+  extra?: string;
+}): Promise<{ results: Array<{ id: string; met: boolean; evidence: string }> }> {
+  const { review, criteria, disputed, diff, holistic, feedback } = args;
+  const disputedIds = new Set(disputed.map((d) => d.id));
+  const targets = criteria.filter((c) => disputedIds.has(c.id));
+  if (!targets.length) return { results: [] };
+
+  const system = withMaintainerInstructions(
+    "You are DevAsign's maintainer-dispute re-evaluation step. A maintainer claims that one or more acceptance " +
+    "criteria the previous review marked NOT met are in fact already satisfied by the code — typically by code that " +
+    "lives OUTSIDE the PR diff hunk. Re-check ONLY the criteria listed below, against the full evidence provided: the " +
+    "PR diff AND the repository index (summaries of the touched files, their dependents, and a repo manifest). " +
+    "Decide each independently and on the evidence — NOT on the maintainer's authority or association. Set met:true " +
+    "ONLY when you can point to concrete code (name the file and the function/symbol) that satisfies the criterion, and " +
+    "cite it in `evidence`. If the provided evidence does not let you confirm the claim, keep met:false and in " +
+    "`evidence` state exactly what you checked and what is still missing. 'Not shown in the diff' is NEVER sufficient " +
+    "to confirm OR to deny — judge against the repository code, not just the changed hunk. Never invent code that " +
+    "isn't in the diff or index. " +
+    'Emit ONLY JSON: {"results": [{"id": string, "met": boolean, "evidence": string}]}. ' +
+    "Return exactly one result per criterion id given below, using those ids verbatim.",
+    args.extra
+  );
+
+  const touchedBlock = holistic.entries.slice(0, holistic.touchedCount)
+    .map((e) =>
+      `### ${e.path}\nExports: ${e.exports.join(", ") || "(none)"}\nImports: ${e.imports.join(", ") || "(none)"}\nSummary: ${e.summary}`
+    )
+    .join("\n\n");
+  const dependentsBlock = holistic.entries.slice(holistic.touchedCount)
+    .map((e) => `### ${e.path}\nSummary: ${e.summary}`)
+    .join("\n\n");
+  const manifestBlock = holistic.manifest.map((m) => `- ${m.path}: ${m.summary}`).join("\n");
+
+  const criteriaBlock = targets
+    .map((c) => {
+      const claim = disputed.find((d) => d.id === c.id)?.claim || "";
+      return (
+        `- ${c.id}: ${c.text}\n` +
+        `  Previous verdict: NOT met — ${c.evidence || "(no evidence recorded)"}\n` +
+        `  Maintainer's claim: ${claim || "(the criterion is already satisfied)"}`
+      );
+    })
+    .join("\n");
+
+  const userText =
+    `# PR ${review.prTitle}\n\n` +
+    `# Maintainer\n${feedback.author} (${feedback.authorAssociation})\n\n` +
+    `# Disputed criteria to re-check\n${criteriaBlock}\n\n` +
+    `# Maintainer comment\n${feedback.body}\n\n` +
+    `# PR diff\n\`\`\`diff\n${diff.slice(0, 40_000)}\n\`\`\`\n\n` +
+    (touchedBlock ? `# Touched files (repo index)\n${touchedBlock}\n\n` : "") +
+    (dependentsBlock ? `# Dependent files (repo index)\n${dependentsBlock}\n\n` : "") +
+    (manifestBlock ? `# Repo manifest\n${manifestBlock}\n` : "");
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+  });
+  const parsed = tryParseJSON<{ results?: Array<{ id?: string; met?: boolean; evidence?: string }> }>(
+    raw,
+    { results: [] }
+  );
+
+  const valid = new Set(targets.map((c) => c.id));
+  const results = (parsed.results || [])
+    .map((r) => {
+      const id = String(r?.id || "").trim();
+      const evidence = String(r?.evidence || "").trim();
+      // Verify-gate enforced in code, not just the prompt: a flip to met needs
+      // cited evidence. An empty-evidence "met" is treated as unverified.
+      const met = r?.met === true && evidence.length > 0;
+      return {
+        id,
+        met,
+        evidence:
+          evidence ||
+          "Re-checked against the codebase; no concrete evidence found that this criterion is satisfied.",
+      };
+    })
+    .filter((r) => valid.has(r.id));
+  return { results };
 }
 
 async function synthesizeImplementationGuide(args: {
@@ -2838,15 +2983,21 @@ function buildFeedbackFixPrompt(args: {
 export function formatImplementationGuide(
   guide: ImplementationGuide,
   comment: { author: string; sourceUrl: string },
-  ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[] }
+  ctx: { prTitle: string; repoFullName: string; newCriteria: Criterion[]; hasReopened?: boolean }
 ): string {
+  // Describe accurately what moved the bar: new criteria, re-opened ones, or both.
+  const reason = ctx.newCriteria.length > 0 && ctx.hasReopened
+    ? "added new and re-opened existing acceptance criteria"
+    : ctx.hasReopened
+      ? "re-opened existing acceptance criteria"
+      : "added new acceptance criteria";
   const lines: string[] = [
     `### How to implement ${comment.author}'s feedback — ${guide.title}`,
     "",
     // The changes-requested notice lives here rather than in a formal review:
     // a REQUEST_CHANGES review requires a body, which GitHub renders as an
     // extra comment block — this guide is the one comment the feedback gets.
-    "**Changes requested** — this feedback added new acceptance criteria, so the PR's " +
+    `**Changes requested** — this feedback ${reason}, so the PR's ` +
       "status is changes-requested until they are addressed. The review re-runs " +
       "automatically when you push a new commit.",
     "",
@@ -2876,6 +3027,150 @@ export function formatImplementationGuide(
   return lines.join("\n");
 }
 
+// The security gate is never softened (see decisions.ts), so a maintainer
+// dispute that clears the last open criteria can't approve a PR over an
+// outstanding blocker. Blocker state isn't persisted on the review, so before
+// flipping to passed we re-run the same security backstop the main pipeline uses
+// (c.1 / c.1a) against the unchanged diff + repo index. Returns whether the diff
+// introduces a blocker. Best-effort; emits one finding-log per surfaced issue.
+async function detectIntroducedBlockers(args: {
+  review: PRReview;
+  repo: Repository;
+  diff: string;
+  holistic: HolisticContext;
+}): Promise<{ hasBlocker: boolean; summary: string }> {
+  const { review, repo, diff, holistic } = args;
+  const wf = effectiveWorkflow(repo);
+  const holisticRan = wf.stages.holistic && (holistic.entries.length > 0 || holistic.manifest.length > 0);
+  if (holisticRan) {
+    const v = await reviewAgainstRepo({ review, diff, holistic, extraInstructions: wf.prompts?.holistic });
+    for (const f of v.regressions) emitFindingLog(review.id, "regression", f);
+    for (const f of v.criticalErrors) emitFindingLog(review.id, "criticalError", f);
+    for (const f of v.securityFindings) emitFindingLog(review.id, "security", f);
+    const hasBlocker = [...v.regressions, ...v.criticalErrors, ...v.securityFindings].some(
+      (f) => f.severity === "blocker"
+    );
+    return { hasBlocker, summary: v.summary };
+  }
+  if (diff) {
+    const sec = await reviewDiffSecurity({
+      review,
+      diff,
+      touched: holistic.entries.slice(0, holistic.touchedCount),
+      extraInstructions: wf.prompts?.holistic,
+    });
+    for (const f of sec.securityFindings) emitFindingLog(review.id, "security", f);
+    return { hasBlocker: sec.securityFindings.some((f) => f.severity === "blocker"), summary: sec.summary };
+  }
+  return { hasBlocker: false, summary: "" };
+}
+
+// The dispute counterpart to postChangesRequestedNotice: a maintainer's
+// false-positive correction was VERIFIED against the codebase and cleared the
+// last open criteria, so the PR now passes. Post the correction comment, flip the
+// Check Run to success, and submit a bodyless APPROVE (stored so a later failing
+// commit can withdraw it). Best-effort; each step is independently guarded.
+async function postApprovalAfterCorrection(
+  review: PRReview,
+  repo: { owner: string; name: string },
+  install: { installationId: number },
+  args: { summary: string; commentBody: string }
+): Promise<void> {
+  try {
+    await postPRCommentReturningId(
+      install.installationId,
+      repo.owner,
+      repo.name,
+      review.prNumber,
+      args.commentBody
+    );
+  } catch (err) {
+    console.warn("[feedback] failed to post correction comment:", err);
+  }
+  try {
+    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
+      method: "POST",
+      body: JSON.stringify({
+        name: "DevAsign · End goal",
+        head_sha: review.headSha,
+        status: "completed",
+        conclusion: "success",
+        output: { title: "All acceptance criteria met", summary: args.summary || "" },
+      }),
+      headers: { "Content-Type": "application/json" },
+    });
+  } catch (err) {
+    console.warn("[feedback] failed to refresh check run:", err);
+  }
+  if (review.approveReviewId == null) {
+    try {
+      const res = await gh<{ id?: number }>(
+        install.installationId,
+        `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`,
+        {
+          method: "POST",
+          body: JSON.stringify({ event: "APPROVE" }),
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+      if (typeof res?.id === "number") setStatus(review.id, { approveReviewId: res.id });
+    } catch (err) {
+      console.warn("[feedback] failed to post approval:", err);
+    }
+  }
+}
+
+// The comment DevAsign posts after re-checking a maintainer's dispute. When the
+// re-review confirmed the maintainer (the finding was a false positive) it reads
+// as an acknowledgement plus the verifying evidence; when it could not, it
+// explains what was checked and what still stands. No emoji, matching the other
+// review-comment steps.
+function formatDisputeResolutionComment(args: {
+  cleared: Array<{ id: string; text: string; evidence: string }>;
+  stillUnmet: Criterion[];
+  approved: boolean;
+  sourceUrl: string;
+  blockerSummary?: string;
+}): string {
+  const lines: string[] = [];
+  if (args.approved) {
+    lines.push("**Re-reviewed after your note — you're right, these were false positives.**");
+    lines.push("");
+    lines.push(
+      "I re-checked the disputed criteria against the full codebase (not just the PR diff) and confirmed they are satisfied:"
+    );
+  } else {
+    lines.push("**Re-reviewed after your note.**");
+    lines.push("");
+    lines.push("I re-checked the disputed criteria against the full codebase (not just the PR diff).");
+  }
+  if (args.cleared.length) {
+    lines.push("");
+    for (const c of args.cleared) lines.push(`- **${c.id} — now met.** ${c.evidence}`);
+  }
+  if (args.stillUnmet.length) {
+    lines.push("");
+    lines.push("Still open after re-review:");
+    for (const c of args.stillUnmet) lines.push(`- **${c.id}** — ${c.evidence || c.text}`);
+  }
+  // All criteria cleared but the security backstop held the merge — explain why,
+  // otherwise the developer sees "criteria met" with no reason for the block.
+  if (!args.approved && args.blockerSummary) {
+    lines.push("");
+    lines.push("**However, changes are still requested:**");
+    lines.push(args.blockerSummary);
+  }
+  if (args.approved) {
+    lines.push("");
+    lines.push("All acceptance criteria are now met, so I've updated the verdict to approved.");
+  }
+  if (args.sourceUrl) {
+    lines.push("");
+    lines.push(`_Source: ${args.sourceUrl}_`);
+  }
+  return lines.join("\n");
+}
+
 export async function runMaintainerFeedbackJob(
   reviewId: string,
   comment: MaintainerComment
@@ -2891,6 +3186,14 @@ export async function runMaintainerFeedbackJob(
   if (!repo) return;
   const install = db.find("installations", (i) => i.id === repo.installationId);
 
+  // Tier the model by the repo owner's plan and open a usage scope, exactly like
+  // runReviewJob: this job makes several LLM calls (refineGoalFromFeedback,
+  // rescoreDisputedCriteria, synthesizeImplementationGuide, detectIntroducedBlockers)
+  // that must respect plan restrictions and roll their token cost into one scope.
+  const plan = install?.userId ? planForUser(install.userId) : null;
+  const reviewModel = plan ? modelForPlan(plan) : config.llm.model;
+
+  return withModel(reviewModel, () => withUsage(async () => {
   // The "comment arrived" log is written synchronously by the webhook
   // handler so the Agent page surfaces the comment before this job even
   // dequeues. Here we mark the start of the analysis phase — the brain
@@ -2964,41 +3267,10 @@ export async function runMaintainerFeedbackJob(
     },
   });
 
-  if (refined.changed) {
-    if (task) {
-      db.update("tasks", (t) => t.id === task.id, { endGoal: refined.endGoal });
-    }
-    // The bar moved: new criteria came in from the maintainer's comment.
-    // Flip the visible status to `changes_requested` so a PR that read as
-    // "passed" no longer reads as approved while the developer hasn't had a
-    // chance to implement the new requirement yet. We deliberately do NOT
-    // re-run the full review here: the diff is unchanged, so re-checking it
-    // against a criterion we just learned it can't meet only burns an LLM pass
-    // and posts redundant findings. The implementation guide below is the
-    // actionable feedback, and the lightweight REQUEST_CHANGES further down
-    // blocks the merge. The real re-review fires on the next `synchronize`
-    // webhook, once the developer actually pushes a commit.
-    setStatus(review.id, {
-      criteria: refined.criteria,
-      status: "changes_requested",
-    });
-    log(review.id, "criteria", "End goal updated from maintainer feedback", {
-      detail: refined.rationale || refined.endGoal,
-      meta: { count: refined.criteria.length, added: refined.added.length, statusGated: true },
-    });
-  } else {
-    log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
-      detail: refined.rationale || "No actionable change inferred from the comment.",
-    });
-    // No goal movement → no PR reply. The "Maintainer feedback received" +
-    // this "reviewed; unchanged" pair in the review log is the agent's
-    // observable acknowledgement that it saw and considered the comment.
-    return;
-  }
-
-  // Pull the latest diff so the implementation guide can be anchored in the
-  // actual code. Best-effort: a missing install or a fetch failure just means
-  // we synthesise the guide from feedback + criteria alone.
+  // Pull the latest diff once: the implementation guide anchors on it, and the
+  // dispute re-check + security backstop verify against it plus the repo index.
+  // Best-effort — a missing install or fetch failure just means we work from the
+  // feedback + repo index alone.
   let diffSlice = "";
   if (install) {
     try {
@@ -3011,69 +3283,233 @@ export async function runMaintainerFeedbackJob(
       console.warn("[feedback] failed to fetch diff:", err);
     }
   }
+  const holistic = gatherHolisticContext(repo, diffSlice);
 
-  const guide = await synthesizeImplementationGuide({
-    feedback: {
-      author: comment.author,
-      body: comment.body,
-      videoSummaries,
-      docUrls,
-    },
-    endGoal: refined.endGoal,
-    criteria: refined.criteria,
-    prTitle: review.prTitle,
-    diffSlice,
-  });
+  // 1. Re-verify any disputed verdicts against the full codebase BEFORE settling
+  //    status. A dispute claims a criterion we marked unmet is actually satisfied
+  //    by code outside the diff; rescoreDisputedCriteria checks the repo index and
+  //    flips unmet→met only on cited evidence. Runs in dev too (LLM-only, no
+  //    GitHub calls) so the correction is observable without an install.
+  let criteria = refined.criteria;
+  const cleared: Array<{ id: string; text: string; evidence: string }> = [];
+  if (refined.disputed.length) {
+    const wfForDispute = effectiveWorkflow(repo);
+    const rescore = await rescoreDisputedCriteria({
+      review,
+      criteria,
+      disputed: refined.disputed,
+      diff: diffSlice,
+      holistic,
+      feedback: {
+        author: comment.author,
+        authorAssociation: comment.authorAssociation,
+        body: comment.body,
+      },
+      extra: wfForDispute.prompts?.review,
+    });
+    const byId = new Map(rescore.results.map((r) => [r.id, r]));
+    criteria = criteria.map((c) => {
+      const r = byId.get(c.id);
+      if (!r) return c;
+      if (r.met && c.met !== true) cleared.push({ id: c.id, text: c.text, evidence: r.evidence });
+      return { ...c, met: r.met, evidence: r.evidence };
+    });
+    log(review.id, "criteria", "Re-evaluated disputed criteria against the codebase", {
+      detail: `${cleared.length} of ${refined.disputed.length} disputed criterion/criteria verified and cleared`,
+      meta: { disputed: refined.disputed.map((d) => d.id), cleared: cleared.map((c) => c.id) },
+    });
+  }
 
-  if (!install) return; // dev: nothing to post to
+  // 1b. Re-opens: the maintainer reasserts that a previously-MET criterion is NOT
+  //     satisfied. Unlike a clear, this is NOT verify-gated — re-opening only ever
+  //     blocks the merge, so the maintainer's authority on "done" prevails (this is
+  //     symmetric with adding a new criterion). We flip met→unmet and record the
+  //     maintainer's reason as the evidence; gating it on a re-check would just
+  //     recreate the original "agent won't listen to the maintainer" bug in reverse.
+  const reopened: Array<{ id: string; text: string }> = [];
+  if (refined.reopened.length) {
+    const claimById = new Map(refined.reopened.map((r) => [r.id, r.claim]));
+    criteria = criteria.map((c) => {
+      if (!claimById.has(c.id) || c.met !== true) return c;
+      reopened.push({ id: c.id, text: c.text });
+      return {
+        ...c,
+        met: false,
+        evidence: `Re-opened by ${comment.author}: ${claimById.get(c.id) || "the maintainer says this is not actually satisfied."}`,
+      };
+    });
+    log(review.id, "criteria", "Re-opened criteria at maintainer's request", {
+      detail: `${reopened.length} previously-met criterion/criteria re-opened`,
+      meta: { reopened: reopened.map((r) => r.id) },
+    });
+  }
 
-  const body = formatImplementationGuide(guide, comment, {
-    prTitle: review.prTitle,
-    repoFullName: `${repo.owner}/${repo.name}`,
-    newCriteria: refined.added,
-  });
-  try {
-    await gh(
-      install.installationId,
-      `/repos/${repo.owner}/${repo.name}/issues/${review.prNumber}/comments`,
+  // 2. Bar-moved-up path: the comment introduced brand-new criteria and/or re-opened
+  //    previously-met ones. Either way the PR can no longer read as approved, so we
+  //    request changes and post the implementation guide. Any disputes were already
+  //    merged into `criteria` above. New/re-opened criteria are unmet, so the status
+  //    is changes_requested regardless — no need to re-run the diff verdict here;
+  //    that fires on the next `synchronize` once the developer pushes.
+  if (refined.changed || reopened.length) {
+    if (task && refined.changed) {
+      db.update("tasks", (t) => t.id === task.id, { endGoal: refined.endGoal });
+    }
+    setStatus(review.id, { criteria, status: "changes_requested" });
+    log(
+      review.id,
+      "criteria",
+      refined.changed ? "End goal updated from maintainer feedback" : "Criteria re-opened from maintainer feedback",
       {
-        method: "POST",
-        body: JSON.stringify({ body }),
-        headers: { "Content-Type": "application/json" },
+        detail: refined.rationale || refined.endGoal || `Re-opened ${reopened.length} criterion/criteria.`,
+        meta: {
+          count: criteria.length,
+          added: refined.added.length,
+          reopened: reopened.length,
+          cleared: cleared.length,
+          statusGated: true,
+        },
       }
     );
-  } catch (err) {
-    console.warn("[feedback] failed to post implementation guide:", err);
+
+    const guide = await synthesizeImplementationGuide({
+      feedback: { author: comment.author, body: comment.body, videoSummaries, docUrls },
+      endGoal: refined.endGoal,
+      criteria,
+      prTitle: review.prTitle,
+      diffSlice,
+    });
+
+    if (!install) return; // dev: nothing to post to
+
+    const body = formatImplementationGuide(guide, comment, {
+      prTitle: review.prTitle,
+      repoFullName: `${repo.owner}/${repo.name}`,
+      newCriteria: refined.added,
+      hasReopened: reopened.length > 0,
+    });
+    try {
+      await gh(
+        install.installationId,
+        `/repos/${repo.owner}/${repo.name}/issues/${review.prNumber}/comments`,
+        {
+          method: "POST",
+          body: JSON.stringify({ body }),
+          headers: { "Content-Type": "application/json" },
+        }
+      );
+    } catch (err) {
+      console.warn("[feedback] failed to post implementation guide:", err);
+      return;
+    }
+    log(review.id, "comment", "Posted implementation guide for maintainer feedback", {
+      target: comment.sourceUrl,
+      detail: guide.title,
+      meta: { author: comment.author, refs: guide.references.length },
+    });
+
+    const wf = effectiveWorkflow(repo);
+    const { event: reviewEvent } = resolveReviewEvent({
+      status: "changes_requested",
+      specless: criteria.length === 0,
+      blocking: wf.verdict.blocking,
+      endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
+    });
+    await postChangesRequestedNotice(review, repo, install, {
+      event: reviewEvent,
+      summary: refined.changed
+        ? "Maintainer feedback added new acceptance criteria; see the implementation guide."
+        : "Maintainer re-opened acceptance criteria; see the implementation guide.",
+    });
+    log(review.id, "verdict", "Changes requested — merge blocked; awaiting developer commit", {
+      meta: { event: reviewEvent, reReview: false },
+    });
     return;
   }
 
-  log(review.id, "comment", "Posted implementation guide for maintainer feedback", {
-    target: comment.sourceUrl,
-    detail: guide.title,
-    meta: { author: comment.author, refs: guide.references.length },
-  });
+  // 3. No new criteria, but the comment disputed verdicts: settle status from the
+  //    re-scored criteria. The security gate is never softened — a flip to passed
+  //    re-checks the diff for introduced blockers first (detectIntroducedBlockers).
+  if (refined.disputed.length) {
+    const allMet = criteria.length > 0 && criteria.every((c) => c.met === true);
+    let status: PRReviewStatus = "changes_requested";
+    let blockerSummary = "";
+    if (allMet) {
+      const blockers = await detectIntroducedBlockers({ review, repo, diff: diffSlice, holistic });
+      blockerSummary = blockers.summary;
+      status = blockers.hasBlocker ? "changes_requested" : "passed";
+    }
+    setStatus(review.id, { criteria, status });
+    if (status === "passed") {
+      log(review.id, "verdict", "Verdict corrected after maintainer dispute — all criteria met", {
+        detail: `Cleared ${cleared.length} false-positive finding(s) after verifying against the codebase.`,
+        meta: { cleared: cleared.map((c) => c.id), status },
+      });
+    } else {
+      log(review.id, "criteria", "Disputed criteria re-evaluated; changes still requested", {
+        detail: cleared.length
+          ? `Cleared ${cleared.length} finding(s); ${criteria.filter((c) => c.met !== true).length} still unmet.`
+          : "Re-checked the disputed criteria against the codebase; the findings stand.",
+        meta: { cleared: cleared.map((c) => c.id), status },
+      });
+    }
 
-  // Block merge without re-running the pipeline: refresh the Check Run to
-  // action_required and (in blocking mode) dismiss our stale approval. No new
-  // conversation comment beyond the implementation guide above — the
-  // changes-requested note is folded into the guide itself
-  // (formatImplementationGuide). Advisory mode (verdict.blocking=false)
-  // downgrades the event to COMMENT so the merge is never blocked — the policy
-  // lives in resolveReviewEvent (decisions.ts).
-  const wf = effectiveWorkflow(repo);
-  const { event: reviewEvent } = resolveReviewEvent({
-    status: "changes_requested",
-    specless: refined.criteria.length === 0,
-    blocking: wf.verdict.blocking,
-    endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
+    if (!install) return; // dev: status updated; nothing to post
+
+    if (status === "passed") {
+      await postApprovalAfterCorrection(review, repo, install, {
+        summary: blockerSummary || "All acceptance criteria met after re-review.",
+        commentBody: formatDisputeResolutionComment({
+          cleared,
+          stillUnmet: [],
+          approved: true,
+          sourceUrl: comment.sourceUrl,
+        }),
+      });
+    } else {
+      const stillUnmet = criteria.filter((c) => c.met !== true);
+      try {
+        await gh(
+          install.installationId,
+          `/repos/${repo.owner}/${repo.name}/issues/${review.prNumber}/comments`,
+          {
+            method: "POST",
+            body: JSON.stringify({
+              body: formatDisputeResolutionComment({
+                cleared,
+                stillUnmet,
+                approved: false,
+                sourceUrl: comment.sourceUrl,
+                blockerSummary,
+              }),
+            }),
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+      } catch (err) {
+        console.warn("[feedback] failed to post dispute resolution comment:", err);
+      }
+      const wf = effectiveWorkflow(repo);
+      const { event: reviewEvent } = resolveReviewEvent({
+        status: "changes_requested",
+        specless: criteria.length === 0,
+        blocking: wf.verdict.blocking,
+        endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
+      });
+      await postChangesRequestedNotice(review, repo, install, {
+        event: reviewEvent,
+        summary: "Re-reviewed the disputed criteria; changes are still requested.",
+      });
+    }
+    return;
+  }
+
+  // 4. Nothing actionable: the original acknowledgement that we saw the comment.
+  //    The "Maintainer feedback received" + this "reviewed; unchanged" pair in the
+  //    review log is the agent's observable acknowledgement.
+  log(review.id, "criteria", "Maintainer feedback reviewed; end goal unchanged", {
+    detail: refined.rationale || "No actionable change inferred from the comment.",
   });
-  await postChangesRequestedNotice(review, repo, install, {
-    event: reviewEvent,
-    summary: "Maintainer feedback added new acceptance criteria; see the implementation guide.",
-  });
-  log(review.id, "verdict", "Changes requested — merge blocked; awaiting developer commit", {
-    meta: { event: reviewEvent, reReview: false },
-  });
+  }));
 }
 
 // --- Helpers ---

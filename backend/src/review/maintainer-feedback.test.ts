@@ -96,3 +96,142 @@ test("a substantive maintainer comment requests changes but does NOT re-run the 
   // commit is exactly the noise we're eliminating.
   assert.equal(queueSnapshot().reviews, before, "no review should be enqueued without a new commit");
 });
+
+// Seed a review with a known criteria verdict mix. No install row means the
+// GitHub-posting tail is skipped (`if (!install) return`), so we assert the
+// in-db status/criteria the dispute path writes before any posting.
+function seedDisputeReview(criteria: any[], status: string = "changes_requested") {
+  const repo = db.insert("repositories", {
+    id: uuid(),
+    installationId: uuid(),
+    owner: "acme",
+    name: "widgets",
+    private: false,
+    reviewsEnabled: true,
+    workflow: undefined,
+  } as any);
+  const review = db.insert("prReviews", {
+    id: uuid(),
+    repoId: repo.id,
+    prNumber: 7,
+    prTitle: "Surface encryption status in /api/health",
+    headSha: "abc1234",
+    baseSha: "def5678",
+    status,
+    verdict: null,
+    criteria,
+    taskId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+  } as any);
+  return { repo, review };
+}
+
+const C1_MET = { id: "c1", text: "The /api/health response includes an encryption field.", met: true, evidence: "field added" };
+const C2_UNMET = {
+  id: "c2",
+  text: "Encryption status is derived from the existing dbHealth tracking.",
+  met: false,
+  evidence: "the diff does not show how the value is derived",
+};
+
+test("a verified maintainer dispute clears the false positive and flips the verdict to passed", async () => {
+  const { review } = seedDisputeReview([{ ...C1_MET }, { ...C2_UNMET }]);
+  const before = queueSnapshot().reviews;
+
+  await runMaintainerFeedbackJob(review.id, {
+    body: "Those are false positives. c2 is already satisfied — write is dbHealth() in api.ts, two lines above the hunk.",
+    author: "maintainer",
+    authorAssociation: "OWNER",
+    sourceUrl: "https://github.com/acme/widgets/pull/7#issuecomment-9",
+    sourceEvent: "issue_comment",
+  });
+
+  const updated = db.find("prReviews", (r) => r.id === review.id)!;
+  // A pure dispute adds nothing — it only re-scores existing criteria.
+  assert.equal(updated.criteria.length, 2, "a pure dispute should not append a criterion");
+  assert.equal(
+    updated.criteria.find((c) => c.id === "c2")!.met,
+    true,
+    "the disputed criterion should be re-verified as met"
+  );
+  // All criteria now met → the verdict is corrected instead of left stale.
+  assert.equal(updated.status, "passed", "all criteria met after the dispute → passed");
+  assert.equal(queueSnapshot().reviews, before, "a dispute must not enqueue a fresh review job");
+});
+
+test("an unverifiable maintainer dispute leaves the finding in place", async () => {
+  const { review } = seedDisputeReview([{ ...C1_MET }, { ...C2_UNMET }]);
+  const before = queueSnapshot().reviews;
+
+  await runMaintainerFeedbackJob(review.id, {
+    body: "Those are false positives, trust me — I can't point you to the exact code.",
+    author: "maintainer",
+    authorAssociation: "OWNER",
+    sourceUrl: "https://github.com/acme/widgets/pull/7#issuecomment-10",
+    sourceEvent: "issue_comment",
+  });
+
+  const updated = db.find("prReviews", (r) => r.id === review.id)!;
+  // The guardrail: an unverifiable claim must NOT flip the verdict — evidence,
+  // not the maintainer's authority, clears a finding.
+  assert.equal(updated.criteria.find((c) => c.id === "c2")!.met, false, "unverifiable claim must not flip to met");
+  assert.equal(updated.status, "changes_requested", "finding stands → merge stays blocked");
+  assert.equal(queueSnapshot().reviews, before, "a dispute must not enqueue a fresh review job");
+});
+
+test("a comment that both disputes and adds clears the false positive and still requests changes", async () => {
+  const { review } = seedDisputeReview([{ ...C1_MET }, { ...C2_UNMET }]);
+
+  await runMaintainerFeedbackJob(review.id, {
+    body: "c2 is a false positive — it's already handled. Also please add an audit-log entry on write.",
+    author: "maintainer",
+    authorAssociation: "OWNER",
+    sourceUrl: "https://github.com/acme/widgets/pull/7#issuecomment-11",
+    sourceEvent: "issue_comment",
+  });
+
+  const updated = db.find("prReviews", (r) => r.id === review.id)!;
+  // Additive path still runs: the new criterion is appended...
+  assert.equal(updated.criteria.length, 3, "the new criterion should be appended");
+  // ...the disputed one is cleared by the re-score...
+  assert.equal(updated.criteria.find((c) => c.id === "c2")!.met, true, "the disputed criterion is cleared");
+  // ...and the brand-new criterion starts unmet, so the merge stays blocked.
+  const added = updated.criteria.find((c) => c.id !== "c1" && c.id !== "c2")!;
+  assert.equal(added.met, null, "a brand-new criterion starts unmet");
+  assert.equal(updated.status, "changes_requested", "a new unmet criterion keeps changes requested");
+});
+
+test("a maintainer can re-open a previously-passed criterion (honored, not verify-gated)", async () => {
+  // The PR had been approved (all criteria met) before the maintainer chimed in.
+  const { review } = seedDisputeReview(
+    [
+      { ...C1_MET },
+      { id: "c2", text: "The empty-state path is handled.", met: true, evidence: "early return added" },
+    ],
+    "passed"
+  );
+  const before = queueSnapshot().reviews;
+
+  await runMaintainerFeedbackJob(review.id, {
+    body: "Re-open c1 — it isn't actually satisfied; the response is missing the encryption field on the error branch.",
+    author: "maintainer",
+    authorAssociation: "OWNER",
+    sourceUrl: "https://github.com/acme/widgets/pull/7#issuecomment-12",
+    sourceEvent: "issue_comment",
+  });
+
+  const updated = db.find("prReviews", (r) => r.id === review.id)!;
+  // The named criterion flips met→unmet on the maintainer's word — no re-check.
+  assert.equal(updated.criteria.find((c) => c.id === "c1")!.met, false, "the re-opened criterion is now unmet");
+  // The evidence records who re-opened it and why.
+  assert.match(
+    updated.criteria.find((c) => c.id === "c1")!.evidence || "",
+    /re-opened by/i,
+    "the re-open reason should be recorded as evidence"
+  );
+  // The other passed criterion is untouched.
+  assert.equal(updated.criteria.find((c) => c.id === "c2")!.met, true, "an un-named criterion stays met");
+  assert.equal(updated.status, "changes_requested", "a re-opened criterion blocks the merge");
+  assert.equal(queueSnapshot().reviews, before, "a re-open must not enqueue a fresh review job");
+});
