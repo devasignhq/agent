@@ -116,9 +116,10 @@ export type UsageCheck = { plan: Plan; used: number; limit: number; allowed: boo
 // calls recordReviewUsage() only when it actually starts a new-PR review.
 //
 // `usagePeriodStart` anchors the window. The Stripe webhook resets it on each
-// paid renewal (invoice.payment_succeeded); this 30-day fallback covers free
-// users (who have no webhook) and any missed renewal event. Max's Infinity
-// limit makes `allowed` always true regardless.
+// true renewal (invoice.payment_succeeded with billing_reason "subscription_cycle"
+// — NOT the proration invoices from mid-cycle plan switches); this 30-day fallback
+// covers free users (who have no webhook) and any missed renewal event. Max's
+// Infinity limit makes `allowed` always true regardless.
 export function rollAndCheckUsage(sub: Subscription): UsageCheck {
   const plan = effectivePlan(sub);
   const limit = PLAN_LIMITS[plan].monthlyReviews;
