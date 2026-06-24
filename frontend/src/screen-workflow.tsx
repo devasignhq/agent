@@ -821,7 +821,7 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
   );
 }
 
-const WorkflowPage = () => {
+const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) => void } = {}) => {
   const { user } = useAuth();
   const [repos, setRepos] = React.useState<Repository[]>([]);
   const [repoId, setRepoId] = React.useState<string>("");
@@ -949,6 +949,13 @@ const WorkflowPage = () => {
   const noRepos = repos.length === 0 && !loading;
   const mode = wf ? activeMode(wf) : null;
 
+  // Surface the selected repo's name to the app shell for the header breadcrumb
+  // (user / Workflow / repo). Clear it on unmount so other pages don't inherit it.
+  React.useEffect(() => {
+    onRepoChange?.(repo ? repo.name : null);
+  }, [repo, onRepoChange]);
+  React.useEffect(() => () => onRepoChange?.(null), [onRepoChange]);
+
   return (
     <div className="wf-layout">
       {/* Full-bleed canvas — the floating panels below sit over it. */}
@@ -1034,14 +1041,11 @@ const WorkflowPage = () => {
         </div>
       </aside>
 
-      {/* Repo name + Mode — directly on the canvas (no card behind them) */}
+      {/* Mode selector — sits top-left of the canvas, where the repo name used
+          to be (the repo name now lives in the header breadcrumb). */}
       {!noRepos && (
         <div className="wf-toolbar">
-          <span className="wf-toolbar-title mono">
-            {repo ? `${repo.owner}/${repo.name}` : "Workflow"}
-          </span>
-          <div className="wf-toolbar-right">
-            {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
+          <div className="wf-toolbar-left">
             <span className="mute" style={{ fontSize: 11 }}>Mode</span>
             {([
               ["strict", "Strict"],
@@ -1067,6 +1071,7 @@ const WorkflowPage = () => {
               Custom
             </span>
           </div>
+          {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
         </div>
       )}
 
