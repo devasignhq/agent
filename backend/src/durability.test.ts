@@ -99,7 +99,7 @@ test("durabilityBarrier: pendingWrites>0 + headers already sent → forwards bod
   const { res, calls } = makeBarrierRes(true);
 
   let nextCalled = false;
-  barrier({} as Request, res, (() => (nextCalled = true)) as NextFunction);
+  barrier({ method: "POST" } as Request, res, (() => (nextCalled = true)) as NextFunction);
   assert.equal(nextCalled, true, "middleware passes control on");
 
   const cb = () => {};
@@ -118,7 +118,7 @@ test("durabilityBarrier: pendingWrites>0 + headers already sent → forwards bod
 test("durabilityBarrier: pendingWrites>0 + headers NOT sent → 503 (routes into finishNotDurable)", async () => {
   const barrier = makeDurabilityBarrier({ flushPending: async () => {}, pendingWrites: () => 1 });
   const { res, calls } = makeBarrierRes(false);
-  barrier({} as Request, res, (() => {}) as NextFunction);
+  barrier({ method: "POST" } as Request, res, (() => {}) as NextFunction);
 
   (res.end as (...a: unknown[]) => unknown)("would-be-success-body");
   await tick();
@@ -130,11 +130,38 @@ test("durabilityBarrier: pendingWrites>0 + headers NOT sent → 503 (routes into
 test("durabilityBarrier: pendingWrites==0 → normal response forwarded unchanged", async () => {
   const barrier = makeDurabilityBarrier({ flushPending: async () => {}, pendingWrites: () => 0 });
   const { res, calls } = makeBarrierRes(false);
-  barrier({} as Request, res, (() => {}) as NextFunction);
+  barrier({ method: "POST" } as Request, res, (() => {}) as NextFunction);
 
   (res.end as (...a: unknown[]) => unknown)("ok-body");
   await tick();
 
   assert.equal(res.statusCode, 200, "durable write → normal success");
   assert.deepEqual(calls[0], ["ok-body"], "body forwarded unchanged");
+});
+
+test("durabilityBarrier: reads (GET/HEAD/OPTIONS) bypass entirely — no flush, no 503, even with a backlog", async () => {
+  // The prod regression: a write backlog (or unreachable DB) made the barrier 503
+  // EVERY response, reads included, taking the whole app down. Reads must pass
+  // straight through, untouched and without ever flushing.
+  let flushCalled = false;
+  const barrier = makeDurabilityBarrier({
+    flushPending: async () => {
+      flushCalled = true;
+    },
+    pendingWrites: () => 99, // a large write backlog that must NOT affect reads
+  });
+
+  for (const method of ["GET", "HEAD", "OPTIONS"]) {
+    const { res, calls } = makeBarrierRes(false);
+    let nextCalled = false;
+    barrier({ method } as Request, res, (() => (nextCalled = true)) as NextFunction);
+    assert.equal(nextCalled, true, `${method} passes straight through`);
+
+    (res.end as (...a: unknown[]) => unknown)("read-body");
+    await tick();
+
+    assert.equal(res.statusCode, 200, `${method} not turned into 503 by the write backlog`);
+    assert.deepEqual(calls[0], ["read-body"], `${method} body forwarded unchanged`);
+  }
+  assert.equal(flushCalled, false, "a read never triggers a flush (no pool pressure, no latency)");
 });
