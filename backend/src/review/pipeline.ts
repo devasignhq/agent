@@ -1509,8 +1509,12 @@ export async function synthesizeCriteriaCore(args: {
     messages: [{ role: "user", content: userText }],
   });
   const parsed = tryParseJSON(raw, { endGoal: "", criteria: [] });
+  // Number criteria positionally (1, 2, 3 …) rather than trusting the LLM's id —
+  // the model tends to emit uppercase "C1", which then collides with the plain
+  // numbers appendAddedCriteria assigns to later-commit criteria, splitting the
+  // comment into two runs. Positional ids keep the whole list a single sequence.
   const criteria: Criterion[] = (parsed.criteria || []).map((c: any, i: number) => ({
-    id: String(c.id || `c${i + 1}`),
+    id: String(i + 1),
     text: String(c.text || ""),
     met: null,
     evidence: null,
@@ -1749,7 +1753,7 @@ async function refineGoalFromVideos(args: {
   }
 
   const nextCriteria: Criterion[] = (parsed.criteria || []).map((c: any, i: number) => {
-    const id = String(c.id || `c${i + 1}`);
+    const id = String(c.id || `${i + 1}`);
     const prev = criteria.find((x) => x.id === id);
     return {
       id,
