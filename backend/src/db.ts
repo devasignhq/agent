@@ -221,6 +221,32 @@ const deleted = new Map<keyof DB, Set<string>>();
 let flushTimer: NodeJS.Timeout | null = null;
 let flushing: Promise<void> | null = null;
 
+// ---------------------------------------------------------------------------
+// Coherence (delta-sync) — keep this process's cache live with Postgres
+//
+// The cache used to be a load-ONCE snapshot: read at boot, never reconciled, so
+// a second process on the same DB (Render's zero-downtime deploy overlaps the
+// old and new instance) served a stale view AND clobbered the other's committed
+// rows via whole-row last-write-wins. We close that by (a) tagging every row
+// with a per-row monotonic `version` (in its jsonb) and only letting a write win
+// the upsert when its version is >= the stored one — a stale instance can't roll
+// a row back; and (b) giving every table a DB-assigned `rev` (a global sequence)
+// and polling `where rev > watermark` so each instance pulls in rows another
+// instance committed. Postgres is the source of truth; the cache revalidates to
+// it continuously instead of trusting a frozen boot snapshot.
+//
+// NB: delta-sync uses plain SELECTs, so it works through Neon's PgBouncer pooler
+// (which prod connects to and which does NOT support LISTEN/NOTIFY).
+const REV_SEQ = "devasign_rev_seq";
+const DELTA_SYNC_MS = 1_000; // pull inserts/updates committed elsewhere
+const DELETE_SWEEP_MS = 30_000; // reconcile deletes (rev-watermark can't see a gone row)
+// Highest `rev` this process has merged, per table. Drives the delta-sync poll.
+const revWatermark = new Map<keyof DB, number>();
+let coherenceTimer: NodeJS.Timeout | null = null;
+let sweepCountdownMs = 0; // run the (heavier) delete sweep every DELETE_SWEEP_MS
+let syncing = false; // single-flight guard so the two passes never interleave on `state`
+let lastSyncAt = 0; // for dbHealth — confirms coherence is actually ticking
+
 // --- Write-through health (surfaced via dbHealth() -> /api/health) ----------
 // The old flush re-staged a failed batch and retried it forever; because the
 // whole dataset went in one transaction, a single row Postgres refused to store
@@ -357,12 +383,25 @@ export function dbHealth() {
     lastFlushErrorAt,
     rowsLoadedAtBoot,
     bootedAt,
+    // Coherence (delta-sync) liveness: how long since the cache last revalidated
+    // against Postgres. Ticks every ~1s; a climbing value means this instance may
+    // be serving a stale view (the failure the coherent cache exists to prevent).
+    coherence: !pool ? "ok" : lastSyncAt && Date.now() - lastSyncAt > 10_000 ? "stalled" : "ok",
+    coherenceAgeMs: pool && lastSyncAt ? Date.now() - lastSyncAt : 0,
   };
 }
 
 function rowId(row: unknown): string | null {
   const id = (row as { id?: unknown } | null)?.id;
   return typeof id === "string" ? id : null;
+}
+
+// Per-row monotonic version, bumped on every mutation. Persisted inside the
+// row's jsonb and used solely by the upsert's anti-clobber guard — read sites
+// never reference it. A row with no version yet (legacy) starts at 1.
+function bumpedVersion(row: unknown): number {
+  const v = (row as { version?: unknown } | null)?.version;
+  return (typeof v === "number" ? v : 0) + 1;
 }
 
 function stageUpsert(name: keyof DB, row: unknown): void {
@@ -430,6 +469,148 @@ export function reconcileAll(): void {
   }
 }
 
+// Pull rows another instance committed since our per-table watermark and merge
+// them into the cache, so this process serves Postgres' current state instead of
+// a frozen boot snapshot. Skips any id we hold an un-flushed local write for
+// (ours is the newer truth until it lands) and any row whose `version` isn't
+// newer than what we already have (mirrors the upsert's anti-clobber guard).
+async function deltaSyncMerge(): Promise<void> {
+  for (const name of COLLECTIONS) {
+    const watermark = revWatermark.get(name) ?? 0;
+    const { rows } = await pool!.query<{ id: string; data: unknown; rev: string }>(
+      `select id, data, rev from "${TABLES[name]}" where rev > $1 order by rev`,
+      [watermark]
+    );
+    if (!rows.length) continue;
+    const list = state[name] as Array<{ id?: string; version?: number }>;
+    const pendingUpserts = dirty.get(name);
+    const pendingDeletes = deleted.get(name);
+    let maxRev = watermark;
+    let minPendingSkip = Infinity; // lowest rev we skipped because OUR write is un-flushed
+    for (const r of rows) {
+      const rev = Number(r.rev);
+      if (rev > maxRev) maxRev = rev;
+      const id = typeof r.id === "string" ? r.id : null;
+      if (!id) continue;
+      // Our own un-flushed write to this id is the newer truth — don't clobber it.
+      if (pendingUpserts?.has(id) || pendingDeletes?.has(id)) {
+        if (rev < minPendingSkip) minPendingSkip = rev;
+        continue;
+      }
+      const incoming = decodeFromLoad(name, r.data) as { id?: string; version?: number };
+      const idx = list.findIndex((row) => row.id === id);
+      if (idx === -1) {
+        list.push(incoming);
+      } else {
+        const localV = typeof list[idx].version === "number" ? list[idx].version! : -1;
+        const incomingV = typeof incoming.version === "number" ? incoming.version : 0;
+        if (incomingV >= localV) list[idx] = incoming;
+      }
+    }
+    // Hold the watermark just below the lowest rev we skipped because our own
+    // write to that id is still pending: if that write later loses the version
+    // guard (another instance committed newer), we must re-pull this rev to
+    // re-converge. Once the pending write resolves, the next pass advances.
+    //
+    // This can only HOLD the watermark, never regress it: the query returns only
+    // rows with rev > watermark, so every skipped rev is >= watermark+1, hence
+    // minPendingSkip-1 >= watermark; and maxRev >= watermark always. So the new
+    // value is >= the old — the watermark is monotonically non-decreasing. The
+    // worst case is re-pulling already-merged higher-rev rows for as long as a
+    // low-rev write stays pending, which is bounded (a pending write drains in
+    // ~one flush) and harmless: re-merges are idempotent and the `incomingV >=
+    // localV` guard above means a re-pulled row can never overwrite a newer
+    // cached one. (See db-coherence.test.ts "watermark hold-back".)
+    revWatermark.set(name, Math.min(maxRev, minPendingSkip - 1));
+  }
+}
+
+// A rev-watermark poll can't observe a deletion (the row is just gone), so a row
+// another instance deleted would linger here — and could be resurrected if we
+// later updated it. Periodically reconcile each table's id set against Postgres
+// and drop cache rows that no longer exist there, never touching an id we have an
+// un-flushed local write for (a freshly inserted row not yet persisted).
+async function deleteSweepMerge(): Promise<void> {
+  for (const name of COLLECTIONS) {
+    const { rows } = await pool!.query<{ id: string }>(`select id from "${TABLES[name]}"`);
+    const live = new Set(rows.map((r) => r.id));
+    const pendingUpserts = dirty.get(name);
+    const list = state[name] as Array<{ id?: string }>;
+    const kept = list.filter((row) => {
+      const id = typeof row.id === "string" ? row.id : null;
+      if (!id) return true;
+      return live.has(id) || !!pendingUpserts?.has(id);
+    });
+    if (kept.length !== list.length) (state[name] as unknown[]) = kept;
+  }
+}
+
+// One coherence tick: always delta-sync; run the heavier delete sweep on a slower
+// cadence. Single-flighted so the two passes never mutate `state` concurrently.
+// Errors are swallowed — the next tick retries — so a transient DB blip can't
+// kill the poller. Unref'd timer, so it never holds the process open.
+async function coherenceTick(): Promise<void> {
+  if (!pool || syncing) return;
+  syncing = true;
+  try {
+    await deltaSyncMerge();
+    sweepCountdownMs -= DELTA_SYNC_MS;
+    if (sweepCountdownMs <= 0) {
+      sweepCountdownMs = DELETE_SWEEP_MS;
+      await deleteSweepMerge();
+    }
+    lastSyncAt = Date.now();
+  } catch (err) {
+    console.error("[db] coherence poll failed (will retry):", (err as Error)?.message || err);
+  } finally {
+    syncing = false;
+  }
+}
+
+function startCoherence(): void {
+  if (!pool || coherenceTimer) return;
+  sweepCountdownMs = DELETE_SWEEP_MS;
+  lastSyncAt = Date.now();
+  coherenceTimer = setInterval(() => void coherenceTick(), DELTA_SYNC_MS);
+  coherenceTimer.unref?.();
+}
+
+function stopCoherence(): void {
+  if (coherenceTimer) {
+    clearInterval(coherenceTimer);
+    coherenceTimer = null;
+  }
+}
+
+// Force a synchronous, full coherence pass — both the delta-sync merge and the
+// delete sweep — without waiting on the 1s timer. For tests/ops ("reconcile this
+// instance's cache against Postgres now"). No-op in ephemeral mode.
+export async function syncFromStore(): Promise<void> {
+  if (!pool || syncing) return;
+  syncing = true;
+  try {
+    await deltaSyncMerge();
+    await deleteSweepMerge();
+    lastSyncAt = Date.now();
+  } finally {
+    syncing = false;
+  }
+}
+
+// The `on conflict` clause shared by every upsert path. A write only wins when
+// its row `version` is >= the stored one, so a stale instance (lower version)
+// can never roll a row back — the anti-clobber half of coherence. `rev` is a
+// global-sequence value re-used from the proposed (excluded) row so delta-sync
+// on other instances notices the change. Existing rows with no `version` yet
+// (legacy / pre-coherence) read as -1 so any real version supersedes them.
+function upsertConflict(t: string): string {
+  return (
+    `on conflict (id) do update set data = excluded.data, rev = excluded.rev ` +
+    `where coalesce((excluded.data->>'version')::bigint, 0) >= ` +
+    `coalesce(("${t}".data->>'version')::bigint, -1)`
+  );
+}
+
 async function persistBatch(
   upserts: Array<[keyof DB, unknown[]]>,
   deletes: Array<[keyof DB, string[]]>
@@ -449,11 +630,12 @@ async function persistBatch(
           // reject (see db-sanitize). The sealed blob is clean base64, so the
           // scrub is a no-op on it — encode before sanitize is safe.
           params.push(rowId(row), sanitizeForJsonb(encodeForStore(name, row)));
-          return `($${j * 2 + 1}, $${j * 2 + 2})`;
+          // Each row gets its own freshly-allocated `rev` from the global sequence.
+          return `($${j * 2 + 1}, $${j * 2 + 2}, nextval('${REV_SEQ}'))`;
         });
         await client.query(
-          `insert into "${t}" (id, data) values ${tuples.join(", ")} ` +
-            `on conflict (id) do update set data = excluded.data`,
+          `insert into "${t}" (id, data, rev) values ${tuples.join(", ")} ` +
+            upsertConflict(t),
           params
         );
       }
@@ -530,8 +712,8 @@ async function persistIsolating(
         const row = rows[ri];
         try {
           await client.query(
-            `insert into "${t}" (id, data) values ($1, $2) ` +
-              `on conflict (id) do update set data = excluded.data`,
+            `insert into "${t}" (id, data, rev) values ($1, $2, nextval('${REV_SEQ}')) ` +
+              upsertConflict(t),
             [rowId(row), sanitizeForJsonb(encodeForStore(name, row))]
           );
         } catch (err) {
@@ -692,19 +874,38 @@ function describeDb(url: string): string {
 }
 
 async function ensureSchema(): Promise<void> {
+  // One global sequence stamps every committed write with a monotonic `rev` so
+  // delta-sync can pull "everything changed since my watermark" across all tables.
+  await pool!.query(`create sequence if not exists ${REV_SEQ}`);
   for (const name of COLLECTIONS) {
+    const t = TABLES[name];
     await pool!.query(
-      `create table if not exists "${TABLES[name]}" (id text primary key, data jsonb not null)`
+      `create table if not exists "${t}" (id text primary key, data jsonb not null)`
     );
+    // Added idempotently so pre-coherence databases upgrade in place. Existing
+    // rows get rev 0; the next write to each restamps it from the sequence.
+    await pool!.query(`alter table "${t}" add column if not exists rev bigint not null default 0`);
+    await pool!.query(`create index if not exists "${t}_rev_idx" on "${t}" (rev)`);
   }
 }
 
 async function loadAll(): Promise<void> {
   const fresh = structuredClone(empty);
   legacyPlaintextIds = new Map(); // recomputed below by decodeFromLoad
+  revWatermark.clear();
   for (const name of COLLECTIONS) {
-    const { rows } = await pool!.query<{ data: unknown }>(`select data from "${TABLES[name]}"`);
+    const { rows } = await pool!.query<{ data: unknown; rev: string }>(
+      `select data, rev from "${TABLES[name]}"`
+    );
     (fresh[name] as unknown[]) = rows.map((r) => decodeFromLoad(name, r.data));
+    // Seed the delta-sync watermark to the highest rev present at boot; the
+    // poller then only pulls rows committed after this snapshot.
+    let max = 0;
+    for (const r of rows) {
+      const rev = Number(r.rev);
+      if (rev > max) max = rev;
+    }
+    revWatermark.set(name, max);
   }
   state = fresh;
 }
@@ -750,6 +951,11 @@ export async function initDb(opts?: {
   }
   flushing = null;
   firstStagedAt = null;
+  // Coherence poller + watermarks are per-connection; drop any from a prior run.
+  stopCoherence();
+  revWatermark.clear();
+  syncing = false;
+  lastSyncAt = 0;
   if (opts?.poolOverride) {
     pool = opts.poolOverride;
   } else if (!config.databaseUrl) {
@@ -833,6 +1039,10 @@ export async function initDb(opts?: {
 
   const total = COLLECTIONS.reduce((n, k) => n + state[k].length, 0);
   rowsLoadedAtBoot = total;
+  // Begin revalidating the cache against Postgres. From here the snapshot is no
+  // longer load-once: another instance's committed writes (e.g. the outgoing
+  // instance during a zero-downtime deploy) flow in within ~1s.
+  startCoherence();
   const target = opts?.poolOverride ? "injected test pool" : describeDb(config.databaseUrl);
   console.log(
     `[db] connected [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
@@ -841,6 +1051,7 @@ export async function initDb(opts?: {
 
 /** Flush pending writes and close the pool. Call on graceful shutdown. */
 export async function shutdownDb(): Promise<void> {
+  stopCoherence();
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
@@ -859,6 +1070,8 @@ export const db = {
   },
 
   insert<K extends keyof DB>(name: K, row: DB[K][number]) {
+    // Stamp the monotonic version the upsert's anti-clobber guard keys off.
+    (row as { version?: number }).version = bumpedVersion(row);
     (state[name] as DB[K][number][]).push(row);
     stageUpsert(name, row);
     return row;
@@ -872,7 +1085,9 @@ export const db = {
     const list = state[name] as DB[K][number][];
     const idx = list.findIndex(predicate);
     if (idx === -1) return null;
-    list[idx] = { ...list[idx], ...patch };
+    // Bump from the pre-update version so a later/concurrent writer with a stale
+    // base can't win the upsert and roll this change back.
+    list[idx] = { ...list[idx], ...patch, version: bumpedVersion(list[idx]) } as DB[K][number];
     stageUpsert(name, list[idx]);
     return list[idx];
   },

@@ -24,6 +24,7 @@ import { api } from "./routes/api.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
 import { db, initDb, shutdownDb } from "./db.js";
+import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 
@@ -105,6 +106,12 @@ app.use(cookieParser());
 // across many provider IPs and won't individually trip it. LLM-triggering routes
 // get a much tighter bucket of their own (see rate-limit.ts / api.ts).
 app.use(globalLimiter);
+
+// Durability barrier: hold each response until its staged writes have reached
+// Postgres so a redeploy/crash can't drop a write the client was told succeeded.
+// Mounted before the webhook receivers + /api so it covers every mutating path.
+// See durability.ts (extracted there so its failure-finalization is unit tested).
+app.use(durabilityBarrier);
 
 // Webhook receiver needs the raw body for HMAC verification, so register it
 // BEFORE express.json() takes over the body. Both paths are accepted because
@@ -197,7 +204,7 @@ if (mergedReviews > 0) {
 await initStatsig();
 
 const port = config.port;
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
   console.log(`  · LLM:        ${isLLMLive() ? "live (Anthropic)" : "mock"}`);
   console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing (outbound App credentials unset)"}`);
@@ -224,11 +231,14 @@ startWorker();
 backfillRepoIndex();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
-// the debounce window aren't lost.
+// the debounce window aren't lost. Stop accepting new connections FIRST so no
+// request can stage a fresh write during the drain (otherwise the listener stays
+// open and a late write could miss the flush, then die on exit).
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
-    console.log(`\n[server] ${signal} received — flushing pending writes…`);
+    console.log(`\n[server] ${signal} received — draining and flushing pending writes…`);
     try {
+      server.close();
       await Promise.all([shutdownDb(), shutdownStatsig()]);
     } catch (err) {
       console.error("[server] error during shutdown", err);
