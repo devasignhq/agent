@@ -37,8 +37,10 @@ export function buildCriteriaSection(
 // onto the existing list. Existing criteria pass through untouched — including
 // `met` and `evidence` — so prior verdicts survive the next review pass and
 // already-satisfied requirements don't re-fail just because a new bar moved.
-// New IDs continue the `c{N}` sequence past whatever numeric suffix the
-// existing list reached, so they never collide with a preserved id.
+// New IDs continue the plain-number sequence past whatever number the existing
+// list reached, so the criteria render as one run (1, 2, 3 …) across commits
+// instead of restarting. The trailing-digit parse is prefix-tolerant so it also
+// counts past legacy ids ("c5", "C5") on PRs synthesized before this convention.
 export function appendAddedCriteria(
   existing: Criterion[],
   addedTexts: string[]
@@ -47,14 +49,14 @@ export function appendAddedCriteria(
   if (!cleaned.length) return existing;
   let nextN = 0;
   for (const c of existing) {
-    const m = /^c(\d+)$/.exec(c.id);
+    const m = /(\d+)$/.exec(c.id);
     if (m) {
       const n = Number(m[1]);
       if (n > nextN) nextN = n;
     }
   }
   const added: Criterion[] = cleaned.map((text) => ({
-    id: `c${++nextN}`,
+    id: String(++nextN),
     text,
     met: null,
     evidence: null,

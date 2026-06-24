@@ -172,10 +172,10 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       endGoal:
         "Reviewer should confirm the change delivers the described user-facing capability with no regressions in the touched files.",
       criteria: [
-        { id: "c1", text: "All paths described in the linked issue are implemented." },
-        { id: "c2", text: "No regressions in existing covered behavior." },
-        { id: "c3", text: "User-facing copy matches the ticket's wording." },
-        { id: "c4", text: "Edge cases listed in the issue are handled." },
+        { id: "1", text: "All paths described in the linked issue are implemented." },
+        { id: "2", text: "No regressions in existing covered behavior." },
+        { id: "3", text: "User-facing copy matches the ticket's wording." },
+        { id: "4", text: "Edge cases listed in the issue are handled." },
       ],
     });
   }
@@ -202,10 +202,10 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       summary:
         "The diff covers the main path, but two acceptance criteria are not yet visibly satisfied. See per-criterion notes.",
       criteria: [
-        { id: "c1", met: true, evidence: "src/handler.ts updated to cover the new path." },
-        { id: "c2", met: true, evidence: "No tests were removed; existing assertions still hold." },
-        { id: "c3", met: false, evidence: "Button label still reads 'Submit' instead of 'Send for review'." },
-        { id: "c4", met: false, evidence: "Empty-state error from the ticket is not handled in the new branch." },
+        { id: "1", met: true, evidence: "src/handler.ts updated to cover the new path." },
+        { id: "2", met: true, evidence: "No tests were removed; existing assertions still hold." },
+        { id: "3", met: false, evidence: "Button label still reads 'Submit' instead of 'Send for review'." },
+        { id: "4", met: false, evidence: "Empty-state error from the ticket is not handled in the new branch." },
       ],
       comments: [
         {
@@ -216,7 +216,7 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       ],
       suggestions: [
         {
-          criterionId: "c3",
+          criterionId: "3",
           title: "Rename the submit button label",
           rationale: "The ticket specifies 'Send for review' as the user-facing copy; update the JSX label.",
           codeExample: "<button>Send for review</button>",
@@ -239,7 +239,7 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
             "```",
         },
         {
-          criterionId: "c4",
+          criterionId: "4",
           title: "Handle the empty-state branch",
           rationale: "Return early with the empty payload before the main path so the new branch matches the ticket.",
           codeExample: "if (!items.length) return { items: [] };",

@@ -68,7 +68,7 @@ test("appending new criteria preserves existing met/evidence and assigns fresh i
   assert.deepEqual(merged[2], existing[2]);
   // the appended one gets the next sequential id and starts un-evaluated
   assert.deepEqual(merged[3], {
-    id: "c4",
+    id: "4",
     text: "PR must add rate limiting to /api/foo",
     met: null,
     evidence: null,
@@ -85,7 +85,7 @@ test("whitespace-only added texts are dropped before id assignment", () => {
   const existing: Criterion[] = [verdict("c1", "X", true, "e")];
   const merged = appendAddedCriteria(existing, ["   ", "", "real new criterion"]);
   assert.equal(merged.length, 2);
-  assert.equal(merged[1].id, "c2");
+  assert.equal(merged[1].id, "2");
   assert.equal(merged[1].text, "real new criterion");
 });
 
@@ -98,28 +98,51 @@ test("new ids skip past the highest existing numeric suffix, not the count", () 
     verdict("c7", "c", null, null),
   ];
   const merged = appendAddedCriteria(existing, ["x", "y"]);
-  assert.equal(merged[3].id, "c8");
-  assert.equal(merged[4].id, "c9");
+  assert.equal(merged[3].id, "8");
+  assert.equal(merged[4].id, "9");
 });
 
 test("spec-less PR (empty existing) bootstraps the list from added criteria", () => {
   const merged = appendAddedCriteria([], ["first thing", "second thing"]);
   assert.deepEqual(merged, [
-    { id: "c1", text: "first thing", met: null, evidence: null },
-    { id: "c2", text: "second thing", met: null, evidence: null },
+    { id: "1", text: "first thing", met: null, evidence: null },
+    { id: "2", text: "second thing", met: null, evidence: null },
   ]);
 });
 
-test("non-`c{n}` existing ids don't interfere with sequential numbering", () => {
+test("non-standard existing ids still continue by trailing digits", () => {
   // Defensive: if some upstream path ever seeded non-standard ids, the helper
-  // should still produce sane new ids rather than crashing or colliding.
+  // parses the trailing number off each so it keeps numbering instead of colliding.
   const existing: Criterion[] = [
     verdict("acceptance-1", "weird id", null, null),
-    verdict("c3", "normal id", null, null),
+    verdict("c3", "legacy id", null, null),
   ];
   const merged = appendAddedCriteria(existing, ["new"]);
-  // c3 is the highest numeric suffix recognised — next is c4
-  assert.equal(merged[2].id, "c4");
+  // trailing digits: acceptance-1 → 1, c3 → 3; highest is 3, so next is 4
+  assert.equal(merged[2].id, "4");
+});
+
+test("appended ids continue past legacy UPPERCASE ids instead of restarting at 1", () => {
+  // The reported bug: synthesis emitted "C1".."C9" (uppercase), the old lowercase-only
+  // parser matched none of them, and appended criteria restarted at c1 — so the comment
+  // showed two runs (C1..C9 then c1..c7). Trailing-digit parsing must continue: C9 → 10, 11.
+  const existing: Criterion[] = Array.from({ length: 9 }, (_, i) =>
+    verdict(`C${i + 1}`, `met ${i + 1}`, true, "ok")
+  );
+  const merged = appendAddedCriteria(existing, ["new bar A", "new bar B"]);
+  assert.equal(merged.length, 11);
+  assert.equal(merged[9].id, "10");
+  assert.equal(merged[10].id, "11");
+});
+
+test("appended ids continue past plain-number ids", () => {
+  const existing: Criterion[] = [
+    verdict("1", "a", true, "ok"),
+    verdict("2", "b", null, null),
+    verdict("3", "c", false, "no"),
+  ];
+  const merged = appendAddedCriteria(existing, ["d"]);
+  assert.equal(merged[3].id, "4");
 });
 
 // --- splitForComment: regressed vs unmet vs met buckets for the comment/UI ---
