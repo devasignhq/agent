@@ -4937,8 +4937,9 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   display: flex; align-items: center; gap: 11px;
   width: 272px; padding: 11px 13px;
   background: var(--bg-1); border: 1px solid var(--line-2);
-  cursor: pointer; transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
+  cursor: grab; transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
 }
+.wf-node:active { cursor: grabbing; }
 .wf-node:hover { border-color: #3a4250; transform: translateY(-1px); }
 .wf-node.is-off { opacity: 0.5; }
 .wf-node.is-selected {
@@ -4973,6 +4974,24 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-node-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; }
 .wf-node-dot.on { background: var(--nc, var(--accent)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc, var(--accent)) 22%, transparent); }
 .wf-node-dot.off { background: var(--fg-faint); }
+
+/* Read-only status chip (in place of the on/off dot) on always-on / advisory
+   nodes — the steps the agent runs unconditionally. */
+.wf-node-badge {
+  flex: 0 0 auto; padding: 2px 6px;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase;
+  border: 1px solid var(--line-2); color: var(--fg-mute); white-space: nowrap;
+}
+.wf-node-badge.always-on { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
+.wf-node-badge.advisory { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
+/* Second entry lane (maintainer feedback): tint its trigger tab so the two
+   entry points read as distinct. */
+.wf-node.wf-lane-m .wf-node-tab { color: var(--info); border-color: color-mix(in srgb, var(--info) 45%, transparent); }
+
+/* Branch / loop edge labels. labelStyle (inline) sets the fill; this tightens
+   the chip background + is a fallback if inline props are dropped. */
+.react-flow__edge-text { font-family: var(--mono); font-size: 10px; fill: var(--fg-dim); }
+.react-flow__edge-textbg { fill: var(--bg-1); }
 
 .react-flow__attribution { background: transparent; color: var(--fg-faint); font-size: 9px; }
 .react-flow__attribution a { color: var(--fg-faint); }
