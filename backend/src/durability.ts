@@ -50,26 +50,44 @@ export function finishNotDurable(res: Response, origEnd: EndFn, args: unknown[])
   );
 }
 
-export function durabilityBarrier(_req: Request, res: Response, next: NextFunction): void {
-  const origEnd = res.end.bind(res) as EndFn;
-  let gated = false;
-  (res as unknown as { end: EndFn }).end = (...args: unknown[]) => {
-    if (gated) return origEnd(...args);
-    gated = true;
-    flushPending().then(
-      () => {
-        // Writes that genuinely couldn't be persisted (DB unreachable) must not
-        // be acknowledged as success. finishNotDurable handles the already-sent
-        // case by forwarding the buffered body instead of dropping it.
-        if (dbHealth().pendingWrites > 0) return finishNotDurable(res, origEnd, args);
-        return origEnd(...args);
-      },
-      (err) => {
-        console.error("[server] durability flush failed — responding 503", err);
-        return finishNotDurable(res, origEnd, args);
-      }
-    );
-    return res;
+// The store dependencies the barrier needs. Injectable purely so the wrapper's
+// own routing (deciding success-forward vs. finishNotDurable) is unit testable
+// without a live Postgres or a slow real flush failure — production binds them to
+// the real db functions below, so runtime behaviour is unchanged.
+export type DurabilityDeps = {
+  flushPending: () => Promise<void>;
+  pendingWrites: () => number;
+};
+
+export function makeDurabilityBarrier(deps: DurabilityDeps) {
+  return function durabilityBarrier(_req: Request, res: Response, next: NextFunction): void {
+    const origEnd = res.end.bind(res) as EndFn;
+    let gated = false;
+    (res as unknown as { end: EndFn }).end = (...args: unknown[]) => {
+      if (gated) return origEnd(...args);
+      gated = true;
+      deps.flushPending().then(
+        () => {
+          // Writes that genuinely couldn't be persisted (DB unreachable) must not
+          // be acknowledged as success. finishNotDurable handles the already-sent
+          // case by forwarding the buffered body instead of dropping it — so this
+          // branch is correct whether or not headers have gone out.
+          if (deps.pendingWrites() > 0) return finishNotDurable(res, origEnd, args);
+          return origEnd(...args);
+        },
+        (err) => {
+          console.error("[server] durability flush failed — responding 503", err);
+          return finishNotDurable(res, origEnd, args);
+        }
+      );
+      return res;
+    };
+    next();
   };
-  next();
 }
+
+// Production middleware: the real store-backed durability barrier.
+export const durabilityBarrier = makeDurabilityBarrier({
+  flushPending,
+  pendingWrites: () => dbHealth().pendingWrites,
+});
