@@ -4891,7 +4891,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-stat-ok { color: var(--green); }
 .wf-stat-blk { color: var(--warn); }
 
-/* Repo name + Mode — sit directly on the canvas (no card behind them). */
+/* Mode selector — sits directly on the canvas (no card behind it), top-left
+   where the repo name used to be (the repo name now lives in the header). */
 .wf-toolbar {
   position: absolute; top: 16px; left: 280px; right: 372px; z-index: 6;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
@@ -4899,8 +4900,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   pointer-events: none; /* let canvas panning work through the empty gaps */
 }
 .wf-toolbar > * { pointer-events: auto; }
-.wf-toolbar-title { font-size: 13px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.wf-toolbar-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.wf-toolbar-left { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
 .wf-err { font-size: 11px; }
 /* Mode (preset) buttons — the applied mode stays highlighted. */
 .wf-mode-btn {

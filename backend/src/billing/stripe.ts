@@ -358,6 +358,21 @@ function syncFromInvoice(invoice: Stripe.Invoice, patch: Partial<Subscription>):
   mirrorUserPlan(sub, patch);
 }
 
+// Handle a paid invoice. A paid invoice always confirms the sub is active, but
+// only a genuine renewal — the billing cycle advancing into a new period
+// (billing_reason "subscription_cycle") — opens a fresh monthly usage window.
+// Mid-cycle plan switches also produce a paid *proration* invoice
+// ("subscription_update"), and the initial trial invoice is "subscription_create";
+// neither must reset usage, or changing tiers mid-month would wrongly zero
+// reviewsUsed (brand-new subs are seeded at 0 and reset via checkout.session.completed).
+export function applyPaidInvoice(invoice: Stripe.Invoice): void {
+  const isRenewal = invoice.billing_reason === "subscription_cycle";
+  syncFromInvoice(invoice, {
+    status: "active",
+    ...(isRenewal ? { reviewsUsed: 0, usagePeriodStart: Date.now() } : {}),
+  });
+}
+
 // ─── Reconcile from Stripe (self-heal) ──────────────────────────────────────
 
 // Pull live subscription state from Stripe — the source of truth — and apply it
@@ -459,12 +474,10 @@ export async function handleStripeWebhook(req: Request, res: Response): Promise<
         break;
       }
       case "invoice.payment_succeeded": {
-        // New paid period: mark active and reset the monthly usage window.
-        syncFromInvoice(event.data.object as Stripe.Invoice, {
-          status: "active",
-          reviewsUsed: 0,
-          usagePeriodStart: Date.now(),
-        });
+        // Mark active; reset the monthly usage window only on a true renewal —
+        // applyPaidInvoice gates that on billing_reason so proration invoices
+        // from mid-cycle plan switches don't zero reviewsUsed.
+        applyPaidInvoice(event.data.object as Stripe.Invoice);
         break;
       }
       case "invoice.payment_failed": {

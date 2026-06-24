@@ -325,10 +325,13 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
   );
 };
 
-const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications }) => {
+const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowRepo }) => {
   const labels = {
     agent: "Agents", workflow: "Workflow", settings: "Settings"
   };
+  // On the Workflow page the selected repo becomes the final crumb:
+  // user / Workflow / repo-name.
+  const showRepoCrumb = current === "workflow" && !!workflowRepo;
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
   const unread = notifications?.unreadCount ?? 0;
@@ -339,7 +342,14 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications 
       )}
       <div className="crumbs">
         <span>{user?.githubLogin || "workspace"}</span><span className="sep">/</span>
-        <span className="now">{labels[current]}</span>
+        {showRepoCrumb ? (
+          <>
+            {!isMobile && <><span>{labels[current]}</span><span className="sep">/</span></>}
+            <span className="now">{workflowRepo}</span>
+          </>
+        ) : (
+          <span className="now">{labels[current]}</span>
+        )}
       </div>
       <div className="topbar-spacer"></div>
       <div className="topbar-actions">
@@ -440,6 +450,9 @@ const AppContent = () => {
   const [current, setCurrent] = React.useState("agent");
   // Lets a deep-link (e.g. returning from Stripe) open a specific Settings tab.
   const [settingsSection, setSettingsSection] = React.useState<string | undefined>(undefined);
+  // The Workflow screen's selected repo name, surfaced for the header breadcrumb
+  // (WorkflowPage reports it via onRepoChange).
+  const [workflowRepo, setWorkflowRepo] = React.useState<string | null>(null);
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
@@ -713,10 +726,11 @@ const AppContent = () => {
           onNavigate={(k) => setCurrent(k)}
           user={auth.user}
           notifications={notifications}
+          workflowRepo={workflowRepo}
         />
         <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}
-          {current === "workflow" && <WorkflowPage />}
+          {current === "workflow" && <WorkflowPage onRepoChange={setWorkflowRepo} />}
           {current === "settings" && <SettingsPage initialSection={settingsSection} />}
         </div>
       </div>
