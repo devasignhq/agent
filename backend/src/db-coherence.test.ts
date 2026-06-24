@@ -180,3 +180,66 @@ test("delete sweep: a row deleted by another instance is dropped from the cache"
 
   assert.equal(find("d"), null, "row deleted elsewhere was swept from the cache");
 });
+
+test("watermark hold-back: a low-rev pending row holds the watermark but the cache still converges", async () => {
+  // The reviewer's scenario: a pending-skipped row ("lo") has a LOWER rev than an
+  // already-merged row ("hi"). The watermark is held just below "lo"'s rev (so
+  // "hi" gets re-pulled each pass), but (a) the pending local row is never
+  // clobbered, (b) the watermark never regresses, and (c) once the pending write
+  // resolves the cache converges to Postgres' newer row and re-pulls stop.
+  const { pool, external } = makeStorePool();
+  await initDb({ poolOverride: pool as never });
+
+  // Postgres (another instance) holds lo@rev1 (newer, version 2) and hi@rev2.
+  external.upsert("notifications", "lo", { id: "lo", body: "lo-external-v2", version: 2 });
+  external.upsert("notifications", "hi", { id: "hi", body: "hi-external", version: 1 });
+
+  // Our instance has an un-flushed insert of "lo" (version 1) — lower than PG's.
+  db.insert("notifications", { id: "lo", body: "lo-local-v1" } as never);
+
+  // Pass 1: lo is pending → skipped (held), hi is merged. Watermark held at 0
+  // (just below lo@rev1), NOT advanced past hi@rev2.
+  await syncFromStore();
+  assert.equal(find("lo")?.body, "lo-local-v1", "pending local row not clobbered while pending");
+  assert.equal(find("hi")?.body, "hi-external", "higher-rev row merged even though watermark held");
+
+  // Our stale write flushes and LOSES the version guard (v1 < PG's v2) — so it is
+  // dropped from persistence, leaving cache (v1) behind Postgres (v2).
+  await flushPending();
+  assert.equal(
+    external.get("notifications", "lo")!.data.body,
+    "lo-external-v2",
+    "stale local write did not clobber Postgres' newer row"
+  );
+
+  // Pass 2: lo no longer pending → re-pulled and merged (v2 >= v1). Cache converges.
+  await syncFromStore();
+  assert.equal(find("lo")?.body, "lo-external-v2", "cache converged to Postgres' newer row");
+
+  // Pass 3: stable — nothing changes, no stale re-application.
+  await syncFromStore();
+  assert.equal(find("lo")?.body, "lo-external-v2", "converged state is stable across further passes");
+  assert.equal(find("hi")?.body, "hi-external", "hi unchanged");
+});
+
+test("delta-sync guard: a re-pulled row with a LOWER version never overwrites a newer cached row", async () => {
+  // Defense in depth: even if Postgres somehow surfaces an older row at a fresh
+  // rev (the version guard at the upsert should prevent it, but delta-sync must
+  // not trust that), the merge's `incomingV >= localV` check must reject it.
+  const { pool, external } = makeStorePool();
+  await initDb({ poolOverride: pool as never });
+
+  db.insert("notifications", { id: "z", body: "z-v1" } as never); // version 1
+  await flushPending();
+  db.update("notifications", (r) => (r as any).id === "z", { body: "z-v2" } as never); // -> 2
+  db.update("notifications", (r) => (r as any).id === "z", { body: "z-v3" } as never); // -> 3
+  await flushPending();
+  assert.equal(find("z")?.version, 3, "cache holds the newest version");
+
+  // Another instance writes a STALE version 1 at a brand-new (higher) rev.
+  external.upsert("notifications", "z", { id: "z", body: "z-stale", version: 1 });
+
+  await syncFromStore();
+  assert.equal(find("z")?.body, "z-v3", "stale lower-version row was NOT applied");
+  assert.equal(find("z")?.version, 3, "cache kept its newer version");
+});

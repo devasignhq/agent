@@ -507,10 +507,20 @@ async function deltaSyncMerge(): Promise<void> {
         if (incomingV >= localV) list[idx] = incoming;
       }
     }
-    // Never advance the watermark past a row we skipped because our own write to
-    // it is still pending: if that write later loses the version guard (another
-    // instance committed newer), we must re-pull this rev to re-converge. Once
-    // the pending write resolves, the next pass advances normally.
+    // Hold the watermark just below the lowest rev we skipped because our own
+    // write to that id is still pending: if that write later loses the version
+    // guard (another instance committed newer), we must re-pull this rev to
+    // re-converge. Once the pending write resolves, the next pass advances.
+    //
+    // This can only HOLD the watermark, never regress it: the query returns only
+    // rows with rev > watermark, so every skipped rev is >= watermark+1, hence
+    // minPendingSkip-1 >= watermark; and maxRev >= watermark always. So the new
+    // value is >= the old — the watermark is monotonically non-decreasing. The
+    // worst case is re-pulling already-merged higher-rev rows for as long as a
+    // low-rev write stays pending, which is bounded (a pending write drains in
+    // ~one flush) and harmless: re-merges are idempotent and the `incomingV >=
+    // localV` guard above means a re-pulled row can never overwrite a newer
+    // cached one. (See db-coherence.test.ts "watermark hold-back".)
     revWatermark.set(name, Math.min(maxRev, minPendingSkip - 1));
   }
 }
