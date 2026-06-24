@@ -289,8 +289,13 @@ function onFlushOk(): void {
   const wasFailing = consecutiveFlushFailures > 0;
   consecutiveFlushFailures = 0;
   lastFlushError = null;
-  // Backlog fully drained → reset the stall clock (a later stage re-arms it).
-  if (!hasPending()) firstStagedAt = null;
+  // A successful flush is forward progress, so reset the stall clock. If writes
+  // re-staged concurrently (continuous load), re-arm it to NOW so the age measures
+  // how long the CURRENT undrained backlog has been stuck — not total time since
+  // the first-ever stage. Without this, sustained load keeps hasPending() true so
+  // the clock stays pinned to the oldest stage and a healthy, draining backlog
+  // eventually reads as a false "stalled".
+  firstStagedAt = hasPending() ? Date.now() : null;
   // The instant a wedged connection comes back, re-stage the FULL in-memory
   // snapshot so Postgres reconverges to memory — not just the last dirty set.
   // This recovers anything the give-up path parked AND anything that drifted
