@@ -250,6 +250,34 @@ const backoffMs = (attempt: number) => Math.min(500 * 2 ** (attempt - 1), 5_000)
 let heartbeatTimer: NodeJS.Timeout | null = null;
 const HEARTBEAT_MS = 15_000;
 
+// Second-order data-loss trap this guards against: a flush that HANGS (vs errors).
+// The pool bounds connect (connectionTimeoutMillis) but a query on a half-open
+// socket can hang forever; runFlush's `if (flushing) return flushing` guard then
+// wedges every later flush — heartbeat included — so writes pile up unpersisted
+// while NOTHING errors (writeThrough stayed "ok"), and the backlog dies on the
+// next redeploy. Two bounds close it, plus a visibility signal:
+//  • Pool statement/query/idle-txn timeouts (DB_STATEMENT_TIMEOUT_MS): a stuck
+//    flush query REJECTS so the existing restage→retry→heartbeat path fires.
+//  • A per-op watchdog (flushWatchdogMs) races each flush op as a last-resort net
+//    for a hang the DB layer doesn't reject, so `flushing` can never stay pending.
+//    Sits ABOVE the DB timeout so the clean DB-level cancellation normally wins.
+//  • Stall detection (stallThresholdMs): an un-drained backlog older than this
+//    reads as writeThrough "stalled" even when nothing errored — so a future
+//    unforeseen wedge is visible/alertable instead of masquerading as "ok".
+// Generous vs a healthy flush (tens of ms) and safe for the boot load select.
+const DB_STATEMENT_TIMEOUT_MS = 30_000;
+const DEFAULT_FLUSH_WATCHDOG_MS = 45_000;
+const DEFAULT_STALL_THRESHOLD_MS = 60_000;
+// Overridable via initDb opts so tests can exercise hang/stall paths without
+// waiting tens of seconds; production always uses the defaults above.
+let flushWatchdogMs = DEFAULT_FLUSH_WATCHDOG_MS;
+let stallThresholdMs = DEFAULT_STALL_THRESHOLD_MS;
+
+// When the oldest still-pending write was first staged (null = backlog empty).
+// Drives stall detection without timestamping every row: set on the first stage
+// into an empty backlog, cleared once a flush confirms the backlog fully drained.
+let firstStagedAt: number | null = null;
+
 function pendingCount(): number {
   let n = 0;
   for (const m of dirty.values()) n += m.size;
@@ -261,6 +289,8 @@ function onFlushOk(): void {
   const wasFailing = consecutiveFlushFailures > 0;
   consecutiveFlushFailures = 0;
   lastFlushError = null;
+  // Backlog fully drained → reset the stall clock (a later stage re-arms it).
+  if (!hasPending()) firstStagedAt = null;
   // The instant a wedged connection comes back, re-stage the FULL in-memory
   // snapshot so Postgres reconverges to memory — not just the last dirty set.
   // This recovers anything the give-up path parked AND anything that drifted
@@ -292,17 +322,30 @@ function quarantineRow(name: keyof DB, row: unknown, err: unknown): void {
 /**
  * Write-through health snapshot for /api/health. `writeThrough` reads "degraded"
  * while flushes are failing or after any row was quarantined (a dropped write =
- * latent data loss worth surfacing until the next clean restart).
+ * latent data loss worth surfacing until the next clean restart), and "stalled"
+ * when a backlog has sat un-drained past stallThresholdMs WITHOUT recording a
+ * failure — the silent-wedge signature that used to read as a healthy "ok".
  */
 export function dbHealth() {
+  const oldestPendingAgeMs =
+    firstStagedAt !== null && hasPending() ? Date.now() - firstStagedAt : 0;
+  const stalled = !!pool && oldestPendingAgeMs > stallThresholdMs;
   return {
     mode: pool ? "postgres" : "ephemeral",
-    writeThrough:
-      !pool || (consecutiveFlushFailures === 0 && quarantinedRows === 0) ? "ok" : "degraded",
+    writeThrough: !pool
+      ? "ok"
+      : consecutiveFlushFailures > 0 || quarantinedRows > 0
+        ? "degraded"
+        : stalled
+          ? "stalled"
+          : "ok",
     // "unconfigured" once a real DB is connected but no encryption key is set —
     // integration tokens are being written in plaintext until the key is added.
     encryption: pool && !isEncryptionConfigured() ? "unconfigured" : "ok",
     pendingWrites: pendingCount(),
+    // Age of the oldest un-flushed write (0 when the backlog is empty). A value
+    // that keeps climbing = writes aren't reaching Postgres.
+    oldestPendingAgeMs,
     consecutiveFlushFailures,
     quarantinedRows,
     lastFlushError,
@@ -325,6 +368,7 @@ function stageUpsert(name: keyof DB, row: unknown): void {
   if (!d) dirty.set(name, (d = new Map()));
   d.set(id, row);
   deleted.get(name)?.delete(id);
+  if (firstStagedAt === null) firstStagedAt = Date.now();
   schedule();
 }
 
@@ -334,6 +378,7 @@ function stageDelete(name: keyof DB, id: string): void {
   if (!s) deleted.set(name, (s = new Set()));
   s.add(id);
   dirty.get(name)?.delete(id);
+  if (firstStagedAt === null) firstStagedAt = Date.now();
   schedule();
 }
 
@@ -512,6 +557,29 @@ async function persistIsolating(
   }
 }
 
+// Bound a DB op so a HANG (vs a rejection) can't leave the single in-flight
+// `flushing` promise pending forever — which would wedge every later flush and
+// the heartbeat, the exact silent-stall failure this guards against. Rejects with
+// a labelled error the flush loop treats as a transient failure. The timer is
+// unref'd so it can never hold the process open; the orphaned op is left to the
+// pool's statement/query timeout to cancel server-side.
+function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      }
+    );
+  });
+}
+
 async function runFlush(): Promise<void> {
   if (flushing) return flushing;
   flushing = (async () => {
@@ -519,25 +587,39 @@ async function runFlush(): Promise<void> {
     try {
       while (pool && hasPending()) {
         const { upserts, deletes } = drainStaged();
-        // Fast path: the whole batch in one transaction.
+        // Fast path: the whole batch in one transaction, watchdog-bounded so a
+        // hung query rejects here instead of wedging `flushing` forever.
         try {
-          await persistBatch(upserts, deletes);
+          await withTimeout(persistBatch(upserts, deletes), flushWatchdogMs, "flush batch");
           onFlushOk();
           transientRetries = 0;
           continue;
         } catch {
-          // Atomic batch failed — fall through to row-by-row isolation so one
-          // poison row is quarantined instead of rolling back (and blocking)
+          // Atomic batch failed/timed out — fall through to row-by-row isolation so
+          // one poison row is quarantined instead of rolling back (and blocking)
           // every other write in the batch.
         }
-        const remaining = await persistIsolating(upserts, deletes);
+        // Row-by-row isolation, also watchdog-bounded. drainStaged already cleared
+        // these from `dirty`, so on a hang/throw here we must NOT drop them: treat
+        // the whole drained set as still-pending and let the restage below requeue
+        // it (no row is lost just because isolation itself stalled).
+        let remaining: "ok" | Batch;
+        try {
+          remaining = await withTimeout(
+            persistIsolating(upserts, deletes),
+            flushWatchdogMs,
+            "flush isolate"
+          );
+        } catch {
+          remaining = { upserts, deletes };
+        }
         if (remaining === "ok") {
           onFlushOk();
           transientRetries = 0;
           continue;
         }
-        // Genuinely transient (couldn't connect / mid-stream drop): re-stage the
-        // remainder and back off — bounded, so we never hot-spin or hang.
+        // Genuinely transient (couldn't connect / mid-stream drop / timed out):
+        // re-stage the remainder and back off — bounded, so we never hot-spin or hang.
         restage(remaining.upserts, remaining.deletes);
         transientRetries++;
         recordFlushFailure(`transient write failure (attempt ${transientRetries}/${MAX_TRANSIENT_RETRIES})`);
@@ -630,8 +712,14 @@ async function loadAll(): Promise<void> {
  *
  * `poolOverride` injects a pool for tests (exercise the write-through flush with
  * a fake pg pool); production always constructs its own from DATABASE_URL.
+ * `flushWatchdogMs` / `stallThresholdMs` let tests drive the hang/stall paths on
+ * a short clock; production uses the defaults.
  */
-export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
+export async function initDb(opts?: {
+  poolOverride?: PgPool;
+  flushWatchdogMs?: number;
+  stallThresholdMs?: number;
+}): Promise<void> {
   // Reset health counters so each boot (and each test that re-inits) starts clean.
   consecutiveFlushFailures = 0;
   lastFlushError = null;
@@ -640,6 +728,23 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
   warnedSealedNoKey = false;
   rowsLoadedAtBoot = 0;
   bootedAt = Date.now();
+  flushWatchdogMs = opts?.flushWatchdogMs ?? DEFAULT_FLUSH_WATCHDOG_MS;
+  stallThresholdMs = opts?.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
+  // Drop any write-through state from a previous run so a re-init (tests, mainly)
+  // never inherits a wedged in-flight flush promise, stale timers, or staged rows.
+  // At a real boot these are already empty, so this is a harmless no-op there.
+  dirty.clear();
+  deleted.clear();
+  if (flushTimer) {
+    clearTimeout(flushTimer);
+    flushTimer = null;
+  }
+  if (heartbeatTimer) {
+    clearInterval(heartbeatTimer);
+    heartbeatTimer = null;
+  }
+  flushing = null;
+  firstStagedAt = null;
   if (opts?.poolOverride) {
     pool = opts.poolOverride;
   } else if (!config.databaseUrl) {
@@ -658,6 +763,15 @@ export async function initDb(opts?: { poolOverride?: PgPool }): Promise<void> {
       // Bound a connect attempt so a suspended/unreachable Neon endpoint can't
       // hang a flush (or the shutdown drain) — the retry/heartbeat handle waiting.
       connectionTimeoutMillis: 10_000,
+      // Bound the QUERY too, not just connect: a flush query on a half-open socket
+      // would otherwise hang forever and wedge the flusher (see runFlush). query_timeout
+      // rejects client-side even if the server never answers; statement_timeout +
+      // idle_in_transaction_session_timeout cancel the work server-side so a killed
+      // flush can't leave a zombie query/txn holding locks. Generous enough for the
+      // boot load select; a hung flush is what we're bounding, not normal work.
+      statement_timeout: DB_STATEMENT_TIMEOUT_MS,
+      query_timeout: DB_STATEMENT_TIMEOUT_MS,
+      idle_in_transaction_session_timeout: DB_STATEMENT_TIMEOUT_MS,
     });
     // node-postgres emits 'error' on an idle client failing (Neon dropping an
     // idle connection, a network blip). With NO listener Node escalates it to an
