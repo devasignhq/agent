@@ -23,7 +23,8 @@ import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
-import { db, dbHealth, flushPending, initDb, shutdownDb } from "./db.js";
+import { db, initDb, shutdownDb } from "./db.js";
+import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 
@@ -106,49 +107,11 @@ app.use(cookieParser());
 // get a much tighter bucket of their own (see rate-limit.ts / api.ts).
 app.use(globalLimiter);
 
-// Durability barrier. The store applies writes to its in-memory cache
-// synchronously and persists them to Postgres on a debounce, so a response could
-// previously be sent — telling the client a review/charge succeeded — while that
-// write was still only in RAM. A redeploy or crash in that window dropped it
-// (the recurring "reviewed PRs vanish after a deploy" bug). We close the window
-// at the one chokepoint every response funnels through (res.end): hold the
-// response until the staged writes have reached Postgres. flushPending() is
-// bounded and a no-op when nothing is staged (and in ephemeral mode), so the
-// read-heavy GET traffic pays ~nothing. If the writes genuinely can't be
-// persisted (DB unreachable), fail the request with 503 rather than acknowledge
-// a write that isn't durable — the writes stay staged and the heartbeat retries.
-app.use((_req, res, next) => {
-  const origEnd = res.end.bind(res) as (...args: unknown[]) => unknown;
-  let gated = false;
-  (res as unknown as { end: (...a: unknown[]) => unknown }).end = (...args: unknown[]) => {
-    if (gated) return origEnd(...args);
-    gated = true;
-    flushPending().then(
-      () => {
-        if (dbHealth().pendingWrites > 0 && !res.headersSent) return notDurable();
-        return origEnd(...args);
-      },
-      (err) => {
-        console.error("[server] durability flush failed — responding 503", err);
-        return notDurable();
-      }
-    );
-    return res;
-  };
-  // Replace an in-flight success response with a clean 503 when we couldn't make
-  // its writes durable. Safe only before headers are sent (checked by callers).
-  const notDurable = () => {
-    if (res.headersSent) return origEnd();
-    res.statusCode = 503;
-    res.removeHeader("Content-Length");
-    res.removeHeader("ETag");
-    res.setHeader("Content-Type", "application/json; charset=utf-8");
-    return origEnd(
-      JSON.stringify({ error: "not_durable", message: "write not yet persisted — please retry" })
-    );
-  };
-  next();
-});
+// Durability barrier: hold each response until its staged writes have reached
+// Postgres so a redeploy/crash can't drop a write the client was told succeeded.
+// Mounted before the webhook receivers + /api so it covers every mutating path.
+// See durability.ts (extracted there so its failure-finalization is unit tested).
+app.use(durabilityBarrier);
 
 // Webhook receiver needs the raw body for HMAC verification, so register it
 // BEFORE express.json() takes over the body. Both paths are accepted because
