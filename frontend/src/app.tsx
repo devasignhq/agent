@@ -344,7 +344,7 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
         <span>{user?.githubLogin || "workspace"}</span><span className="sep">/</span>
         {showRepoCrumb ? (
           <>
-            <span>{labels[current]}</span><span className="sep">/</span>
+            {!isMobile && <><span>{labels[current]}</span><span className="sep">/</span></>}
             <span className="now">{workflowRepo}</span>
           </>
         ) : (
