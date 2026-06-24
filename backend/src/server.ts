@@ -23,7 +23,7 @@ import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
-import { db, initDb, shutdownDb } from "./db.js";
+import { db, dbHealth, flushPending, initDb, shutdownDb } from "./db.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 
@@ -105,6 +105,50 @@ app.use(cookieParser());
 // across many provider IPs and won't individually trip it. LLM-triggering routes
 // get a much tighter bucket of their own (see rate-limit.ts / api.ts).
 app.use(globalLimiter);
+
+// Durability barrier. The store applies writes to its in-memory cache
+// synchronously and persists them to Postgres on a debounce, so a response could
+// previously be sent — telling the client a review/charge succeeded — while that
+// write was still only in RAM. A redeploy or crash in that window dropped it
+// (the recurring "reviewed PRs vanish after a deploy" bug). We close the window
+// at the one chokepoint every response funnels through (res.end): hold the
+// response until the staged writes have reached Postgres. flushPending() is
+// bounded and a no-op when nothing is staged (and in ephemeral mode), so the
+// read-heavy GET traffic pays ~nothing. If the writes genuinely can't be
+// persisted (DB unreachable), fail the request with 503 rather than acknowledge
+// a write that isn't durable — the writes stay staged and the heartbeat retries.
+app.use((_req, res, next) => {
+  const origEnd = res.end.bind(res) as (...args: unknown[]) => unknown;
+  let gated = false;
+  (res as unknown as { end: (...a: unknown[]) => unknown }).end = (...args: unknown[]) => {
+    if (gated) return origEnd(...args);
+    gated = true;
+    flushPending().then(
+      () => {
+        if (dbHealth().pendingWrites > 0 && !res.headersSent) return notDurable();
+        return origEnd(...args);
+      },
+      (err) => {
+        console.error("[server] durability flush failed — responding 503", err);
+        return notDurable();
+      }
+    );
+    return res;
+  };
+  // Replace an in-flight success response with a clean 503 when we couldn't make
+  // its writes durable. Safe only before headers are sent (checked by callers).
+  const notDurable = () => {
+    if (res.headersSent) return origEnd();
+    res.statusCode = 503;
+    res.removeHeader("Content-Length");
+    res.removeHeader("ETag");
+    res.setHeader("Content-Type", "application/json; charset=utf-8");
+    return origEnd(
+      JSON.stringify({ error: "not_durable", message: "write not yet persisted — please retry" })
+    );
+  };
+  next();
+});
 
 // Webhook receiver needs the raw body for HMAC verification, so register it
 // BEFORE express.json() takes over the body. Both paths are accepted because
@@ -197,7 +241,7 @@ if (mergedReviews > 0) {
 await initStatsig();
 
 const port = config.port;
-app.listen(port, () => {
+const server = app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
   console.log(`  · LLM:        ${isLLMLive() ? "live (Anthropic)" : "mock"}`);
   console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing (outbound App credentials unset)"}`);
@@ -224,11 +268,14 @@ startWorker();
 backfillRepoIndex();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
-// the debounce window aren't lost.
+// the debounce window aren't lost. Stop accepting new connections FIRST so no
+// request can stage a fresh write during the drain (otherwise the listener stays
+// open and a late write could miss the flush, then die on exit).
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, async () => {
-    console.log(`\n[server] ${signal} received — flushing pending writes…`);
+    console.log(`\n[server] ${signal} received — draining and flushing pending writes…`);
     try {
+      server.close();
       await Promise.all([shutdownDb(), shutdownStatsig()]);
     } catch (err) {
       console.error("[server] error during shutdown", err);
