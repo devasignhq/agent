@@ -45,9 +45,12 @@ export function finishNotDurable(res: Response, origEnd: EndFn, args: unknown[])
   res.removeHeader("Content-Length");
   res.removeHeader("ETag");
   res.setHeader("Content-Type", "application/json; charset=utf-8");
-  return origEnd(
-    JSON.stringify({ error: "not_durable", message: "write not yet persisted — please retry" })
-  );
+  // Rewrite the body to a 503, but preserve any res.end(..., callback) the caller
+  // passed: that callback fires only when res.end completes and may resolve a
+  // promise or free a resource, so dropping it can hang the request.
+  const body = JSON.stringify({ error: "not_durable", message: "write not yet persisted — please retry" });
+  const cb = typeof args[args.length - 1] === "function" ? args[args.length - 1] : undefined;
+  return cb ? origEnd(body, "utf8", cb) : origEnd(body);
 }
 
 // The store dependencies the barrier needs. Injectable purely so the wrapper's

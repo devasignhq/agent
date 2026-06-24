@@ -38,6 +38,18 @@ test("notDurable (headers NOT sent): replaces the response with a 503 JSON error
   assert.match(String(calls[0][0]), /not_durable/, "a fresh 503 body is sent");
 });
 
+test("notDurable (headers NOT sent, callback given): rewrites to 503 but preserves the callback", () => {
+  const { res, origEnd, calls } = makeRes(false);
+  const cb = () => {};
+
+  finishNotDurable(res, origEnd, ["original-body", "utf8", cb]);
+
+  assert.equal(res.statusCode, 503);
+  assert.equal(calls.length, 1, "res.end called exactly once");
+  assert.match(String(calls[0][0]), /not_durable/, "503 JSON body replaces the original");
+  assert.equal(calls[0][2], cb, "the res.end callback is forwarded, not dropped (would hang the caller)");
+});
+
 test("notDurable (headers ALREADY sent): forwards the buffered body, never drops it", () => {
   const { res, origEnd, calls } = makeRes(true);
   const cb = () => {};
