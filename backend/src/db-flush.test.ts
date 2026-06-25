@@ -310,3 +310,41 @@ test("stall-breaker recovers a SILENT wedge even when the queue is IDLE", async 
   assert.equal(after.consecutiveFlushFailures, 0, "cancelled loop did not record a spurious failure");
   assert.equal(after.pendingWrites, 0, "backlog fully drained, single-flight preserved");
 });
+
+test("the first write after a long idle period does NOT trip a spurious stall-breaker", async () => {
+  let generation = 0;
+  const stored = new Set<string>();
+  // A healthy pool — every write persists fine. Any pool REBUILD here can only
+  // come from a spurious stall-breaker fire.
+  const poolFactory = () => {
+    generation++;
+    const runQuery = (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert"))
+        for (let i = 0; i < (params?.length ?? 0); i += 2) stored.add(String(params![i]));
+      return Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    };
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+
+  await initDb({
+    poolFactory: poolFactory as never,
+    flushWatchdogMs: 100,
+    stallBreakMs: 150,
+    stallCheckMs: 10,
+  });
+  assert.equal(generation, 1, "one pool built at boot");
+
+  // Stay idle well past stallBreakMs, so lastFlushProgressAt goes stale.
+  await delay(220);
+
+  // First write after idle. The stall clock must be reset on leaving idle, so the
+  // breaker must NOT fire during the debounce/flush window for this fresh write.
+  db.insert("notifications", row("after-idle"));
+  await delay(180); // span the 50ms debounce + many 10ms breaker ticks
+
+  assert.equal(stored.has("after-idle"), true, "the write persisted normally");
+  assert.equal(generation, 1, "no spurious pool rebuild — the stall-breaker did NOT fire");
+  assert.equal(dbHealth().pendingWrites, 0, "backlog drained, nothing left stalled");
+  assert.equal(dbHealth().writeThrough, "ok", "healthy — never read as stalled");
+});

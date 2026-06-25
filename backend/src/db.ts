@@ -454,7 +454,14 @@ function stageUpsert(name: keyof DB, row: unknown): void {
   if (!d) dirty.set(name, (d = new Map()));
   d.set(id, row);
   deleted.get(name)?.delete(id);
-  if (firstStagedAt === null) firstStagedAt = Date.now();
+  if (firstStagedAt === null) {
+    firstStagedAt = Date.now();
+    // Leaving the idle state: reset the stall clock so it measures THIS backlog's
+    // age, not the (possibly very old) time of the last successful flush. Without
+    // this, the first write after a long idle period reads as instantly stalled
+    // and trips a spurious rebuild + reconcile before its flush even runs.
+    lastFlushProgressAt = Date.now();
+  }
   schedule();
 }
 
@@ -464,7 +471,10 @@ function stageDelete(name: keyof DB, id: string): void {
   if (!s) deleted.set(name, (s = new Set()));
   s.add(id);
   dirty.get(name)?.delete(id);
-  if (firstStagedAt === null) firstStagedAt = Date.now();
+  if (firstStagedAt === null) {
+    firstStagedAt = Date.now();
+    lastFlushProgressAt = Date.now(); // reset stall clock when leaving the idle state (see stageUpsert)
+  }
   schedule();
 }
 
