@@ -1453,14 +1453,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     }
   }, []);
 
-  // Auto-select the most recent review the first time the queue lands (and
-  // any time the selection gets cleared, e.g. when the picked PR closes).
-  // Lives in its own effect so refreshList can be dependency-free, which
-  // keeps the polling loop below from tearing down on every selection change.
-  React.useEffect(() => {
-    if (!pickedId && liveReviews.length > 0) setPickedId(liveReviews[0].id);
-  }, [pickedId, liveReviews]);
-
   // On mount, pull every open PR from every connected repo into the queue.
   // The endpoint is idempotent — PRs we've already seen are skipped, and only
   // the newly-discovered ones are enqueued for review.
@@ -1677,13 +1669,22 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       : mappedReviews.filter((r) => r.repo === repoFilter)
   ), [mappedReviews, repoFilter]);
 
-  // If the picked review got filtered out, jump to the first visible one so
-  // the right-rail panes don't show stale state.
+  // Keep the selection in sync with the visible (filtered) queue. This is the
+  // only writer of pickedId-from-the-list: it auto-selects the first visible
+  // review on load, re-selects when the current pick falls out of the filter
+  // (PR closed, repo switched), and clears to null when the filtered queue is
+  // empty (e.g. a repo with no open PRs).
+  //
+  // It MUST read from filteredReviews, not the unfiltered list. Selecting an id
+  // outside the active filter would fail this same membership check on the very
+  // next run and ping-pong pickedId forever — each flip firing a fresh
+  // GET /api/reviews/:id, which is what saturated the network and surfaced as
+  // "Failed to fetch". The `next !== pickedId` guard also stops a null→null
+  // self-trigger when the filtered queue is already empty.
   React.useEffect(() => {
-    if (!pickedId) return;
-    if (!filteredReviews.some((r) => r.id === pickedId)) {
-      setPickedId(filteredReviews[0]?.id || null);
-    }
+    if (pickedId && filteredReviews.some((r) => r.id === pickedId)) return;
+    const next = filteredReviews[0]?.id ?? null;
+    if (next !== pickedId) setPickedId(next);
   }, [filteredReviews, pickedId]);
 
   // The selected card (for the queue and the right-rail goal panel — we shim
