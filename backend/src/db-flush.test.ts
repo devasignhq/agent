@@ -348,3 +348,56 @@ test("the first write after a long idle period does NOT trip a spurious stall-br
   assert.equal(dbHealth().pendingWrites, 0, "backlog drained, nothing left stalled");
   assert.equal(dbHealth().writeThrough, "ok", "healthy — never read as stalled");
 });
+
+test("stall-breaker still fires for a wedged NON-EMPTY backlog (narrowed reset doesn't block it)", async () => {
+  let generation = 0;
+  const stored = new Set<string>();
+  // gen-0's INSERT hangs (wedges `flushing`); gen-1 (after rebuild) works.
+  const poolFactory = () => {
+    const myGen = generation++;
+    const runQuery = (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert")) {
+        if (myGen === 0) return new Promise(() => {}); // hang -> wedges `flushing`
+        for (let i = 0; i < (params?.length ?? 0); i += 2) stored.add(String(params![i]));
+      }
+      return Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    };
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+
+  await initDb({
+    poolFactory: poolFactory as never,
+    flushWatchdogMs: 200,
+    stallBreakMs: 250,
+    stallCheckMs: 20,
+    backoffMs: 5,
+  });
+
+  // First write leaves idle (resets the stall clock) and wedges the flush on gen-0.
+  db.insert("notifications", row("w-old"));
+  void flushPending();
+  await delay(120);
+
+  // More writes pile into the DIRTY queue behind the wedge — the backlog is now
+  // NON-EMPTY. These subsequent stages must NOT reset the stall clock (firstStagedAt
+  // is already set), otherwise the breaker could never age past stallBreakMs.
+  db.insert("notifications", row("s1"));
+  db.insert("notifications", row("s2"));
+  await delay(30);
+  const mid = dbHealth();
+  assert.equal(mid.pendingWrites, 2, "a real NON-EMPTY backlog is stuck behind the wedge");
+  assert.equal(mid.consecutiveFlushFailures, 0, "no failure recorded yet — silent wedge");
+
+  // The clock keeps aging (not reset by s1/s2), so the breaker fires after
+  // stallBreakMs and recovers the whole backlog onto a rebuilt pool.
+  const deadline = Date.now() + 5000;
+  while (!(stored.has("s1") && stored.has("s2") && stored.has("w-old")) && Date.now() < deadline)
+    await delay(20);
+
+  assert.equal(stored.has("w-old"), true, "trapped write recovered");
+  assert.equal(stored.has("s1"), true, "piled-up backlog write s1 drained");
+  assert.equal(stored.has("s2"), true, "piled-up backlog write s2 drained");
+  assert.ok(generation >= 2, "stall-breaker fired and rebuilt the pool for the non-empty backlog");
+  assert.equal(dbHealth().pendingWrites, 0, "backlog fully drained after recovery");
+});
