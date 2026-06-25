@@ -841,6 +841,10 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
   // while it's still the latest save — a newer change supersedes it.
   const saveSeq = React.useRef(0);
   const retryTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Always reflects the currently-selected repo (assigned every render), so a
+  // deferred save can tell whether the user switched repos while it was in flight.
+  const repoIdRef = React.useRef(repoId);
+  repoIdRef.current = repoId;
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([]);
@@ -907,6 +911,7 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
       runSave(
         {
           repoId,
+          activeRepoId: () => repoIdRef.current,
           getPrev: () => wf,
           persist: (id, n) => api.setRepoWorkflow(id, n),
           setWf,
@@ -929,6 +934,16 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
     },
     []
   );
+
+  // Switching repos invalidates any in-flight or scheduled save for the previous
+  // repo: bump the token so its deferred state no-ops, drop the pending re-confirm,
+  // and clear the transient notice/error so the new repo starts from a clean slate.
+  React.useEffect(() => {
+    saveSeq.current++;
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+    setPending(false);
+    setErr(null);
+  }, [repoId]);
 
   // Basic (free): toggle which optional stages run.
   const toggleStage = (key: StageKey) =>

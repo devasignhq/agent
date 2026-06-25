@@ -1,7 +1,10 @@
 // Unit tests for the Workflow durability-aware save state machine (workflow-save.ts).
 // These lock down the behaviour added for transient `not_durable` 503s: keep the
 // optimistic state + show a "queued" notice + re-confirm once, the monotonic
-// saveSeq supersession guard, and the unchanged hard-failure revert path.
+// saveSeq supersession guard, the unchanged hard-failure revert path, and the two
+// maintainer-feedback edge cases: a repo switch mid-save must not bleed into the
+// new repo's UI (criterion 7), and a re-confirm that also 503s must leave the
+// 'queued' state rather than spin forever (criterion 8).
 //
 // No DOM / React needed — runSave takes plain dependency callbacks. Run with:
 //   node --test src/workflow-save.test.ts        (Node >=22 strips the types)
@@ -137,12 +140,14 @@ test("supersession: a newer save makes the stale in-flight save no-op when it se
   assert.equal(h.scheduled.length, 0, "stale save schedules no retry");
 });
 
-test("re-confirm is one-shot: a still-failing retry does not reschedule", async () => {
+test("criterion 8 — a re-confirm that still 503s leaves 'queued' (not stuck) with a background note", async () => {
   const h = makeHarness({ persist: () => { throw transientError(); } });
-  await runSave(h.deps, NEXT, true); // isRetry = true
+  await runSave(h.deps, NEXT, true); // this call IS the re-confirm (isRetry = true)
 
-  assert.deepEqual(h.calls.setPending, [true], "still shows the queued notice");
-  assert.equal(h.scheduled.length, 0, "no further retry scheduled from a retry");
+  assert.deepEqual(h.calls.setPending, [false], "clears the 'queued' spinner — must not stay stuck");
+  assert.match(String(h.calls.setErr.at(-1)), /saving in the background/i, "calm terminal note");
+  assert.deepEqual(h.calls.setWf, [NEXT], "optimistic state kept — no revert");
+  assert.equal(h.scheduled.length, 0, "a retry never schedules another retry");
 });
 
 test("scheduled re-confirm runs and clears the notice once durable", async () => {
@@ -170,6 +175,43 @@ test("scheduled re-confirm is suppressed if a newer save superseded it", async (
   await flush();
 
   assert.equal(h.persistCount(), 1, "superseded re-confirm did not persist again");
+});
+
+test("criterion 7 — a stale FAILED save does not touch the new repo's UI after a repo switch", async () => {
+  let reject!: (e: any) => void;
+  const inflight = new Promise((_res, rej) => { reject = rej; });
+  let active = "repo-1";
+  const h = makeHarness({
+    deps: { repoId: "repo-1", activeRepoId: () => active },
+    persist: () => inflight,
+  });
+
+  const run = runSave(h.deps, NEXT); // targets repo-1, then awaits persist
+  active = "repo-2";                 // user switches repos mid-flight
+  reject(transientError());          // the stale attempt now fails
+  await run;
+
+  assert.deepEqual(h.calls.setWf, [NEXT], "no revert bled into repo-2");
+  assert.deepEqual(h.calls.setPending, [], "no 'queued' notice on repo-2");
+  assert.deepEqual(h.calls.setErr, [null], "no stale error on repo-2");
+  assert.equal(h.scheduled.length, 0, "no retry scheduled for the abandoned repo-1");
+});
+
+test("criterion 7 — a stale SUCCEEDED save does not clear the new repo's notice after a switch", async () => {
+  let resolve!: (v: any) => void;
+  const inflight = new Promise((res) => { resolve = res; });
+  let active = "repo-1";
+  const h = makeHarness({
+    deps: { repoId: "repo-1", activeRepoId: () => active },
+    persist: () => inflight,
+  });
+
+  const run = runSave(h.deps, NEXT);
+  active = "repo-2";                 // switched away before persist resolved
+  resolve({ ok: true });
+  await run;
+
+  assert.deepEqual(h.calls.setPending, [], "did not flip pending on repo-2");
 });
 
 test("no repo selected: does nothing", async () => {

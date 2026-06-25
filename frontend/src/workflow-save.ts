@@ -7,7 +7,11 @@
 // If it fails with a TRANSIENT durability blip (HTTP 503 not_durable — the backend
 // has already staged the write in memory and its heartbeat persists it within
 // ~15s), KEEP the optimistic state, surface a calm "queued" notice and re-confirm
-// ONCE after a short delay. Any other failure reverts and shows the error.
+// ONCE after a short delay; if that re-confirm also 503s, leave the optimistic
+// state but swap the notice for a terminal "saving in the background" note instead
+// of an endless spinner. Any other failure reverts and shows the error. All
+// deferred state is scoped to the save's target repo + a monotonic token, so a
+// newer save — or switching repos mid-save — can't bleed into the current UI.
 import type { RepoWorkflow } from "./api";
 
 // Delay before the single re-confirm after a transient not_durable. The barrier
@@ -30,6 +34,11 @@ export function saveErrorMessage(e: any): string {
 
 export type SaveDeps = {
   repoId: string;
+  // The currently-selected repo, read just before any deferred state is applied. A
+  // save pins its target repo (repoId above); if the user switches repos while it's
+  // in flight, its outcome must NOT bleed into the new repo's UI. Optional — when
+  // omitted only the seq token guards currency (used by tests that ignore repos).
+  activeRepoId?: () => string;
   // The current workflow at call time — restored verbatim on a hard failure.
   getPrev: () => RepoWorkflow | null;
   // Persist the workflow (production binds api.setRepoWorkflow).
@@ -54,21 +63,34 @@ export async function runSave(
   if (!deps.repoId) return;
   const seq = ++deps.seqRef.current; // claim latest; stale callbacks below no-op
   const prev = deps.getPrev();
+  // Deferred state (success / transient / scheduled retry) may only be applied
+  // while this save is STILL the relevant one: no newer save has claimed the token
+  // AND the user hasn't switched away from the repo it targets. Either miss means
+  // its outcome would bleed the old repo's state into whatever is on screen now.
+  const stillCurrent = () =>
+    seq === deps.seqRef.current &&
+    (!deps.activeRepoId || deps.activeRepoId() === deps.repoId);
   deps.setWf(next);
   deps.setErr(null);
   try {
     await deps.persist(deps.repoId, next);
-    if (seq === deps.seqRef.current) deps.setPending(false); // confirmed durable
+    if (stillCurrent()) deps.setPending(false); // confirmed durable
   } catch (e: any) {
-    if (seq !== deps.seqRef.current) return; // a newer save superseded this one
+    if (!stillCurrent()) return; // superseded by a newer save or a repo switch
     if (isTransientNotDurable(e)) {
-      deps.setPending(true); // keep the optimistic state — do NOT revert
-      if (!isRetry) {
-        if (deps.retryTimer.current) clearTimeout(deps.retryTimer.current);
-        deps.retryTimer.current = deps.scheduleRetry(() => {
-          if (seq === deps.seqRef.current) void runSave(deps, next, true);
-        }, deps.retryDelayMs ?? RETRY_DELAY_MS);
+      if (isRetry) {
+        // The single re-confirm ALSO hit a transient 503. Don't sit in 'queued'
+        // forever: the write is staged and the heartbeat persists it, so keep the
+        // optimistic state but replace the spinner with a calm, terminal note.
+        deps.setPending(false);
+        deps.setErr("Still saving in the background — reload later to confirm.");
+        return;
       }
+      deps.setPending(true); // keep the optimistic state — do NOT revert
+      if (deps.retryTimer.current) clearTimeout(deps.retryTimer.current);
+      deps.retryTimer.current = deps.scheduleRetry(() => {
+        if (stillCurrent()) void runSave(deps, next, true);
+      }, deps.retryDelayMs ?? RETRY_DELAY_MS);
       return;
     }
     deps.setPending(false);
