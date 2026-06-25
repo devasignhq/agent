@@ -714,7 +714,6 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
           <span className="mono mute" style={{ fontSize: 11 }}>
             {sources.length} source{sources.length === 1 ? "" : "s"}
           </span>
-          <button className="btn sm ghost"><Icon name="download" size={11} /></button>
           <button className="btn sm ghost"><Icon name="spark" size={11} /> Re-ingest</button>
         </div>
       </div>
