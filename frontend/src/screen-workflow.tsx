@@ -25,6 +25,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
 import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow, type RepoGuidanceItem } from "./api";
+import { runSave } from "./workflow-save";
 import { useAuth } from "./auth-context";
 
 type StageKey = "holistic" | "deferrals" | "docs";
@@ -897,47 +898,27 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
     setRfEdges(edges);
   }, [wf, selectedId, advancedLocked, setRfNodes, setRfEdges]);
 
-  // Optimistic save: paint `next` immediately, persist, revert on failure.
-  //
-  // Exception — a transient durability blip (HTTP 503 not_durable, e.g. a DB
-  // cold-start): the backend has ALREADY applied the write to its in-memory cache
-  // and staged it; its heartbeat persists it within ~15s, so the optimistic state
-  // already matches backend truth. Reverting would make the UI disagree with a
-  // reload. So we keep the optimistic state, show a calm "queued" notice (not a red
-  // error) and re-confirm ONCE after a short delay — the barrier only 503s after
-  // exhausting its own multi-second retry loop, so an immediate retry just re-hangs.
+  // Optimistic save with durability-aware error handling: paint `next` immediately,
+  // keep it on a transient `not_durable` (re-confirming once), revert on a hard
+  // failure. The state machine lives in runSave (workflow-save.ts) so it can be
+  // unit-tested without a DOM; here we just bind it to React state + refs.
   const save = React.useCallback(
-    async (next: RepoWorkflow, isRetry = false) => {
-      if (!repoId) return;
-      const seq = ++saveSeq.current; // claim latest; stale callbacks below no-op
-      const prev = wf;
-      setWf(next);
-      setErr(null);
-      try {
-        await api.setRepoWorkflow(repoId, next);
-        if (seq === saveSeq.current) setPending(false); // confirmed durable
-      } catch (e: any) {
-        if (seq !== saveSeq.current) return; // a newer save superseded this one
-        const transient = e?.status === 503 && e?.body?.error === "not_durable";
-        if (transient) {
-          setPending(true); // keep the optimistic state — do NOT revert
-          if (!isRetry) {
-            if (retryTimer.current) clearTimeout(retryTimer.current);
-            retryTimer.current = setTimeout(() => {
-              if (seq === saveSeq.current) void save(next, true);
-            }, 4000);
-          }
-          return;
-        }
-        setPending(false);
-        setWf(prev); // hard failure — revert
-        setErr(
-          e?.message === "upgrade_required"
-            ? "That control is a Pro/Max feature."
-            : e?.body?.message || e?.message || "Couldn't save — reverted."
-        );
-      }
-    },
+    (next: RepoWorkflow, isRetry = false) =>
+      runSave(
+        {
+          repoId,
+          getPrev: () => wf,
+          persist: (id, n) => api.setRepoWorkflow(id, n),
+          setWf,
+          setErr,
+          setPending,
+          seqRef: saveSeq,
+          retryTimer,
+          scheduleRetry: (fn, ms) => setTimeout(fn, ms),
+        },
+        next,
+        isRetry
+      ),
     [repoId, wf]
   );
 

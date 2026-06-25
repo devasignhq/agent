@@ -1,0 +1,193 @@
+// Unit tests for the Workflow durability-aware save state machine (workflow-save.ts).
+// These lock down the behaviour added for transient `not_durable` 503s: keep the
+// optimistic state + show a "queued" notice + re-confirm once, the monotonic
+// saveSeq supersession guard, and the unchanged hard-failure revert path.
+//
+// No DOM / React needed — runSave takes plain dependency callbacks. Run with:
+//   node --test src/workflow-save.test.ts        (Node >=22 strips the types)
+//   npm test                                     (globs all src/**/*.test.ts)
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import {
+  runSave,
+  isTransientNotDurable,
+  saveErrorMessage,
+  RETRY_DELAY_MS,
+} from "./workflow-save.ts";
+
+// A workflow distinct from the harness's `prev`, so a deep-equality check on the
+// recorded setWf calls can tell an optimistic paint apart from a revert.
+const NEXT: any = {
+  version: 1,
+  trigger: { onSynchronize: false, skipDrafts: true, skipBots: true },
+  stages: { holistic: false, docs: true, deferrals: false },
+  verdict: { blocking: false },
+};
+
+function baseWf(): any {
+  return {
+    version: 1,
+    trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
+    stages: { holistic: true, docs: true, deferrals: true },
+    verdict: { blocking: true },
+  };
+}
+
+function transientError(): any {
+  return Object.assign(new Error("not_durable"), {
+    status: 503,
+    body: { error: "not_durable", message: "write not yet persisted — please retry" },
+  });
+}
+
+// Builds runSave deps backed by call recorders. `persist(callNo)` decides each
+// attempt's outcome (throw to reject); `scheduleRetry` captures the re-confirm
+// callback instead of arming a real timer so tests drive it synchronously.
+function makeHarness(overrides: any = {}) {
+  const calls = { setWf: [] as any[], setErr: [] as any[], setPending: [] as boolean[] };
+  const scheduled: Array<{ fn: () => void; ms: number }> = [];
+  let persistCalls = 0;
+  const prev = "prev" in overrides ? overrides.prev : baseWf();
+  const deps = {
+    repoId: "repo-1",
+    getPrev: () => prev,
+    persist: async (id: string, n: any) => {
+      persistCalls++;
+      return overrides.persist ? overrides.persist(persistCalls, id, n) : { ok: true };
+    },
+    setWf: (wf: any) => calls.setWf.push(wf),
+    setErr: (m: any) => calls.setErr.push(m),
+    setPending: (p: boolean) => calls.setPending.push(p),
+    seqRef: overrides.seqRef ?? { current: 0 },
+    retryTimer: { current: null as any },
+    scheduleRetry: (fn: () => void, ms: number) => {
+      scheduled.push({ fn, ms });
+      return scheduled.length as any;
+    },
+    retryDelayMs: overrides.retryDelayMs,
+    ...(overrides.deps || {}),
+  };
+  return { deps, calls, scheduled, prev, persistCount: () => persistCalls };
+}
+
+// Let a fired re-confirm's async chain settle (it isn't returned by scheduleRetry).
+const flush = () => new Promise((r) => setTimeout(r, 0));
+
+test("transient not_durable: keeps optimistic state, shows pending, schedules ONE retry", async () => {
+  const h = makeHarness({ persist: () => { throw transientError(); } });
+  await runSave(h.deps, NEXT);
+
+  assert.deepEqual(h.calls.setWf, [NEXT], "only the optimistic paint — must NOT revert");
+  assert.deepEqual(h.calls.setErr, [null], "no hard error surfaced");
+  assert.deepEqual(h.calls.setPending, [true], "calm 'queued' notice shown");
+  assert.equal(h.scheduled.length, 1, "exactly one re-confirm scheduled");
+  assert.equal(h.scheduled[0].ms, RETRY_DELAY_MS, "scheduled at the configured delay");
+});
+
+test("hard failure: reverts to prev and surfaces the backend's friendly message", async () => {
+  const err = Object.assign(new Error("server_boom"), {
+    status: 500,
+    body: { error: "server_boom", message: "Something went wrong on our end." },
+  });
+  const h = makeHarness({ persist: () => { throw err; } });
+  await runSave(h.deps, NEXT);
+
+  assert.deepEqual(h.calls.setWf, [NEXT, h.prev], "optimistic paint, then revert to prev");
+  assert.deepEqual(h.calls.setPending, [false], "pending cleared on a hard failure");
+  assert.equal(h.calls.setErr.at(-1), "Something went wrong on our end.", "friendly message, not the raw code");
+  assert.equal(h.scheduled.length, 0, "no retry for a non-transient error");
+});
+
+test("upgrade_required: tailored Pro/Max copy and revert", async () => {
+  const err = Object.assign(new Error("upgrade_required"), {
+    status: 403,
+    body: { error: "upgrade_required" },
+  });
+  const h = makeHarness({ persist: () => { throw err; } });
+  await runSave(h.deps, NEXT);
+
+  assert.deepEqual(h.calls.setWf, [NEXT, h.prev]);
+  assert.equal(h.calls.setErr.at(-1), "That control is a Pro/Max feature.");
+});
+
+test("happy path: confirms durable, no revert, no notice, no retry", async () => {
+  const h = makeHarness({ persist: () => ({ ok: true }) });
+  await runSave(h.deps, NEXT);
+
+  assert.deepEqual(h.calls.setWf, [NEXT], "no revert");
+  assert.deepEqual(h.calls.setErr, [null]);
+  assert.deepEqual(h.calls.setPending, [false], "confirmed durable");
+  assert.equal(h.scheduled.length, 0);
+});
+
+test("supersession: a newer save makes the stale in-flight save no-op when it settles", async () => {
+  let reject!: (e: any) => void;
+  const inflight = new Promise((_res, rej) => { reject = rej; });
+  const seqRef = { current: 0 };
+  const h = makeHarness({ seqRef, persist: () => inflight });
+
+  const run = runSave(h.deps, NEXT); // claims seq = 1, then awaits persist
+  seqRef.current = 5;                // a newer save claims latest
+  reject(transientError());          // the stale attempt now fails
+  await run;
+
+  assert.deepEqual(h.calls.setWf, [NEXT], "stale save must NOT revert");
+  assert.deepEqual(h.calls.setPending, [], "stale save toggles no pending/durable state");
+  assert.deepEqual(h.calls.setErr, [null], "stale save surfaces no error");
+  assert.equal(h.scheduled.length, 0, "stale save schedules no retry");
+});
+
+test("re-confirm is one-shot: a still-failing retry does not reschedule", async () => {
+  const h = makeHarness({ persist: () => { throw transientError(); } });
+  await runSave(h.deps, NEXT, true); // isRetry = true
+
+  assert.deepEqual(h.calls.setPending, [true], "still shows the queued notice");
+  assert.equal(h.scheduled.length, 0, "no further retry scheduled from a retry");
+});
+
+test("scheduled re-confirm runs and clears the notice once durable", async () => {
+  const h = makeHarness({ persist: (n: number) => { if (n === 1) throw transientError(); return { ok: true }; } });
+  await runSave(h.deps, NEXT);
+  assert.equal(h.scheduled.length, 1);
+  assert.deepEqual(h.calls.setPending, [true]);
+
+  h.scheduled[0].fn(); // fire the re-confirm
+  await flush();
+
+  assert.equal(h.persistCount(), 2, "re-confirm persisted again");
+  assert.deepEqual(h.calls.setPending, [true, false], "notice cleared after the retry confirmed durable");
+  assert.deepEqual(h.calls.setWf, [NEXT, NEXT], "no revert across the retry");
+});
+
+test("scheduled re-confirm is suppressed if a newer save superseded it", async () => {
+  const seqRef = { current: 0 };
+  const h = makeHarness({ seqRef, persist: () => { throw transientError(); } });
+  await runSave(h.deps, NEXT);          // claims seq = 1, schedules retry
+  assert.equal(h.scheduled.length, 1);
+
+  seqRef.current = 9;                    // a newer save superseded
+  h.scheduled[0].fn();                   // the stale timer fires
+  await flush();
+
+  assert.equal(h.persistCount(), 1, "superseded re-confirm did not persist again");
+});
+
+test("no repo selected: does nothing", async () => {
+  const h = makeHarness({ deps: { repoId: "" } });
+  await runSave(h.deps, NEXT);
+
+  assert.deepEqual(h.calls.setWf, []);
+  assert.equal(h.persistCount(), 0);
+});
+
+test("helpers: isTransientNotDurable + saveErrorMessage", () => {
+  assert.equal(isTransientNotDurable({ status: 503, body: { error: "not_durable" } }), true);
+  assert.equal(isTransientNotDurable({ status: 503, body: { error: "boom" } }), false, "wrong code is not transient");
+  assert.equal(isTransientNotDurable({ status: 500, body: { error: "not_durable" } }), false, "wrong status is not transient");
+  assert.equal(isTransientNotDurable(new Error("x")), false);
+
+  assert.equal(saveErrorMessage({ message: "upgrade_required" }), "That control is a Pro/Max feature.");
+  assert.equal(saveErrorMessage({ body: { message: "Friendly" }, message: "raw_code" }), "Friendly", "prefers body.message over the code");
+  assert.equal(saveErrorMessage({ message: "raw_code" }), "raw_code");
+  assert.equal(saveErrorMessage({}), "Couldn't save — reverted.");
+});
