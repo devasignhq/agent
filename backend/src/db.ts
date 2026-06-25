@@ -238,7 +238,7 @@ let flushing: Promise<void> | null = null;
 // NB: delta-sync uses plain SELECTs, so it works through Neon's PgBouncer pooler
 // (which prod connects to and which does NOT support LISTEN/NOTIFY).
 const REV_SEQ = "devasign_rev_seq";
-const DELTA_SYNC_MS = 1_000; // pull inserts/updates committed elsewhere
+const DELTA_SYNC_MS = 2_000; // pull inserts/updates committed elsewhere (gentle on the pool)
 const DELETE_SWEEP_MS = 30_000; // reconcile deletes (rev-watermark can't see a gone row)
 // Highest `rev` this process has merged, per table. Drives the delta-sync poll.
 const revWatermark = new Map<keyof DB, number>();
@@ -246,6 +246,24 @@ let coherenceTimer: NodeJS.Timeout | null = null;
 let sweepCountdownMs = 0; // run the (heavier) delete sweep every DELETE_SWEEP_MS
 let syncing = false; // single-flight guard so the two passes never interleave on `state`
 let lastSyncAt = 0; // for dbHealth — confirms coherence is actually ticking
+
+// --- Pool self-healing ------------------------------------------------------
+// node-pg does NOT always recover a pool whose connections died in a way it
+// didn't observe — Neon dropping the whole compute's sessions, a PgBouncer/proxy
+// reset. The pool then keeps handing out dead clients and EVERY flush fails
+// "unreachable" indefinitely (the prod symptom: writes work for ~90s, then wedge
+// for minutes while reads keep serving from cache). Swapping in a brand-new Pool
+// forces fresh TCP/PgBouncer sessions. Debounced so repeated failures can't
+// thrash it. Staged writes live in dirty/deleted (not the pool), so the swap
+// loses nothing.
+let realPool = false; // true only for a pool we built from DATABASE_URL (not a test stub)
+let lastPoolRebuild = 0;
+const POOL_REBUILD_DEBOUNCE_MS = 20_000;
+let lastErrorLoggedAt = 0; // rate-limit surfacing the real flush error
+// Tests inject a factory so a rebuild mints a fresh fake pool (production uses a
+// real Pool from DATABASE_URL); and a fixed backoff so the give-up path is fast.
+let poolFactory: (() => PgPool) | null = null;
+let backoffOverrideMs: number | null = null;
 
 // --- Write-through health (surfaced via dbHealth() -> /api/health) ----------
 // The old flush re-staged a failed batch and retried it forever; because the
@@ -450,9 +468,69 @@ function startHeartbeat(): void {
       heartbeatTimer = null;
       return;
     }
+    // Writes are still backed up. If they keep failing the pool may be wedged, so
+    // give the retry a fresh pool to work with (rebuildPool is debounced).
+    if (consecutiveFlushFailures > 0) rebuildPool("heartbeat: writes still failing");
     void runFlush();
   }, HEARTBEAT_MS);
   heartbeatTimer.unref?.();
+}
+
+// Construct the production Pool (from DATABASE_URL) with the bounds + idle-error
+// handler. Extracted so rebuildPool() can mint a fresh one on a wedge.
+function buildPool(): PgPool {
+  if (poolFactory) return poolFactory(); // test-injected; factory wires its own handlers
+  const p = new Pool({
+    connectionString: sanitizeUrl(config.databaseUrl),
+    ssl: { rejectUnauthorized: true },
+    max: 5,
+    // Keep TCP alive through Neon/Render proxies so idle pooled connections
+    // aren't silently reaped between flushes (the trigger for the prod wipe).
+    keepAlive: true,
+    // Bound a connect attempt so a suspended/unreachable Neon endpoint can't hang
+    // a flush (or the shutdown drain) — the retry/heartbeat/rebuild handle waiting.
+    connectionTimeoutMillis: 10_000,
+    // Bound the QUERY too, not just connect: a flush query on a half-open socket
+    // would otherwise hang forever and wedge the flusher (see runFlush).
+    statement_timeout: DB_STATEMENT_TIMEOUT_MS,
+    query_timeout: DB_STATEMENT_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: DB_STATEMENT_TIMEOUT_MS,
+  });
+  // node-postgres emits 'error' on an idle client failing (Neon dropping an idle
+  // connection, a network blip). With NO listener Node escalates it to an uncaught
+  // exception that can kill the process — which then silently restarts and reloads
+  // the stale DB. Swallow it (the bad client is already evicted) and make sure the
+  // heartbeat is draining any parked writes once connectivity returns.
+  p.on("error", (err) => {
+    console.error("[db] idle pool client error (pool reconnects on next query):", err.message);
+    startHeartbeat();
+  });
+  return p;
+}
+
+// Replace a wedged pool with a brand-new one (see the self-healing note above).
+// Synchronous swap so the very next flush uses the fresh pool; the old pool is
+// drained in the background (its end() can hang on dead clients, so never await).
+function rebuildPool(reason: string): void {
+  if (!realPool) return; // ephemeral / injected test pool — never rebuild
+  const now = Date.now();
+  if (now - lastPoolRebuild < POOL_REBUILD_DEBOUNCE_MS) return;
+  lastPoolRebuild = now;
+  const old = pool;
+  console.warn(`[db] rebuilding Postgres connection pool — ${reason}`);
+  pool = buildPool();
+  void old?.end().catch(() => {});
+}
+
+// Surface the REAL error behind a flush failure (rate-limited). The flush path
+// otherwise swallows it and only logs the generic "database unreachable?", which
+// hides whether it's a connection drop, a timeout, or a server-side SQL error.
+function logFlushError(err: unknown): void {
+  const now = Date.now();
+  if (now - lastErrorLoggedAt < 10_000) return;
+  lastErrorLoggedAt = now;
+  const e = err as { message?: string; code?: string } | null;
+  console.error(`[db] flush error (code=${e?.code ?? "?"}): ${e?.message ?? String(err)}`);
 }
 
 // Convergence safety net: re-stage every row in the in-memory snapshot so a
@@ -551,6 +629,10 @@ async function deleteSweepMerge(): Promise<void> {
 // kill the poller. Unref'd timer, so it never holds the process open.
 async function coherenceTick(): Promise<void> {
   if (!pool || syncing) return;
+  // Stand down while writes are failing: the pool is under recovery (and possibly
+  // being rebuilt), so the poller's reads must not compete for connections or pile
+  // more errors on. It resumes the moment a flush succeeds (failures reset to 0).
+  if (consecutiveFlushFailures > 0) return;
   syncing = true;
   try {
     await deltaSyncMerge();
@@ -702,7 +784,10 @@ async function persistIsolating(
   upserts: Array<[keyof DB, unknown[]]>,
   deletes: Array<[keyof DB, string[]]>
 ): Promise<"ok" | Batch> {
-  const client = await pool!.connect().catch(() => null);
+  const client = await pool!.connect().catch((err) => {
+    logFlushError(err); // surface the connect failure (e.g. ECONNREFUSED / timeout)
+    return null;
+  });
   if (!client) return { upserts, deletes }; // can't even connect -> all transient
   try {
     for (let ui = 0; ui < upserts.length; ui++) {
@@ -721,7 +806,8 @@ async function persistIsolating(
             quarantineRow(name, row, err);
             continue;
           }
-          // Transient mid-stream: re-stage this row and everything after it.
+          // Transient mid-stream: surface it, then re-stage this row and after.
+          logFlushError(err);
           return { upserts: [[name, rows.slice(ri)], ...upserts.slice(ui + 1)], deletes };
         }
       }
@@ -781,10 +867,11 @@ async function runFlush(): Promise<void> {
           onFlushOk();
           transientRetries = 0;
           continue;
-        } catch {
-          // Atomic batch failed/timed out — fall through to row-by-row isolation so
-          // one poison row is quarantined instead of rolling back (and blocking)
-          // every other write in the batch.
+        } catch (err) {
+          // Atomic batch failed/timed out — surface the real cause (rate-limited),
+          // then fall through to row-by-row isolation so one poison row is
+          // quarantined instead of rolling back (and blocking) every other write.
+          logFlushError(err);
         }
         // Row-by-row isolation, also watchdog-bounded. drainStaged already cleared
         // these from `dirty`, so on a hang/throw here we must NOT drop them: treat
@@ -816,10 +903,13 @@ async function runFlush(): Promise<void> {
               `${pendingCount()} write(s) remain in memory — a background heartbeat will keep ` +
               `retrying every ${HEARTBEAT_MS / 1000}s until the database is reachable again.`
           );
+          // The pool may be wedged (dead connections node-pg won't replace). Mint a
+          // fresh one so the heartbeat's next pass isn't doomed to the same failure.
+          rebuildPool("flush gave up after repeated transient failures");
           startHeartbeat();
           break;
         }
-        await new Promise((r) => setTimeout(r, backoffMs(transientRetries)));
+        await new Promise((r) => setTimeout(r, backoffOverrideMs ?? backoffMs(transientRetries)));
       }
     } finally {
       flushing = null;
@@ -923,8 +1013,10 @@ async function loadAll(): Promise<void> {
  */
 export async function initDb(opts?: {
   poolOverride?: PgPool;
+  poolFactory?: () => PgPool;
   flushWatchdogMs?: number;
   stallThresholdMs?: number;
+  backoffMs?: number;
 }): Promise<void> {
   // Reset health counters so each boot (and each test that re-inits) starts clean.
   consecutiveFlushFailures = 0;
@@ -956,7 +1048,16 @@ export async function initDb(opts?: {
   revWatermark.clear();
   syncing = false;
   lastSyncAt = 0;
-  if (opts?.poolOverride) {
+  // Pool-rebuild state — a re-init starts clean.
+  realPool = false;
+  lastPoolRebuild = 0;
+  lastErrorLoggedAt = 0;
+  poolFactory = opts?.poolFactory ?? null;
+  backoffOverrideMs = opts?.backoffMs ?? null;
+  if (opts?.poolFactory) {
+    pool = buildPool(); // mints via the factory; rebuildable (exercises self-healing)
+    realPool = true;
+  } else if (opts?.poolOverride) {
     pool = opts.poolOverride;
   } else if (!config.databaseUrl) {
     console.warn("[db] DATABASE_URL not set — using ephemeral in-memory store (no persistence)");
@@ -964,37 +1065,8 @@ export async function initDb(opts?: {
     pool = null;
     return;
   } else {
-    pool = new Pool({
-      connectionString: sanitizeUrl(config.databaseUrl),
-      ssl: { rejectUnauthorized: true },
-      max: 5,
-      // Keep TCP alive through Neon/Render proxies so idle pooled connections
-      // aren't silently reaped between flushes (the trigger for the prod wipe).
-      keepAlive: true,
-      // Bound a connect attempt so a suspended/unreachable Neon endpoint can't
-      // hang a flush (or the shutdown drain) — the retry/heartbeat handle waiting.
-      connectionTimeoutMillis: 10_000,
-      // Bound the QUERY too, not just connect: a flush query on a half-open socket
-      // would otherwise hang forever and wedge the flusher (see runFlush). query_timeout
-      // rejects client-side even if the server never answers; statement_timeout +
-      // idle_in_transaction_session_timeout cancel the work server-side so a killed
-      // flush can't leave a zombie query/txn holding locks. Generous enough for the
-      // boot load select; a hung flush is what we're bounding, not normal work.
-      statement_timeout: DB_STATEMENT_TIMEOUT_MS,
-      query_timeout: DB_STATEMENT_TIMEOUT_MS,
-      idle_in_transaction_session_timeout: DB_STATEMENT_TIMEOUT_MS,
-    });
-    // node-postgres emits 'error' on an idle client failing (Neon dropping an
-    // idle connection, a network blip). With NO listener Node escalates it to an
-    // uncaught exception that can kill the process — which then silently restarts
-    // and reloads the stale DB: precisely the data loss we're fixing. Swallow it
-    // (the bad client is already evicted; the next query gets a fresh one) and
-    // make sure the heartbeat is draining any parked writes once connectivity
-    // returns. Real pool only — the test poolOverride is a bare stub with no .on.
-    pool.on("error", (err) => {
-      console.error("[db] idle pool client error (pool reconnects on next query):", err.message);
-      startHeartbeat();
-    });
+    pool = buildPool();
+    realPool = true; // a real DATABASE_URL pool — eligible for self-healing rebuilds
   }
   await ensureSchema();
   await loadAll();
