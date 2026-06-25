@@ -25,6 +25,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
 import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow, type RepoGuidanceItem } from "./api";
+import { runSave } from "./workflow-save";
 import { useAuth } from "./auth-context";
 
 type StageKey = "holistic" | "deferrals" | "docs";
@@ -832,6 +833,18 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
   );
   const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState<string | null>(null);
+  // Transient "write staged but not yet durable" notice — distinct from a hard
+  // error: on a not_durable 503 we keep the optimistic state and show this calm
+  // notice instead of reverting (see save()).
+  const [pending, setPending] = React.useState(false);
+  // Monotonic token so a scheduled re-confirm (or a slow in-flight save) only acts
+  // while it's still the latest save — a newer change supersedes it.
+  const saveSeq = React.useRef(0);
+  const retryTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
+  // Always reflects the currently-selected repo (assigned every render), so a
+  // deferred save can tell whether the user switched repos while it was in flight.
+  const repoIdRef = React.useRef(repoId);
+  repoIdRef.current = repoId;
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([]);
@@ -889,26 +902,48 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
     setRfEdges(edges);
   }, [wf, selectedId, advancedLocked, setRfNodes, setRfEdges]);
 
-  // Optimistic save: paint `next` immediately, persist, revert on failure.
+  // Optimistic save with durability-aware error handling: paint `next` immediately,
+  // keep it on a transient `not_durable` (re-confirming once), revert on a hard
+  // failure. The state machine lives in runSave (workflow-save.ts) so it can be
+  // unit-tested without a DOM; here we just bind it to React state + refs.
   const save = React.useCallback(
-    async (next: RepoWorkflow) => {
-      if (!repoId) return;
-      const prev = wf;
-      setWf(next);
-      setErr(null);
-      try {
-        await api.setRepoWorkflow(repoId, next);
-      } catch (e: any) {
-        setWf(prev); // revert
-        setErr(
-          e?.message === "upgrade_required"
-            ? "That control is a Pro/Max feature."
-            : e?.message || "Couldn't save — reverted."
-        );
-      }
-    },
+    (next: RepoWorkflow, isRetry = false) =>
+      runSave(
+        {
+          repoId,
+          activeRepoId: () => repoIdRef.current,
+          getPrev: () => wf,
+          persist: (id, n) => api.setRepoWorkflow(id, n),
+          setWf,
+          setErr,
+          setPending,
+          seqRef: saveSeq,
+          retryTimer,
+          scheduleRetry: (fn, ms) => setTimeout(fn, ms),
+        },
+        next,
+        isRetry
+      ),
     [repoId, wf]
   );
+
+  // Drop any pending re-confirm if the page unmounts mid-wait.
+  React.useEffect(
+    () => () => {
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+    },
+    []
+  );
+
+  // Switching repos invalidates any in-flight or scheduled save for the previous
+  // repo: bump the token so its deferred state no-ops, drop the pending re-confirm,
+  // and clear the transient notice/error so the new repo starts from a clean slate.
+  React.useEffect(() => {
+    saveSeq.current++;
+    if (retryTimer.current) clearTimeout(retryTimer.current);
+    setPending(false);
+    setErr(null);
+  }, [repoId]);
 
   // Basic (free): toggle which optional stages run.
   const toggleStage = (key: StageKey) =>
@@ -1071,6 +1106,11 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
               Custom
             </span>
           </div>
+          {pending && (
+            <span className="wf-err" style={{ color: "var(--warn)" }}>
+              Saving… your change is queued and will save automatically.
+            </span>
+          )}
           {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
         </div>
       )}
