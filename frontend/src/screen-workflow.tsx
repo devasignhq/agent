@@ -832,6 +832,14 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
   );
   const [loading, setLoading] = React.useState(true);
   const [err, setErr] = React.useState<string | null>(null);
+  // Transient "write staged but not yet durable" notice — distinct from a hard
+  // error: on a not_durable 503 we keep the optimistic state and show this calm
+  // notice instead of reverting (see save()).
+  const [pending, setPending] = React.useState(false);
+  // Monotonic token so a scheduled re-confirm (or a slow in-flight save) only acts
+  // while it's still the latest save — a newer change supersedes it.
+  const saveSeq = React.useRef(0);
+  const retryTimer = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([]);
@@ -890,24 +898,55 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
   }, [wf, selectedId, advancedLocked, setRfNodes, setRfEdges]);
 
   // Optimistic save: paint `next` immediately, persist, revert on failure.
+  //
+  // Exception — a transient durability blip (HTTP 503 not_durable, e.g. a DB
+  // cold-start): the backend has ALREADY applied the write to its in-memory cache
+  // and staged it; its heartbeat persists it within ~15s, so the optimistic state
+  // already matches backend truth. Reverting would make the UI disagree with a
+  // reload. So we keep the optimistic state, show a calm "queued" notice (not a red
+  // error) and re-confirm ONCE after a short delay — the barrier only 503s after
+  // exhausting its own multi-second retry loop, so an immediate retry just re-hangs.
   const save = React.useCallback(
-    async (next: RepoWorkflow) => {
+    async (next: RepoWorkflow, isRetry = false) => {
       if (!repoId) return;
+      const seq = ++saveSeq.current; // claim latest; stale callbacks below no-op
       const prev = wf;
       setWf(next);
       setErr(null);
       try {
         await api.setRepoWorkflow(repoId, next);
+        if (seq === saveSeq.current) setPending(false); // confirmed durable
       } catch (e: any) {
-        setWf(prev); // revert
+        if (seq !== saveSeq.current) return; // a newer save superseded this one
+        const transient = e?.status === 503 && e?.body?.error === "not_durable";
+        if (transient) {
+          setPending(true); // keep the optimistic state — do NOT revert
+          if (!isRetry) {
+            if (retryTimer.current) clearTimeout(retryTimer.current);
+            retryTimer.current = setTimeout(() => {
+              if (seq === saveSeq.current) void save(next, true);
+            }, 4000);
+          }
+          return;
+        }
+        setPending(false);
+        setWf(prev); // hard failure — revert
         setErr(
           e?.message === "upgrade_required"
             ? "That control is a Pro/Max feature."
-            : e?.message || "Couldn't save — reverted."
+            : e?.body?.message || e?.message || "Couldn't save — reverted."
         );
       }
     },
     [repoId, wf]
+  );
+
+  // Drop any pending re-confirm if the page unmounts mid-wait.
+  React.useEffect(
+    () => () => {
+      if (retryTimer.current) clearTimeout(retryTimer.current);
+    },
+    []
   );
 
   // Basic (free): toggle which optional stages run.
@@ -1071,6 +1110,11 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
               Custom
             </span>
           </div>
+          {pending && (
+            <span className="wf-err" style={{ color: "var(--warn)" }}>
+              Saving… your change is queued and will save automatically.
+            </span>
+          )}
           {err && <span className="wf-err" style={{ color: "var(--danger)" }}>{err}</span>}
         </div>
       )}
