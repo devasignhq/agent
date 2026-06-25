@@ -213,3 +213,43 @@ test("a draining backlog under continuous load is NOT falsely 'stalled' (c7)", a
     await flushPending();
   }
 });
+
+test("self-heals a wedged pool: rebuilds it and recovers the stuck writes", async () => {
+  let generation = 0;
+  const stored = new Set<string>();
+  // The first pool generation is "wedged" — connect() always fails, like node-pg
+  // holding dead Neon/PgBouncer connections it won't replace. A rebuild mints a
+  // fresh generation (>= 1) that works. poolFactory lets the rebuild path run.
+  const poolFactory = () => {
+    const myGen = generation++;
+    const runQuery = async (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert"))
+        for (let i = 0; i < (params?.length ?? 0); i += 2) stored.add(String(params![i]));
+      return { rows: [] as Array<{ data: unknown }> };
+    };
+    const client = { query: runQuery, release: () => {} };
+    return {
+      connect: async () => {
+        if (myGen === 0) throw new Error("ECONNREFUSED"); // wedged generation
+        return client;
+      },
+      query: runQuery,
+      end: async () => {},
+      on: () => {},
+    };
+  };
+
+  // backoffMs:1 makes the give-up path (5 transient failures) run in milliseconds.
+  await initDb({ poolFactory: poolFactory as never, flushWatchdogMs: 50, backoffMs: 1 });
+
+  db.insert("notifications", row("w1"));
+  // Pass 1 exhausts retries on the wedged gen-0 pool, gives up, and rebuilds.
+  await flushPending();
+  assert.ok(generation >= 2, "the wedged pool was rebuilt (a fresh generation was minted)");
+  assert.equal(stored.has("w1"), false, "nothing persisted while the pool was wedged");
+
+  // The write is still staged; the next pass runs on the rebuilt (working) pool.
+  await flushPending();
+  assert.equal(stored.has("w1"), true, "write recovered on the rebuilt pool");
+  assert.equal(dbHealth().pendingWrites, 0, "backlog fully drained after self-heal");
+});
