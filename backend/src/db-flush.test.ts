@@ -253,3 +253,54 @@ test("self-heals a wedged pool: rebuilds it and recovers the stuck writes", asyn
   assert.equal(stored.has("w1"), true, "write recovered on the rebuilt pool");
   assert.equal(dbHealth().pendingWrites, 0, "backlog fully drained after self-heal");
 });
+
+test("stall-breaker recovers a SILENT wedge (writeThrough 'stalled', no error)", async () => {
+  let generation = 0;
+  const stored = new Set<string>();
+  // gen-0's INSERT hangs FOREVER (a wedge the per-op watchdog won't catch within
+  // the test's window) — no error, no give-up: the silent-stall signature seen in
+  // prod. gen-1 (after a rebuild) works. Everything else resolves so boot loads.
+  const poolFactory = () => {
+    const myGen = generation++;
+    const runQuery = (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert")) {
+        if (myGen === 0) return new Promise(() => {}); // hang forever -> wedges `flushing`
+        for (let i = 0; i < (params?.length ?? 0); i += 2) stored.add(String(params![i]));
+      }
+      return Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    };
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+
+  // Large watchdog so the hang is NOT caught as a failure (forces the silent path);
+  // short stallBreakMs so the breaker fires quickly.
+  await initDb({ poolFactory: poolFactory as never, flushWatchdogMs: 60_000, stallBreakMs: 40 });
+
+  // First flush wedges on gen-0: w-old is drained into the hung batch (trapped),
+  // and `flushing` never settles.
+  db.insert("notifications", row("w-old"));
+  void flushPending();
+  await delay(60);
+
+  // New writes now pile up in `dirty` — every flush short-circuits on the wedged
+  // `flushing`. This is exactly the prod state: pendingWrites=3, no error.
+  db.insert("notifications", row("s1"));
+  db.insert("notifications", row("s2"));
+  db.insert("notifications", row("s3"));
+  await delay(60);
+  const mid = dbHealth();
+  assert.equal(mid.pendingWrites, 3, "3 writes piled up behind the wedge (matches prod)");
+  assert.equal(mid.consecutiveFlushFailures, 0, "no failure recorded — a SILENT wedge");
+  assert.equal(mid.lastFlushError, null);
+
+  // The stall-breaker must abandon the wedge, reconcile from memory (recovering
+  // the trapped w-old), rebuild to gen-1, and drain everything.
+  const deadline = Date.now() + 5000;
+  while (!(stored.has("s1") && stored.has("w-old")) && Date.now() < deadline) await delay(50);
+
+  assert.equal(stored.has("w-old"), true, "trapped write recovered from memory via reconcileAll");
+  assert.equal(stored.has("s1"), true, "piled-up writes drained on the rebuilt pool");
+  assert.ok(generation >= 2, "stall-breaker rebuilt the pool");
+  assert.equal(dbHealth().pendingWrites, 0, "backlog fully drained after the stall-breaker fired");
+});

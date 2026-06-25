@@ -265,6 +265,23 @@ let lastErrorLoggedAt = 0; // rate-limit surfacing the real flush error
 let poolFactory: (() => PgPool) | null = null;
 let backoffOverrideMs: number | null = null;
 
+// --- Stall breaker: recover a SILENT write-through wedge ---------------------
+// A flush can wedge WITHOUT erroring — a hung op the per-op watchdog didn't
+// catch leaves the single-flight `flushing` promise pending, so every later
+// flush short-circuits (`if (flushing) return flushing`) and staged writes never
+// drain. Because nothing ERRORS, the failure-keyed recovery (rebuild-on-give-up,
+// heartbeat) never engages: /api/health just reads `writeThrough:"stalled"`,
+// `lastFlushError:null` forever and writes 503. This breaks it: when the backlog
+// hasn't made progress in stallBreakMs AND nothing has been recorded as failing,
+// abandon the wedged flush, reconcile the FULL in-memory snapshot (so any write
+// trapped in the abandoned flush is re-staged from authoritative memory — no
+// loss), rebuild the pool, and re-flush. The forced flush also makes the real
+// error finally surface if the writes genuinely can't persist.
+let lastFlushProgressAt = 0;
+let stallBreakerTimer: NodeJS.Timeout | null = null;
+const DEFAULT_STALL_BREAK_MS = 20_000;
+let stallBreakMs = DEFAULT_STALL_BREAK_MS;
+
 // --- Write-through health (surfaced via dbHealth() -> /api/health) ----------
 // The old flush re-staged a failed batch and retried it forever; because the
 // whole dataset went in one transaction, a single row Postgres refused to store
@@ -333,6 +350,7 @@ function onFlushOk(): void {
   const wasFailing = consecutiveFlushFailures > 0;
   consecutiveFlushFailures = 0;
   lastFlushError = null;
+  lastFlushProgressAt = Date.now(); // real forward progress — resets the stall-breaker clock
   // A successful flush is forward progress, so reset the stall clock. If writes
   // re-staged concurrently (continuous load), re-arm it to NOW so the age measures
   // how long the CURRENT undrained backlog has been stuck — not total time since
@@ -531,6 +549,46 @@ function logFlushError(err: unknown): void {
   lastErrorLoggedAt = now;
   const e = err as { message?: string; code?: string } | null;
   console.error(`[db] flush error (code=${e?.code ?? "?"}): ${e?.message ?? String(err)}`);
+}
+
+// Force-recover a backlog that's stalled with NO recorded failure (the silent
+// wedge described above). reconcileAll() re-stages the whole snapshot from
+// authoritative in-memory state, so even writes trapped in the abandoned flush
+// come back — nothing is lost.
+function breakStall(): void {
+  const stalledForMs = Date.now() - lastFlushProgressAt;
+  console.error(
+    `[db] write-through STALLED ${Math.round(stalledForMs / 1000)}s with ${pendingCount()} ` +
+      `write(s) pending and NO error recorded — force-recovering (abandon wedged flush, ` +
+      `reconcile snapshot, rebuild pool, re-flush).`
+  );
+  flushing = null; // abandon the wedged single-flight promise so a fresh flush can run
+  reconcileAll(); // re-stage everything from memory (recovers writes trapped in the abandoned flush)
+  rebuildPool("stall breaker: silent write-through wedge");
+  lastFlushProgressAt = Date.now(); // give the forced flush room before re-tripping
+  void runFlush();
+}
+
+function startStallBreaker(): void {
+  if (!pool || stallBreakerTimer) return;
+  // Check often enough to react promptly, but never busier than ~1s.
+  const checkMs = Math.min(5_000, Math.max(1_000, Math.floor(stallBreakMs / 2)));
+  stallBreakerTimer = setInterval(() => {
+    // Only act on a SILENT stall: pending, no progress for stallBreakMs, and no
+    // recorded failure (a real outage records failures and is handled by the
+    // give-up/heartbeat/rebuild path already).
+    if (!pool || !hasPending() || consecutiveFlushFailures > 0) return;
+    if (Date.now() - lastFlushProgressAt < stallBreakMs) return;
+    breakStall();
+  }, checkMs);
+  stallBreakerTimer.unref?.();
+}
+
+function stopStallBreaker(): void {
+  if (stallBreakerTimer) {
+    clearInterval(stallBreakerTimer);
+    stallBreakerTimer = null;
+  }
 }
 
 // Convergence safety net: re-stage every row in the in-memory snapshot so a
@@ -1017,6 +1075,7 @@ export async function initDb(opts?: {
   flushWatchdogMs?: number;
   stallThresholdMs?: number;
   backoffMs?: number;
+  stallBreakMs?: number;
 }): Promise<void> {
   // Reset health counters so each boot (and each test that re-inits) starts clean.
   consecutiveFlushFailures = 0;
@@ -1028,6 +1087,8 @@ export async function initDb(opts?: {
   bootedAt = Date.now();
   flushWatchdogMs = opts?.flushWatchdogMs ?? DEFAULT_FLUSH_WATCHDOG_MS;
   stallThresholdMs = opts?.stallThresholdMs ?? DEFAULT_STALL_THRESHOLD_MS;
+  stallBreakMs = opts?.stallBreakMs ?? DEFAULT_STALL_BREAK_MS;
+  lastFlushProgressAt = Date.now();
   // Drop any write-through state from a previous run so a re-init (tests, mainly)
   // never inherits a wedged in-flight flush promise, stale timers, or staged rows.
   // At a real boot these are already empty, so this is a harmless no-op there.
@@ -1043,8 +1104,10 @@ export async function initDb(opts?: {
   }
   flushing = null;
   firstStagedAt = null;
-  // Coherence poller + watermarks are per-connection; drop any from a prior run.
+  // Coherence poller + stall-breaker + watermarks are per-connection; drop any
+  // from a prior run.
   stopCoherence();
+  stopStallBreaker();
   revWatermark.clear();
   syncing = false;
   lastSyncAt = 0;
@@ -1115,6 +1178,8 @@ export async function initDb(opts?: {
   // longer load-once: another instance's committed writes (e.g. the outgoing
   // instance during a zero-downtime deploy) flow in within ~1s.
   startCoherence();
+  // Watchdog for a silent write-through wedge (stuck flush, no error).
+  startStallBreaker();
   const target = opts?.poolOverride ? "injected test pool" : describeDb(config.databaseUrl);
   console.log(
     `[db] connected [${target}] — loaded ${total} rows across ${COLLECTIONS.length} tables`
@@ -1124,6 +1189,7 @@ export async function initDb(opts?: {
 /** Flush pending writes and close the pool. Call on graceful shutdown. */
 export async function shutdownDb(): Promise<void> {
   stopCoherence();
+  stopStallBreaker();
   if (heartbeatTimer) {
     clearInterval(heartbeatTimer);
     heartbeatTimer = null;
