@@ -53,6 +53,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }: IconProps) => {
     case "logout":     return <svg {...p}><path d="M9 3H3v10h6M7 8h8M12 5l3 3-3 3"/></svg>;
     case "swap":       return <svg {...p}><path d="M2 5h11M10 2l3 3-3 3M14 11H3M6 8l-3 3 3 3"/></svg>;
     case "workflow":   return <svg {...p}><rect x="2" y="2" width="5" height="4" rx="1"/><rect x="9" y="10" width="5" height="4" rx="1"/><path d="M4.5 6v3a2 2 0 002 2H9"/></svg>;
+    case "bounties":   return <svg {...p}><circle cx="8" cy="8" r="6"/><circle cx="8" cy="8" r="2.8"/><path d="M8 1v2.2M8 12.8V15M1 8h2.2M12.8 8H15"/></svg>;
     default: return null;
   }
 };

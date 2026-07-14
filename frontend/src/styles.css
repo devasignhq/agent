@@ -1610,6 +1610,60 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .cb-rule .accent { color: var(--accent); }
 .cb-rule.warn .cb-rule-num { color: var(--warn); }
 .cb-rule.warn .cb-rule-title { color: var(--warn); }
+.cb-rule.accent .cb-rule-num { color: var(--accent); }
+.cb-rule.accent .cb-rule-title { color: var(--accent); }
+
+/* "NEW BOUNTY" eyebrow above the create-bounty modal title */
+.cb-eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
+
+/* ─── Top-up modal ─────────────────────────────────────────────────────────── */
+.tu-body { display: flex; gap: 20px; padding: 20px 24px 10px; align-items: stretch; }
+.tu-qr { flex-shrink: 0; width: 164px; height: 164px; background: #fff; padding: 11px; display: grid; place-items: center; }
+.tu-qr svg { width: 100%; height: 100%; display: block; }
+.tu-side { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 14px; }
+.tu-address { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--line); background: var(--bg); }
+.tu-address .mono { flex: 1; min-width: 0; font-size: 11px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tu-address .cb-copy { flex-shrink: 0; }
+.tu-chain { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.tu-notice {
+  display: flex; gap: 10px; align-items: flex-start;
+  margin: 6px 24px 16px; padding: 11px 13px;
+  background: rgba(245, 165, 36, 0.06);
+  border: 1px solid rgba(245, 165, 36, 0.28);
+  border-left: 3px solid var(--warn);
+  font-size: 12px; color: var(--fg-dim); line-height: 1.5;
+}
+.tu-notice svg { color: var(--warn); flex-shrink: 0; margin-top: 1px; }
+.tu-notice b { color: var(--fg); }
+
+/* ─── Withdraw modal ───────────────────────────────────────────────────────── */
+.wd-steps { display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid var(--line); }
+.wd-step { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-mute); }
+.wd-step.active { color: var(--fg); }
+.wd-step-n {
+  width: 20px; height: 20px; display: grid; place-items: center;
+  border: 1px solid var(--line-2); font-size: 10px; color: var(--fg-mute);
+}
+.wd-step.active .wd-step-n { border-color: var(--accent); color: var(--accent); }
+.wd-step.done .wd-step-n { background: var(--accent); border-color: var(--accent); color: #052413; }
+.wd-step-bar { flex: 1; height: 1px; background: var(--line); }
+.wd-body { padding: 18px 24px 8px; display: flex; flex-direction: column; gap: 14px; min-height: 150px; }
+.wd-field { display: flex; flex-direction: column; }
+/* Match the input height to the top-up modal's read-only wallet field (46px). */
+.wd-body .input { height: 46px; }
+.wd-hint { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 6px; }
+.wd-hint a { color: var(--accent); cursor: pointer; text-decoration: none; }
+.wd-hint a:hover { text-decoration: underline; }
+.wd-code { font-family: var(--mono); font-size: 20px; letter-spacing: 0.4em; text-align: center; }
+.wd-verify { text-align: center; padding: 6px 0 2px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
+.wd-verify-icon { width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid var(--line-2); background: var(--bg-2); color: var(--accent); }
+.wd-verify-title { font-family: var(--sans); font-size: 15px; color: var(--fg); }
+.wd-verify-sub { font-size: 12px; color: var(--fg-mute); line-height: 1.55; max-width: 380px; }
+.wd-verify-sub b { color: var(--fg); }
+.wd-success { text-align: center; padding: 22px 0 14px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
+.wd-success-icon { width: 52px; height: 52px; display: grid; place-items: center; background: rgba(61, 220, 151, 0.12); color: var(--green); border: 1px solid rgba(61, 220, 151, 0.4); }
+.wd-success-title { font-family: var(--sans); font-size: 17px; color: var(--fg); }
+.wd-success-sub { font-size: 12px; color: var(--fg-mute); line-height: 1.55; max-width: 400px; }
 
 /* Footer */
 .cb-modal-foot {
@@ -2137,16 +2191,16 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .balance-eye {
   background: transparent;
-  border: 1px solid var(--line);
+  border: none;
   color: var(--fg-mute);
   width: 26px;
   height: 26px;
   display: grid;
   place-items: center;
   cursor: pointer;
-  transition: color 80ms ease, border-color 80ms ease, background 80ms ease;
+  transition: color 80ms ease;
 }
-.balance-eye:hover { color: var(--fg); border-color: var(--line-2); background: var(--bg-2); }
+.balance-eye:hover { color: var(--fg); }
 .balance-amount {
   font-family: var(--mono);
   font-size: 48px;
@@ -5086,3 +5140,149 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .is-mobile .wf-toolbar { order: 2; }
 .is-mobile .wf-flow { position: relative; inset: auto; height: 52vh; flex: 0 0 auto; order: 3; }
 .is-mobile .wf-panel { order: 4; }
+
+/* ═══ Bounties page (redesign) ═══════════════════════════════════════════════ */
+.bnty-page { padding-bottom: 40px; }
+
+/* Header: title/sub on the left, balance + actions on the right */
+.bnty-head { align-items: flex-start; gap: 16px; flex-wrap: wrap; }
+.bnty-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.bnty-balance {
+  display: flex; align-items: center; gap: 8px;
+  padding: 0 10px; height: 34px;
+  border: 1px solid var(--line); background: var(--bg-1);
+}
+.bnty-balance-label { font-family: var(--mono); font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--fg-mute); }
+.bnty-balance-amt { font-family: var(--mono); font-size: 13px; color: var(--fg); font-variant-numeric: tabular-nums; }
+.bnty-balance-unit { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
+
+/* Six stat cards laid out 3 × 2 */
+.bnty-stats { grid-template-columns: repeat(3, 1fr); margin-bottom: 22px; }
+/* Match the primary stat number to the Agents page stat size (22px). */
+.bnty-stats .stat-value { font-size: 22px; }
+.bnty-stats .stat { border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); }
+.bnty-stats .stat:nth-child(3n) { border-right: 0; }
+.bnty-stats .stat:nth-child(n+4) { border-bottom: 0; }
+.bnty-stat-suffix { font-family: var(--mono); font-size: 12px; font-weight: 400; letter-spacing: 0; color: var(--fg-mute); }
+
+/* Filter tabs + search */
+.bnty-controls { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin: 0 0 14px; }
+.bnty-filters { display: flex; gap: 8px; flex-wrap: wrap; }
+.bnty-filter {
+  height: 28px; padding: 0 10px;
+  background: var(--bg-1); border: 1px solid var(--line);
+  color: var(--fg-mute); font-family: var(--mono); font-size: 11px;
+  letter-spacing: 0.02em; cursor: pointer;
+  display: inline-flex; align-items: center; gap: 4px; border-radius: 0;
+}
+.bnty-filter:hover { color: var(--fg-dim); border-color: var(--line-2); }
+.bnty-filter.active { color: var(--fg); border-color: var(--accent); background: rgba(255, 122, 61, 0.06); }
+.bnty-filter .n { color: var(--fg-faint); }
+.bnty-filter.active .n { color: var(--accent); }
+.bnty-controls-right { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.bnty-unread-note { font-family: var(--mono); font-size: 11px; color: var(--accent); }
+.bnty-search { display: flex; align-items: center; gap: 8px; padding: 0 10px; height: 32px; border: 1px solid var(--line-2); background: var(--bg); min-width: 220px; }
+.bnty-search svg { color: var(--fg-mute); flex-shrink: 0; }
+.bnty-search .input.bare { height: 100%; font-size: 12px; }
+
+/* Two-column dashboard: bounties table | transaction history */
+.bounty-dash { display: grid; grid-template-columns: 1.1fr 1fr; gap: 16px; align-items: start; }
+.bnty-panel { display: flex; flex-direction: column; min-width: 0; }
+.bnty-panel-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 12px 14px;
+  border: 1px solid var(--line); border-bottom: 0;
+  background: var(--bg-1);
+}
+.bnty-panel-title { font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-dim); }
+.bnty-panel-meta { display: flex; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
+.bnty-empty { display: grid; place-items: center; padding: 44px 16px; font-size: 12px; }
+
+/* Bounty list — narrower column set than the standalone .bounty-row default */
+.bnty-list { overflow-x: auto; }
+.bnty-list .bounty-row {
+  grid-template-columns: 22px 74px minmax(120px, 1.5fr) minmax(92px, 1fr) 70px 100px 46px;
+  min-width: 0; gap: 10px;
+}
+.bnty-list .subs-badge { color: var(--info); }
+
+/* Transaction history table */
+.txn-row {
+  display: grid;
+  grid-template-columns: 64px 80px minmax(90px, 1.3fr) 66px minmax(78px, 1fr) 100px 58px;
+  gap: 10px; align-items: center;
+  padding: 0 14px; height: 44px;
+  border-bottom: 1px solid var(--line);
+  font-size: 13px;
+}
+.txn-row:last-child { border-bottom: 0; }
+.txn-row > * { min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.txn-row.head {
+  background: var(--bg); font-family: var(--mono); font-size: 10px;
+  letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-mute);
+  height: 32px;
+}
+.txn-row > .pill { justify-self: start; width: max-content; overflow: visible; }
+.txn-row > span:has(button) { overflow: visible; }
+
+/* Drawer width for the bounty detail slide-over */
+.drawer.bounty { width: 760px; }
+
+/* Drawer tab count badges (and the inline NEW badge on application cards) */
+.tab-count {
+  display: inline-flex; align-items: center;
+  height: 15px; padding: 0 5px; margin-left: 6px;
+  font-family: var(--mono); font-size: 9px; font-weight: 600; letter-spacing: 0.04em;
+  background: var(--bg-3); color: var(--fg-dim); border-radius: 0;
+}
+.tab-count.new { background: var(--accent); color: #0a0b0d; }
+
+/* Acceptance-criteria list markers */
+.ac-list { list-style: none; }
+.ac-item { position: relative; padding-left: 18px; }
+.ac-item::before { content: ""; position: absolute; left: 4px; top: 0.72em; width: 5px; height: 5px; background: var(--fg-faint); }
+
+/* Applications tab cards */
+.app-cards { display: flex; flex-direction: column; gap: 8px; }
+.app-card { border: 1px solid var(--line); background: var(--bg-1); }
+.app-card.new { border-left: 2px solid var(--accent); }
+.app-card-row { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 8px; }
+
+/* Inline confirm prompt shown under an application when Reject / Delegate is
+   clicked. Reject = danger (red), Delegate = accent (orange). */
+.app-confirm {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 8px;
+  margin: 0 8px 12px;
+  border: 1px solid var(--line-2);
+  animation: notifPopIn 120ms ease-out;
+}
+.app-confirm.reject {
+  background: rgba(255, 90, 95, 0.06);
+  border-color: rgba(255, 90, 95, 0.25);
+}
+.app-confirm.delegate {
+  background: rgba(255, 122, 61, 0.06);
+  border-color: rgba(255, 122, 61, 0.25);
+}
+.app-confirm-icon { display: flex; flex-shrink: 0; color: var(--danger); }
+.app-confirm-msg { flex: 1; min-width: 0; font-size: 12px; color: var(--fg-dim); line-height: 1.5; }
+.app-confirm-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.app-confirm-go.reject { background: var(--danger); border-color: var(--danger); color: #fff; }
+.app-confirm-go.reject:hover { background: var(--danger); border-color: var(--danger); filter: brightness(1.1); }
+.app-confirm-go.delegate { background: var(--accent); border-color: var(--accent); color: #052413; }
+.app-confirm-go.delegate:hover { background: #fff; border-color: #fff; color: #0a0b0d; }
+
+@media (max-width: 1100px) {
+  .bounty-dash { grid-template-columns: 1fr; }
+}
+@media (max-width: 720px) {
+  .bnty-stats { grid-template-columns: repeat(2, 1fr); }
+  .bnty-stats .stat:nth-child(3n) { border-right: 1px solid var(--line); }
+  .bnty-stats .stat:nth-child(2n) { border-right: 0; }
+  .bnty-stats .stat:nth-child(n+4) { border-bottom: 1px solid var(--line); }
+  .bnty-stats .stat:nth-child(n+5) { border-bottom: 0; }
+  .drawer.bounty { width: 100%; }
+}
