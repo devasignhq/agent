@@ -43,11 +43,11 @@ if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
 
 // GitHub signs every webhook with GITHUB_APP_WEBHOOK_SECRET, and the receiver
 // verifies that HMAC before trusting an event (github/webhooks.ts). With no
-// secret the receiver — and the catch-all POST / it shares a handler with —
-// would accept forged, unsigned installs/PR events from anyone. Same prod
-// signal as the session guard above (https WEB_ORIGIN): refuse to boot rather
-// than run wide open. In local dev (http) we only warn — verification is off,
-// which is fine offline but must never reach prod.
+// secret the receiver now FAILS CLOSED (rejects every delivery) — but a prod
+// deployment silently dropping all webhooks is still broken, so keep the same
+// prod signal as the session guard above (https WEB_ORIGIN): refuse to boot.
+// In local dev (http) we only warn; unsigned events can be explicitly allowed
+// with ALLOW_UNSIGNED_WEBHOOKS=1 (never honored on an https origin).
 if (config.secureCookies && !isGithubWebhookConfigured()) {
   throw new Error(
     "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https). " +
@@ -56,8 +56,13 @@ if (config.secureCookies && !isGithubWebhookConfigured()) {
 }
 if (!config.secureCookies && !isGithubWebhookConfigured()) {
   console.warn(
-    "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset — GitHub webhook signature " +
-      "verification is DISABLED. Fine for local dev; never run production this way."
+    config.github.allowUnsignedWebhooks
+      ? "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset and ALLOW_UNSIGNED_WEBHOOKS=1 — " +
+          "the GitHub webhook receiver accepts UNSIGNED events. Local dev only; " +
+          "never run production this way."
+      : "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset — the GitHub webhook receiver " +
+          "fails closed and will REJECT all deliveries. Set the secret (or, for local " +
+          "dev only, ALLOW_UNSIGNED_WEBHOOKS=1)."
   );
 }
 
