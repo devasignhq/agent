@@ -2,6 +2,7 @@
 // Agent page — parallel PR reviews, switcher, log + terminal, goal drawer
 import React from "react";
 import DOMPurify from "dompurify";
+import { escapeHtml, safeUrl, SANITIZE_ALLOWED_TAGS, SANITIZE_ALLOWED_ATTR } from "./sanitize";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
@@ -981,37 +982,6 @@ const matchVideo = (text) => {
 
 const URL_RE  = /https?:\/\/[^\s<]+/i;
 
-const escapeHtml = (s) =>
-  String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
-
-// Accept a raw user-supplied string only if it is a well-formed http(s) URL.
-// Returns the normalized URL, or "" for anything else — javascript:, data:,
-// vbscript:, mailto:, relative/garbage input all get rejected.
-const safeUrl = (raw) => {
-  const s = String(raw ?? "").trim();
-  if (!s) return "";
-  // If the input already declares a scheme, it must be http(s) — never silently
-  // rewrite mailto:/javascript:/data: into an https link. A schemeless string
-  // (e.g. "example.com") is retried as https:// so the common case still works.
-  // The negative lookahead ensures that port numbers (e.g. localhost:3000) are
-  // not mistaken for custom schemes.
-  const hasScheme = /^[a-z][a-z0-9+.-]*:(?!\d+(?:[/?#]|$))/i.test(s);
-  const candidates = hasScheme ? [s] : [s, `https://${s}`];
-  for (const candidate of candidates) {
-    try {
-      const u = new URL(candidate);
-      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
-    } catch {
-      /* not a valid URL for this candidate — try the next */
-    }
-  }
-  return "";
-};
-
 // Clear any existing hooks to prevent accumulation during HMR (Hot Module
 // Replacement); removeHooks (plural) empties the entry point regardless of count.
 DOMPurify.removeHooks("afterSanitizeAttributes");
@@ -1032,11 +1002,8 @@ DOMPurify.addHook("afterSanitizeAttributes", (node) => {
 // javascript:/data: URIs, style/svg/iframe — is stripped by DOMPurify.
 const sanitizeHtml = (dirty) =>
   DOMPurify.sanitize(String(dirty ?? ""), {
-    ALLOWED_TAGS: [
-      "b", "strong", "i", "em", "u", "s", "code", "pre",
-      "a", "br", "p", "div", "span", "ul", "ol", "li", "blockquote",
-    ],
-    ALLOWED_ATTR: ["href", "target", "rel"],
+    ALLOWED_TAGS: SANITIZE_ALLOWED_TAGS,
+    ALLOWED_ATTR: SANITIZE_ALLOWED_ATTR,
   });
 
 const nowHMS = () => {
