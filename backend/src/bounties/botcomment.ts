@@ -18,11 +18,11 @@ export function renderConfirmBody(bounty: Bounty): string {
   const fund = fundingUrl(bounty.id);
   const cancel = cancelUrl(bounty.id);
   return [
-    `🤖 **DevAsign Bounty** — you're about to create a bounty of **$${bounty.amountUsdc} USDC** with a **${bounty.deliveryDays}-day** delivery window.`,
+    `🤖 **DevAsign Bounty** — your bounty of **$${bounty.amountUsdc} USDC** with a **${bounty.deliveryDays}-day** delivery window is being created. 🎉`,
     ``,
-    `Kindly proceed to fund the bounty, or cancel.`,
+    `Next, fund the escrow from your **Freighter** wallet to activate it:`,
     ``,
-    `**[✅ Fund bounty →](${fund})**  ·  [✖ Cancel](${cancel})`,
+    `**[💰 Fund bounty →](${fund})**  ·  [✖ Cancel](${cancel})`,
     ``,
     `<sub>Funds are locked in a Stellar USDC escrow. Delegate a contributor and, once their PR merges within the window, the escrow releases to them automatically; if the window elapses first, it's refunded to your wallet.</sub>`,
   ].join("\n");

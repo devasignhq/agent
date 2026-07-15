@@ -1,6 +1,8 @@
 // @ts-nocheck
 // Agent page — parallel PR reviews, switcher, log + terminal, goal drawer
 import React from "react";
+import DOMPurify from "dompurify";
+import { escapeHtml, safeUrl, SANITIZE_ALLOWED_TAGS, SANITIZE_ALLOWED_ATTR } from "./sanitize";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
@@ -980,12 +982,29 @@ const matchVideo = (text) => {
 
 const URL_RE  = /https?:\/\/[^\s<]+/i;
 
-const escapeHtml = (s) =>
-  String(s)
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+// Clear any existing hooks to prevent accumulation during HMR (Hot Module
+// Replacement); removeHooks (plural) empties the entry point regardless of count.
+DOMPurify.removeHooks("afterSanitizeAttributes");
+
+// Any link that survives sanitization gets forced to open in a new tab safely,
+// closing the reverse-tabnabbing hole (window.opener access). This also ensures
+// links created via createLink (which lack target="_blank") are hardened.
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+// Render user-authored rich text through a strict allow-list before it ever
+// reaches dangerouslySetInnerHTML. Covers exactly what the composer can emit
+// (bold/italic/code/links/lists); everything else — scripts, event handlers,
+// javascript:/data: URIs, style/svg/iframe — is stripped by DOMPurify.
+const sanitizeHtml = (dirty) =>
+  DOMPurify.sanitize(String(dirty ?? ""), {
+    ALLOWED_TAGS: SANITIZE_ALLOWED_TAGS,
+    ALLOWED_ATTR: SANITIZE_ALLOWED_ATTR,
+  });
 
 const nowHMS = () => {
   const d = new Date();
@@ -1041,14 +1060,22 @@ const AgentComposer = ({ onSend, disabled }) => {
   };
 
   const insertLink = () => {
-    const url = prompt("Paste a URL (Loom, doc, or any link):");
-    if (!url) return;
+    const raw = prompt("Paste a URL (Loom, doc, or any link):");
+    if (!raw) return;
+    const url = safeUrl(raw);
+    if (!url) {
+      alert("Please enter a valid http(s) URL.");
+      return;
+    }
     ref.current?.focus();
     const sel = window.getSelection();
     if (sel && sel.toString().trim() === "") {
+      const safe = escapeHtml(url);
       document.execCommand("insertHTML", false,
-        `<a href="${url}" target="_blank" rel="noopener">${url}</a>&nbsp;`);
+        `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>&nbsp;`);
     } else {
+      // createLink sets href via the DOM API (no string interpolation), and
+      // url is already validated to be http(s) — safe as-is.
       document.execCommand("createLink", false, url);
     }
     setEmpty(!ref.current?.innerText.trim());
@@ -1080,11 +1107,14 @@ const AgentComposer = ({ onSend, disabled }) => {
     const text = (e.clipboardData || window.clipboardData).getData("text");
     if (!text) return;
     e.preventDefault();
-    if (URL_RE.test(text.trim())) {
-      const url = text.trim();
+    const url = URL_RE.test(text.trim()) ? safeUrl(text.trim()) : "";
+    if (url) {
+      const safe = escapeHtml(url);
       document.execCommand("insertHTML", false,
-        `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
+        `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>`);
     } else {
+      // Anything that isn't a clean http(s) URL is inserted as literal text
+      // (execCommand insertText creates a text node — no HTML is parsed).
       document.execCommand("insertText", false, text);
     }
     setEmpty(!ref.current?.innerText.trim());
@@ -1748,7 +1778,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         icon: "user",
         flavor: "active",
         target: <span className="mono mute" style={{ fontSize: 11 }}>you</span>,
-        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: html || escapeHtml(text) }} />,
+        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) || escapeHtml(text) }} />,
       });
       return;
     }
@@ -1801,7 +1831,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         _key: key, t: nowHMS(),
         action: "user.input", icon: "user", flavor: "active",
         target: <span className="mono mute" style={{ fontSize: 11 }}>you</span>,
-        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: html || escapeHtml(text) }} />,
+        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) || escapeHtml(text) }} />,
       });
       try {
         await api.addAttachment(taskId, { kind: "text", note: text });
