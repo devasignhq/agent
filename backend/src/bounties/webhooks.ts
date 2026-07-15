@@ -5,7 +5,8 @@
 // bounty in-review.
 import { db, flushPending } from "../db.js";
 import { isStellarConfigured } from "../config.js";
-import type { Integration } from "../types.js";
+import { installationPermissions } from "../github/app.js";
+import type { Bounty, Integration } from "../types.js";
 import { createLinearComment } from "../linear/client.js";
 import { looksLikeBountyCommand, parseBountyCommand } from "./parse.js";
 import { createBounty, markInReview, releaseByMerge } from "./service.js";
@@ -15,6 +16,52 @@ import { resolveBountyForPR } from "./prlink.js";
 // Same authority gate as review triggers: a repo owner, org member, or collaborator.
 const MAINTAINER_ASSOCIATIONS = new Set(["OWNER", "MEMBER", "COLLABORATOR"]);
 const ACTIVE = new Set(["PENDING_FUNDING", "OPEN", "DELEGATED", "IN_REVIEW"]);
+
+/**
+ * The confirm comment is the sponsor's GitHub-side handle on the Fund/Cancel
+ * links, so a failed post is an operator-visible ERROR, not a shrug. The most
+ * common cause is the GitHub App lacking "Issues: write" — commenting on a
+ * plain issue is NOT covered by "Pull requests: write", which is all a
+ * PR-review App needs elsewhere — so diagnose that case by name. The bounty
+ * itself is fine either way: sponsor-facing reads mint the same links, so the
+ * app's Bounties page remains a full fallback.
+ */
+export async function reportConfirmCommentFailure(bounty: Bounty): Promise<void> {
+  const perms = await installationPermissions(bounty.installationId).catch(
+    () => ({}) as Record<string, string>
+  );
+  const issues = perms.issues ?? "none";
+  const cause =
+    issues === "write"
+      ? "the POST failed (see the preceding [github] warning for the response)"
+      : `the GitHub App's "Issues" permission is "${issues}" — posting comments on issues ` +
+        `requires read & write; grant it in the App's settings, then approve the change on the installation`;
+  console.error(
+    `[bounty] ${bounty.code}: could not post the confirm comment on ` +
+      `${bounty.repo}#${bounty.issueNumber}: ${cause}. ` +
+      `The sponsor can still fund or cancel this bounty from the app's Bounties page.`
+  );
+}
+
+/**
+ * Post the Fund/Cancel confirm comment for a GitHub bounty and remember its id
+ * (so later status transitions edit it in place). Shared by the comment-command
+ * webhook and the app's POST /bounties. Best-effort — a failure is reported
+ * loudly but never breaks bounty creation.
+ */
+export async function postAndRecordConfirmComment(bounty: Bounty): Promise<void> {
+  try {
+    const commentId = await postConfirmComment(bounty);
+    if (commentId) {
+      db.update("bounties", (b) => b.id === bounty.id, { botCommentId: commentId });
+    } else {
+      await reportConfirmCommentFailure(bounty);
+    }
+    await flushPending();
+  } catch (err) {
+    console.warn(`[bounty] confirm comment failed for ${bounty.code}:`, err);
+  }
+}
 
 /**
  * Handle a `bounty $X $Nd` comment on a GitHub ISSUE. Returns true if this was a
@@ -31,7 +78,13 @@ export function maybeHandleBountyComment(event: any): boolean {
   if (!cmd) return false;
 
   if (!isStellarConfigured()) {
-    console.log("[bounty] command seen but Stellar is not configured — ignoring");
+    // A maintainer explicitly asked for a bounty and nothing will visibly
+    // happen — make the config gap unmissable in the logs.
+    console.error(
+      "[bounty] bounty command received but Stellar is not configured — no bounty was created " +
+        "and no comment will be posted. Set STELLAR_ESCROW_CONTRACT_ID, STELLAR_USDC_SAC_ID and " +
+        "the admin key (see config.stellar) on this deployment to enable bounties."
+    );
     return true;
   }
   const repo: string = event.repository?.full_name || "";
@@ -64,15 +117,7 @@ export function maybeHandleBountyComment(event: any): boolean {
   console.log(
     `[bounty] created ${bounty.code} for ${repo}#${issueNumber} ($${cmd.amountUsdc}, ${cmd.deliveryDays}d)`
   );
-  void (async () => {
-    try {
-      const commentId = await postConfirmComment(bounty);
-      if (commentId) db.update("bounties", (b) => b.id === bounty.id, { botCommentId: commentId });
-      await flushPending();
-    } catch (err) {
-      console.warn(`[bounty] confirm comment failed for ${bounty.code}:`, err);
-    }
-  })();
+  void postAndRecordConfirmComment(bounty);
   return true;
 }
 

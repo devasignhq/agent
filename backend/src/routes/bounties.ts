@@ -12,9 +12,9 @@ import { isStellarConfigured } from "../config.js";
 import { getSessionUser } from "../github/oauth.js";
 import { installationsForUser, userInInstall } from "../github/installations.js";
 import { assertValidAddress } from "../stellar/scval.js";
-import { verifyBountyLinkToken } from "../bounties/links.js";
-import { fundingUrl } from "../bounties/links.js";
+import { cancelUrl, fundingUrl, verifyBountyLinkToken } from "../bounties/links.js";
 import { updateStatusComment } from "../bounties/botcomment.js";
+import { postAndRecordConfirmComment } from "../bounties/webhooks.js";
 import {
   acceptAndStartClock,
   applyToBounty,
@@ -69,6 +69,16 @@ function failStatus(reason: string): number {
   return 400;
 }
 
+// A PENDING_FUNDING bounty is only actionable through its signed Fund/Cancel
+// links. The GitHub confirm comment is the usual carrier, but posting it can
+// fail (e.g. the App lacks Issues:write) — so sponsor-facing reads mint fresh
+// links too, making the app's Bounties page a full fallback. Sponsor-only:
+// callers must scope to the sponsor before applying this.
+function withSponsorLinks(b: Bounty): Bounty & { fundingUrl?: string; cancelUrl?: string } {
+  if (b.status !== "PENDING_FUNDING") return b;
+  return { ...b, fundingUrl: fundingUrl(b.id), cancelUrl: cancelUrl(b.id) };
+}
+
 function summarize(list: Bounty[]) {
   const active = ["OPEN", "DELEGATED", "IN_REVIEW"];
   let inEscrow = 0;
@@ -87,15 +97,18 @@ function summarize(list: Bounty[]) {
 
 // --- reads ---
 
-bounties.get("/bounties", (req, res) => {
+export function listBountiesHandler(req: Request, res: Response) {
   const user = requireUser(req, res);
   if (!user) return;
   const ids = userInstallationIds(user.id);
+  // This list is already sponsor-scoped (installation member or creator), so
+  // every row may carry the funding links.
   const list = db
     .filter("bounties", (b) => ids.has(b.installationId) || b.sponsorUserId === user.id)
     .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ bounties: list, summary: summarize(list) });
-});
+  res.json({ bounties: list.map(withSponsorLinks), summary: summarize(list) });
+}
+bounties.get("/bounties", listBountiesHandler);
 
 bounties.get("/bounties/transactions", (req, res) => {
   const user = requireUser(req, res);
@@ -110,20 +123,24 @@ bounties.get("/bounties/transactions", (req, res) => {
   res.json({ transactions: txns });
 });
 
-bounties.get("/bounties/:id", (req, res) => {
+export function getBountyHandler(req: Request, res: Response) {
   const user = requireUser(req, res);
   if (!user) return;
-  const b = getBounty(req.params.id);
+  const b = getBounty(String(req.params.id));
   if (!b) return void res.status(404).json({ error: "not_found" });
+  const sponsor = isSponsor(b, user.id);
   const isApplicant =
     user.githubId != null &&
     (b.assigneeGithubId === user.githubId ||
       b.applications.some((a) => a.githubId === user.githubId));
-  if (!isSponsor(b, user.id) && !isApplicant) {
+  if (!sponsor && !isApplicant) {
     return void res.status(403).json({ error: "forbidden" });
   }
-  res.json({ bounty: b });
-});
+  // Funding links only for the sponsor — an applicant must not receive a token
+  // that can cancel the bounty.
+  res.json({ bounty: sponsor ? withSponsorLinks(b) : b });
+}
+bounties.get("/bounties/:id", getBountyHandler);
 
 // --- create (app path) ---
 
@@ -159,6 +176,11 @@ bounties.post("/bounties", (req, res) => {
       deliveryDays,
       sponsorUserId: user.id,
     });
+    // Same confirm comment as the comment-command path, so the funding links
+    // reach the issue no matter how the bounty was created. Off the request
+    // thread; best-effort (failures are diagnosed in the log, and the response
+    // below already carries the funding URL).
+    if (bounty.issueNumber > 0) void postAndRecordConfirmComment(bounty);
     res.json({ bounty, fundingUrl: fundingUrl(bounty.id) });
   } catch (err) {
     res.status(400).json({ error: "invalid_bounty", message: (err as Error).message });
