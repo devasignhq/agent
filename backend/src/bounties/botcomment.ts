@@ -68,8 +68,9 @@ export async function postConfirmComment(bounty: Bounty): Promise<number | null>
 
 /**
  * Edit the confirmation comment to reflect the bounty's current state. Only acts
- * on comment-triggered bounties (those with a botCommentId) — app-created bounties
- * have no issue comment to edit, and we don't spam the issue with a fresh one.
+ * on bounties with a botCommentId — when the confirm comment never made it up
+ * (or a Linear bounty has no GitHub issue), there's nothing to edit and we don't
+ * spam the issue with a fresh one.
  */
 export async function updateStatusComment(bounty: Bounty): Promise<void> {
   if (!bounty.botCommentId) return;

@@ -24,9 +24,12 @@ export function appJWT(): string {
   return token;
 }
 
-type InstallationToken = { token: string; expires_at: string };
+type InstallationToken = { token: string; expires_at: string; permissions?: Record<string, string> };
 
-const installTokens = new Map<number, { token: string; expiresAt: number }>();
+const installTokens = new Map<
+  number,
+  { token: string; expiresAt: number; permissions: Record<string, string> }
+>();
 
 export async function installationToken(installationId: number): Promise<string> {
   const now = Date.now();
@@ -49,8 +52,24 @@ export async function installationToken(installationId: number): Promise<string>
   }
   const body = (await res.json()) as InstallationToken;
   const expiresAt = Date.parse(body.expires_at);
-  installTokens.set(installationId, { token: body.token, expiresAt });
+  installTokens.set(installationId, {
+    token: body.token,
+    expiresAt,
+    permissions: body.permissions ?? {},
+  });
   return body.token;
+}
+
+// The permission map GitHub actually granted this installation's token, e.g.
+// { issues: "read", pull_requests: "write" }. This is the ground truth for
+// "can the App do X here" — the App-level settings can request more than an
+// installation has approved. Used to turn silent 403s (e.g. posting a comment
+// on a plain issue without Issues:write) into actionable diagnostics.
+export async function installationPermissions(
+  installationId: number
+): Promise<Record<string, string>> {
+  await installationToken(installationId);
+  return installTokens.get(installationId)?.permissions ?? {};
 }
 
 // Uninstall the App from an account by deleting its installation. This revokes

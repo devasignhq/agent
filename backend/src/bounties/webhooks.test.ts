@@ -20,7 +20,11 @@ import {
   defaultChain,
   type EscrowChain,
 } from "./service.js";
-import { handleBountyPRMerge, handleBountyPROpened } from "./webhooks.js";
+import {
+  handleBountyPRMerge,
+  handleBountyPROpened,
+  maybeHandleBountyComment,
+} from "./webhooks.js";
 
 // handleBountyPRMerge no-ops unless the escrow is "configured", so make it so —
 // then stub the on-chain release to record a call instead of hitting a node.
@@ -29,6 +33,12 @@ config.stellar.rpcUrl ||= "https://soroban-testnet.stellar.org";
 config.stellar.contractId ||= "C_TEST";
 config.stellar.usdcSac ||= "C_TEST";
 config.stellar.adminSecret ||= "S_TEST";
+
+// Keep the GitHub side hermetic: with no App credentials, appJWT() throws, so
+// the confirm-comment path fails locally (no network) — exactly the swallowed-
+// failure scenario the diagnostics below assert on.
+config.github.appId = "";
+config.github.privateKey = "";
 
 let releaseCalls = 0;
 defaultChain.adminRelease = async () => {
@@ -166,4 +176,78 @@ test("in-review allowed: delegate's opened PR advances to in-review", async () =
   handleBountyPROpened(prEvent(b, { merged: false, authorId: DELEGATE }));
   await flush();
   assert.equal(getBounty(b.id)!.status, "IN_REVIEW");
+});
+
+// ── maybeHandleBountyComment: the `bounty $X $Nd` issue command ───────────────
+
+// An issue_comment.created payload carrying a bounty command from a maintainer.
+const commentEvent = (body: string, over: Record<string, unknown> = {}) => ({
+  comment: { body, author_association: "OWNER", user: { login: "owner" } },
+  sender: { type: "User" },
+  issue: { number: 5, title: "Fix the thing", html_url: "https://github.com/acme/app/issues/5", body: "desc" },
+  repository: { full_name: "acme/app" },
+  installation: { id: 42 },
+  ...over,
+});
+
+const issueBounty = () =>
+  db.find("bounties", (b) => b.repo === "acme/app" && b.issueNumber === 5);
+
+test("bounty command creates a PENDING_FUNDING bounty even when the confirm comment fails, and diagnoses why", async (t) => {
+  const errors: string[] = [];
+  t.mock.method(console, "error", (...args: unknown[]) => {
+    errors.push(args.map(String).join(" "));
+  });
+  const handled = maybeHandleBountyComment(commentEvent("bounty $100 5 days"));
+  assert.equal(handled, true);
+  const b = issueBounty();
+  assert.ok(b, "bounty row created synchronously");
+  assert.equal(b!.status, "PENDING_FUNDING");
+  assert.equal(b!.amountUsdc, 100);
+  assert.equal(b!.deliveryDays, 5);
+  await flush();
+  // The comment could not be posted (no App credentials) — the bounty must
+  // survive, botCommentId stays null, and the log names the likely permission
+  // gap plus the in-app fallback instead of failing silently.
+  assert.equal(getBounty(b!.id)!.botCommentId, null);
+  const diag = errors.find((e) => e.includes(b!.code));
+  assert.ok(diag, "an operator-visible error is logged");
+  assert.match(diag!, /"Issues" permission/);
+  assert.match(diag!, /Bounties page/);
+});
+
+test("bounty command ignored on PR comments, from bots, and from non-maintainers", () => {
+  assert.equal(
+    maybeHandleBountyComment(
+      commentEvent("bounty $100 5 days", {
+        issue: { number: 5, pull_request: { url: "x" } },
+      })
+    ),
+    false
+  );
+  assert.equal(
+    maybeHandleBountyComment(
+      commentEvent("bounty $100 5 days", { sender: { type: "Bot" } })
+    ),
+    false
+  );
+  assert.equal(
+    maybeHandleBountyComment(
+      commentEvent("bounty $100 5 days", {
+        comment: { body: "bounty $100 5 days", author_association: "NONE", user: { login: "drive-by" } },
+      })
+    ),
+    false
+  );
+  assert.equal(issueBounty(), null, "no bounty row for any of the rejected commands");
+});
+
+test("second bounty command on the same issue is a no-op while one is active", async () => {
+  maybeHandleBountyComment(commentEvent("bounty $100 5 days"));
+  const handled = maybeHandleBountyComment(commentEvent("bounty $200 3 days"));
+  assert.equal(handled, true, "still consumed as a bounty command");
+  await flush();
+  const all = db.filter("bounties", (b) => b.repo === "acme/app" && b.issueNumber === 5);
+  assert.equal(all.length, 1, "only the first bounty exists");
+  assert.equal(all[0].amountUsdc, 100);
 });

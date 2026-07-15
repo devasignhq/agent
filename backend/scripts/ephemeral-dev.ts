@@ -13,6 +13,12 @@ process.env.GEMINI_API_KEY = "";
 process.env.STATSIG_SECRET_KEY = "";
 process.env.WEB_ORIGIN = "http://localhost:3001";
 process.env.PORT = "8787";
+// Dummy Stellar config so isStellarConfigured() passes and the bounty surfaces
+// (create/list/links) are exercisable — nothing here reaches a chain until a
+// funding tx is actually built, which will just error against the fake ids.
+process.env.STELLAR_ESCROW_CONTRACT_ID ||= "C_EPHEMERAL_TEST";
+process.env.STELLAR_USDC_SAC_ID ||= "C_EPHEMERAL_TEST";
+process.env.STELLAR_ADMIN_SECRET ||= "S_EPHEMERAL_TEST";
 
 // Dynamic import so the assignments above run first (static imports hoist).
 await import("../src/server.js");
@@ -35,6 +41,22 @@ db.insert("installations", {
   installationId: 1,
   repoIds: [],
 });
+// One awaiting-funding bounty on the seeded installation so the Bounties page
+// (list, drawer, in-app Fund/Cancel links) renders with real data.
+const { createBounty } = await import("../src/bounties/service.js");
+createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 1,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/1",
+  title: "Demo bounty (ephemeral)",
+  description: "Seeded by scripts/ephemeral-dev.ts for local verification.",
+  amountUsdc: 100,
+  deliveryDays: 5,
+  sponsorUserId: "ephemeral-user-1",
+});
+
 // Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the
 // cookie through the same helper the server verifies — a hand-rolled value won't
 // pass getSessionUser anymore. Print it ready to paste into a curl Cookie header.

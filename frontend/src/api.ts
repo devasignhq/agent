@@ -343,6 +343,10 @@ export type Bounty = {
   refundTxHash?: string | null;
   createdAt: number;
   updatedAt: number;
+  // Signed Fund/Cancel links, present only on sponsor reads of a
+  // PENDING_FUNDING bounty (the in-app fallback for the GitHub confirm comment).
+  fundingUrl?: string;
+  cancelUrl?: string;
 };
 
 export type EscrowTransaction = {

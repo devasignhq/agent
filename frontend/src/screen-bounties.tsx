@@ -437,8 +437,16 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
         {tab === "details" && (
           <div className="drawer-foot">
             <span className="mono mute" style={{ fontSize: 11 }}>
-              {delegated ? "Cannot cancel · bounty is delegated" : "This bounty can still be cancelled"}
+              {bounty.status === "PENDING_FUNDING"
+                ? "Awaiting funding · sign with Freighter to activate"
+                : delegated ? "Cannot cancel · bounty is delegated" : "This bounty can still be cancelled"}
             </span>
+            {bounty.status === "PENDING_FUNDING" && bounty.cancelUrl && (
+              <a className="btn" href={bounty.cancelUrl}><Icon name="x" size={13} /> Cancel</a>
+            )}
+            {bounty.status === "PENDING_FUNDING" && bounty.fundingUrl && (
+              <a className="btn primary" href={bounty.fundingUrl}><Icon name="check" size={13} /> Fund bounty</a>
+            )}
             <a className="btn" href={bounty.issueUrl} target="_blank" rel="noreferrer"><Icon name="github" size={13} /> View on GitHub</a>
           </div>
         )}
