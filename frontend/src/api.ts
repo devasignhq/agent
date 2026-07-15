@@ -532,9 +532,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify(input),
     }),
-  // Funding (token from the Fund link). Returns the unsigned create_escrow xdr.
+  // Funding (token from the Fund link). Returns the unsigned create_escrow xdr
+  // plus the network passphrase it was built for (so Freighter signs against the
+  // same network the backend submits to).
   bountyFundingTx: (id: string, token: string, address: string) =>
-    request<{ xdr: string }>(
+    request<{ xdr: string; networkPassphrase: string }>(
       `/api/bounties/${id}/funding-tx?token=${encodeURIComponent(token)}&address=${encodeURIComponent(address)}`
     ),
   submitBountyFunding: (id: string, token: string, signedXdr: string) =>

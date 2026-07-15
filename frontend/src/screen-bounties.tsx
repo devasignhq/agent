@@ -12,6 +12,7 @@
 // / Applications.
 import React from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router-dom";
+import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-api";
 import { Icon } from "./icons";
 import {
   api,
@@ -681,24 +682,29 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
 };
 
 // ─── Freighter (browser wallet) bridge ────────────────────────────────────────
-// The Freighter extension injects `window.freighterApi`. We feature-detect and
-// throw a clear message when it's absent so the funding flow degrades to guidance
-// instead of crashing. Return shapes vary across versions, so we read defensively.
+// We talk to Freighter through its official `@stellar/freighter-api` package
+// rather than sniffing for an injected `window` global: current Freighter builds
+// don't expose a reliable page global, and the extension's content script is
+// injected asynchronously — so global detection produced false "not detected"
+// errors even when the wallet was installed. The package handles the postMessage
+// bridge (and its readiness) for us.
 async function freighterAddress(): Promise<string> {
-  const fr: any = (window as any).freighterApi || (window as any).freighter;
-  if (!fr) throw new Error("Freighter wallet not detected. Install it from freighter.app, then reload this page.");
-  const access = await (fr.requestAccess ? fr.requestAccess() : fr.getPublicKey?.());
-  const address = typeof access === "string" ? access : access?.address || access?.publicKey;
-  if (!address) throw new Error("Couldn't read your Freighter wallet address.");
-  return address;
+  const conn = await isConnected();
+  if (!conn.isConnected) {
+    throw new Error("Freighter wallet not detected. Install it from freighter.app, then reload this page.");
+  }
+  const access = await requestAccess();
+  if (access.error || !access.address) {
+    throw new Error(access.error?.message || "Couldn't read your Freighter wallet address.");
+  }
+  return access.address;
 }
-async function freighterSign(xdr: string, address: string): Promise<string> {
-  const fr: any = (window as any).freighterApi || (window as any).freighter;
-  if (!fr?.signTransaction) throw new Error("Freighter wallet not available.");
-  const signed = await fr.signTransaction(xdr, { address });
-  const signedXdr = typeof signed === "string" ? signed : signed?.signedTxXdr || signed?.signedXDR;
-  if (!signedXdr) throw new Error("Transaction signing was cancelled.");
-  return signedXdr;
+async function freighterSign(xdr: string, address: string, networkPassphrase: string): Promise<string> {
+  const signed = await signTransaction(xdr, { address, networkPassphrase });
+  if (signed.error || !signed.signedTxXdr) {
+    throw new Error(signed.error?.message || "Transaction signing was cancelled.");
+  }
+  return signed.signedTxXdr;
 }
 
 // ─── Fund modal (from /bounties/:id/fund?token=…) ─────────────────────────────
@@ -738,8 +744,8 @@ const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | 
     setMsg(null);
     try {
       const address = await freighterAddress();
-      const { xdr } = await api.bountyFundingTx(id, token, address);
-      const signedXdr = await freighterSign(xdr, address);
+      const { xdr, networkPassphrase } = await api.bountyFundingTx(id, token, address);
+      const signedXdr = await freighterSign(xdr, address, networkPassphrase);
       const res = await api.submitBountyFunding(id, token, signedXdr);
       setHash(res.hash || null);
       setPhase("done");
