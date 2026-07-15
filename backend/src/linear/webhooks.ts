@@ -18,15 +18,17 @@ import { maybeHandleBountyLinearComment } from "../bounties/webhooks.js";
 // Reject deliveries whose timestamp is more than a minute from now (replay guard).
 const MAX_SKEW_MS = 60 * 1000;
 
+// A Linear webhook signature: lowercase hex HMAC-SHA256 of the raw body.
+// Validating the shape up front means timingSafeEqual always compares
+// equal-length buffers (it throws otherwise) and malformed headers are
+// rejected before any comparison.
+const LINEAR_SIG_RE = /^[0-9a-f]{64}$/;
+
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   const secret = config.linear.webhookSigningSecret;
-  if (!secret || !signature) return false;
+  if (!secret || !signature || !LINEAR_SIG_RE.test(signature)) return false;
   const expected = crypto.createHmac("sha256", secret).update(rawBody).digest("hex");
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
-  } catch {
-    return false;
-  }
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
 export function handleLinearWebhook(req: Request, res: Response) {

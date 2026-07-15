@@ -48,6 +48,10 @@ export const config = {
     appId: process.env.GITHUB_APP_ID || "",
     appName: process.env.GITHUB_APP_NAME || "devasign",
     webhookSecret: process.env.GITHUB_APP_WEBHOOK_SECRET || "",
+    // Explicit dev-only escape hatch: with no webhookSecret the receiver now
+    // fails CLOSED; set ALLOW_UNSIGNED_WEBHOOKS=1 to accept unsigned events on
+    // a local (non-https) server. Never honored when WEB_ORIGIN is https.
+    allowUnsignedWebhooks: process.env.ALLOW_UNSIGNED_WEBHOOKS === "1",
     privateKey: loadPrivateKey(),
   },
   llm: {

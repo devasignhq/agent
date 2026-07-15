@@ -29,20 +29,26 @@ import {
   maybeHandleBountyComment,
 } from "../bounties/webhooks.js";
 
+// A GitHub webhook signature header: "sha256=" + lowercase hex HMAC-SHA256.
+// Validating the shape up front means timingSafeEqual always compares
+// equal-length buffers (it throws otherwise) and malformed headers are
+// rejected before any comparison.
+const GITHUB_SIG_RE = /^sha256=[0-9a-f]{64}$/;
+
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
-  // No secret ⇒ skip verification. The boot guard in server.ts refuses to start
-  // in production (https WEB_ORIGIN) without GITHUB_APP_WEBHOOK_SECRET, so this
-  // permissive branch is reachable only in local dev.
-  if (!config.github.webhookSecret) return true;
-  if (!signature) return false;
+  if (!config.github.webhookSecret) {
+    // Fail CLOSED with no secret — mirrors the Linear receiver. The server.ts
+    // boot guard already refuses https deployments without a secret; this
+    // covers every other misconfiguration. Local dev without a secret can
+    // opt in explicitly (and only on a non-https origin) via
+    // ALLOW_UNSIGNED_WEBHOOKS=1.
+    return config.github.allowUnsignedWebhooks && !config.secureCookies;
+  }
+  if (!signature || !GITHUB_SIG_RE.test(signature)) return false;
   const expected =
     "sha256=" +
     crypto.createHmac("sha256", config.github.webhookSecret).update(rawBody).digest("hex");
-  try {
-    return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
-  } catch {
-    return false;
-  }
+  return crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(signature));
 }
 
 // GitHub delivers webhooks at-least-once: a slow response, a redelivery from
