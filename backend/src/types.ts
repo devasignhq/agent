@@ -8,6 +8,14 @@ export type User = {
   avatarUrl?: string;
   plan: "free" | "pro" | "max";
   createdAt: number;
+  // Bounty payout wallet. A contributor authenticates with GitHub, then MANUALLY
+  // enters the Stellar address (G…) their bounty payouts should go to — so their
+  // GitHub identity is linked to the receiving address at all times. Optional so
+  // existing rows load unchanged; only set once a user registers a payout wallet.
+  // `stellarPayoutTrustline` caches whether that address had a USDC trustline when
+  // last checked (a payout to a trustline-less account would trap on-chain).
+  stellarPayoutAddress?: string;
+  stellarPayoutTrustline?: boolean;
 };
 
 export type Installation = {
@@ -402,6 +410,107 @@ export type LinearProjectUpdate = {
   updatedAt: number;
 };
 
+// ── Bounties (Soroban USDC escrow) ──────────────────────────────────────────
+// A bounty attached to a GitHub issue (or Linear ticket). Funds live in the
+// on-chain escrow contract, NOT with DevAsign — `sponsorAddress` (the funder's
+// Freighter wallet) is the on-chain `creator`. The app status is the source of
+// truth for the workflow; `onchainStatus` mirrors the contract's TaskStatus.
+export type BountySource = "github" | "linear";
+
+export type BountyStatus =
+  | "PENDING_FUNDING" // created from a comment; awaiting the sponsor's Freighter funding signature
+  | "OPEN" // funded + HELD in escrow; awaiting applications
+  | "DELEGATED" // an approved contributor accepted (gave a payout address); delivery clock running
+  | "IN_REVIEW" // the contributor opened a PR referencing the issue
+  | "PAID" // escrow released to the contributor
+  | "CANCELLED" // refunded to the sponsor (deleted while undelegated, or deadline expired), or resolved
+  | "DISPUTED"; // escalated to the admin arbiter (resolve_dispute)
+
+// Mirrors the contract's on-chain TaskStatus (Open → Completed | Disputed;
+// Open → Cancelled). Null until the escrow is funded on-chain.
+export type OnchainStatus = "Open" | "Completed" | "Cancelled" | "Disputed";
+
+export type BountyCancelReason = "deleted" | "expired" | "disputed";
+
+// A contributor's application to work a bounty. The sponsor must approve one
+// (status "approved") before that contributor can accept (status "accepted",
+// which delegates the bounty and starts the delivery clock).
+export type BountyApplication = {
+  githubId: number;
+  githubLogin: string;
+  note?: string;
+  appliedAt: number;
+  status: "pending" | "approved" | "accepted" | "rejected";
+};
+
+export type Bounty = {
+  id: string;
+  seq: number; // monotonic display index
+  code: string; // "BNTY-<seq>"
+  source: BountySource;
+  installationId: number; // GitHub installation numeric id (for gh() comment posts)
+  repo: string; // "owner/name"
+  issueNumber: number;
+  issueUrl: string;
+  externalKey?: string | null; // Linear issue id, when source === "linear"
+  title: string;
+  description: string;
+  acceptance: string[];
+  sponsorUserId?: string | null; // the DevAsign user who triggered it (may be unset for a pure-comment sponsor)
+  sponsorAddress?: string | null; // Freighter G… = on-chain creator; set when funding lands
+  taskId: string; // EXACTLY 25 chars; the on-chain escrow key (deterministic from id)
+  contractId: string; // escrow contract id the escrow was created on
+  amountStroops: string; // i128 amount in USDC stroops (7 decimals), as a string
+  amountUsdc: number; // whole/decimal USDC, for display
+  deliveryDays: number; // delivery window length (starts at acceptance)
+  status: BountyStatus;
+  onchainStatus: OnchainStatus | null;
+  applications: BountyApplication[];
+  assigneeGithubId?: number | null;
+  assigneeGithubLogin?: string | null;
+  assigneeAddress?: string | null; // the accepted contributor's payout G…, snapshotted at acceptance
+  acceptedAt?: number | null;
+  deadlineAt?: number | null; // acceptedAt + deliveryDays; the keeper refunds past this
+  prNumber?: number | null; // the delivering PR
+  botCommentId?: number | null; // the DevAsign confirm/status comment on the issue (so we can edit it)
+  escrowTxHash?: string | null;
+  payoutTxHash?: string | null;
+  refundTxHash?: string | null;
+  cancelReason?: BountyCancelReason | null;
+  // Single-flight guard: set while an on-chain release/refund is in flight so the
+  // two payout triggers (PR-merge + in-app approve) and the deadline sweeper can't
+  // fire concurrently. Cleared once the tx confirms or fails.
+  pendingOp?: "releasing" | "refunding" | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type EscrowTxnKind = "escrow" | "payout" | "refund" | "dispute" | "resolve";
+export type EscrowTxnStatus = "pending" | "confirmed" | "failed";
+
+// One row per on-chain escrow operation. Doubles as the frontend transaction
+// ledger AND the idempotency + reconciliation ledger: `idempotencyKey` is
+// deterministic (e.g. "escrow:{taskId}", "release:{taskId}", "refund:{taskId}")
+// so a retried webhook/keeper tick reuses the same row instead of double-paying.
+export type EscrowTransaction = {
+  id: string;
+  bountyId?: string | null;
+  githubLogin?: string | null; // the counterparty (contributor) when relevant
+  kind: EscrowTxnKind;
+  idempotencyKey: string;
+  signer: "sponsor" | "admin"; // who authorized it (client Freighter vs. backend admin key)
+  sourceAccount?: string | null;
+  status: EscrowTxnStatus;
+  hash?: string | null;
+  ledger?: number | null;
+  amountStroops: string;
+  dir: "in" | "out"; // sponsor-centric: escrow/payout = out, refund = in
+  note?: string;
+  error?: string | null;
+  createdAt: number;
+  confirmedAt?: number | null;
+};
+
 export type DB = {
   users: User[];
   installations: Installation[];
@@ -415,4 +524,6 @@ export type DB = {
   repoIndex: RepoIndexEntry[];
   notifications: Notification[];
   linearProjectUpdates: LinearProjectUpdate[];
+  bounties: Bounty[];
+  escrowTransactions: EscrowTransaction[];
 };

@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Settings page (and its sub-sections)
 import React from "react";
+import { useParams, useNavigate } from "react-router-dom";
 import { Icon } from "./icons";
 import { api, installRedirectUrl, linearConnectUrl, type LinearTeamsView } from "./api";
 import { useAuth } from "./auth-context";
@@ -15,11 +16,12 @@ const SET_SECTIONS = [
 { key: "support", name: "Support" }];
 
 
-const SettingsPage = ({ initialSection }) => {
-  const [sec, setSec] = React.useState(initialSection || "account");
-  React.useEffect(() => {
-    if (initialSection) setSec(initialSection);
-  }, [initialSection]);
+const SettingsPage = () => {
+  // The active sub-section comes from the URL (/settings/:section), so tabs are
+  // linkable and back/forward moves between them. Unknown/missing → account.
+  const { section } = useParams();
+  const navigate = useNavigate();
+  const sec = SET_SECTIONS.some((s) => s.key === section) ? section : "account";
   return (
     <div className="page" style={{ maxWidth: "none" }}>
       <div className="page-head">
@@ -34,7 +36,7 @@ const SettingsPage = ({ initialSection }) => {
           {SET_SECTIONS.map((s) =>
           <div key={s.key}
           className={`set-nav-item ${sec === s.key ? "active" : ""}`}
-          onClick={() => setSec(s.key)}>{s.name}</div>
+          onClick={() => navigate("/settings/" + s.key)}>{s.name}</div>
           )}
         </div>
 

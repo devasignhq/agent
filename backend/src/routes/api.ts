@@ -8,7 +8,7 @@ import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueue
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
-import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStripeConfigured } from "../config.js";
+import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStellarConfigured, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
@@ -112,6 +112,10 @@ api.get("/health", (_req, res) => {
     // connected but INTEGRATION_ENCRYPTION_KEY is unset, so tokens are written in
     // PLAINTEXT. Prod must read "ok" (set the key, then redeploy — see config.ts).
     encryption: write.encryption,
+    // Soroban escrow (bounties). "live" once the contract/USDC-SAC ids + admin
+    // seed are set; "unconfigured" means the bounty routes 503 and the keeper
+    // no-ops. Non-bounty features are unaffected either way.
+    stellar: isStellarConfigured() ? "live" : "unconfigured",
     // Write-through health. `writeThrough: "degraded"` (or quarantinedRows > 0,
     // or a growing pendingWrites) means writes aren't reaching Postgres and the
     // in-memory snapshot is drifting ahead of it — the next restart will lose

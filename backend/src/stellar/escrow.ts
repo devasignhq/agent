@@ -1,0 +1,108 @@
+// Typed wrappers over the escrow contract — one function per method, in terms of
+// plain JS args. Method names here MUST match the deployed contract:
+//   create_escrow(creator, task_id, issue_url, bounty_amount)   [creator-signed]
+//   release(task_id, contributor)                                [creator-signed]  ← sponsor in-app approve
+//   admin_release(task_id, contributor)                          [admin-signed]    ← backend on PR merge
+//   admin_refund(task_id)                                        [admin-signed]    ← backend on delete/expiry
+//   reads: get_escrow(task_id), get_usdc_balance(address)
+// (release/admin_release/admin_refund are the additions this feature requires in
+// devasignhq/soroban-contract — see the plan's "Contract changes" section.)
+import { config } from "../config.js";
+import { adminAddress, adminKeypair } from "./client.js";
+import { buildEscrowInvoke, simulateEscrowRead } from "./build.js";
+import { sendSignedTx, type SendResult } from "./submit.js";
+import { addressScVal, i128ScVal, stringScVal, taskIdScVal } from "./scval.js";
+
+// ── Client-signed builds (return unsigned prepared XDR for Freighter) ─────────
+
+/** Prepared `create_escrow` XDR for the sponsor to sign with Freighter (funding). */
+export async function buildCreateEscrowXdr(
+  sponsorAddress: string,
+  taskId: string,
+  issueUrl: string,
+  amountStroops: bigint
+): Promise<string> {
+  const tx = await buildEscrowInvoke(sponsorAddress, "create_escrow", [
+    addressScVal(sponsorAddress),
+    taskIdScVal(taskId),
+    stringScVal(issueUrl),
+    i128ScVal(amountStroops),
+  ]);
+  return tx.toXDR();
+}
+
+/** Prepared `release` XDR for the sponsor to sign with Freighter (in-app "Approve payment"). */
+export async function buildReleaseXdr(
+  sponsorAddress: string,
+  taskId: string,
+  contributorAddress: string
+): Promise<string> {
+  const tx = await buildEscrowInvoke(sponsorAddress, "release", [
+    taskIdScVal(taskId),
+    addressScVal(contributorAddress),
+  ]);
+  return tx.toXDR();
+}
+
+// ── Admin-signed operations (signed server-side, broadcast immediately) ───────
+
+/** Backend releases the escrow to the contributor on PR merge (admin arbiter). */
+export async function adminRelease(taskId: string, contributorAddress: string): Promise<SendResult> {
+  const tx = await buildEscrowInvoke(adminAddress(), "admin_release", [
+    taskIdScVal(taskId),
+    addressScVal(contributorAddress),
+  ]);
+  tx.sign(adminKeypair());
+  return sendSignedTx(tx);
+}
+
+/** Backend refunds the escrow to the sponsor on delete/expiry (admin arbiter, funds → creator only). */
+export async function adminRefund(taskId: string): Promise<SendResult> {
+  const tx = await buildEscrowInvoke(adminAddress(), "admin_refund", [taskIdScVal(taskId)]);
+  tx.sign(adminKeypair());
+  return sendSignedTx(tx);
+}
+
+// ── Reads (simulation-only; admin address is a throwaway source) ──────────────
+
+/** The on-chain escrow record for a task, or null if it doesn't exist. */
+export async function getEscrow(taskId: string): Promise<unknown> {
+  try {
+    return await simulateEscrowRead(adminAddress(), "get_escrow", [taskIdScVal(taskId)]);
+  } catch {
+    return null;
+  }
+}
+
+/** USDC balance (in stroops) of an address, per the contract's view. */
+export async function getUsdcBalance(address: string): Promise<bigint> {
+  const v = await simulateEscrowRead(adminAddress(), "get_usdc_balance", [addressScVal(address)]);
+  return typeof v === "bigint" ? v : BigInt((v as number | string) ?? 0);
+}
+
+/**
+ * Best-effort check that `address` can RECEIVE USDC (a payout to a classic
+ * account with no USDC trustline would trap). Only meaningful when the classic
+ * issuer is configured; otherwise (pure Soroban token, or unconfigured) there is
+ * no trustline model, so we return true. Network errors also return true — we
+ * don't block a payout on a Horizon blip; the on-chain tx is the final backstop.
+ */
+export async function hasUsdcTrustline(address: string): Promise<boolean> {
+  const issuer = config.stellar.usdcIssuer;
+  if (!issuer) return true; // no classic trustline model configured
+  try {
+    const res = await fetch(`${config.stellar.horizonUrl.replace(/\/+$/, "")}/accounts/${address}`, {
+      headers: { Accept: "application/json" },
+    });
+    if (res.status === 404) return false; // account doesn't exist → can't receive
+    if (!res.ok) return true; // transient Horizon issue → don't block
+    const body = (await res.json()) as {
+      balances?: Array<{ asset_code?: string; asset_issuer?: string }>;
+    };
+    return (body.balances || []).some(
+      (b) => b.asset_code === config.stellar.usdcCode && b.asset_issuer === issuer
+    );
+  } catch {
+    return true; // network error → don't block; the tx is the backstop
+  }
+}

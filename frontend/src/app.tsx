@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Main App shell + sidebar + routing
 import React from "react";
+import { useLocation, useNavigate, Routes, Route, Navigate } from "react-router-dom";
 import { StatsigProvider, useClientAsyncInit } from "@statsig/react-bindings";
 import { StatsigAutoCapturePlugin } from "@statsig/web-analytics";
 import { StatsigSessionReplayPlugin } from "@statsig/session-replay";
@@ -9,6 +10,7 @@ import { useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio, TweakSele
 import { Auth, Onboarding } from "./screens-onboarding";
 import { AgentPage } from "./screen-agent";
 import { WorkflowPage } from "./screen-workflow";
+import { BountiesPage } from "./screen-bounties";
 import { SettingsPage } from "./screens-rest";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
@@ -32,6 +34,7 @@ export { useIsMobile };
 const NAV = [
   { key: "agent",     name: "Agents",    icon: "agent",     kbd: "g a" },
   { key: "workflow",  name: "Workflow",  icon: "workflow",  kbd: "g w" },
+  { key: "bounty",    name: "Bounty",    icon: "bounties",  kbd: "g b" },
   { key: "settings",  name: "Settings",  icon: "settings",  kbd: "g s" },
 ];
 
@@ -327,7 +330,7 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
 
 const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowRepo }) => {
   const labels = {
-    agent: "Agents", workflow: "Workflow", settings: "Settings"
+    agent: "Agents", workflow: "Workflow", bounty: "Bounty", settings: "Settings"
   };
   // On the Workflow page the selected repo becomes the final crumb:
   // user / Workflow / repo-name.
@@ -447,9 +450,16 @@ const AppContent = () => {
   // re-enter onboarding from settings if they want to add another install.
   const [forceStage, setForceStage] = React.useState<null | "onboarding" | "app">(null);
   const [hasInstall, setHasInstall] = React.useState<null | boolean>(null);
-  const [current, setCurrent] = React.useState("agent");
-  // Lets a deep-link (e.g. returning from Stripe) open a specific Settings tab.
-  const [settingsSection, setSettingsSection] = React.useState<string | undefined>(undefined);
+  // The visible page is derived from the URL rather than held in state. `current`
+  // is the first path segment (agent|workflow|bounty|settings, default agent);
+  // `setCurrent` is a shim that navigates, so every existing setCurrent(key) call
+  // site (sidebar, mobile tabs, popovers, keyboard chords) keeps working unchanged.
+  const location = useLocation();
+  const navigate = useNavigate();
+  const PAGE_KEYS = ["agent", "workflow", "bounty", "settings"];
+  const seg = location.pathname.split("/")[1];
+  const current = PAGE_KEYS.includes(seg) ? seg : "agent";
+  const setCurrent = React.useCallback((key) => navigate("/" + key), [navigate]);
   // The Workflow screen's selected repo name, surfaced for the header breadcrumb
   // (WorkflowPage reports it via onRepoChange).
   const [workflowRepo, setWorkflowRepo] = React.useState<string | null>(null);
@@ -506,8 +516,7 @@ const AppContent = () => {
       url.searchParams.delete("linear");
       window.history.replaceState({}, "", url.pathname + url.search);
     } else if (linear === "error") {
-      setCurrent("settings");
-      setSettingsSection("integrations");
+      navigate("/settings/integrations", { replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -521,8 +530,7 @@ const AppContent = () => {
     url.searchParams.delete("billing");
     window.history.replaceState({}, "", url.pathname + url.search);
     auth.reload();
-    setCurrent("settings");
-    setSettingsSection("billing");
+    navigate("/settings/billing", { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -646,7 +654,7 @@ const AppContent = () => {
       const now = Date.now();
       if (e.key === "g") { lastKey = "g"; last = now; return; }
       if (lastKey === "g" && now - last < 800) {
-        const map = { a: "agent", w: "workflow", s: "settings" };
+        const map = { a: "agent", w: "workflow", b: "bounty", s: "settings" };
         if (map[e.key]) { setCurrent(map[e.key]); e.preventDefault(); }
         lastKey = "";
       }
@@ -729,9 +737,17 @@ const AppContent = () => {
           workflowRepo={workflowRepo}
         />
         <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
-          {current === "agent" && <AgentPage logStyle={t.logStyle} isMobile={isMobile} />}
-          {current === "workflow" && <WorkflowPage onRepoChange={setWorkflowRepo} />}
-          {current === "settings" && <SettingsPage initialSection={settingsSection} />}
+          <Routes>
+            <Route path="/agent"    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
+            <Route path="/workflow" element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
+            <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
+            <Route path="/bounties/:id/fund" element={<BountiesPage isMobile={isMobile} isFunding />} />
+            <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
+            <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
+            <Route path="/settings/:section" element={<SettingsPage />} />
+            <Route path="/" element={<Navigate to="/agent" replace />} />
+            <Route path="*" element={<Navigate to="/agent" replace />} />
+          </Routes>
         </div>
       </div>
       {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} />}

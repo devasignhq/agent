@@ -292,7 +292,75 @@ export type Health = {
   llm: "live" | "mock";
   githubApp: "configured" | "missing";
   githubAppName: string;
+  stellar?: "live" | "unconfigured";
 };
+
+// --- Bounties (mirror backend/src/types.ts) ---
+
+export type BountyStatus =
+  | "PENDING_FUNDING"
+  | "OPEN"
+  | "DELEGATED"
+  | "IN_REVIEW"
+  | "PAID"
+  | "CANCELLED"
+  | "DISPUTED";
+
+export type BountyApplication = {
+  githubId: number;
+  githubLogin: string;
+  note?: string;
+  appliedAt: number;
+  status: "pending" | "approved" | "accepted" | "rejected";
+};
+
+export type Bounty = {
+  id: string;
+  seq: number;
+  code: string;
+  source: "github" | "linear";
+  repo: string;
+  issueNumber: number;
+  issueUrl: string;
+  title: string;
+  description: string;
+  acceptance: string[];
+  sponsorAddress?: string | null;
+  taskId: string;
+  amountUsdc: number;
+  amountStroops: string;
+  deliveryDays: number;
+  status: BountyStatus;
+  onchainStatus: "Open" | "Completed" | "Cancelled" | "Disputed" | null;
+  applications: BountyApplication[];
+  assigneeGithubLogin?: string | null;
+  assigneeAddress?: string | null;
+  acceptedAt?: number | null;
+  deadlineAt?: number | null;
+  prNumber?: number | null;
+  escrowTxHash?: string | null;
+  payoutTxHash?: string | null;
+  refundTxHash?: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type EscrowTransaction = {
+  id: string;
+  bountyId?: string | null;
+  githubLogin?: string | null;
+  kind: "escrow" | "payout" | "refund" | "dispute" | "resolve";
+  signer: "sponsor" | "admin";
+  status: "pending" | "confirmed" | "failed";
+  hash?: string | null;
+  amountStroops: string;
+  dir: "in" | "out";
+  note?: string;
+  createdAt: number;
+  confirmedAt?: number | null;
+};
+
+export type BountySummary = { total: number; active: number; inEscrow: number; paidOut: number };
 
 // --- Endpoints ---
 
@@ -437,5 +505,77 @@ export const api = {
     request<{ ok: true; marked: number }>("/api/notifications/read", {
       method: "POST",
       body: "{}",
+    }),
+
+  // bounties. Funding + in-app "Approve payment" are two-step: fetch an UNSIGNED
+  // transaction (xdr), sign it with the sponsor's Freighter wallet client-side,
+  // then post the signed envelope back to the matching *-submit endpoint.
+  bounties: () => request<{ bounties: Bounty[]; summary: BountySummary }>("/api/bounties"),
+  bounty: (id: string) => request<{ bounty: Bounty }>(`/api/bounties/${id}`),
+  bountyTransactions: () =>
+    request<{ transactions: EscrowTransaction[] }>("/api/bounties/transactions"),
+  createBounty: (input: {
+    repo: string;
+    issueNumber: number;
+    issueUrl: string;
+    title: string;
+    amountUsdc: number;
+    deliveryDays: number;
+    description?: string;
+    acceptance?: string[];
+  }) =>
+    request<{ bounty: Bounty; fundingUrl: string }>("/api/bounties", {
+      method: "POST",
+      body: JSON.stringify(input),
+    }),
+  // Funding (token from the Fund link). Returns the unsigned create_escrow xdr.
+  bountyFundingTx: (id: string, token: string, address: string) =>
+    request<{ xdr: string }>(
+      `/api/bounties/${id}/funding-tx?token=${encodeURIComponent(token)}&address=${encodeURIComponent(address)}`
+    ),
+  submitBountyFunding: (id: string, token: string, signedXdr: string) =>
+    request<{ ok: true; hash?: string; status: string }>(`/api/bounties/${id}/funding-submit`, {
+      method: "POST",
+      body: JSON.stringify({ token, signedXdr }),
+    }),
+  cancelBounty: (id: string, token: string) =>
+    request<{ ok: true }>(`/api/bounties/${id}/cancel`, {
+      method: "POST",
+      body: JSON.stringify({ token }),
+    }),
+  // Applications + delegation.
+  applyToBounty: (id: string, note?: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/apply`, {
+      method: "POST",
+      body: JSON.stringify({ note }),
+    }),
+  approveApplication: (id: string, githubId: number) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/applications/${githubId}/approve`, {
+      method: "POST",
+      body: "{}",
+    }),
+  rejectApplication: (id: string, githubId: number) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/applications/${githubId}/reject`, {
+      method: "POST",
+      body: "{}",
+    }),
+  acceptBounty: (id: string, address: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/accept`, {
+      method: "POST",
+      body: JSON.stringify({ address }),
+    }),
+  // In-app "Approve payment" (sponsor Freighter-signs the release).
+  bountyApproveTx: (id: string) =>
+    request<{ xdr: string }>(`/api/bounties/${id}/approve-tx`, { method: "POST", body: "{}" }),
+  submitBountyApprove: (id: string, signedXdr: string) =>
+    request<{ ok: true; hash?: string; status: string }>(`/api/bounties/${id}/approve-submit`, {
+      method: "POST",
+      body: JSON.stringify({ signedXdr }),
+    }),
+  deleteBounty: (id: string) => request<{ ok: true }>(`/api/bounties/${id}`, { method: "DELETE" }),
+  setPayoutAddress: (address: string) =>
+    request<{ ok: true; address: string }>("/api/me/payout-address", {
+      method: "POST",
+      body: JSON.stringify({ address }),
     }),
 };

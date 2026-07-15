@@ -13,6 +13,7 @@ import type { Request, Response } from "express";
 import { config } from "../config.js";
 import { db } from "../db.js";
 import { enqueueLinearIngest } from "../queue.js";
+import { maybeHandleBountyLinearComment } from "../bounties/webhooks.js";
 
 // Reject deliveries whose timestamp is more than a minute from now (replay guard).
 const MAX_SKEW_MS = 60 * 1000;
@@ -80,6 +81,11 @@ export function handleLinearWebhook(req: Request, res: Response) {
   if (type === "Issue" && (action === "create" || action === "update")) {
     issueId = event?.data?.id || "";
   } else if (type === "Comment" && action === "create") {
+    // A `bounty $X $Nd` comment creates a bounty (and posts the Fund/Cancel
+    // confirm back to Linear) instead of re-ingesting criteria.
+    if (maybeHandleBountyLinearComment(event, integration)) {
+      return void res.json({ ok: true, bounty: true });
+    }
     issueId = event?.data?.issueId || event?.data?.issue?.id || "";
   } else if (type === "IssueAttachment" && (action === "create" || action === "update")) {
     issueId = event?.data?.issueId || event?.data?.issue?.id || "";
