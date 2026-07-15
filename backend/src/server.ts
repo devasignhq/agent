@@ -21,8 +21,10 @@ import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
 import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
+import { bounties } from "./routes/bounties.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
+import { startBountyKeeper } from "./bounties/keeper.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
@@ -164,6 +166,7 @@ app.get("/api/auth/linear/callback", authLimiter, finishLinearOAuth);
 
 // API
 app.use("/api", api);
+app.use("/api", bounties);
 
 // Convenience: where the GitHub-app-install button on onboarding sends users.
 app.get("/api/install/redirect", (_req, res) => {
@@ -228,6 +231,7 @@ const server = app.listen(port, () => {
 });
 
 startWorker();
+startBountyKeeper();
 backfillRepoIndex();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside

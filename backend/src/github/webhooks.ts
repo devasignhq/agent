@@ -23,6 +23,11 @@ import {
 } from "../review/eligibility.js";
 import { purgeAccount } from "../account.js";
 import { track } from "../statsig.js";
+import {
+  handleBountyPRMerge,
+  handleBountyPROpened,
+  maybeHandleBountyComment,
+} from "../bounties/webhooks.js";
 
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   // No secret ⇒ skip verification. The boot guard in server.ts refuses to start
@@ -159,6 +164,9 @@ function handleIssueComment(event: any) {
     console.log(`[webhook] issue_comment: ignored, action=${event.action}`);
     return;
   }
+  // Bounty command ("bounty $100 2 days") lives on an ISSUE, so it's handled
+  // here — BEFORE the PR-comment gate below, which would otherwise drop it.
+  if (maybeHandleBountyComment(event)) return;
   if (!event.issue?.pull_request) {
     console.log("[webhook] issue_comment: ignored, not a PR comment");
     return;
@@ -787,6 +795,9 @@ function handlePullRequest(event: any) {
   if (event.action === "closed") {
     const pullReq = event.pull_request;
     if (!pullReq?.merged) return;
+    // Bounty payout: if this merged PR delivers a delegated bounty, release the
+    // escrow to the contributor (admin-signed). Independent of the re-index below.
+    handleBountyPRMerge(event);
     const repo = db.find("repositories", (r) => r.owner === owner && r.name === name);
     if (!repo) return;
     if (pullReq.base?.ref !== repo.defaultBranch) return;
@@ -836,6 +847,10 @@ function handlePullRequest(event: any) {
     })();
     return;
   }
+
+  // Bounty: an opened/ready/synchronized PR that references a delegated bounty's
+  // issue moves it to in-review (best-effort; no-op when it references none).
+  handleBountyPROpened(event);
 
   // Make sure we have a repo row; the user may not have customised settings yet.
   let repo = db.find(
