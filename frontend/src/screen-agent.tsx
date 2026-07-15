@@ -997,7 +997,9 @@ const safeUrl = (raw) => {
   // If the input already declares a scheme, it must be http(s) — never silently
   // rewrite mailto:/javascript:/data: into an https link. A schemeless string
   // (e.g. "example.com") is retried as https:// so the common case still works.
-  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(s);
+  // The negative lookahead ensures that port numbers (e.g. localhost:3000) are
+  // not mistaken for custom schemes.
+  const hasScheme = /^[a-z][a-z0-9+.-]*:(?!\d+(?:[/?#]|$))/i.test(s);
   const candidates = hasScheme ? [s] : [s, `https://${s}`];
   for (const candidate of candidates) {
     try {
@@ -1010,10 +1012,15 @@ const safeUrl = (raw) => {
   return "";
 };
 
-// Any link that survives sanitization and opens in a new tab gets a hardened
-// rel to close the reverse-tabnabbing hole (window.opener access).
+// Clean up any existing hook to prevent accumulation during HMR (Hot Module Replacement)
+DOMPurify.removeHook("afterSanitizeAttributes");
+
+// Any link that survives sanitization gets forced to open in a new tab safely,
+// closing the reverse-tabnabbing hole (window.opener access). This also ensures
+// links created via createLink (which lack target="_blank") are hardened.
 DOMPurify.addHook("afterSanitizeAttributes", (node) => {
-  if (node.tagName === "A" && node.hasAttribute("target")) {
+  if (node.tagName === "A") {
+    node.setAttribute("target", "_blank");
     node.setAttribute("rel", "noopener noreferrer");
   }
 });
