@@ -1616,15 +1616,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 /* "NEW BOUNTY" eyebrow above the create-bounty modal title */
 .cb-eyebrow { font-family: var(--mono); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
 
-/* ─── Top-up modal ─────────────────────────────────────────────────────────── */
-.tu-body { display: flex; gap: 20px; padding: 20px 24px 10px; align-items: stretch; }
-.tu-qr { flex-shrink: 0; width: 164px; height: 164px; background: #fff; padding: 11px; display: grid; place-items: center; }
-.tu-qr svg { width: 100%; height: 100%; display: block; }
-.tu-side { flex: 1; min-width: 0; display: flex; flex-direction: column; justify-content: center; gap: 14px; }
-.tu-address { display: flex; align-items: center; gap: 8px; padding: 9px 10px; border: 1px solid var(--line); background: var(--bg); }
-.tu-address .mono { flex: 1; min-width: 0; font-size: 11px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.tu-address .cb-copy { flex-shrink: 0; }
-.tu-chain { display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+/* Shared danger-notice callout — reused by the Fund / Cancel bounty modals. */
 .tu-notice {
   display: flex; gap: 10px; align-items: flex-start;
   margin: 6px 24px 16px; padding: 11px 13px;
@@ -1636,30 +1628,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .tu-notice svg { color: var(--warn); flex-shrink: 0; margin-top: 1px; }
 .tu-notice b { color: var(--fg); }
 
-/* ─── Withdraw modal ───────────────────────────────────────────────────────── */
-.wd-steps { display: flex; align-items: center; gap: 12px; padding: 14px 24px; border-bottom: 1px solid var(--line); }
-.wd-step { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 12px; color: var(--fg-mute); }
-.wd-step.active { color: var(--fg); }
-.wd-step-n {
-  width: 20px; height: 20px; display: grid; place-items: center;
-  border: 1px solid var(--line-2); font-size: 10px; color: var(--fg-mute);
-}
-.wd-step.active .wd-step-n { border-color: var(--accent); color: var(--accent); }
-.wd-step.done .wd-step-n { background: var(--accent); border-color: var(--accent); color: #052413; }
-.wd-step-bar { flex: 1; height: 1px; background: var(--line); }
-.wd-body { padding: 18px 24px 8px; display: flex; flex-direction: column; gap: 14px; min-height: 150px; }
-.wd-field { display: flex; flex-direction: column; }
-/* Match the input height to the top-up modal's read-only wallet field (46px). */
-.wd-body .input { height: 46px; }
-.wd-hint { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 6px; }
-.wd-hint a { color: var(--accent); cursor: pointer; text-decoration: none; }
-.wd-hint a:hover { text-decoration: underline; }
-.wd-code { font-family: var(--mono); font-size: 20px; letter-spacing: 0.4em; text-align: center; }
-.wd-verify { text-align: center; padding: 6px 0 2px; display: flex; flex-direction: column; align-items: center; gap: 8px; }
-.wd-verify-icon { width: 44px; height: 44px; display: grid; place-items: center; border: 1px solid var(--line-2); background: var(--bg-2); color: var(--accent); }
-.wd-verify-title { font-family: var(--sans); font-size: 15px; color: var(--fg); }
-.wd-verify-sub { font-size: 12px; color: var(--fg-mute); line-height: 1.55; max-width: 380px; }
-.wd-verify-sub b { color: var(--fg); }
+/* Shared success panel — reused by the Fund / Cancel bounty modals. */
 .wd-success { text-align: center; padding: 22px 0 14px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
 .wd-success-icon { width: 52px; height: 52px; display: grid; place-items: center; background: rgba(61, 220, 151, 0.12); color: var(--green); border: 1px solid rgba(61, 220, 151, 0.4); }
 .wd-success-title { font-family: var(--sans); font-size: 17px; color: var(--fg); }

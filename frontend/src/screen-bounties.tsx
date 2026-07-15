@@ -78,17 +78,6 @@ const fmtDay = (ts?: number | null) =>
 const fmtDate = (ts?: number | null) =>
   ts ? new Date(ts).toISOString().slice(0, 10) : "—";
 
-// Live-format a currency input: thousands separators on the integer part, at
-// most two decimals, tolerant of partially-typed values ("2000." → "2,000.").
-function formatAmountInput(raw: string): string {
-  let cleaned = raw.replace(/[^\d.]/g, "");
-  const dot = cleaned.indexOf(".");
-  if (dot !== -1) cleaned = cleaned.slice(0, dot + 1) + cleaned.slice(dot + 1).replace(/\./g, "");
-  const [intPart, decPart] = cleaned.split(".");
-  const intFmt = intPart ? Number(intPart).toLocaleString("en-US") : "";
-  return cleaned.includes(".") ? `${intFmt}.${(decPart || "").slice(0, 2)}` : intFmt;
-}
-
 // ─── Page ───────────────────────────────────────────────────────────────────
 export const BountiesPage = ({
   isMobile,
@@ -116,8 +105,6 @@ export const BountiesPage = ({
   const [balanceHidden, setBalanceHidden] = React.useState(false);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [creating, setCreating] = React.useState(false);
-  const [toppingUp, setToppingUp] = React.useState(false);
-  const [withdrawing, setWithdrawing] = React.useState(false);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -185,8 +172,6 @@ export const BountiesPage = ({
               <Icon name={balanceHidden ? "eye-off" : "eye"} size={13} />
             </button>
           </div>
-          <button className="btn" onClick={() => setToppingUp(true)}><Icon name="download" size={13} /> Top up</button>
-          <button className="btn" onClick={() => setWithdrawing(true)}><Icon name="swap" size={13} /> Withdraw</button>
           <button className="btn primary" onClick={() => setCreating(true)}><Icon name="plus" size={13} /> Create bounty</button>
         </div>
       </div>
@@ -308,8 +293,6 @@ export const BountiesPage = ({
 
       {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} onChanged={applyBounty} />}
       {creating && <CreateBountyModal onClose={() => setCreating(false)} />}
-      {toppingUp && <TopUpModal onClose={() => setToppingUp(false)} />}
-      {withdrawing && <WithdrawModal onClose={() => setWithdrawing(false)} />}
       {isFunding && (
         <FundBountyModal id={params.id} token={search.get("token")} onClose={() => navigate("/bounty")} />
       )}
@@ -984,195 +967,6 @@ const CreateBountyModal = ({ onClose }: { onClose: () => void }) => {
         <div className="cb-modal-foot">
           <button className="btn ghost" onClick={onClose}>Close</button>
           <button className="btn primary"><Icon name="external" size={13} /> Open {isGithub ? "GitHub" : "Linear"}</button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ─── Top-up modal ───────────────────────────────────────────────────────────
-const STELLAR_WALLET = "GDEVASIGN7XQK2M4RJ5H8ZP3WYVN6TQBC9FLA0DUS1E2R3T4Y5U6I7O";
-const AVAILABLE = "3,390.00";
-
-// Deterministic decorative QR — three finder patterns + a stable module field
-// derived from the address. A visual placeholder for the mock wallet (not a
-// scannable code; wire a QR library when real deposit addresses land).
-const QrCode = ({ text, n = 27 }: { text: string; n?: number }) => {
-  let s = 2166136261 >>> 0;
-  for (let i = 0; i < text.length; i++) { s ^= text.charCodeAt(i); s = Math.imul(s, 16777619) >>> 0; }
-  const rand = () => { s = (Math.imul(s, 1664525) + 1013904223) >>> 0; return s / 4294967296; };
-  const zones = [[0, 0], [0, n - 7], [n - 7, 0]];
-  const finderModule = (r: number, c: number): boolean | null => {
-    for (const [zr, zc] of zones) {
-      if (r >= zr && r < zr + 7 && c >= zc && c < zc + 7) {
-        const rr = r - zr, cc = c - zc;
-        return rr === 0 || rr === 6 || cc === 0 || cc === 6 || (rr >= 2 && rr <= 4 && cc >= 2 && cc <= 4);
-      }
-    }
-    return null;
-  };
-  const nearFinder = (r: number, c: number) => zones.some(([zr, zc]) => r >= zr - 1 && r < zr + 8 && c >= zc - 1 && c < zc + 8);
-  const rects: React.ReactNode[] = [];
-  for (let r = 0; r < n; r++) for (let c = 0; c < n; c++) {
-    const fm = finderModule(r, c);
-    const on = fm !== null ? fm : nearFinder(r, c) ? false : rand() > 0.52;
-    if (on) rects.push(<rect key={`${r}-${c}`} x={c} y={r} width={1} height={1} />);
-  }
-  return (
-    <svg viewBox={`-1 -1 ${n + 2} ${n + 2}`} shapeRendering="crispEdges" fill="#0a0b0d">{rects}</svg>
-  );
-};
-
-const TopUpModal = ({ onClose }: { onClose: () => void }) => {
-  const [copied, setCopied] = React.useState(false);
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const copy = () => {
-    try { navigator.clipboard?.writeText(STELLAR_WALLET); } catch { /* clipboard unavailable */ }
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
-  };
-
-  return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
-
-        <div className="cb-modal-head">
-          <div className="cb-eyebrow">Top up</div>
-          <h2 className="cb-modal-title">Add funds to your wallet</h2>
-          <div className="cb-modal-sub">
-            Scan the code or copy the address to deposit USDC into your DevAsign escrow wallet. Funds appear in your balance once Stellar confirms the transfer.
-          </div>
-        </div>
-
-        <div className="tu-body">
-          <div className="tu-qr"><QrCode text={STELLAR_WALLET} /></div>
-          <div className="tu-side">
-            <div>
-              <label className="label">Stellar wallet address</label>
-              <div className="tu-address">
-                <span className="mono">{STELLAR_WALLET}</span>
-                <button className="cb-copy" onClick={copy} aria-label="Copy address"><Icon name={copied ? "check" : "copy"} size={13} /></button>
-              </div>
-            </div>
-            <div className="tu-chain"><span className="chain-pip" style={{ background: "var(--purple)" }} /> Stellar network · USDC</div>
-          </div>
-        </div>
-
-        <div className="tu-notice">
-          <Icon name="warn" size={15} />
-          <span>Only send <b>USDC</b> on the <b>Stellar</b> network to this address. Sending any other asset, or using a different chain, will result in permanent loss of funds.</span>
-        </div>
-
-        <div className="cb-modal-foot">
-          <button className="btn ghost" onClick={onClose}>Close</button>
-          <button className="btn primary" onClick={copy}><Icon name={copied ? "check" : "copy"} size={13} /> {copied ? "Copied" : "Copy address"}</button>
-        </div>
-      </div>
-    </div>
-  );
-};
-
-// ─── Withdraw modal (2 steps: details → email verification) ──────────────────
-const WithdrawModal = ({ onClose }: { onClose: () => void }) => {
-  const [step, setStep] = React.useState<1 | 2 | 3>(1);
-  const [amount, setAmount] = React.useState("");
-  const [wallet, setWallet] = React.useState("");
-  const [memo, setMemo] = React.useState("");
-  const [code, setCode] = React.useState("");
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
-
-        <div className="cb-modal-head">
-          <div className="cb-eyebrow">Withdraw</div>
-          <h2 className="cb-modal-title">Withdraw USDC</h2>
-          <div className="cb-modal-sub">Send USDC from your DevAsign balance to an external Stellar wallet.</div>
-        </div>
-
-        <div className="wd-steps">
-          <div className={`wd-step ${step >= 1 ? "active" : ""} ${step > 1 ? "done" : ""}`}>
-            <span className="wd-step-n">{step > 1 ? <Icon name="check" size={11} /> : "1"}</span> Details
-          </div>
-          <div className="wd-step-bar" />
-          <div className={`wd-step ${step >= 2 ? "active" : ""} ${step > 2 ? "done" : ""}`}>
-            <span className="wd-step-n">{step > 2 ? <Icon name="check" size={11} /> : "2"}</span> Verify
-          </div>
-        </div>
-
-        <div className="wd-body">
-          {step === 1 && (
-            <>
-              <div className="wd-field">
-                <label className="label">Amount (USDC)</label>
-                <input className="input" value={amount} onChange={(e) => setAmount(formatAmountInput(e.target.value))} placeholder="0.00" inputMode="decimal" />
-                <div className="wd-hint">Available: {AVAILABLE} USDC</div>
-              </div>
-              <div className="wd-field">
-                <label className="label">Destination wallet</label>
-                <input className="input" value={wallet} onChange={(e) => setWallet(e.target.value)} placeholder="G… Stellar address" style={{ fontFamily: "var(--mono)" }} />
-              </div>
-              <div className="wd-field">
-                <label className="label">Memo (optional)</label>
-                <input className="input" value={memo} onChange={(e) => setMemo(e.target.value)} placeholder="e.g. exchange deposit id" style={{ fontFamily: "var(--mono)" }} />
-              </div>
-            </>
-          )}
-
-          {step === 2 && (
-            <>
-              <div className="wd-verify">
-                <div className="wd-verify-icon"><Icon name="bell" size={20} /></div>
-                <div className="wd-verify-title">Check your email</div>
-                <div className="wd-verify-sub">We sent a 6-digit verification code to <b>bethel@devasign.org</b>. Enter it below to confirm this withdrawal.</div>
-              </div>
-              <div className="wd-field">
-                <label className="label">Verification code</label>
-                <input className="input wd-code" value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, "").slice(0, 6))} placeholder="••••••" inputMode="numeric" />
-                <div className="wd-hint">Didn't get it? <a onClick={(e) => e.preventDefault()}>Resend code</a></div>
-              </div>
-            </>
-          )}
-
-          {step === 3 && (
-            <div className="wd-success">
-              <div className="wd-success-icon"><Icon name="check" size={22} /></div>
-              <div className="wd-success-title">Withdrawal submitted</div>
-              <div className="wd-success-sub">
-                {amount ? `${amount} USDC` : "Your USDC"} is on its way to {wallet ? <span className="mono">{wallet.slice(0, 10)}…</span> : "your wallet"}. It typically settles on Stellar within a minute.
-              </div>
-            </div>
-          )}
-        </div>
-
-        <div className="cb-modal-foot">
-          {step === 1 && (
-            <>
-              <button className="btn ghost" onClick={onClose}>Cancel</button>
-              <button className="btn primary" disabled={!wallet.trim()} onClick={() => setStep(2)}>Continue <Icon name="chevron-r" size={12} /></button>
-            </>
-          )}
-          {step === 2 && (
-            <>
-              <button className="btn ghost" onClick={() => setStep(1)}>Back</button>
-              <button className="btn primary" disabled={code.length < 6} onClick={() => setStep(3)}><Icon name="check" size={13} /> Withdraw</button>
-            </>
-          )}
-          {step === 3 && <button className="btn primary" onClick={onClose}>Done</button>}
         </div>
       </div>
     </div>
