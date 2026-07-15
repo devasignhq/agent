@@ -1012,8 +1012,9 @@ const safeUrl = (raw) => {
   return "";
 };
 
-// Clean up any existing hook to prevent accumulation during HMR (Hot Module Replacement)
-DOMPurify.removeHook("afterSanitizeAttributes");
+// Clear any existing hooks to prevent accumulation during HMR (Hot Module
+// Replacement); removeHooks (plural) empties the entry point regardless of count.
+DOMPurify.removeHooks("afterSanitizeAttributes");
 
 // Any link that survives sanitization gets forced to open in a new tab safely,
 // closing the reverse-tabnabbing hole (window.opener access). This also ensures
