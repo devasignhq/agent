@@ -1,6 +1,7 @@
 // @ts-nocheck
 // Agent page — parallel PR reviews, switcher, log + terminal, goal drawer
 import React from "react";
+import DOMPurify from "dompurify";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
@@ -987,6 +988,49 @@ const escapeHtml = (s) =>
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;");
 
+// Accept a raw user-supplied string only if it is a well-formed http(s) URL.
+// Returns the normalized URL, or "" for anything else — javascript:, data:,
+// vbscript:, mailto:, relative/garbage input all get rejected.
+const safeUrl = (raw) => {
+  const s = String(raw ?? "").trim();
+  if (!s) return "";
+  // If the input already declares a scheme, it must be http(s) — never silently
+  // rewrite mailto:/javascript:/data: into an https link. A schemeless string
+  // (e.g. "example.com") is retried as https:// so the common case still works.
+  const hasScheme = /^[a-z][a-z0-9+.-]*:/i.test(s);
+  const candidates = hasScheme ? [s] : [s, `https://${s}`];
+  for (const candidate of candidates) {
+    try {
+      const u = new URL(candidate);
+      if (u.protocol === "http:" || u.protocol === "https:") return u.href;
+    } catch {
+      /* not a valid URL for this candidate — try the next */
+    }
+  }
+  return "";
+};
+
+// Any link that survives sanitization and opens in a new tab gets a hardened
+// rel to close the reverse-tabnabbing hole (window.opener access).
+DOMPurify.addHook("afterSanitizeAttributes", (node) => {
+  if (node.tagName === "A" && node.hasAttribute("target")) {
+    node.setAttribute("rel", "noopener noreferrer");
+  }
+});
+
+// Render user-authored rich text through a strict allow-list before it ever
+// reaches dangerouslySetInnerHTML. Covers exactly what the composer can emit
+// (bold/italic/code/links/lists); everything else — scripts, event handlers,
+// javascript:/data: URIs, style/svg/iframe — is stripped by DOMPurify.
+const sanitizeHtml = (dirty) =>
+  DOMPurify.sanitize(String(dirty ?? ""), {
+    ALLOWED_TAGS: [
+      "b", "strong", "i", "em", "u", "s", "code", "pre",
+      "a", "br", "p", "div", "span", "ul", "ol", "li", "blockquote",
+    ],
+    ALLOWED_ATTR: ["href", "target", "rel"],
+  });
+
 const nowHMS = () => {
   const d = new Date();
   const pad = (n) => String(n).padStart(2, "0");
@@ -1041,14 +1085,22 @@ const AgentComposer = ({ onSend, disabled }) => {
   };
 
   const insertLink = () => {
-    const url = prompt("Paste a URL (Loom, doc, or any link):");
-    if (!url) return;
+    const raw = prompt("Paste a URL (Loom, doc, or any link):");
+    if (!raw) return;
+    const url = safeUrl(raw);
+    if (!url) {
+      alert("Please enter a valid http(s) URL.");
+      return;
+    }
     ref.current?.focus();
     const sel = window.getSelection();
     if (sel && sel.toString().trim() === "") {
+      const safe = escapeHtml(url);
       document.execCommand("insertHTML", false,
-        `<a href="${url}" target="_blank" rel="noopener">${url}</a>&nbsp;`);
+        `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>&nbsp;`);
     } else {
+      // createLink sets href via the DOM API (no string interpolation), and
+      // url is already validated to be http(s) — safe as-is.
       document.execCommand("createLink", false, url);
     }
     setEmpty(!ref.current?.innerText.trim());
@@ -1080,11 +1132,14 @@ const AgentComposer = ({ onSend, disabled }) => {
     const text = (e.clipboardData || window.clipboardData).getData("text");
     if (!text) return;
     e.preventDefault();
-    if (URL_RE.test(text.trim())) {
-      const url = text.trim();
+    const url = URL_RE.test(text.trim()) ? safeUrl(text.trim()) : "";
+    if (url) {
+      const safe = escapeHtml(url);
       document.execCommand("insertHTML", false,
-        `<a href="${url}" target="_blank" rel="noopener">${url}</a>`);
+        `<a href="${safe}" target="_blank" rel="noopener noreferrer">${safe}</a>`);
     } else {
+      // Anything that isn't a clean http(s) URL is inserted as literal text
+      // (execCommand insertText creates a text node — no HTML is parsed).
       document.execCommand("insertText", false, text);
     }
     setEmpty(!ref.current?.innerText.trim());
@@ -1748,7 +1803,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         icon: "user",
         flavor: "active",
         target: <span className="mono mute" style={{ fontSize: 11 }}>you</span>,
-        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: html || escapeHtml(text) }} />,
+        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) || escapeHtml(text) }} />,
       });
       return;
     }
@@ -1801,7 +1856,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         _key: key, t: nowHMS(),
         action: "user.input", icon: "user", flavor: "active",
         target: <span className="mono mute" style={{ fontSize: 11 }}>you</span>,
-        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: html || escapeHtml(text) }} />,
+        detail: <span className="user-input-text" dangerouslySetInnerHTML={{ __html: sanitizeHtml(html) || escapeHtml(text) }} />,
       });
       try {
         await api.addAttachment(taskId, { kind: "text", note: text });
