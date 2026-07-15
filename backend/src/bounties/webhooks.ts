@@ -138,9 +138,27 @@ export function handleBountyPRMerge(event: any): void {
   const bounty = resolveBountyForPR(repo, pr.body || "");
   if (!bounty) return;
   if (bounty.status !== "DELEGATED" && bounty.status !== "IN_REVIEW") return;
+  // Escrow release moves money, so the merge and the delegate identity are
+  // verified strictly: never release when the PR wasn't merged, when no delegate
+  // is on record, or when the PR author isn't that delegate. (`merged === true`
+  // already implies a write-access maintainer merged it, per GitHub, and the
+  // caller gates on it — this exported fn self-guards regardless.)
+  if (!pr.merged) {
+    console.warn(`[bounty] ${bounty.code}: PR #${pr.number} closed without merging — no release`);
+    return;
+  }
+  if (!bounty.assigneeGithubId) {
+    console.warn(`[bounty] ${bounty.code}: no delegated contributor on record — refusing release`);
+    return;
+  }
   const authorId = pr.user?.id;
-  // Only release when the PR author is the delegated contributor (best-effort).
-  if (bounty.assigneeGithubId && authorId && bounty.assigneeGithubId !== authorId) return;
+  if (!authorId || authorId !== bounty.assigneeGithubId) {
+    console.warn(
+      `[bounty] ${bounty.code}: PR #${pr.number} author ${authorId ?? "unknown"} ` +
+      `is not the delegate ${bounty.assigneeGithubId} — no release`
+    );
+    return;
+  }
   console.log(`[bounty] PR #${pr.number} merged → releasing ${bounty.code}`);
   void (async () => {
     try {
@@ -162,9 +180,12 @@ export function handleBountyPROpened(event: any): void {
   const bounty = resolveBountyForPR(repo, pr.body || "");
   if (!bounty) return;
   if (bounty.status !== "DELEGATED" && bounty.status !== "IN_REVIEW") return;
+  // Only advance to in-review when the PR author is verified to be the delegate
+  // — mirrors the strict identity check on the release path: no state change
+  // when the delegate is unknown or the author isn't that delegate.
+  if (!bounty.assigneeGithubId) return;
   const authorId = pr.user?.id;
-  // Only advance when the PR author is the delegated contributor (best-effort).
-  if (bounty.assigneeGithubId && authorId && bounty.assigneeGithubId !== authorId) return;
+  if (!authorId || authorId !== bounty.assigneeGithubId) return;
   const r = markInReview(bounty.id, pr.number);
   if (r.ok && r.bounty) {
     const fresh = r.bounty;
