@@ -152,7 +152,10 @@ export function handleBountyPRMerge(event: any): void {
     return;
   }
   const authorId = pr.user?.id;
-  if (!authorId || authorId !== bounty.assigneeGithubId) {
+  // Coerce both to strings before comparing — GitHub ids arrive as numbers and
+  // assigneeGithubId is a number today, but this stays correct if either side is
+  // ever persisted/serialized as a string.
+  if (!authorId || String(authorId) !== String(bounty.assigneeGithubId)) {
     console.warn(
       `[bounty] ${bounty.code}: PR #${pr.number} author ${authorId ?? "unknown"} ` +
       `is not the delegate ${bounty.assigneeGithubId} — no release`
@@ -185,7 +188,7 @@ export function handleBountyPROpened(event: any): void {
   // when the delegate is unknown or the author isn't that delegate.
   if (!bounty.assigneeGithubId) return;
   const authorId = pr.user?.id;
-  if (!authorId || authorId !== bounty.assigneeGithubId) return;
+  if (!authorId || String(authorId) !== String(bounty.assigneeGithubId)) return;
   const r = markInReview(bounty.id, pr.number);
   if (r.ok && r.bounty) {
     const fresh = r.bounty;
