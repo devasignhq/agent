@@ -73,12 +73,16 @@ export async function postConfirmComment(bounty: Bounty): Promise<number | null>
  */
 export async function updateStatusComment(bounty: Bounty): Promise<void> {
   if (!bounty.botCommentId) return;
-  const [owner, name] = ownerName(bounty);
-  await updatePRComment(
-    bounty.installationId,
-    owner,
-    name,
-    bounty.botCommentId,
-    renderStatusBody(bounty)
-  );
+  try {
+    const [owner, name] = ownerName(bounty);
+    await updatePRComment(
+      bounty.installationId,
+      owner,
+      name,
+      bounty.botCommentId,
+      renderStatusBody(bounty)
+    );
+  } catch (err) {
+    console.warn(`[bounty] failed to update status comment for ${bounty.code}:`, err);
+  }
 }

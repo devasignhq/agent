@@ -741,6 +741,8 @@ const AppContent = () => {
             <Route path="/agent"    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
             <Route path="/workflow" element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
             <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
+            <Route path="/bounties/:id/fund" element={<BountiesPage isMobile={isMobile} isFunding />} />
+            <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/agent" replace />} />

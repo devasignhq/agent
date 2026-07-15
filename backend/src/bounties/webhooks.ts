@@ -138,6 +138,9 @@ export function handleBountyPRMerge(event: any): void {
   const bounty = resolveBountyForPR(repo, pr.body || "");
   if (!bounty) return;
   if (bounty.status !== "DELEGATED" && bounty.status !== "IN_REVIEW") return;
+  const authorId = pr.user?.id;
+  // Only release when the PR author is the delegated contributor (best-effort).
+  if (bounty.assigneeGithubId && authorId && bounty.assigneeGithubId !== authorId) return;
   console.log(`[bounty] PR #${pr.number} merged → releasing ${bounty.code}`);
   void (async () => {
     try {

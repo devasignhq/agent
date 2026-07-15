@@ -1,163 +1,61 @@
-// Bounties page — sponsor-facing dashboard. Front-end only: all data below is
-// in-file mock data shaped to reproduce the design mockups. No network calls.
+// Bounties page — sponsor-facing dashboard. Wired to the backend bounty API
+// (frontend/src/api.ts): the header stats, bounty table, transaction history, and
+// the per-bounty drawer all render live data from `api.bounties()` +
+// `api.bountyTransactions()`. The Fund and Cancel routes (/bounties/:id/fund,
+// /bounties/:id/cancel — reached from the GitHub bot comment links) mount this
+// page with isFunding/isCancelling and drive the matching escrow flow.
 //
-// Layout: a header (title + balance + top-up/withdraw/create actions), a 6-stat
-// grid, filter tabs + search, and a two-column body — a bounties table on the
-// left and a transaction-history table on the right. Clicking a bounty row opens
-// a right-anchored slide-over drawer with three tabs: Details / Submissions /
-// Applications.
+// Layout: a header (title + escrow balance + top-up/withdraw/create actions), a
+// 6-stat grid, filter tabs + search, and a two-column body — a bounties table on
+// the left and a transaction-history table on the right. Clicking a bounty row
+// opens a right-anchored slide-over drawer with three tabs: Details / Submissions
+// / Applications.
 import React from "react";
+import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { Icon } from "./icons";
+import {
+  api,
+  type Bounty,
+  type BountyApplication,
+  type BountyStatus,
+  type BountySummary,
+  type EscrowTransaction,
+} from "./api";
 
-// ─── Types ──────────────────────────────────────────────────────────────────
-type Status = "OPEN" | "IN REVIEW" | "DELEGATED" | "PAID" | "CANCELLED" | "DISPUTED";
-type TxnStatus = "CONFIRMED" | "HELD";
-
-interface Bounty {
-  seq: number;
-  code: string;
-  title: string;
-  repo: string;
-  issue: number;
-  amount: number;      // whole USD
-  status: Status;
-  subs: number;        // submissions awaiting review
-  unread: boolean;     // new developer messages
-  difficulty: string;
-  chain: string;
-}
-
-interface Txn {
-  id: string;
-  date: string;
-  note: string;
-  amount: number;      // whole USD (absolute)
-  dir: "in" | "out";   // in = deposit/refund, out = escrow/payout
-  hash: string;
-  status: TxnStatus;
-}
-
-// stage → status pill class (matches the mockup: OPEN accent, IN REVIEW amber,
-// DISPUTED red, everything terminal/assigned a muted grey).
-const STATUS_CLS: Record<Status, string> = {
-  "OPEN": "running",
-  "IN REVIEW": "warn",
-  "DELEGATED": "nit",
-  "PAID": "nit",
-  "CANCELLED": "nit",
-  "DISPUTED": "danger",
+// ─── Status presentation ──────────────────────────────────────────────────────
+// Backend BountyStatus → human label / pill class / status-dot colour.
+const ST_LABEL: Record<BountyStatus, string> = {
+  PENDING_FUNDING: "PENDING",
+  OPEN: "OPEN",
+  DELEGATED: "DELEGATED",
+  IN_REVIEW: "IN REVIEW",
+  PAID: "PAID",
+  CANCELLED: "CANCELLED",
+  DISPUTED: "DISPUTED",
 };
-const STATUS_DOT: Record<Status, string> = {
-  "OPEN": "var(--accent)",
-  "IN REVIEW": "var(--warn)",
-  "DELEGATED": "var(--fg-faint)",
-  "PAID": "var(--green)",
-  "CANCELLED": "var(--fg-faint)",
-  "DISPUTED": "var(--danger)",
+const ST_CLS: Record<BountyStatus, string> = {
+  PENDING_FUNDING: "warn",
+  OPEN: "running",
+  DELEGATED: "nit",
+  IN_REVIEW: "warn",
+  PAID: "nit",
+  CANCELLED: "nit",
+  DISPUTED: "danger",
 };
-
-// ─── Mock data ──────────────────────────────────────────────────────────────
-// The ten rows visible on page 1, taken straight from the mockup.
-const PAGE1: Array<[number, string, string, number, number, Status, number, boolean]> = [
-  // seq, title, repo, issue, amount, status, subs, unread
-  [184, "Fix WebSocket reconnect storm on flaky LTE", "acme/mobile", 612, 450, "DELEGATED", 0, false],
-  [183, "Audit logs schema + viewer", "acme/admin", 884, 1200, "IN REVIEW", 1, true],
-  [182, "Stellar memo parser for legacy txs", "acme/pay", 920, 350, "OPEN", 0, false],
-  [181, "Migrate Postgres extension to pgvector", "acme/infra", 311, 800, "DELEGATED", 1, true],
-  [180, "i18n strings for French CA locale", "acme/admin", 881, 220, "IN REVIEW", 1, true],
-  [179, "Receipt PDF — fix accents in header", "acme/mobile", 588, 180, "PAID", 0, false],
-  [178, "Fees calc rounding off by 1 satoshi", "acme/pay", 902, 280, "PAID", 0, false],
-  [177, "Rate-limit middleware unit tests", "acme/infra", 308, 320, "OPEN", 0, false],
-  [176, "Webhooks dashboard filters", "acme/admin", 870, 400, "CANCELLED", 0, false],
-  [175, "Retry queue backoff jitter", "acme/infra", 246, 260, "IN REVIEW", 1, true],
-];
-
-// Remaining 16 rows (pages 2–3) — distribution tuned so the filter counts match
-// the mockup: 9 open · 4 in review · 1 disputed · 5 paid (+ delegated/cancelled).
-const REST: Array<[Status, string, string, number, number]> = [
-  ["OPEN",      "GraphQL pagination cursors",          "acme/api",    271, 300],
-  ["OPEN",      "Dark-mode token audit",               "acme/web",    455, 180],
-  ["OPEN",      "CLI --json output flag",              "acme/cli",    142, 220],
-  ["OPEN",      "Webhook signature verification",      "acme/infra",  299, 500],
-  ["OPEN",      "Sentry source-map upload",            "acme/web",    388, 240],
-  ["OPEN",      "Idempotency keys on payouts",         "acme/pay",    611, 640],
-  ["OPEN",      "Flaky e2e: checkout timeout",         "acme/web",    502, 200],
-  ["IN REVIEW", "OAuth token refresh race",            "acme/api",    233, 420],
-  ["DISPUTED",  "Currency rounding in invoices",       "acme/pay",    777, 360],
-  ["PAID",      "Nightly backup verification",         "acme/infra",  190, 300],
-  ["PAID",      "Avatar upload EXIF strip",            "acme/mobile", 244, 150],
-  ["PAID",      "Search debounce + cancel",            "acme/web",    431, 220],
-  ["DELEGATED", "Feature-flag SDK upgrade",            "acme/api",    118, 480],
-  ["DELEGATED", "Slack digest formatting",             "acme/infra",  356, 260],
-  ["CANCELLED", "Legacy cron migration",               "acme/infra",  90,  340],
-  ["CANCELLED", "Deprecated v1 route cleanup",         "acme/api",    77,  120],
-];
-
-const MOCK_BOUNTIES: Bounty[] = [
-  ...PAGE1.map(([seq, title, repo, issue, amount, status, subs, unread]) => ({
-    seq, code: `BNTY-${seq}`, title, repo, issue: issue as number, amount, status, subs, unread,
-    difficulty: amount >= 700 ? "hard" : amount >= 300 ? "medium" : "easy",
-    chain: "stellar",
-  })),
-  ...REST.map(([status, title, repo, issue, amount], i) => {
-    const seq = 174 - i;
-    const subs = status === "IN REVIEW" || status === "PAID" ? 1 : 0;
-    return {
-      seq, code: `BNTY-${seq}`, title, repo, issue, amount, status, subs,
-      unread: status === "IN REVIEW",
-      difficulty: amount >= 700 ? "hard" : amount >= 300 ? "medium" : "easy",
-      chain: "stellar",
-    };
-  }),
-];
-
-const MOCK_TXNS: Txn[] = [
-  ["TX-2389", "2026-05-09", "USDC deposit",              1000, "in",  "0x9a4F…c2E1", "CONFIRMED"],
-  ["TX-2388", "2026-05-08", "BNTY-183 escrow · audit",   1200, "out", "0x4e21…77c0", "HELD"],
-  ["TX-2387", "2026-05-06", "BNTY-179 → @meilin",         180, "out", "Hv8s…kqLp",   "CONFIRMED"],
-  ["TX-2386", "2026-05-04", "BNTY-178 → @otis",           280, "out", "TJYe…uA5g",   "CONFIRMED"],
-  ["TX-2385", "2026-05-02", "USDC deposit · memo",       2500, "in",  "GAYL…QH2K",   "CONFIRMED"],
-  ["TX-2384", "2026-04-29", "BNTY-181 escrow · Rand",     800, "out", "0x77a2…0b13", "HELD"],
-  ["TX-2383", "2026-04-27", "BNTY-170 → @minhaj",         240, "out", "TRx9…me4Q",   "CONFIRMED"],
-  ["TX-2382", "2026-04-25", "BNTY-176 refund · cancel",   400, "in",  "0x9b1D…42fc", "CONFIRMED"],
-  ["TX-2381", "2026-04-23", "USDC deposit",              1500, "in",  "0x3c8E…aa90", "CONFIRMED"],
-  ["TX-2380", "2026-04-21", "BNTY-161 → @yusuf",          200, "out", "0x55aE…7d21", "CONFIRMED"],
-  ["TX-2379", "2026-04-19", "USDC deposit",               900, "in",  "0x71bC…14aa", "CONFIRMED"],
-  ["TX-2378", "2026-04-17", "BNTY-158 → @wei",            330, "out", "GB3T…pP2m",   "CONFIRMED"],
-  ["TX-2377", "2026-04-15", "BNTY-180 escrow · i18n",     220, "out", "0x08dF…9b21", "HELD"],
-  ["TX-2376", "2026-04-13", "BNTY-155 → @lucia",          470, "out", "TZ9k…Qm4d",   "CONFIRMED"],
-  ["TX-2375", "2026-04-11", "USDC deposit",              1200, "in",  "0x2a90…c7e0", "CONFIRMED"],
-  ["TX-2374", "2026-04-09", "BNTY-152 → @andre",          150, "out", "Hq2s…Lp8x",   "CONFIRMED"],
-  ["TX-2373", "2026-04-07", "BNTY-149 refund · cancel",   260, "in",  "0x5f11…22ab", "CONFIRMED"],
-  ["TX-2372", "2026-04-05", "BNTY-177 escrow · rate",     320, "out", "0x9c02…83de", "HELD"],
-  ["TX-2371", "2026-04-03", "BNTY-146 → @sana",           540, "out", "GC8L…mN3q",   "CONFIRMED"],
-  ["TX-2370", "2026-04-01", "USDC deposit",              2000, "in",  "0x3311…af90", "CONFIRMED"],
-  ["TX-2369", "2026-03-30", "BNTY-143 → @tobi",           190, "out", "TJ4m…kR7p",   "CONFIRMED"],
-  ["TX-2368", "2026-03-28", "USDC deposit",               750, "in",  "0x77de…0c12", "CONFIRMED"],
-].map(([id, date, note, amount, dir, hash, status]) => ({
-  id: id as string, date: date as string, note: note as string,
-  amount: amount as number, dir: dir as "in" | "out",
-  hash: hash as string, status: status as TxnStatus,
-}));
-
-// Summary numbers shown in the header + stat grid (match the mockup).
-const SUMMARY = {
-  org: "acme",
-  activeCount: 18,
-  escrow: 10870,
-  balance: 3390,
-  totalBounties: 26,
-  activeBounties: 18,
-  openBounties: 9,
-  inReviewCount: 4,
-  paidOut: 1080,
-  unreadCount: 10,
+const ST_DOT: Record<BountyStatus, string> = {
+  PENDING_FUNDING: "var(--warn)",
+  OPEN: "var(--accent)",
+  DELEGATED: "var(--fg-faint)",
+  IN_REVIEW: "var(--warn)",
+  PAID: "var(--green)",
+  CANCELLED: "var(--fg-faint)",
+  DISPUTED: "var(--danger)",
 };
 
 const TABS: Array<{ key: string; label: string; match: (b: Bounty) => boolean }> = [
   { key: "all",       label: "all",       match: () => true },
   { key: "open",      label: "open",      match: (b) => b.status === "OPEN" },
-  { key: "in_review", label: "in review", match: (b) => b.status === "IN REVIEW" },
+  { key: "in_review", label: "in review", match: (b) => b.status === "IN_REVIEW" },
   { key: "disputed",  label: "disputed",  match: (b) => b.status === "DISPUTED" },
   { key: "paid",      label: "paid",      match: (b) => b.status === "PAID" },
 ];
@@ -168,6 +66,17 @@ const TX_PAGE_SIZE = 10;
 const money = (n: number) => `$${n.toLocaleString("en-US")}`;
 // Placeholder shown for monetary values when the balance-eye toggle hides them.
 const MASK = "••••";
+
+// Stellar amounts are i128 "stroops" (1 USDC = 10^7 stroops). Display-only, so a
+// double is fine for the magnitudes bounties use.
+const stroopsToUsdc = (s: string) => (Number(s) || 0) / 1e7;
+const shortHash = (h: string) => (h.length > 18 ? `${h.slice(0, 8)}…${h.slice(-6)}` : h);
+const stellarTxUrl = (h: string) => `https://stellar.expert/explorer/testnet/tx/${h}`;
+const prUrl = (repo: string, pr: number) => `https://github.com/${repo}/pull/${pr}`;
+const fmtDay = (ts?: number | null) =>
+  ts ? new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
+const fmtDate = (ts?: number | null) =>
+  ts ? new Date(ts).toISOString().slice(0, 10) : "—";
 
 // Live-format a currency input: thousands separators on the integer part, at
 // most two decimals, tolerant of partially-typed values ("2000." → "2,000.").
@@ -181,19 +90,62 @@ function formatAmountInput(raw: string): string {
 }
 
 // ─── Page ───────────────────────────────────────────────────────────────────
-export const BountiesPage = ({ isMobile }: { isMobile?: boolean }) => {
+export const BountiesPage = ({
+  isMobile,
+  isFunding,
+  isCancelling,
+}: {
+  isMobile?: boolean;
+  isFunding?: boolean;
+  isCancelling?: boolean;
+}) => {
+  const params = useParams();
+  const [search] = useSearchParams();
+  const navigate = useNavigate();
+
+  const [bounties, setBounties] = React.useState<Bounty[]>([]);
+  const [summary, setSummary] = React.useState<BountySummary>({ total: 0, active: 0, inEscrow: 0, paidOut: 0 });
+  const [txns, setTxns] = React.useState<EscrowTransaction[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [error, setError] = React.useState<string | null>(null);
+
   const [tab, setTab] = React.useState("all");
   const [query, setQuery] = React.useState("");
   const [page, setPage] = React.useState(1);
   const [txPage, setTxPage] = React.useState(1);
   const [balanceHidden, setBalanceHidden] = React.useState(false);
-  const [selectedId, setSelectedId] = React.useState<number | null>(null);
+  const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [creating, setCreating] = React.useState(false);
   const [toppingUp, setToppingUp] = React.useState(false);
   const [withdrawing, setWithdrawing] = React.useState(false);
 
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    setError(null);
+    try {
+      const [b, t] = await Promise.all([api.bounties(), api.bountyTransactions()]);
+      setBounties(b.bounties);
+      setSummary(b.summary);
+      setTxns(t.transactions);
+    } catch (err: any) {
+      setError(err?.message || "Couldn't load bounties.");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  React.useEffect(() => {
+    load();
+  }, [load]);
+
+  // Merge a mutated bounty (returned by approve/reject) back into the list so the
+  // open drawer and table update without a full refetch.
+  const applyBounty = React.useCallback((b: Bounty) => {
+    setBounties((prev) => prev.map((x) => (x.id === b.id ? b : x)));
+  }, []);
+
   const matcher = TABS.find((t) => t.key === tab)!.match;
-  const filtered = MOCK_BOUNTIES.filter(matcher).filter((b) => {
+  const filtered = bounties.filter(matcher).filter((b) => {
     if (!query.trim()) return true;
     const q = query.toLowerCase();
     return b.title.toLowerCase().includes(q) || b.code.toLowerCase().includes(q) || b.repo.toLowerCase().includes(q);
@@ -203,12 +155,16 @@ export const BountiesPage = ({ isMobile }: { isMobile?: boolean }) => {
   const start = (cur - 1) * PAGE_SIZE;
   const shown = filtered.slice(start, start + PAGE_SIZE);
 
-  const txPages = Math.max(1, Math.ceil(MOCK_TXNS.length / TX_PAGE_SIZE));
+  const txPages = Math.max(1, Math.ceil(txns.length / TX_PAGE_SIZE));
   const txCur = Math.min(txPage, txPages);
   const txStart = (txCur - 1) * TX_PAGE_SIZE;
-  const txShown = MOCK_TXNS.slice(txStart, txStart + TX_PAGE_SIZE);
+  const txShown = txns.slice(txStart, txStart + TX_PAGE_SIZE);
 
-  const selected = selectedId != null ? MOCK_BOUNTIES.find((b) => b.seq === selectedId) || null : null;
+  const selected = selectedId != null ? bounties.find((b) => b.id === selectedId) || null : null;
+
+  const openCount = bounties.filter((b) => b.status === "OPEN").length;
+  const inReviewCount = bounties.filter((b) => b.status === "IN_REVIEW").length;
+  const org = bounties[0]?.repo?.split("/")[0];
 
   return (
     <div className="page bnty-page" style={{ maxWidth: "none" }}>
@@ -217,13 +173,13 @@ export const BountiesPage = ({ isMobile }: { isMobile?: boolean }) => {
         <div>
           <h1 className="page-title">Bounty</h1>
           <div className="page-sub">
-            {SUMMARY.activeCount} active · {SUMMARY.org} org
+            {summary.active} active{org ? ` · ${org} org` : ""}
           </div>
         </div>
         <div className="bnty-head-actions">
           <div className="bnty-balance">
-            <span className="bnty-balance-label">balance</span>
-            <span className="bnty-balance-amt">{balanceHidden ? "••••••" : SUMMARY.balance.toLocaleString("en-US", { minimumFractionDigits: 2 })}</span>
+            <span className="bnty-balance-label">in escrow</span>
+            <span className="bnty-balance-amt">{balanceHidden ? "••••••" : summary.inEscrow.toLocaleString("en-US", { minimumFractionDigits: 2 })}</span>
             <span className="bnty-balance-unit">USDC</span>
             <button className="balance-eye" onClick={() => setBalanceHidden((v) => !v)} aria-label="Toggle balance visibility">
               <Icon name={balanceHidden ? "eye-off" : "eye"} size={13} />
@@ -235,108 +191,131 @@ export const BountiesPage = ({ isMobile }: { isMobile?: boolean }) => {
         </div>
       </div>
 
-      {/* Stat grid */}
-      <div className="stat-grid bnty-stats">
-        <Stat label="Account balance" value={money(SUMMARY.balance)} suffix="USDC" color="var(--accent)" hidden={balanceHidden} />
-        <Stat label="Total bounties" value={String(SUMMARY.totalBounties)} suffix={`${SUMMARY.activeBounties} active`} />
-        <Stat label="Open bounties" value={String(SUMMARY.openBounties)} suffix="accepting work" />
-        <Stat label="In review" value={String(SUMMARY.inReviewCount)} suffix="awaiting merge" />
-        <Stat label="In escrow" value={money(SUMMARY.escrow)} suffix="held for devs" color="var(--info)" hidden={balanceHidden} />
-        <Stat label="Paid out" value={money(SUMMARY.paidOut)} suffix="lifetime" color="var(--green)" hidden={balanceHidden} />
-      </div>
-
-      {/* Filters + search */}
-      <div className="bnty-controls">
-        <div className="bnty-filters">
-          {TABS.map((t) => (
-            <button
-              key={t.key}
-              className={`bnty-filter ${tab === t.key ? "active" : ""}`}
-              onClick={() => { setTab(t.key); setPage(1); }}
-            >
-              {t.label} <span className="n">· {MOCK_BOUNTIES.filter(t.match).length}</span>
-            </button>
-          ))}
+      {error ? (
+        <div className="bnty-empty mono mute" style={{ padding: 48, textAlign: "center" }}>
+          {error}
+          <button className="btn sm" style={{ marginLeft: 10 }} onClick={load}>Retry</button>
         </div>
-        <div className="bnty-controls-right">
-          <div className="bnty-search">
-            <Icon name="search" size={13} />
-            <input
-              className="input bare"
-              placeholder="Search bounties…"
-              value={query}
-              onChange={(e) => { setQuery(e.target.value); setPage(1); }}
-            />
+      ) : loading ? (
+        <div className="bnty-empty mono mute" style={{ padding: 48, textAlign: "center" }}>Loading bounties…</div>
+      ) : (
+        <>
+          {/* Stat grid */}
+          <div className="stat-grid bnty-stats">
+            <Stat label="Total bounties" value={String(summary.total)} suffix={`${summary.active} active`} />
+            <Stat label="Active" value={String(summary.active)} suffix="in flight" />
+            <Stat label="Open bounties" value={String(openCount)} suffix="accepting work" />
+            <Stat label="In review" value={String(inReviewCount)} suffix="awaiting merge" />
+            <Stat label="In escrow" value={money(summary.inEscrow)} suffix="held for devs" color="var(--info)" hidden={balanceHidden} />
+            <Stat label="Paid out" value={money(summary.paidOut)} suffix="lifetime" color="var(--green)" hidden={balanceHidden} />
           </div>
-        </div>
-      </div>
 
-      {/* Two-column body */}
-      <div className="bounty-dash">
-        {/* Bounties */}
-        <section className="bnty-panel">
-          <div className="bnty-panel-head">
-            <span className="bnty-panel-title">Bounties</span>
-            <span className="bnty-panel-meta">{filtered.length} shown</span>
-          </div>
-          <div className="row-table bnty-list">
-            <div className="bounty-row head">
-              <span />
-              <span>ID</span>
-              <span>Title</span>
-              <span>Repo · Issue</span>
-              <span>Amount</span>
-              <span>Status</span>
-              <span>Subs</span>
+          {/* Filters + search */}
+          <div className="bnty-controls">
+            <div className="bnty-filters">
+              {TABS.map((t) => (
+                <button
+                  key={t.key}
+                  className={`bnty-filter ${tab === t.key ? "active" : ""}`}
+                  onClick={() => { setTab(t.key); setPage(1); }}
+                >
+                  {t.label} <span className="n">· {bounties.filter(t.match).length}</span>
+                </button>
+              ))}
             </div>
-            {shown.length === 0 ? (
-              <div className="bnty-empty mono mute">No {tab.replace("_", " ")} bounties.</div>
-            ) : (
-              shown.map((b) => <BountyRow key={b.seq} b={b} hidden={balanceHidden} onClick={() => setSelectedId(b.seq)} />)
-            )}
-          </div>
-          <div className="bounty-pager">
-            <span className="mono mute" style={{ fontSize: 11 }}>
-              Showing {filtered.length === 0 ? 0 : start + 1}–{Math.min(start + PAGE_SIZE, filtered.length)} of {filtered.length}
-            </span>
-            <Pager cur={cur} pages={pages} onGo={setPage} />
-          </div>
-        </section>
-
-        {/* Transactions */}
-        <section className="bnty-panel">
-          <div className="bnty-panel-head">
-            <span className="bnty-panel-title">Transaction history</span>
-            <span className="bnty-panel-meta">
-              {MOCK_TXNS.length} total
-              <button className="btn ghost sm" style={{ marginLeft: 10 }}><Icon name="download" size={12} /> CSV</button>
-            </span>
-          </div>
-          <div className="row-table txn-listwrap">
-            <div className="txn-row head">
-              <span>Txn ID</span>
-              <span>Date</span>
-              <span>Note</span>
-              <span>Amount</span>
-              <span>Txn hash</span>
-              <span>Status</span>
-              <span>Invoice</span>
+            <div className="bnty-controls-right">
+              <div className="bnty-search">
+                <Icon name="search" size={13} />
+                <input
+                  className="input bare"
+                  placeholder="Search bounties…"
+                  value={query}
+                  onChange={(e) => { setQuery(e.target.value); setPage(1); }}
+                />
+              </div>
             </div>
-            {txShown.map((t) => <TxnRow key={t.id} t={t} hidden={balanceHidden} />)}
           </div>
-          <div className="bounty-pager">
-            <span className="mono mute" style={{ fontSize: 11 }}>
-              Showing {txStart + 1}–{Math.min(txStart + TX_PAGE_SIZE, MOCK_TXNS.length)} of {MOCK_TXNS.length}
-            </span>
-            <Pager cur={txCur} pages={txPages} onGo={setTxPage} />
-          </div>
-        </section>
-      </div>
 
-      {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} />}
+          {/* Two-column body */}
+          <div className="bounty-dash">
+            {/* Bounties */}
+            <section className="bnty-panel">
+              <div className="bnty-panel-head">
+                <span className="bnty-panel-title">Bounties</span>
+                <span className="bnty-panel-meta">{filtered.length} shown</span>
+              </div>
+              <div className="row-table bnty-list">
+                <div className="bounty-row head">
+                  <span />
+                  <span>ID</span>
+                  <span>Title</span>
+                  <span>Repo · Issue</span>
+                  <span>Amount</span>
+                  <span>Status</span>
+                  <span>Subs</span>
+                </div>
+                {shown.length === 0 ? (
+                  <div className="bnty-empty mono mute">
+                    {bounties.length === 0 ? "No bounties yet. Comment `bounty` on a GitHub issue to create one." : `No ${tab.replace("_", " ")} bounties.`}
+                  </div>
+                ) : (
+                  shown.map((b) => <BountyRow key={b.id} b={b} hidden={balanceHidden} onClick={() => setSelectedId(b.id)} />)
+                )}
+              </div>
+              <div className="bounty-pager">
+                <span className="mono mute" style={{ fontSize: 11 }}>
+                  Showing {filtered.length === 0 ? 0 : start + 1}–{Math.min(start + PAGE_SIZE, filtered.length)} of {filtered.length}
+                </span>
+                <Pager cur={cur} pages={pages} onGo={setPage} />
+              </div>
+            </section>
+
+            {/* Transactions */}
+            <section className="bnty-panel">
+              <div className="bnty-panel-head">
+                <span className="bnty-panel-title">Transaction history</span>
+                <span className="bnty-panel-meta">
+                  {txns.length} total
+                  <button className="btn ghost sm" style={{ marginLeft: 10 }}><Icon name="download" size={12} /> CSV</button>
+                </span>
+              </div>
+              <div className="row-table txn-listwrap">
+                <div className="txn-row head">
+                  <span>Txn ID</span>
+                  <span>Date</span>
+                  <span>Note</span>
+                  <span>Amount</span>
+                  <span>Txn hash</span>
+                  <span>Status</span>
+                  <span>Invoice</span>
+                </div>
+                {txShown.length === 0 ? (
+                  <div className="bnty-empty mono mute">No transactions yet.</div>
+                ) : (
+                  txShown.map((t) => <TxnRow key={t.id} t={t} hidden={balanceHidden} />)
+                )}
+              </div>
+              <div className="bounty-pager">
+                <span className="mono mute" style={{ fontSize: 11 }}>
+                  Showing {txns.length === 0 ? 0 : txStart + 1}–{Math.min(txStart + TX_PAGE_SIZE, txns.length)} of {txns.length}
+                </span>
+                <Pager cur={txCur} pages={txPages} onGo={setTxPage} />
+              </div>
+            </section>
+          </div>
+        </>
+      )}
+
+      {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} onChanged={applyBounty} />}
       {creating && <CreateBountyModal onClose={() => setCreating(false)} />}
       {toppingUp && <TopUpModal onClose={() => setToppingUp(false)} />}
       {withdrawing && <WithdrawModal onClose={() => setWithdrawing(false)} />}
+      {isFunding && (
+        <FundBountyModal id={params.id} token={search.get("token")} onClose={() => navigate("/bounty")} />
+      )}
+      {isCancelling && (
+        <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => navigate("/bounty")} />
+      )}
     </div>
   );
 };
@@ -361,183 +340,87 @@ const Pager = ({ cur, pages, onGo }: { cur: number; pages: number; onGo: (p: num
   </div>
 );
 
-const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hidden?: boolean }) => (
-  <div className={`bounty-row ${b.unread ? "has-unread" : ""}`} onClick={onClick}>
-    <span><i style={{ display: "inline-block", width: 6, height: 6, background: STATUS_DOT[b.status] }} /></span>
-    <span className="bounty-id">{b.code}</span>
-    <span className="bounty-title" title={b.title}>{b.title}</span>
-    <span className="mono mute" style={{ fontSize: 11 }}>{b.repo}#{b.issue}</span>
-    <span className="mono" style={{ fontVariantNumeric: "tabular-nums", color: hidden ? "var(--fg-mute)" : undefined }}>{hidden ? MASK : money(b.amount)}</span>
-    <span className={`pill ${STATUS_CLS[b.status]}`}><i className="dot" />{b.status}</span>
-    <span>
-      {b.subs > 0
-        ? <span className="subs-badge"><Icon name="git" size={11} /> {b.subs}</span>
-        : <span className="mute">–</span>}
-    </span>
-  </div>
-);
+const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hidden?: boolean }) => {
+  const subs = b.prNumber ? 1 : 0;
+  const unread = (b.applications || []).some((a) => a.status === "pending");
+  return (
+    <div className={`bounty-row ${unread ? "has-unread" : ""}`} onClick={onClick}>
+      <span><i style={{ display: "inline-block", width: 6, height: 6, background: ST_DOT[b.status] }} /></span>
+      <span className="bounty-id">{b.code}</span>
+      <span className="bounty-title" title={b.title}>{b.title}</span>
+      <span className="mono mute" style={{ fontSize: 11 }}>{b.repo}#{b.issueNumber}</span>
+      <span className="mono" style={{ fontVariantNumeric: "tabular-nums", color: hidden ? "var(--fg-mute)" : undefined }}>{hidden ? MASK : money(b.amountUsdc)}</span>
+      <span className={`pill ${ST_CLS[b.status]}`}><i className="dot" />{ST_LABEL[b.status]}</span>
+      <span>
+        {subs > 0
+          ? <span className="subs-badge"><Icon name="git" size={11} /> {subs}</span>
+          : <span className="mute">–</span>}
+      </span>
+    </div>
+  );
+};
 
-const TxnRow = ({ t, hidden }: { t: Txn; hidden?: boolean }) => (
-  <div className="txn-row">
-    <span className="mono mute" style={{ fontSize: 11 }}>{t.id}</span>
-    <span className="mono mute" style={{ fontSize: 11 }}>{t.date}</span>
-    <span className="mono" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={t.note}>{t.note}</span>
-    <span className="mono" style={{ fontVariantNumeric: "tabular-nums", color: hidden ? "var(--fg-mute)" : (t.dir === "in" ? "var(--green)" : "var(--danger)") }}>
-      {hidden ? MASK : `${t.dir === "in" ? "+" : ""}${money(t.amount)}`}
-    </span>
-    <span className="txn-hash">
-      <a href="#" onClick={(e) => e.preventDefault()}>{t.hash}</a>
-      <Icon name="external" size={11} />
-    </span>
-    <span className={`pill ${t.status === "CONFIRMED" ? "running" : "warn"}`}><i className="dot" />{t.status}</span>
-    <span>
-      <button className="btn ghost sm"><Icon name="download" size={11} /> PDF</button>
-    </span>
-  </div>
-);
+const TXN_PILL: Record<EscrowTransaction["status"], { label: string; cls: string }> = {
+  confirmed: { label: "CONFIRMED", cls: "running" },
+  pending: { label: "PENDING", cls: "warn" },
+  failed: { label: "FAILED", cls: "danger" },
+};
+
+const TxnRow = ({ t, hidden }: { t: EscrowTransaction; hidden?: boolean }) => {
+  const usdc = stroopsToUsdc(t.amountStroops);
+  const note = t.note || `${t.kind}${t.githubLogin ? ` · @${t.githubLogin}` : ""}`;
+  const pill = TXN_PILL[t.status];
+  return (
+    <div className="txn-row">
+      <span className="mono mute" style={{ fontSize: 11 }}>{t.id.slice(0, 10)}</span>
+      <span className="mono mute" style={{ fontSize: 11 }}>{fmtDate(t.createdAt)}</span>
+      <span className="mono" style={{ fontSize: 12, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }} title={note}>{note}</span>
+      <span className="mono" style={{ fontVariantNumeric: "tabular-nums", color: hidden ? "var(--fg-mute)" : (t.dir === "in" ? "var(--green)" : "var(--danger)") }}>
+        {hidden ? MASK : `${t.dir === "in" ? "+" : ""}${money(Math.round(usdc))}`}
+      </span>
+      <span className="txn-hash">
+        {t.hash ? (
+          <>
+            <a href={stellarTxUrl(t.hash)} target="_blank" rel="noreferrer">{shortHash(t.hash)}</a>
+            <Icon name="external" size={11} />
+          </>
+        ) : (
+          <span className="mute">—</span>
+        )}
+      </span>
+      <span className={`pill ${pill.cls}`}><i className="dot" />{pill.label}</span>
+      <span>
+        <button className="btn ghost sm"><Icon name="download" size={11} /> PDF</button>
+      </span>
+    </div>
+  );
+};
 
 // ─── Drawer ─────────────────────────────────────────────────────────────────
-interface Detail {
-  amount: number;
-  chain: string;
-  status: Status;
-  difficulty: string;
-  applicationsText: string;
-  issueRef: string;
-  escrowHash: string;
-  escrowNote: string;
-  description: string;
-  acceptance: string[];
-  activity: Array<{ time: string; text: React.ReactNode }>;
-  delegated: boolean;
+function activityFor(b: Bounty): Array<{ time: string; text: React.ReactNode }> {
+  const out: Array<{ time: string; text: React.ReactNode }> = [];
+  out.push({ time: fmtDay(b.createdAt), text: <>bounty published from <span className="txt-accent">{b.repo}#{b.issueNumber}</span></> });
+  if (b.escrowTxHash) out.push({ time: fmtDay(b.createdAt), text: `escrowed $${b.amountUsdc} USDC on Stellar` });
+  if (b.acceptedAt) out.push({ time: fmtDay(b.acceptedAt), text: `bounty assigned to @${b.assigneeGithubLogin || "developer"}` });
+  if (b.prNumber) out.push({ time: fmtDay(b.updatedAt), text: <>PR #{b.prNumber} opened</> });
+  if (b.payoutTxHash) out.push({ time: fmtDay(b.updatedAt), text: `payout released to @${b.assigneeGithubLogin || "developer"}` });
+  if (b.refundTxHash) out.push({ time: fmtDay(b.updatedAt), text: "escrow refunded to sponsor" });
+  return out.reverse(); // newest first
 }
 
-interface Submission {
-  author: string;
-  prRef: string;
-  ago: string;
-  added: number;
-  deleted: number;
-  files: number;
-  acMet: number;
-  acTotal: number;
-  testsPass: boolean;
-  blockers: number;
-  note: string;
-}
-
-interface Application {
-  handle: string;
-  isNew: boolean;
-  rating: number;
-  mergedPrs: number;
-  fit: string;
-  appliedAgo: string;
-}
-
-function detailFor(b: Bounty): Detail {
-  if (b.seq === 183) {
-    return {
-      amount: 1200, chain: "stellar", status: "IN REVIEW", difficulty: "hard",
-      applicationsText: "5 developers applied", issueRef: "acme/admin#884",
-      escrowHash: "CFA0D694 … 0B2A1A7B",
-      escrowNote: "1200 USDC escrowed on Stellar · view on stellar.expert",
-      description:
-        "Synced from acme/admin#884. On flaky LTE the WebSocket layer enters a tight reconnect loop with no backoff cap, causing handle exhaustion on iOS. Repro on iOS 17.4 / poor signal: socket lifecycle exits → immediate retry → server drops with 429 → repeat at <100ms intervals.",
-      acceptance: [
-        "Exponential backoff capped at 30s with jitter",
-        "Circuit breaker after 5 consecutive 429 responses",
-        "Heartbeat interval untouched (out of scope)",
-        "Reproduction script in scripts/repro/ws-storm.ts passes",
-      ],
-      activity: [
-        { time: "May 9 · 11:51", text: <>sara opened PR #1147 · <span className="txt-accent">acme/admin</span></> },
-        { time: "May 9 · 10:14", text: "devon asked a question · see chat" },
-        { time: "May 9 · 09:02", text: "bounty assigned to @devonk" },
-        { time: "May 9 · 08:40", text: "escrowed $1200 USDC on stellar" },
-        { time: "May 8 · 16:20", text: "bounty published from issue #884" },
-      ],
-      delegated: true,
-    };
-  }
-  // Generic detail synthesized from the row's own fields.
-  const apps = b.status === "OPEN" ? Math.max(1, (b.seq % 5) + 1) : b.status === "CANCELLED" ? 0 : 3;
-  return {
-    amount: b.amount, chain: b.chain, status: b.status, difficulty: b.difficulty,
-    applicationsText: apps === 0 ? "no applications yet" : `${apps} developer${apps === 1 ? "" : "s"} applied`,
-    issueRef: `${b.repo}#${b.issue}`,
-    escrowHash: `${b.code.replace("-", "")}A1 … ${(b.seq * 7).toString(16).toUpperCase()}F9`,
-    escrowNote: `${b.amount} USDC escrowed on Stellar · view on stellar.expert`,
-    description:
-      `Synced from ${b.repo}#${b.issue}. ${b.title}. Scope is confined to the linked issue; the fix should be covered by tests and leave adjacent behavior untouched.`,
-    acceptance: [
-      "Change is covered by unit tests",
-      "No regression in the existing suite",
-      "Follows the repository's lint + format rules",
-    ],
-    activity: [
-      { time: "recent", text: <>bounty published from issue #{b.issue} · <span className="txt-accent">{b.repo}</span></> },
-      { time: "earlier", text: `escrowed $${b.amount} USDC on ${b.chain}` },
-    ],
-    delegated: b.status === "DELEGATED",
-  };
-}
-
-function submissionsFor(b: Bounty): Submission[] {
-  if (b.seq === 183) {
-    return [{
-      author: "@sarap", prRef: "acme/admin#1147", ago: "18m ago",
-      added: 412, deleted: 86, files: 14, acMet: 9, acTotal: 9, testsPass: true, blockers: 0,
-      note: "All acceptance criteria met. Tests green.",
-    }];
-  }
-  if (b.subs > 0) {
-    return [{
-      author: "@devk", prRef: `${b.repo}#${b.issue + 231}`, ago: "2h ago",
-      added: 128, deleted: 44, files: 6, acMet: 2, acTotal: 3, testsPass: true, blockers: 1,
-      note: "One acceptance criterion still pending; awaiting maintainer input.",
-    }];
-  }
-  return [];
-}
-
-function applicationsFor(b: Bounty): Application[] {
-  if (b.seq === 183) {
-    return [
-      { handle: "@devonk", isNew: true,  rating: 4.8, mergedPrs: 210, fit: "high", appliedAgo: "20m ago" },
-      { handle: "@sarap",  isNew: true,  rating: 4.6, mergedPrs: 132, fit: "high", appliedAgo: "40m ago" },
-      { handle: "@lin",    isNew: false, rating: 4.4, mergedPrs: 77,  fit: "med",  appliedAgo: "3h ago" },
-      { handle: "@marco",  isNew: false, rating: 4.1, mergedPrs: 54,  fit: "med",  appliedAgo: "1d ago" },
-      { handle: "@ora",    isNew: false, rating: 3.9, mergedPrs: 22,  fit: "low",  appliedAgo: "2d ago" },
-    ];
-  }
-  if (b.seq === 182) {
-    return [
-      { handle: "@tomasv", isNew: true,  rating: 4.7, mergedPrs: 154, fit: "high", appliedAgo: "30m ago" },
-      { handle: "@anyar",  isNew: false, rating: 4.3, mergedPrs: 41,  fit: "med",  appliedAgo: "1d ago" },
-    ];
-  }
-  if (b.status === "OPEN") {
-    return [
-      { handle: "@rhea",  isNew: true,  rating: 4.6, mergedPrs: 88, fit: "high", appliedAgo: "1h ago" },
-      { handle: "@kito",  isNew: false, rating: 4.1, mergedPrs: 23, fit: "med",  appliedAgo: "2d ago" },
-    ];
-  }
-  return [];
-}
-
-const BountyDrawer = ({ bounty, onClose }: { bounty: Bounty; onClose: () => void }) => {
+const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose: () => void; onChanged: (b: Bounty) => void }) => {
   const [tab, setTab] = React.useState<"details" | "submissions" | "applications">("details");
-  const detail = React.useMemo(() => detailFor(bounty), [bounty]);
-  const submissions = React.useMemo(() => submissionsFor(bounty), [bounty]);
-  const applications = React.useMemo(() => applicationsFor(bounty), [bounty]);
-  const newApps = applications.filter((a) => a.isNew).length;
+  const apps = bounty.applications || [];
+  const newApps = apps.filter((a) => a.status === "pending").length;
+  const subCount = bounty.prNumber ? 1 : 0;
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  const delegated = bounty.status === "DELEGATED" || bounty.status === "IN_REVIEW" || !!bounty.assigneeGithubLogin;
 
   return (
     <div className="drawer-scrim" onClick={onClose}>
@@ -554,7 +437,7 @@ const BountyDrawer = ({ bounty, onClose }: { bounty: Bounty; onClose: () => void
           <TabBtn active={tab === "details"} onClick={() => setTab("details")}>Details</TabBtn>
           <TabBtn active={tab === "submissions"} onClick={() => setTab("submissions")}>
             Submissions
-            {tab !== "submissions" && submissions.length > 0 && <span className="tab-count">{submissions.length}</span>}
+            {tab !== "submissions" && subCount > 0 && <span className="tab-count">{subCount}</span>}
           </TabBtn>
           <TabBtn active={tab === "applications"} onClick={() => setTab("applications")}>
             Applications
@@ -563,17 +446,17 @@ const BountyDrawer = ({ bounty, onClose }: { bounty: Bounty; onClose: () => void
         </div>
 
         <div className="drawer-body">
-          {tab === "details" && <DetailsTab d={detail} />}
-          {tab === "submissions" && <SubmissionsTab subs={submissions} chain={bounty.chain} />}
-          {tab === "applications" && <ApplicationsTab apps={applications} />}
+          {tab === "details" && <DetailsTab b={bounty} />}
+          {tab === "submissions" && <SubmissionsTab b={bounty} />}
+          {tab === "applications" && <ApplicationsTab b={bounty} onChanged={onChanged} />}
         </div>
 
         {tab === "details" && (
           <div className="drawer-foot">
             <span className="mono mute" style={{ fontSize: 11 }}>
-              {detail.delegated ? "Cannot delete · bounty is delegated" : "This bounty can still be cancelled"}
+              {delegated ? "Cannot cancel · bounty is delegated" : "This bounty can still be cancelled"}
             </span>
-            <button className="btn"><Icon name="github" size={13} /> View on GitHub</button>
+            <a className="btn" href={bounty.issueUrl} target="_blank" rel="noreferrer"><Icon name="github" size={13} /> View on GitHub</a>
           </div>
         )}
       </div>
@@ -585,140 +468,147 @@ const TabBtn = ({ active, onClick, children }: { active: boolean; onClick: () =>
   <div className={`drawer-tab ${active ? "picked" : ""}`} onClick={onClick}>{children}</div>
 );
 
-const DetailsTab = ({ d }: { d: Detail }) => (
-  <>
-    <div className="kv-grid">
-      <div className="kv">
-        <div className="kv-k">Amount</div>
-        <div className="kv-v"><span style={{ color: "var(--accent)" }}>{money(d.amount)}</span> <span className="mute">USDC</span></div>
-      </div>
-      <div className="kv">
-        <div className="kv-k">Payout chain</div>
-        <div className="kv-v"><span className="chain-pip" style={{ background: "var(--purple)" }} /> {d.chain}</div>
-      </div>
-      <div className="kv">
-        <div className="kv-k">Status</div>
-        <div className="kv-v"><span className={`pill ${STATUS_CLS[d.status]}`}><i className="dot" />{d.status}</span></div>
-      </div>
-      <div className="kv">
-        <div className="kv-k">Difficulty</div>
-        <div className="kv-v">{d.difficulty}</div>
-      </div>
-      <div className="kv">
-        <div className="kv-k">Applications</div>
-        <div className="kv-v">{d.applicationsText}</div>
-      </div>
-      <div className="kv">
-        <div className="kv-k">Issue</div>
-        <div className="kv-v mono" style={{ fontSize: 12 }}>{d.issueRef} <Icon name="github" size={12} /></div>
-      </div>
-    </div>
-
-    <div className="drawer-section">
-      <div className="drawer-section-head">Escrow transaction</div>
-      <div className="mono" style={{ fontSize: 13, color: "var(--accent)", display: "flex", alignItems: "center", gap: 6 }}>
-        {d.escrowHash} <Icon name="external" size={12} />
-      </div>
-      <div className="mono mute" style={{ fontSize: 11, marginTop: 6 }}>{d.escrowNote}</div>
-    </div>
-
-    <div className="drawer-section">
-      <div className="drawer-section-head">Description</div>
-      <div className="drawer-prose">{d.description}</div>
-    </div>
-
-    <div className="drawer-section">
-      <div className="drawer-section-head">Acceptance criteria</div>
-      <ul className="ac-list">
-        {d.acceptance.map((c, i) => <li key={i} className="ac-item">{c}</li>)}
-      </ul>
-    </div>
-
-    <div className="drawer-section">
-      <div className="drawer-section-head">Activity</div>
-      {d.activity.map((a, i) => (
-        <div key={i} className="activity-line">
-          <span className="mono" style={{ minWidth: 96, color: "var(--fg-mute)" }}>{a.time}</span>
-          <span>{a.text}</span>
+const DetailsTab = ({ b }: { b: Bounty }) => {
+  const escrowHash = b.escrowTxHash || b.payoutTxHash || b.refundTxHash || null;
+  const activity = activityFor(b);
+  return (
+    <>
+      <div className="kv-grid">
+        <div className="kv">
+          <div className="kv-k">Amount</div>
+          <div className="kv-v"><span style={{ color: "var(--accent)" }}>{money(b.amountUsdc)}</span> <span className="mute">USDC</span></div>
         </div>
-      ))}
-    </div>
-  </>
-);
+        <div className="kv">
+          <div className="kv-k">Payout chain</div>
+          <div className="kv-v"><span className="chain-pip" style={{ background: "var(--purple)" }} /> stellar</div>
+        </div>
+        <div className="kv">
+          <div className="kv-k">Status</div>
+          <div className="kv-v"><span className={`pill ${ST_CLS[b.status]}`}><i className="dot" />{ST_LABEL[b.status]}</span></div>
+        </div>
+        <div className="kv">
+          <div className="kv-k">Delivery</div>
+          <div className="kv-v">{b.deliveryDays} day{b.deliveryDays === 1 ? "" : "s"}{b.deadlineAt ? ` · due ${fmtDay(b.deadlineAt)}` : ""}</div>
+        </div>
+        <div className="kv">
+          <div className="kv-k">Applications</div>
+          <div className="kv-v">{b.applications?.length ? `${b.applications.length} applied` : "no applications yet"}</div>
+        </div>
+        <div className="kv">
+          <div className="kv-k">Issue</div>
+          <div className="kv-v mono" style={{ fontSize: 12 }}>
+            <a href={b.issueUrl} target="_blank" rel="noreferrer">{b.repo}#{b.issueNumber}</a> <Icon name="github" size={12} />
+          </div>
+        </div>
+      </div>
 
-const SubmissionsTab = ({ subs, chain }: { subs: Submission[]; chain: string }) => {
-  if (subs.length === 0) {
+      <div className="drawer-section">
+        <div className="drawer-section-head">Escrow transaction</div>
+        {escrowHash ? (
+          <>
+            <a className="mono" href={stellarTxUrl(escrowHash)} target="_blank" rel="noreferrer" style={{ fontSize: 13, color: "var(--accent)", display: "flex", alignItems: "center", gap: 6 }}>
+              {shortHash(escrowHash)} <Icon name="external" size={12} />
+            </a>
+            <div className="mono mute" style={{ fontSize: 11, marginTop: 6 }}>{b.amountUsdc} USDC escrowed on Stellar · view on stellar.expert</div>
+          </>
+        ) : (
+          <div className="mono mute" style={{ fontSize: 12 }}>Not yet funded.</div>
+        )}
+      </div>
+
+      <div className="drawer-section">
+        <div className="drawer-section-head">Description</div>
+        <div className="drawer-prose">{b.description || "No description provided."}</div>
+      </div>
+
+      {b.acceptance?.length > 0 && (
+        <div className="drawer-section">
+          <div className="drawer-section-head">Acceptance criteria</div>
+          <ul className="ac-list">
+            {b.acceptance.map((c, i) => <li key={i} className="ac-item">{c}</li>)}
+          </ul>
+        </div>
+      )}
+
+      <div className="drawer-section">
+        <div className="drawer-section-head">Activity</div>
+        {activity.map((a, i) => (
+          <div key={i} className="activity-line">
+            <span className="mono" style={{ minWidth: 96, color: "var(--fg-mute)" }}>{a.time}</span>
+            <span>{a.text}</span>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+};
+
+const SubmissionsTab = ({ b }: { b: Bounty }) => {
+  if (!b.prNumber) {
     return (
       <div className="drawer-empty">
         <div className="drawer-empty-art"><Icon name="git" size={22} color="var(--fg-mute)" /></div>
         <div className="drawer-empty-title">No submissions yet</div>
-        <div className="drawer-empty-sub">When a contributor opens a PR against this bounty it appears here for review.</div>
+        <div className="drawer-empty-sub">When the delegated contributor opens a PR against this bounty it appears here.</div>
       </div>
     );
   }
   return (
     <>
       <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
-        {subs.length} PR awaiting review · merging releases escrow on {chain}
+        Merging this PR on GitHub auto-releases the escrow to @{b.assigneeGithubLogin || "the contributor"} on Stellar.
       </div>
       <div className="sub-cards">
-        {subs.map((s, i) => <SubmissionCard key={i} s={s} />)}
+        <div className="sub-card ready">
+          <div className="sub-card-head">
+            <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+              <span className="mono" style={{ fontWeight: 600 }}>@{b.assigneeGithubLogin || "contributor"}</span>
+              <span className="mono mute" style={{ fontSize: 11 }}>
+                <Icon name="git" size={10} /> {b.repo}#{b.prNumber}
+              </span>
+            </div>
+          </div>
+          <div className="sub-card-note">
+            Status: {ST_LABEL[b.status]}. When you merge the PR, the escrowed {money(b.amountUsdc)} USDC is released automatically — no extra action needed.
+          </div>
+          <div className="sub-card-actions">
+            <a className="btn sm" href={prUrl(b.repo, b.prNumber)} target="_blank" rel="noreferrer"><Icon name="github" size={11} /> View PR <Icon name="external" size={10} /></a>
+          </div>
+        </div>
       </div>
     </>
   );
 };
 
-const SubmissionCard = ({ s }: { s: Submission }) => {
-  const [decided, setDecided] = React.useState<null | "approved" | "rejected">(null);
-  return (
-    <div className={`sub-card ${s.blockers === 0 && s.acMet === s.acTotal ? "ready" : "changes"}`}>
-      <div className="sub-card-head">
-        <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-          <span className="mono" style={{ fontWeight: 600 }}>{s.author}</span>
-          <span className="mono mute" style={{ fontSize: 11 }}>
-            <Icon name="git" size={10} /> {s.prRef} · submitted {s.ago}
-          </span>
-        </div>
-      </div>
-      <div className="sub-card-stats">
-        <div className="sub-stat">
-          <span className="sub-stat-label">Diff</span>
-          <span className="sub-stat-value">
-            <span style={{ color: "var(--accent)" }}>+{s.added}</span>
-            {" / "}
-            <span style={{ color: "var(--danger)" }}>-{s.deleted}</span>
-            {" · "}{s.files} files
-          </span>
-        </div>
-        <div className="sub-stat">
-          <span className="sub-stat-label">Checks</span>
-          <span className="sub-stat-value" style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
-            <span className={`pill sm ${s.acMet === s.acTotal ? "running" : "warn"}`}><i className="dot" />AC {s.acMet} / {s.acTotal}</span>
-            <span className={`pill sm ${s.testsPass ? "green" : "danger"}`}><i className="dot" />{s.testsPass ? "TESTS PASSING" : "TESTS FAILING"}</span>
-            <span className={`pill sm ${s.blockers === 0 ? "nit" : "danger"}`}><i className="dot" />BLOCKERS {s.blockers}</span>
-          </span>
-        </div>
-      </div>
-      <div className="sub-card-note">{s.note}</div>
-      <div className="sub-card-actions">
-        {decided ? (
-          <span className={`pill ${decided === "approved" ? "green" : "danger"}`}><i className="dot" />{decided === "approved" ? "APPROVED & PAID" : "REJECTED"}</span>
-        ) : (
-          <>
-            <button className="btn sm"><Icon name="github" size={11} /> View PR <Icon name="external" size={10} /></button>
-            <button className="btn sm" onClick={() => setDecided("rejected")}>Reject</button>
-            <button className="btn sm primary" onClick={() => setDecided("approved")}><Icon name="check" size={11} /> Approve & Pay</button>
-          </>
-        )}
-      </div>
-    </div>
-  );
+const APP_PILL: Record<BountyApplication["status"], { label: string; cls: string }> = {
+  pending: { label: "PENDING", cls: "warn" },
+  approved: { label: "DELEGATED", cls: "running" },
+  accepted: { label: "ACCEPTED", cls: "green" },
+  rejected: { label: "REJECTED", cls: "nit" },
 };
 
-const ApplicationsTab = ({ apps }: { apps: Application[] }) => {
-  const [confirming, setConfirming] = React.useState<Record<string, "reject" | "delegate">>({});
-  const [resolved, setResolved] = React.useState<Record<string, "delegated" | "rejected">>({});
-  const clearConfirm = (handle: string) => setConfirming((c) => { const n = { ...c }; delete n[handle]; return n; });
+const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => void }) => {
+  const [confirming, setConfirming] = React.useState<Record<number, "reject" | "delegate">>({});
+  const [busy, setBusy] = React.useState<number | null>(null);
+  const [err, setErr] = React.useState<string | null>(null);
+  const apps = b.applications || [];
+  const clearConfirm = (githubId: number) => setConfirming((c) => { const n = { ...c }; delete n[githubId]; return n; });
+
+  const act = async (githubId: number, kind: "reject" | "delegate") => {
+    setBusy(githubId);
+    setErr(null);
+    try {
+      const res = kind === "delegate"
+        ? await api.approveApplication(b.id, githubId)
+        : await api.rejectApplication(b.id, githubId);
+      onChanged(res.bounty);
+    } catch (e: any) {
+      setErr(e?.message || "Action failed.");
+    } finally {
+      setBusy(null);
+      clearConfirm(githubId);
+    }
+  };
 
   if (apps.length === 0) {
     return (
@@ -730,62 +620,62 @@ const ApplicationsTab = ({ apps }: { apps: Application[] }) => {
     );
   }
 
+  // Only allow delegating/rejecting while the bounty is still open for assignment.
+  const canAct = b.status === "OPEN";
+
   return (
     <>
       <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
         {apps.length} application{apps.length === 1 ? "" : "s"} · sorted by status
       </div>
+      {err && <div className="mono" style={{ fontSize: 11, color: "var(--danger)", marginBottom: 10 }}>{err}</div>}
       <div className="app-cards">
         {apps.map((a) => {
-          const state = resolved[a.handle];
+          const pill = APP_PILL[a.status];
+          const pending = a.status === "pending";
+          const isBusy = busy === a.githubId;
           return (
-            <div key={a.handle} className={`app-card ${a.isNew ? "new" : ""}`}>
+            <div key={a.githubId} className={`app-card ${pending ? "new" : ""}`}>
               <div className="app-card-row">
                 <div style={{ minWidth: 0 }}>
                   <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                    <span className="mono" style={{ fontWeight: 600 }}>{a.handle}</span>
-                    {a.isNew && <span className="tab-count new">NEW</span>}
+                    <span className="mono" style={{ fontWeight: 600 }}>@{a.githubLogin}</span>
+                    {pending && <span className="tab-count new">NEW</span>}
                   </div>
                   <div className="mono mute" style={{ fontSize: 11, marginTop: 4 }}>
-                    ★ {a.rating.toFixed(1)} · {a.mergedPrs} merged PRs · fit {a.fit} · applied {a.appliedAgo}
+                    applied {fmtDay(a.appliedAt)}{a.note ? ` · ${a.note}` : ""}
                   </div>
                 </div>
                 <div className="flex gap-2">
-                  {state ? (
-                    <span className={`pill ${state === "delegated" ? "running" : "nit"}`}><i className="dot" />{state === "delegated" ? "DELEGATED" : "REJECTED"}</span>
-                  ) : confirming[a.handle] ? null : (
+                  {!pending || !canAct ? (
+                    <span className={`pill ${pill.cls}`}><i className="dot" />{pill.label}</span>
+                  ) : confirming[a.githubId] ? null : (
                     <>
-                      <button className="btn sm" onClick={() => setConfirming((c) => ({ ...c, [a.handle]: "reject" }))}>Reject</button>
-                      <button className="btn sm primary" onClick={() => setConfirming((c) => ({ ...c, [a.handle]: "delegate" }))}>Delegate</button>
+                      <button className="btn sm" disabled={isBusy} onClick={() => setConfirming((c) => ({ ...c, [a.githubId]: "reject" }))}>Reject</button>
+                      <button className="btn sm primary" disabled={isBusy} onClick={() => setConfirming((c) => ({ ...c, [a.githubId]: "delegate" }))}>Delegate</button>
                     </>
                   )}
                 </div>
               </div>
-              {confirming[a.handle] && !state && (
-                <div className={`app-confirm ${confirming[a.handle]}`}>
-                  {confirming[a.handle] === "reject" && (
+              {confirming[a.githubId] && pending && canAct && (
+                <div className={`app-confirm ${confirming[a.githubId]}`}>
+                  {confirming[a.githubId] === "reject" && (
                     <span className="app-confirm-icon"><Icon name="warn" size={15} /></span>
                   )}
                   <div className="app-confirm-msg">
-                    {confirming[a.handle] === "reject"
+                    {confirming[a.githubId] === "reject"
                       ? "Reject this application? This can't be undone."
-                      : `Delegate this bounty to ${a.handle}? Every other application on this bounty will be automatically rejected.`}
+                      : `Delegate this bounty to @${a.githubLogin}? Every other application on this bounty will be automatically rejected.`}
                   </div>
                   <div className="app-confirm-actions">
-                    <button className="btn sm ghost" onClick={() => clearConfirm(a.handle)}>Cancel</button>
-                    {confirming[a.handle] === "reject" ? (
-                      <button
-                        className="btn sm app-confirm-go reject"
-                        onClick={() => { setResolved((r) => ({ ...r, [a.handle]: "rejected" })); clearConfirm(a.handle); }}
-                      >
-                        <Icon name="x" size={11} /> Confirm reject
+                    <button className="btn sm ghost" disabled={isBusy} onClick={() => clearConfirm(a.githubId)}>Cancel</button>
+                    {confirming[a.githubId] === "reject" ? (
+                      <button className="btn sm app-confirm-go reject" disabled={isBusy} onClick={() => act(a.githubId, "reject")}>
+                        <Icon name="x" size={11} /> {isBusy ? "Rejecting…" : "Confirm reject"}
                       </button>
                     ) : (
-                      <button
-                        className="btn sm app-confirm-go delegate"
-                        onClick={() => { setResolved((r) => ({ ...r, [a.handle]: "delegated" })); clearConfirm(a.handle); }}
-                      >
-                        <Icon name="check" size={11} /> Confirm delegate
+                      <button className="btn sm app-confirm-go delegate" disabled={isBusy} onClick={() => act(a.githubId, "delegate")}>
+                        <Icon name="check" size={11} /> {isBusy ? "Delegating…" : "Confirm delegate"}
                       </button>
                     )}
                   </div>
@@ -796,6 +686,210 @@ const ApplicationsTab = ({ apps }: { apps: Application[] }) => {
         })}
       </div>
     </>
+  );
+};
+
+// ─── Freighter (browser wallet) bridge ────────────────────────────────────────
+// The Freighter extension injects `window.freighterApi`. We feature-detect and
+// throw a clear message when it's absent so the funding flow degrades to guidance
+// instead of crashing. Return shapes vary across versions, so we read defensively.
+async function freighterAddress(): Promise<string> {
+  const fr: any = (window as any).freighterApi || (window as any).freighter;
+  if (!fr) throw new Error("Freighter wallet not detected. Install it from freighter.app, then reload this page.");
+  const access = await (fr.requestAccess ? fr.requestAccess() : fr.getPublicKey?.());
+  const address = typeof access === "string" ? access : access?.address || access?.publicKey;
+  if (!address) throw new Error("Couldn't read your Freighter wallet address.");
+  return address;
+}
+async function freighterSign(xdr: string, address: string): Promise<string> {
+  const fr: any = (window as any).freighterApi || (window as any).freighter;
+  if (!fr?.signTransaction) throw new Error("Freighter wallet not available.");
+  const signed = await fr.signTransaction(xdr, { address });
+  const signedXdr = typeof signed === "string" ? signed : signed?.signedTxXdr || signed?.signedXDR;
+  if (!signedXdr) throw new Error("Transaction signing was cancelled.");
+  return signedXdr;
+}
+
+// ─── Fund modal (from /bounties/:id/fund?token=…) ─────────────────────────────
+const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | null; onClose: () => void }) => {
+  const [bounty, setBounty] = React.useState<Bounty | null>(null);
+  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "done" | "error">("loading");
+  const [msg, setMsg] = React.useState<string | null>(null);
+  const [hash, setHash] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  React.useEffect(() => {
+    let alive = true;
+    if (!id || !token) { setPhase("error"); setMsg("This funding link is missing its bounty id or security token."); return; }
+    (async () => {
+      try {
+        const r = await api.bounty(id);
+        if (!alive) return;
+        setBounty(r.bounty);
+        setPhase("ready");
+      } catch (e: any) {
+        if (!alive) return;
+        setPhase("error");
+        setMsg(e?.message || "Couldn't load this bounty.");
+      }
+    })();
+    return () => { alive = false; };
+  }, [id, token]);
+
+  const fund = async () => {
+    if (!id || !token) return;
+    setPhase("working");
+    setMsg(null);
+    try {
+      const address = await freighterAddress();
+      const { xdr } = await api.bountyFundingTx(id, token, address);
+      const signedXdr = await freighterSign(xdr, address);
+      const res = await api.submitBountyFunding(id, token, signedXdr);
+      setHash(res.hash || null);
+      setPhase("done");
+    } catch (e: any) {
+      setMsg(e?.message || "Funding failed.");
+      setPhase("error");
+    }
+  };
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
+        <div className="cb-modal-head">
+          <div className="cb-eyebrow">Fund bounty</div>
+          <h2 className="cb-modal-title">Escrow this bounty</h2>
+          <div className="cb-modal-sub">
+            {bounty
+              ? <>Fund <span className="mono">{bounty.code}</span> — {bounty.title}. You'll sign a create-escrow transaction with your Freighter wallet.</>
+              : "Sign a create-escrow transaction with your Freighter wallet to publish this bounty."}
+          </div>
+        </div>
+
+        {bounty && (
+          <div className="tu-notice" style={{ marginBottom: 16 }}>
+            <Icon name="warn" size={15} />
+            <span><b>{money(bounty.amountUsdc)} USDC</b> will move from your wallet into escrow on Stellar. It's released to the contributor when you merge their PR, or refunded to you if the deadline elapses.</span>
+          </div>
+        )}
+
+        {phase === "done" ? (
+          <div className="wd-success">
+            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
+            <div className="wd-success-title">Escrow funded</div>
+            <div className="wd-success-sub">
+              {bounty ? <>{money(bounty.amountUsdc)} USDC is now escrowed. </> : null}
+              {hash ? <>Tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a>.</> : "The transaction has been submitted."}
+            </div>
+          </div>
+        ) : msg ? (
+          <div className="mono" style={{ fontSize: 12, color: phase === "error" ? "var(--danger)" : "var(--fg-mute)", padding: "4px 0 12px" }}>{msg}</div>
+        ) : null}
+
+        <div className="cb-modal-foot">
+          <button className="btn ghost" onClick={onClose}>{phase === "done" ? "Done" : "Cancel"}</button>
+          {phase !== "done" && (
+            <button className="btn primary" disabled={phase === "loading" || phase === "working" || !bounty} onClick={fund}>
+              <Icon name="check" size={13} /> {phase === "working" ? "Signing…" : "Fund with Freighter"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── Cancel modal (from /bounties/:id/cancel?token=…) ─────────────────────────
+const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string | null; onClose: () => void }) => {
+  const [bounty, setBounty] = React.useState<Bounty | null>(null);
+  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "done" | "error">("loading");
+  const [msg, setMsg] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  React.useEffect(() => {
+    let alive = true;
+    if (!id || !token) { setPhase("error"); setMsg("This cancel link is missing its bounty id or security token."); return; }
+    (async () => {
+      try {
+        const r = await api.bounty(id);
+        if (!alive) return;
+        setBounty(r.bounty);
+        setPhase("ready");
+      } catch (e: any) {
+        if (!alive) return;
+        setPhase("error");
+        setMsg(e?.message || "Couldn't load this bounty.");
+      }
+    })();
+    return () => { alive = false; };
+  }, [id, token]);
+
+  const cancel = async () => {
+    if (!id || !token) return;
+    setPhase("working");
+    setMsg(null);
+    try {
+      await api.cancelBounty(id, token);
+      setPhase("done");
+    } catch (e: any) {
+      setMsg(e?.message || "Cancellation failed.");
+      setPhase("error");
+    }
+  };
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
+        <div className="cb-modal-head">
+          <div className="cb-eyebrow">Cancel bounty</div>
+          <h2 className="cb-modal-title">Cancel & refund</h2>
+          <div className="cb-modal-sub">
+            {bounty
+              ? <>Cancel <span className="mono">{bounty.code}</span> — {bounty.title}. Any escrowed funds are refunded to your wallet.</>
+              : "Cancel this bounty and refund any escrowed funds to your wallet."}
+          </div>
+        </div>
+
+        {phase === "done" ? (
+          <div className="wd-success">
+            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
+            <div className="wd-success-title">Bounty cancelled</div>
+            <div className="wd-success-sub">{bounty ? <>{bounty.code} was cancelled.</> : "The bounty was cancelled."} Any escrow is being refunded to your wallet.</div>
+          </div>
+        ) : (
+          <>
+            {bounty && (
+              <div className="tu-notice" style={{ marginBottom: 16 }}>
+                <Icon name="warn" size={15} />
+                <span>This closes the bounty for <b>{money(bounty.amountUsdc)} USDC</b> and refunds any escrow. This can't be undone.</span>
+              </div>
+            )}
+            {msg && <div className="mono" style={{ fontSize: 12, color: "var(--danger)", padding: "4px 0 12px" }}>{msg}</div>}
+          </>
+        )}
+
+        <div className="cb-modal-foot">
+          <button className="btn ghost" onClick={onClose}>{phase === "done" ? "Done" : "Keep bounty"}</button>
+          {phase !== "done" && (
+            <button className="btn primary" disabled={phase === "loading" || phase === "working" || !bounty} onClick={cancel}>
+              <Icon name="x" size={13} /> {phase === "working" ? "Cancelling…" : "Cancel bounty"}
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
   );
 };
 
