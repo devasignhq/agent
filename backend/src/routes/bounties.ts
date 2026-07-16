@@ -12,6 +12,7 @@ import { isStellarConfigured } from "../config.js";
 import { getSessionUser } from "../github/oauth.js";
 import { installationsForUser, userInInstall } from "../github/installations.js";
 import { assertValidAddress } from "../stellar/scval.js";
+import { networkPassphrase } from "../stellar/client.js";
 import { cancelUrl, fundingUrl, verifyBountyLinkToken } from "../bounties/links.js";
 import { updateStatusComment } from "../bounties/botcomment.js";
 import { postAndRecordConfirmComment } from "../bounties/webhooks.js";
@@ -197,7 +198,10 @@ bounties.get("/bounties/:id/funding-tx", async (req, res) => {
   try {
     const r = await buildFundingTx(bountyId, address);
     if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
-    res.json({ xdr: r.xdr });
+    // Return the network passphrase the XDR was built for so Freighter signs
+    // against the same network the backend will submit to (rather than whatever
+    // network the user happens to have selected in the extension).
+    res.json({ xdr: r.xdr, networkPassphrase: networkPassphrase() });
   } catch (err) {
     res.status(400).json({ error: "build_failed", message: (err as Error).message });
   }
