@@ -181,6 +181,35 @@ test("a genuinely unfunded bounty stays PENDING_FUNDING", async () => {
   assert.equal(txnByKey(`escrow:${b.taskId}`), null);
 });
 
+test("per-tick read cap counts actual chain reads, not skipped candidates", async () => {
+  // 10 fresh bounties (inside the grace window) iterate FIRST, then 5 aged past
+  // it — the skips must neither consume read budget nor break the loop early.
+  for (let i = 0; i < 10; i++) mkBounty();
+  const due = Array.from({ length: 5 }, () => mkBounty());
+  for (const b of due) db.update("bounties", (x) => x.id === b.id, { createdAt: Date.now() - 2 * 60 * 1000 });
+  let reads = 0;
+  const deps = keeperDeps({}, () => Date.now(), { async getEscrow() { reads++; return null; } });
+
+  await runTick(deps);
+  assert.equal(reads, 5); // exactly the due candidates — skips cost nothing
+
+  await runTick(deps);
+  assert.equal(reads, 5); // all due candidates now inside the recheck throttle
+});
+
+test("more due candidates than the cap → capped now, remainder next tick", async () => {
+  const due = Array.from({ length: 12 }, () => mkBounty());
+  for (const b of due) db.update("bounties", (x) => x.id === b.id, { createdAt: Date.now() - 2 * 60 * 1000 });
+  let reads = 0;
+  const deps = keeperDeps({}, () => Date.now(), { async getEscrow() { reads++; return null; } });
+
+  await runTick(deps);
+  assert.equal(reads, 10); // ORPHAN_MAX_CHECKS_PER_TICK
+
+  await runTick(deps);
+  assert.equal(reads, 12); // the throttled 10 are skipped; the remaining 2 rotate in
+});
+
 test("a bounty with a live pending escrow txn is left to the confirm path", async () => {
   const b = mkBounty();
   recordFunding(b.id, ADDR(), { hash: "H_UNCONFIRMED", status: "pending" });
