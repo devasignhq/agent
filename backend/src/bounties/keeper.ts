@@ -95,6 +95,15 @@ async function confirmPending(deps: KeeperDeps): Promise<void> {
       outcome = await deps.confirm(txn.hash);
     } catch (err) {
       console.warn(`[bounty-keeper] confirm ${txn.hash} failed:`, err);
+      // Defense-in-depth: confirmTransaction is written not to throw, but a
+      // confirm that somehow keeps throwing must not pin the row `pending`
+      // forever (that also locks out orphan recovery, which only considers
+      // bounties with no live escrow row). Past the max age, fail it so
+      // recoverOrphanedFunding can adopt a tx that actually landed on-chain.
+      if (deps.now() - txn.createdAt > PENDING_MAX_AGE_MS) {
+        await applyTxnOutcome(txn.id, { status: "failed", error: "confirm_error_timeout" }, deps.chain);
+        await syncComment(txn.bountyId);
+      }
       continue;
     }
     if (outcome.status === "not_found") {
