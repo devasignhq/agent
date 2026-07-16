@@ -130,6 +130,28 @@ export const BountiesPage = ({
     load();
   }, [load]);
 
+  // Silent refetch (no loading flash) — used after fund/cancel modals close and
+  // while transactions are settling, so history reflects the keeper's
+  // pending → confirmed flips without a manual page reload.
+  const refresh = React.useCallback(async () => {
+    try {
+      const [b, t] = await Promise.all([api.bounties(), api.bountyTransactions()]);
+      setBounties(b.bounties);
+      setSummary(b.summary);
+      setTxns(t.transactions);
+    } catch {
+      // transient — keep showing the last good data
+    }
+  }, []);
+
+  // Poll while anything is settling on-chain (keeper tick is 12s).
+  const settling = txns.some((t) => t.status === "pending");
+  React.useEffect(() => {
+    if (!settling) return;
+    const timer = setInterval(() => void refresh(), 5000);
+    return () => clearInterval(timer);
+  }, [settling, refresh]);
+
   // Merge a mutated bounty (returned by approve/reject) back into the list so the
   // open drawer and table update without a full refetch.
   const applyBounty = React.useCallback((b: Bounty) => {
@@ -299,10 +321,10 @@ export const BountiesPage = ({
       {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} onChanged={applyBounty} />}
       {creating && <CreateBountyModal onClose={() => setCreating(false)} />}
       {isFunding && (
-        <FundBountyModal id={params.id} token={search.get("token")} onClose={() => navigate("/bounty")} />
+        <FundBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
       )}
       {isCancelling && (
-        <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => navigate("/bounty")} />
+        <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
       )}
       {isApplying && (
         <ApplyBountyModal id={params.id} onClose={() => navigate("/bounty")} />
@@ -352,7 +374,7 @@ const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hid
 };
 
 const TXN_PILL: Record<EscrowTransaction["status"], { label: string; cls: string }> = {
-  confirmed: { label: "CONFIRMED", cls: "running" },
+  confirmed: { label: "COMPLETED", cls: "running" },
   pending: { label: "PENDING", cls: "warn" },
   failed: { label: "FAILED", cls: "danger" },
 };
@@ -449,7 +471,7 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
                 ? "Awaiting funding · sign with Freighter to activate"
                 : delegated ? "Cannot cancel · bounty is delegated" : "This bounty can still be cancelled"}
             </span>
-            {bounty.status === "PENDING_FUNDING" && bounty.cancelUrl && (
+            {bounty.cancelUrl && (
               <a className="btn" href={bounty.cancelUrl}><Icon name="x" size={13} /> Cancel</a>
             )}
             {bounty.status === "PENDING_FUNDING" && bounty.fundingUrl && (
@@ -1001,6 +1023,8 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
   const [bounty, setBounty] = React.useState<Bounty | null>(null);
   const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "done" | "error">("loading");
   const [msg, setMsg] = React.useState<string | null>(null);
+  const [outcome, setOutcome] = React.useState<string | null>(null);
+  const [hash, setHash] = React.useState<string | null>(null);
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -1031,13 +1055,23 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
     setPhase("working");
     setMsg(null);
     try {
-      await api.cancelBounty(id, token);
+      const r = await api.cancelBounty(id, token);
+      setOutcome(r.outcome);
+      setHash(r.hash ?? null);
       setPhase("done");
     } catch (e: any) {
+      if (e?.message === "funding_in_flight") {
+        // The funding tx hasn't confirmed yet — retriable, don't dead-end.
+        setMsg("Your funding transaction is still confirming on Stellar. Try again in a minute — cancelling then refunds the escrow.");
+        setPhase("ready");
+        return;
+      }
       setMsg(e?.message || "Cancellation failed.");
       setPhase("error");
     }
   };
+
+  const refunded = outcome === "submitted" || outcome === "already_pending" || outcome === "already_confirmed";
 
   return (
     <div className="modal-scrim" onClick={onClose}>
@@ -1056,8 +1090,18 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
         {phase === "done" ? (
           <div className="wd-success">
             <div className="wd-success-icon"><Icon name="check" size={22} /></div>
-            <div className="wd-success-title">Bounty cancelled</div>
-            <div className="wd-success-sub">{bounty ? <>{bounty.code} was cancelled.</> : "The bounty was cancelled."} Any escrow is being refunded to your wallet.</div>
+            <div className="wd-success-title">{refunded ? "Refund submitted" : "Bounty cancelled"}</div>
+            <div className="wd-success-sub">
+              {bounty ? <>{bounty.code} was cancelled. </> : "The bounty was cancelled. "}
+              {refunded ? (
+                <>
+                  The escrowed {bounty ? `${money(bounty.amountUsdc)} USDC` : "funds"} are being refunded to your wallet
+                  {hash ? <> — tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a></> : null}. This completes within about a minute.
+                </>
+              ) : (
+                "No funds were in escrow."
+              )}
+            </div>
           </div>
         ) : (
           <>

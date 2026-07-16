@@ -10,7 +10,7 @@
 // STATE preconditions.
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { config } from "../config.js";
+import { config, isStellarConfigured } from "../config.js";
 import type { Bounty, BountyApplication, BountyCancelReason, EscrowTransaction } from "../types.js";
 import { taskIdForBounty } from "./taskid.js";
 import { assertBountyAmount, stroopsToUsdcNumber, usdcToStroops } from "../stellar/amount.js";
@@ -213,6 +213,10 @@ export async function submitFunding(bountyId: string, signedXdr: string): Promis
   const existing = findTxnByKey(`escrow:${b.taskId}`);
   if (existing && existing.status !== "failed") {
     return { ok: true, reason: `already_${existing.status}`, hash: existing.hash ?? undefined };
+  }
+  // A signed envelope fetched before a cancel must not fund a cancelled bounty.
+  if (b.status !== "PENDING_FUNDING") {
+    return { ok: false, reason: `already_${b.status.toLowerCase()}` };
   }
   let source: string;
   try {
@@ -535,16 +539,58 @@ export async function refundBounty(
   return { ok: true, reason: "submitted", hash: send.hash };
 }
 
+/**
+ * Cancel a bounty (the sponsor's Cancel link, or a delete). Refunds the on-chain
+ * escrow when one exists. Safe against the two windows where a bounty is
+ * PENDING_FUNDING locally while USDC already sits in escrow: a funding tx still
+ * confirming (reject, retriable after the keeper's next tick) and an orphaned
+ * escrow whose funding record was lost (adopt it, then refund).
+ */
+export async function cancelBounty(
+  bountyId: string,
+  reason: BountyCancelReason = "deleted",
+  chain: EscrowChain = defaultChain
+): Promise<LifecycleResult> {
+  const b = getBounty(bountyId);
+  if (!b) return { ok: false, reason: "not_found" };
+  if (b.status === "CANCELLED") return { ok: true, reason: "already_cancelled", bounty: b };
+  if (b.status === "PAID") return { ok: false, reason: "already_paid" };
+  if (b.status === "OPEN") return refundBounty(bountyId, reason, chain);
+  if (b.status !== "PENDING_FUNDING") return { ok: false, reason: "delegated_cannot_delete" };
+  // Never mark CANCELLED while a funding tx is in flight — the keeper confirms
+  // it within a tick, after which a retried cancel takes the refund path.
+  const escrowRow = findTxnByKey(`escrow:${b.taskId}`);
+  if (escrowRow && escrowRow.status === "pending") {
+    return { ok: false, reason: "funding_in_flight" };
+  }
+  // The funding record can be lost while the escrow exists on-chain (the orphan
+  // case the keeper also recovers) — ask the chain before discarding. A failed
+  // probe aborts: cancelling blind could strand escrowed USDC forever, since
+  // orphan recovery only considers PENDING_FUNDING bounties. An injected chain
+  // (tests) can always answer; the default chain only when Stellar is configured
+  // (when it isn't, nothing can be escrowed on-chain to begin with).
+  if (chain !== defaultChain || isStellarConfigured()) {
+    let escrow: unknown;
+    try {
+      escrow = await chain.getEscrow(b.taskId);
+    } catch {
+      return { ok: false, reason: "chain_error" };
+    }
+    if (escrow) {
+      const adopted = adoptOnchainEscrow(bountyId, escrow);
+      if (!adopted.ok) return adopted;
+      return refundBounty(bountyId, reason, chain);
+    }
+  }
+  return cancelPending(bountyId);
+}
+
 /** Sponsor deletes an UNDELEGATED bounty → refund. Delegated bounties can't be deleted. */
 export async function deleteBounty(
   bountyId: string,
   chain: EscrowChain = defaultChain
 ): Promise<LifecycleResult> {
-  const b = getBounty(bountyId);
-  if (!b) return { ok: false, reason: "not_found" };
-  if (b.status === "PENDING_FUNDING") return cancelPending(bountyId);
-  if (b.status !== "OPEN") return { ok: false, reason: "delegated_cannot_delete" };
-  return refundBounty(bountyId, "deleted", chain);
+  return cancelBounty(bountyId, "deleted", chain);
 }
 
 // ── reconciliation (driven by the keeper) ────────────────────────────────────
@@ -677,7 +723,11 @@ export function applyTxnOutcome(
     });
     if (!b) return;
     if (txn.kind === "escrow") {
-      patchBounty(b.id, { status: "OPEN", onchainStatus: "Open" });
+      // Only advance from PENDING_FUNDING — a late funding confirm must never
+      // resurrect a bounty that was cancelled in the interim.
+      if (b.status === "PENDING_FUNDING") {
+        patchBounty(b.id, { status: "OPEN", onchainStatus: "Open" });
+      }
     } else if (txn.kind === "payout") {
       patchBounty(b.id, { status: "PAID", onchainStatus: "Completed", pendingOp: null });
     } else if (txn.kind === "refund") {

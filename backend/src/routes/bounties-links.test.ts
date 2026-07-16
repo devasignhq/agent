@@ -1,8 +1,9 @@
 // Sponsor reads must carry the signed Fund/Cancel links for a PENDING_FUNDING
 // bounty — the in-app fallback when the GitHub confirm comment can't be posted
-// (e.g. the App lacks Issues:write). Applicants must NOT receive the links (the
-// cancel token would let them kill the bounty), and non-pending bounties carry
-// none. Drives the exported handlers with a fake session req/res (signed-JWT
+// (e.g. the App lacks Issues:write). A funded (OPEN) bounty keeps its Cancel
+// link (cancelling refunds the escrow) but loses the Fund link. Applicants must
+// NOT receive the links (the cancel token would let them kill the bounty).
+// Drives the exported handlers with a fake session req/res (signed-JWT
 // cookie via signSession), in-memory, no network. Run:
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= \
 //     node --import tsx/esm --test src/routes/bounties-links.test.ts
@@ -97,7 +98,10 @@ test("sponsor detail carries the links; an applicant's detail does not", () => {
 
   const sres2 = fakeRes();
   getBountyHandler(authedReq(sponsorId, { id: bounty.id }), sres2);
-  assert.equal(sres2.body.bounty.fundingUrl, undefined, "no links once funded (OPEN)");
+  assert.equal(sres2.body.bounty.fundingUrl, undefined, "no fundingUrl once funded (OPEN)");
+  assert.ok(sres2.body.bounty.cancelUrl, "cancelUrl persists once funded — cancel refunds the escrow");
+  const openCancelToken = new URL(sres2.body.bounty.cancelUrl).searchParams.get("token")!;
+  assert.equal(verifyBountyLinkToken(openCancelToken, "cancel"), bounty.id);
 });
 
 test("any signed-in user can read a bounty; applications stay scoped", () => {
