@@ -1412,6 +1412,13 @@ api.get("/notifications/stream", (req, res) => {
     "X-Accel-Buffering": "no",
   });
   res.flushHeaders();
+  // A write to a socket the client already dropped surfaces asynchronously as an
+  // 'error' on the response stream (EPIPE/ECONNRESET) — writeFrame's try/catch
+  // can't see it, and with no listener Node escalates it to an uncaught exception
+  // that crashes the process. Swallow it; teardown runs via the 'close' handler
+  // below. Registered before the first write so an instant disconnect can't slip
+  // past it.
+  res.on("error", () => {});
   // Establish the stream and tell the browser how long to wait before
   // reconnecting if it drops (EventSource handles the reconnect itself).
   res.write("retry: 5000\n\n");

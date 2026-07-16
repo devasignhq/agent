@@ -54,6 +54,10 @@ export function startNotificationsStream(deps: StreamDeps): StreamHandle {
       if (stopped) return; // idempotent: React cleanup + a manual stop can overlap
       stopped = true;
       try {
+        // Drop the handlers before closing so no already-queued event can fire
+        // refresh() after teardown; close() then stops the connection.
+        source.onmessage = null;
+        source.onerror = null;
         source.close();
       } catch {
         // already closed — ignore

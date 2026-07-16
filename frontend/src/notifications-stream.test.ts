@@ -69,12 +69,15 @@ test("schedules the fallback poll at the default cadence and it refreshes", () =
   assert.equal(refreshes, 1);
 });
 
-test("stop() closes the source and clears the fallback exactly once", () => {
+test("stop() closes the source and clears the fallback exactly once, and silences late events", () => {
   const source = fakeSource();
+  let refreshes = 0;
   const cleared: unknown[] = [];
   const handle = startNotificationsStream({
     openSource: () => source,
-    refresh: () => {},
+    refresh: () => {
+      refreshes++;
+    },
     scheduleFallback: () => 42,
     clearFallback: (h) => {
       cleared.push(h);
@@ -84,4 +87,6 @@ test("stop() closes the source and clears the fallback exactly once", () => {
   handle.stop(); // idempotent — a manual stop and React cleanup can overlap
   assert.equal(source.closed, true);
   assert.deepEqual(cleared, [42]);
+  source.emit("{}"); // a message queued after teardown must not trigger a refresh
+  assert.equal(refreshes, 0);
 });

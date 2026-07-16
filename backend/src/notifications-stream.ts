@@ -26,6 +26,10 @@ let heartbeatTimer: NodeJS.Timeout | null = null;
 function writeFrame(res: Response, frame: string): boolean {
   try {
     res.write(frame);
+    // No compression middleware is mounted today (SSE would otherwise buffer),
+    // but if one is ever added it decorates res with flush() — call it so frames
+    // still reach the client immediately. A no-op when absent.
+    (res as { flush?: () => void }).flush?.();
     return true;
   } catch {
     return false;
@@ -90,8 +94,11 @@ function stopHeartbeat(): void {
 // End every open stream cleanly on graceful shutdown so clients receive a FIN and
 // reconnect to the next instance, rather than being cut mid-write by process.exit.
 export function closeAllStreams(): void {
-  for (const set of clients.values()) {
-    for (const res of set) {
+  // Snapshot both levels: res.end() can synchronously drive the req 'close'
+  // handler → removeClient, mutating these collections mid-iteration. Matches the
+  // defensive copy in notifyUser/heartbeat.
+  for (const set of [...clients.values()]) {
+    for (const res of [...set]) {
       try {
         res.end();
       } catch {
