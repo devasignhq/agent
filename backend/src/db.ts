@@ -1223,7 +1223,10 @@ export async function initDb(opts?: {
   stallBreakMs = Math.max(opts?.stallBreakMs ?? DEFAULT_STALL_BREAK_MS, flushWatchdogMs + 1);
   stallCheckOverrideMs = opts?.stallCheckMs ?? null;
   stallEscalateAfter = opts?.stallEscalateAfter ?? DEFAULT_STALL_ESCALATE_AFTER;
-  connectTimeoutMs = opts?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+  // Cap at the whole-flush watchdog: connect is a subset of persistBatch, which the
+  // watchdog already bounds, so a connectTimeoutMs above it would never fire (the
+  // watchdog rejects first) — leaving the connect-specific bound dead.
+  connectTimeoutMs = Math.min(opts?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, flushWatchdogMs);
   lastFlushProgressAt = Date.now();
   // Drop any write-through state from a previous run so a re-init (tests, mainly)
   // never inherits a wedged in-flight flush promise, stale timers, or staged rows.
