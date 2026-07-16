@@ -17,6 +17,7 @@ import {
   getBounty,
   pendingTxns,
   refundBounty,
+  resubmitAdminTxn,
   unfundedPendingBounties,
   type EscrowChain,
 } from "./service.js";
@@ -26,6 +27,11 @@ const DEFAULT_TICK_MS = 12_000;
 // Give up waiting for a tx to be included after this long (timebounds expired /
 // dropped) and mark it failed so the operation can be retried.
 const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
+// Rebroadcast an accepted-but-dropped ADMIN tx once it has gone this long without
+// landing. Set ABOVE the admin timebounds (ADMIN_TX_TIMEOUT_S = 120s in escrow.ts)
+// so the prior envelope is provably dead before we send a fresh one — never two
+// live at once. At ~150s this yields ~3 attempts inside PENDING_MAX_AGE_MS.
+const RESUBMIT_STALE_MS = 150 * 1000;
 // Orphan-recovery pacing: leave the normal funding-submit → confirm path room
 // before suspecting a lost record, then re-check each candidate only this often
 // — most PENDING_FUNDING bounties are simply not funded yet, and every check is
@@ -88,8 +94,24 @@ export async function runTick(deps: KeeperDeps = realDeps): Promise<void> {
 }
 
 async function confirmPending(deps: KeeperDeps): Promise<void> {
-  for (const txn of pendingTxns()) {
-    if (!txn.hash) continue;
+  // Prune resubmit stamps for rows that are no longer pending so the map can't
+  // grow without bound (mirrors the orphan-check throttle below).
+  const pending = pendingTxns();
+  const pendingIds = new Set(pending.map((t) => t.id));
+  for (const id of [...lastResubmit.keys()]) if (!pendingIds.has(id)) lastResubmit.delete(id);
+  for (const txn of pending) {
+    if (!txn.hash) {
+      // A pending row with no hash can never be confirmed — there is nothing to
+      // poll. Don't let it pin its bounty pending forever (a funding row would
+      // also lock out orphan recovery, which only considers bounties with no live
+      // escrow row). Past the max age, fail it so the op becomes retryable and
+      // recoverable, exactly like a tx that was never included.
+      if (deps.now() - txn.createdAt > PENDING_MAX_AGE_MS) {
+        await applyTxnOutcome(txn.id, { status: "failed", error: "missing_hash_timeout" }, deps.chain);
+        await syncComment(txn.bountyId);
+      }
+      continue;
+    }
     let outcome: ConfirmResult;
     try {
       outcome = await deps.confirm(txn.hash);
@@ -108,7 +130,23 @@ async function confirmPending(deps: KeeperDeps): Promise<void> {
     }
     if (outcome.status === "not_found") {
       if (deps.now() - txn.createdAt > PENDING_MAX_AGE_MS) {
+        // Age-out is the FINAL backstop — checked first so a genuinely dead tx
+        // fails (retryable) rather than being resubmitted forever.
         await applyTxnOutcome(txn.id, { status: "failed", error: "not_included_timeout" }, deps.chain);
+        await syncComment(txn.bountyId);
+      } else if (
+        txn.signer === "admin" &&
+        deps.now() - (lastResubmit.get(txn.id) ?? txn.createdAt) > RESUBMIT_STALE_MS
+      ) {
+        // Accepted-then-dropped admin tx: its envelope's short timebounds have
+        // expired so it can never land, but it isn't old enough to fail yet.
+        // Rebuild a FRESH envelope and rebroadcast (safe — the prior one is dead;
+        // and the contract's double-settle guard no-ops a redundant broadcast)
+        // instead of waiting out the full 10-minute age-out just to fail it.
+        lastResubmit.set(txn.id, deps.now());
+        const r = await resubmitAdminTxn(txn.id, deps.chain);
+        if (r.ok) console.log(`[bounty-keeper] resubmitted ${txn.kind} ${txn.id} → ${r.hash}`);
+        else console.warn(`[bounty-keeper] resubmit ${txn.kind} ${txn.id}: ${r.reason}`);
         await syncComment(txn.bountyId);
       }
       continue;
@@ -123,6 +161,12 @@ async function confirmPending(deps: KeeperDeps): Promise<void> {
     await syncComment(txn.bountyId);
   }
 }
+
+// Per-txn timestamp of the last admin-tx rebroadcast (confirmPending). In-memory
+// only, like lastOrphanCheck: a restart just means one fresh resubmit per pending
+// admin tx, which is exactly when a dropped tx most needs re-broadcasting. Pruned
+// against the live pending set at the top of confirmPending.
+const lastResubmit = new Map<string, number>();
 
 // Per-bounty timestamp of the last on-chain orphan check. In-memory only: a
 // restart just means one fresh check per candidate, which is exactly when a

@@ -91,11 +91,11 @@ function makeBarrierRes(headersSent: boolean) {
 
 const tick = () => new Promise((r) => setImmediate(r)); // let the flush .then() run
 
-test("durabilityBarrier: pendingWrites>0 + headers already sent → forwards body unchanged", async () => {
+test("durabilityBarrier: persistenceFailing + headers already sent → forwards body unchanged", async () => {
   // The exact equivalence the refactor relies on: when the flush resolves but
-  // writes are still pending and headers have gone out, the success path routes
-  // through finishNotDurable, which must forward the buffered args verbatim.
-  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, pendingWrites: () => 1 });
+  // persistence is genuinely failing and headers have gone out, the success path
+  // routes through finishNotDurable, which must forward the buffered args verbatim.
+  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, persistenceFailing: () => true });
   const { res, calls } = makeBarrierRes(true);
 
   let nextCalled = false;
@@ -115,8 +115,8 @@ test("durabilityBarrier: pendingWrites>0 + headers already sent → forwards bod
   assert.equal(res.statusCode, 200, "status untouched (headers already flushed)");
 });
 
-test("durabilityBarrier: pendingWrites>0 + headers NOT sent → 503 (routes into finishNotDurable)", async () => {
-  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, pendingWrites: () => 1 });
+test("durabilityBarrier: persistenceFailing + headers NOT sent → 503 (routes into finishNotDurable)", async () => {
+  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, persistenceFailing: () => true });
   const { res, calls } = makeBarrierRes(false);
   barrier({ method: "POST" } as Request, res, (() => {}) as NextFunction);
 
@@ -127,8 +127,8 @@ test("durabilityBarrier: pendingWrites>0 + headers NOT sent → 503 (routes into
   assert.match(String(calls[0][0]), /not_durable/, "503 JSON body sent");
 });
 
-test("durabilityBarrier: pendingWrites==0 → normal response forwarded unchanged", async () => {
-  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, pendingWrites: () => 0 });
+test("durabilityBarrier: persistence healthy → normal response forwarded unchanged", async () => {
+  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, persistenceFailing: () => false });
   const { res, calls } = makeBarrierRes(false);
   barrier({ method: "POST" } as Request, res, (() => {}) as NextFunction);
 
@@ -137,6 +137,24 @@ test("durabilityBarrier: pendingWrites==0 → normal response forwarded unchange
 
   assert.equal(res.statusCode, 200, "durable write → normal success");
   assert.deepEqual(calls[0], ["ok-body"], "body forwarded unchanged");
+});
+
+test("durabilityBarrier: healthy flush does NOT 503 despite a concurrent global backlog (spurious-503 regression)", async () => {
+  // The bug this fix closes: the barrier used to gate on the GLOBAL pending-write
+  // count, so a write staged by the keeper/review worker in the drain→recheck gap
+  // 503'd a request whose OWN writes flushPending() had already persisted. The
+  // gate is now persistenceFailing() (a real flush failure), which stays false
+  // here even though writes are still in flight elsewhere — so the response is a
+  // clean 200, not `not_durable`.
+  const barrier = makeDurabilityBarrier({ flushPending: async () => {}, persistenceFailing: () => false });
+  const { res, calls } = makeBarrierRes(false);
+  barrier({ method: "POST" } as Request, res, (() => {}) as NextFunction);
+
+  (res.end as (...a: unknown[]) => unknown)("real-success-body");
+  await tick();
+
+  assert.equal(res.statusCode, 200, "a concurrent backlog no longer fails a healthy request");
+  assert.deepEqual(calls[0], ["real-success-body"], "the real response body is forwarded, not a 503");
 });
 
 test("durabilityBarrier: reads (GET/HEAD/OPTIONS) bypass entirely — no flush, no 503, even with a backlog", async () => {
@@ -148,7 +166,7 @@ test("durabilityBarrier: reads (GET/HEAD/OPTIONS) bypass entirely — no flush, 
     flushPending: async () => {
       flushCalled = true;
     },
-    pendingWrites: () => 99, // a large write backlog that must NOT affect reads
+    persistenceFailing: () => true, // a real persistence failure that must NOT affect reads
   });
 
   for (const method of ["GET", "HEAD", "OPTIONS"]) {

@@ -768,3 +768,44 @@ export async function applyTxnOutcome(
     patchBounty(b.id, { refundTxHash: null, pendingOp: null }); // stays pre-refund; retryable
   }
 }
+
+/**
+ * Re-broadcast a still-pending ADMIN-signed tx the network appears to have dropped
+ * (the keeper saw not_found past the tx's timebounds). Admin txns rebuild from the
+ * bounty with no user signature, so we build+sign+send a FRESH envelope — new
+ * sequence, fresh timebounds, new hash — and repoint the existing row at the new
+ * hash. NEVER inserts a row (stays idempotent on the same idempotencyKey), and the
+ * contract's own double-settle guard makes a redundant broadcast a chain no-op, so
+ * this can never double-refund / double-pay. Sponsor-signed txns are excluded —
+ * their signing key lives in the sponsor's Freighter wallet and can't be rebuilt
+ * server-side, so they keep aging out to `failed` for user retry / orphan recovery.
+ */
+export async function resubmitAdminTxn(
+  txnId: string,
+  chain: EscrowChain = defaultChain
+): Promise<LifecycleResult> {
+  const txn = db.find("escrowTransactions", (t) => t.id === txnId);
+  if (!txn || txn.status !== "pending" || txn.signer !== "admin") {
+    return { ok: false, reason: "not_resubmittable" };
+  }
+  const b = txn.bountyId ? getBounty(txn.bountyId) : null;
+  if (!b) return { ok: false, reason: "not_found" };
+  let send: SendResult;
+  try {
+    if (txn.kind === "refund") {
+      send = await chain.adminRefund(b.taskId);
+    } else if (txn.kind === "payout" && b.assigneeAddress) {
+      send = await chain.adminRelease(b.taskId, b.assigneeAddress);
+    } else {
+      return { ok: false, reason: "not_resubmittable" };
+    }
+  } catch {
+    // Rebuild/simulate failed (RPC down, or the escrow already settled → contract
+    // revert). Leave the row pending; the keeper's age-out is the final backstop.
+    return { ok: false, reason: "chain_error" };
+  }
+  if (send.status === "error") return { ok: false, reason: "send_error", hash: send.hash };
+  db.update("escrowTransactions", (t) => t.id === txnId, { hash: send.hash, error: null });
+  patchBounty(b.id, txn.kind === "refund" ? { refundTxHash: send.hash } : { payoutTxHash: send.hash });
+  return { ok: true, reason: "resubmitted", hash: send.hash };
+}

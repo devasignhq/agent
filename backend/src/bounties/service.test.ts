@@ -19,6 +19,7 @@ import {
   markInReview,
   releaseByMerge,
   refundBounty,
+  resubmitAdminTxn,
   deleteBounty,
   getBounty,
   applyTxnOutcome,
@@ -396,4 +397,36 @@ test("expiredBounties returns overdue delegated bounties, excludes released ones
   const ids = due.map((b) => b.id);
   assert.ok(ids.includes(overdue.id));
   assert.ok(!ids.includes(released.id));
+});
+
+test("resubmitAdminTxn refuses a sponsor-signed row — can't rebuild a Freighter tx", async () => {
+  const { chain, calls } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id); // sponsor-signed escrow row (signer:"sponsor")
+  const escrowRow = txnByKey(`escrow:${b.taskId}`)!;
+  db.update("escrowTransactions", (t) => t.id === escrowRow.id, { status: "pending" }); // model in-flight
+
+  const r = await resubmitAdminTxn(escrowRow.id, chain);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "not_resubmittable");
+  assert.equal(calls.adminRefund, 0, "no chain rebuild for a sponsor-signed row");
+  assert.equal(calls.adminRelease, 0);
+});
+
+test("resubmitAdminTxn rebuilds an admin refund and repoints the row at the fresh hash", async () => {
+  const { chain, calls } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await refundBounty(b.id, "deleted", chain); // admin refund row, hash H_REF_1
+  const row = txnByKey(`refund:${b.taskId}`)!;
+  assert.equal(calls.adminRefund, 1);
+
+  const r = await resubmitAdminTxn(row.id, chain);
+  assert.equal(r.ok, true);
+  assert.equal(r.reason, "resubmitted");
+  assert.equal(calls.adminRefund, 2, "rebuilt a fresh envelope");
+  const after = txnByKey(`refund:${b.taskId}`)!;
+  assert.equal(after.status, "pending", "still one live row — no duplicate inserted");
+  assert.equal(after.hash, "H_REF_2");
+  assert.equal(getBounty(b.id)!.refundTxHash, "H_REF_2");
 });

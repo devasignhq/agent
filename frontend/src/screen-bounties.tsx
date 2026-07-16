@@ -1060,6 +1060,16 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
       setHash(r.hash ?? null);
       setPhase("done");
     } catch (e: any) {
+      if (e instanceof ApiError && e.status === 503 && e.message === "not_durable") {
+        // The refund was already broadcast server-side — the backend submits to
+        // Stellar before it records anything. A "not_durable" 503 means only that
+        // the backend couldn't persist its record yet (it keeps retrying, and the
+        // keeper reconciles against the chain), so showing "failed" would be wrong:
+        // the escrow is being refunded. Mirror the Fund modal and show success.
+        setOutcome("submitted");
+        setPhase("done");
+        return;
+      }
       if (e?.message === "funding_in_flight") {
         // The funding tx hasn't confirmed yet — retriable, don't dead-end.
         setMsg("Your funding transaction is still confirming on Stellar. Try again in a minute — cancelling then refunds the escrow.");

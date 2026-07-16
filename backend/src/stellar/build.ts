@@ -25,13 +25,18 @@ export async function buildEscrowInvoke(
   sourceAddress: string,
   method: string,
   args: Stellar.xdr.ScVal[],
-  timeoutSeconds = 300
+  opts: { timeoutSeconds?: number; fee?: string } = {}
 ): Promise<Stellar.Transaction> {
+  // Admin-signed ops (admin_refund/admin_release) pass a higher inclusion fee and
+  // shorter timebounds so a dropped tx is provably dead sooner and the keeper can
+  // safely rebuild+resubmit a fresh envelope. Client-signed builds keep the
+  // BASE_FEE / 300s defaults (the sponsor pays and re-signs on their own retry).
+  const { timeoutSeconds = 300, fee = BASE_FEE } = opts;
   const srv = server();
   const account = await srv.getAccount(sourceAddress);
   const contract = new Contract(escrowContractId());
   const tx = new TransactionBuilder(account, {
-    fee: BASE_FEE,
+    fee,
     networkPassphrase: networkPassphrase(),
   })
     .addOperation(contract.call(method, ...args))

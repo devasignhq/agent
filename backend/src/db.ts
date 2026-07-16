@@ -437,6 +437,21 @@ export function dbHealth() {
   };
 }
 
+/**
+ * True only when writes are genuinely failing to reach Postgres — a flush errored
+ * and has not since recovered (`onFlushOk` zeroes this on any successful drain).
+ * This is the durability barrier's 503 gate. A non-zero GLOBAL pending backlog is
+ * NORMAL — the bounty keeper and review worker stage writes continuously — and
+ * must NOT fail a request whose own writes `flushPending()` already drained;
+ * gating on `pendingWrites() > 0` produced a spurious `not_durable` whenever any
+ * concurrent actor staged a write in the drain→recheck gap. Quarantined rows are
+ * deliberately excluded: a poison row re-quarantines on every retry, so 503-ing it
+ * would loop the client forever (it is a data bug, not a persistence outage).
+ */
+export function persistenceFailing(): boolean {
+  return !!pool && consecutiveFlushFailures > 0;
+}
+
 function rowId(row: unknown): string | null {
   const id = (row as { id?: unknown } | null)?.id;
   return typeof id === "string" ? id : null;
