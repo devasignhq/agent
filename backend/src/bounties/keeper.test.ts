@@ -39,14 +39,18 @@ const chain: EscrowChain = {
   async hasUsdcTrustline() {
     return true;
   },
+  async getEscrow() {
+    return null;
+  },
 };
 
 function keeperDeps(
   confirmMap: Record<string, ConfirmResult>,
-  now = () => Date.now()
+  now = () => Date.now(),
+  chainOverrides: Partial<EscrowChain> = {}
 ): KeeperDeps {
   return {
-    chain,
+    chain: { ...chain, ...chainOverrides },
     now,
     async confirm(hash: string) {
       return confirmMap[hash] ?? { status: "not_found" };
@@ -131,6 +135,97 @@ test("a never-included tx ages out to failed (retryable)", async () => {
   const after = getBounty(b.id)!;
   assert.equal(after.status, "DELEGATED"); // reverted from the in-flight release
   assert.equal(after.pendingOp, null); // retryable
+});
+
+// now() past the orphan-recovery min age (a fresh bounty gets a grace window
+// before the keeper suspects a lost funding record).
+const PAST_MIN_AGE = () => Date.now() + 2 * 60 * 1000;
+
+test("orphaned funding is recovered from on-chain state → OPEN", async () => {
+  const b = mkBounty(); // PENDING_FUNDING, no escrow txn row (the lost-record shape)
+  const sponsor = ADDR();
+
+  await runTick(keeperDeps({}, PAST_MIN_AGE, { async getEscrow() { return { creator: sponsor }; } }));
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.status, "OPEN");
+  assert.equal(after.sponsorAddress, sponsor);
+  const txn = txnByKey(`escrow:${b.taskId}`)!;
+  assert.equal(txn.status, "confirmed");
+  assert.equal(txn.hash, null); // the row that held the hash is what was lost
+});
+
+test("an aged-out 'failed' funding that actually landed is recovered, hash restored", async () => {
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_LOST", status: "pending" });
+  // The keeper aged the tx out (not included in time) — but it later landed.
+  applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "failed", error: "not_included_timeout" });
+  assert.equal(getBounty(b.id)!.escrowTxHash, null); // cleared by the failed verdict
+
+  await runTick(keeperDeps({}, PAST_MIN_AGE, { async getEscrow() { return { creator: ADDR() }; } }));
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.status, "OPEN");
+  assert.equal(after.escrowTxHash, "H_LOST"); // restored from the repaired row
+  const txn = txnByKey(`escrow:${b.taskId}`)!;
+  assert.equal(txn.status, "confirmed");
+  assert.equal(txn.hash, "H_LOST");
+});
+
+test("a genuinely unfunded bounty stays PENDING_FUNDING", async () => {
+  const b = mkBounty();
+
+  await runTick(keeperDeps({}, PAST_MIN_AGE)); // default getEscrow → null
+
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING");
+  assert.equal(txnByKey(`escrow:${b.taskId}`), null);
+});
+
+test("per-tick read cap counts actual chain reads, not skipped candidates", async () => {
+  // 10 fresh bounties (inside the grace window) iterate FIRST, then 5 aged past
+  // it — the skips must neither consume read budget nor break the loop early.
+  for (let i = 0; i < 10; i++) mkBounty();
+  const due = Array.from({ length: 5 }, () => mkBounty());
+  for (const b of due) db.update("bounties", (x) => x.id === b.id, { createdAt: Date.now() - 2 * 60 * 1000 });
+  let reads = 0;
+  const deps = keeperDeps({}, () => Date.now(), { async getEscrow() { reads++; return null; } });
+
+  await runTick(deps);
+  assert.equal(reads, 5); // exactly the due candidates — skips cost nothing
+
+  await runTick(deps);
+  assert.equal(reads, 5); // all due candidates now inside the recheck throttle
+});
+
+test("more due candidates than the cap → capped now, remainder next tick", async () => {
+  const due = Array.from({ length: 12 }, () => mkBounty());
+  for (const b of due) db.update("bounties", (x) => x.id === b.id, { createdAt: Date.now() - 2 * 60 * 1000 });
+  let reads = 0;
+  const deps = keeperDeps({}, () => Date.now(), { async getEscrow() { reads++; return null; } });
+
+  await runTick(deps);
+  assert.equal(reads, 10); // ORPHAN_MAX_CHECKS_PER_TICK
+
+  await runTick(deps);
+  assert.equal(reads, 12); // the throttled 10 are skipped; the remaining 2 rotate in
+});
+
+test("a bounty with a live pending escrow txn is left to the confirm path", async () => {
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_UNCONFIRMED", status: "pending" });
+  let escrowReads = 0;
+
+  await runTick(
+    keeperDeps({}, PAST_MIN_AGE, {
+      async getEscrow() {
+        escrowReads++;
+        return { creator: ADDR() };
+      },
+    })
+  );
+
+  assert.equal(escrowReads, 0); // not treated as an orphan
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING"); // confirm path still owns it
 });
 
 test("expired bounty already released is NOT refunded", async () => {

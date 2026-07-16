@@ -16,6 +16,7 @@ import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-
 import { Icon } from "./icons";
 import {
   api,
+  ApiError,
   type Bounty,
   type BountyApplication,
   type BountyStatus,
@@ -710,7 +711,7 @@ async function freighterSign(xdr: string, address: string, networkPassphrase: st
 // ─── Fund modal (from /bounties/:id/fund?token=…) ─────────────────────────────
 const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | null; onClose: () => void }) => {
   const [bounty, setBounty] = React.useState<Bounty | null>(null);
-  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "done" | "error">("loading");
+  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "confirming" | "done" | "error">("loading");
   const [msg, setMsg] = React.useState<string | null>(null);
   const [hash, setHash] = React.useState<string | null>(null);
 
@@ -746,14 +747,48 @@ const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | 
       const address = await freighterAddress();
       const { xdr, networkPassphrase } = await api.bountyFundingTx(id, token, address);
       const signedXdr = await freighterSign(xdr, address, networkPassphrase);
-      const res = await api.submitBountyFunding(id, token, signedXdr);
-      setHash(res.hash || null);
-      setPhase("done");
+      try {
+        const res = await api.submitBountyFunding(id, token, signedXdr);
+        setHash(res.hash || null);
+        setPhase("done");
+      } catch (e) {
+        // By this point the signed tx has been BROADCAST — the backend submits to
+        // Stellar before it records anything. A "not_durable" 503 means only that
+        // the backend couldn't persist its record yet (it keeps retrying, and the
+        // keeper reconciles against the chain), so showing "failed" would be
+        // wrong: the USDC is moving into escrow. Watch the bounty until it opens.
+        if (e instanceof ApiError && e.status === 503 && e.message === "not_durable") {
+          setPhase("confirming");
+          return;
+        }
+        throw e;
+      }
     } catch (e: any) {
       setMsg(e?.message || "Funding failed.");
       setPhase("error");
     }
   };
+
+  // While confirming, poll the bounty (reads are never gated by the backend's
+  // durability barrier) until the keeper flips it out of PENDING_FUNDING.
+  React.useEffect(() => {
+    if (phase !== "confirming" || !id) return;
+    let alive = true;
+    const t = setInterval(async () => {
+      try {
+        const r = await api.bounty(id);
+        if (!alive) return;
+        setBounty(r.bounty);
+        if (r.bounty.status !== "PENDING_FUNDING") setPhase("done");
+      } catch {
+        // transient — keep polling
+      }
+    }, 4000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [phase, id]);
 
   return (
     <div className="modal-scrim" onClick={onClose}>
@@ -785,13 +820,23 @@ const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | 
               {hash ? <>Tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a>.</> : "The transaction has been submitted."}
             </div>
           </div>
+        ) : phase === "confirming" ? (
+          <div className="wd-success">
+            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
+            <div className="wd-success-title">Transaction submitted</div>
+            <div className="wd-success-sub">
+              Your funding transaction was signed and broadcast to Stellar. Waiting for
+              on-chain confirmation — this usually takes under a minute. You can close
+              this window; the bounty opens automatically once the escrow confirms.
+            </div>
+          </div>
         ) : msg ? (
           <div className="mono" style={{ fontSize: 12, color: phase === "error" ? "var(--danger)" : "var(--fg-mute)", padding: "4px 0 12px" }}>{msg}</div>
         ) : null}
 
         <div className="cb-modal-foot">
-          <button className="btn ghost" onClick={onClose}>{phase === "done" ? "Done" : "Cancel"}</button>
-          {phase !== "done" && (
+          <button className="btn ghost" onClick={onClose}>{phase === "done" ? "Done" : phase === "confirming" ? "Close" : "Cancel"}</button>
+          {phase !== "done" && phase !== "confirming" && (
             <button className="btn primary" disabled={phase === "loading" || phase === "working" || !bounty} onClick={fund}>
               <Icon name="check" size={13} /> {phase === "working" ? "Signing…" : "Fund with Freighter"}
             </button>

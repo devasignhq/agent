@@ -50,6 +50,9 @@ function fakeChain(overrides: Partial<EscrowChain> = {}) {
       calls.hasUsdcTrustline++;
       return true;
     },
+    async getEscrow() {
+      return null;
+    },
     ...overrides,
   };
   return { chain, calls };

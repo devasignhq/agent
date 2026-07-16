@@ -55,6 +55,7 @@ const fakeChain: EscrowChain = {
   async adminRelease() { return { hash: "H", status: "pending" }; },
   async adminRefund() { return { hash: "H", status: "pending" }; },
   async hasUsdcTrustline() { return true; },
+  async getEscrow() { return null; },
 };
 
 // Create → fund/confirm → apply/approve/accept, leaving a DELEGATED bounty
