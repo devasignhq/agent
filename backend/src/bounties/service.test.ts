@@ -24,6 +24,7 @@ import {
   getBounty,
   applyTxnOutcome,
   expiredBounties,
+  withdrawApplication,
   type EscrowChain,
 } from "./service.js";
 
@@ -89,7 +90,7 @@ function fundAndConfirm(bountyId: string) {
 async function delegate(bountyId: string, chain: EscrowChain) {
   applyToBounty(bountyId, { githubId: 999, githubLogin: "dev" });
   approveApplication(bountyId, 999);
-  return acceptAndStartClock(bountyId, { githubId: 999, githubLogin: "dev" }, ADDR(), chain);
+  return acceptAndStartClock(bountyId, { githubId: 999, githubLogin: "dev" }, ADDR(), "", chain);
 }
 
 beforeEach(() => {
@@ -185,19 +186,128 @@ test("accept refuses without an approved application, bad address, or no trustli
 
   // Not approved yet.
   applyToBounty(b.id, { githubId: 1, githubLogin: "dev" });
-  let r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), fakeChain().chain);
+  let r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), "", fakeChain().chain);
   assert.equal(r.reason, "not_approved");
 
   // Approved but malformed address.
   approveApplication(b.id, 1);
-  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, "not-an-address", fakeChain().chain);
+  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, "not-an-address", "", fakeChain().chain);
   assert.equal(r.reason, "invalid_address");
 
   // Approved, valid address, but no USDC trustline.
   const noTrust = fakeChain({ async hasUsdcTrustline() { return false; } });
-  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), noTrust.chain);
+  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), "", noTrust.chain);
   assert.equal(r.reason, "no_trustline");
   assert.equal(getBounty(b.id)!.status, "OPEN"); // unchanged
+});
+
+test("accept snapshots the payout memo; the release stamps the dest wallet on the payout row", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  applyToBounty(b.id, { githubId: 7, githubLogin: "memodev" });
+  approveApplication(b.id, 7);
+  const addr = ADDR();
+  const r = await acceptAndStartClock(
+    b.id,
+    { githubId: 7, githubLogin: "memodev" },
+    addr,
+    "memodev-exchange-01",
+    chain
+  );
+  assert.equal(r.ok, true);
+  const delegated = getBounty(b.id)!;
+  assert.equal(delegated.assigneeMemo, "memodev-exchange-01");
+
+  const rel = await releaseByMerge(b.id, chain);
+  assert.equal(rel.ok, true);
+  const payout = txnByKey(`release:${b.taskId}`)!;
+  assert.equal(payout.destAddress, addr);
+  assert.equal(payout.destMemo, "memodev-exchange-01");
+});
+
+test("accept without a memo leaves assigneeMemo null and the payout dest memo null", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  const del = await delegate(b.id, chain);
+  assert.equal(del.ok, true);
+  const delegated = getBounty(b.id)!;
+  assert.equal(delegated.assigneeMemo, null);
+
+  await releaseByMerge(b.id, chain);
+  const payout = txnByKey(`release:${b.taskId}`)!;
+  assert.equal(payout.destAddress, delegated.assigneeAddress);
+  assert.equal(payout.destMemo, null);
+});
+
+test("activity log: the full lifecycle appends dated, attributed events", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
+  approveApplication(b.id, 9, "maya");
+  await acceptAndStartClock(b.id, { githubId: 9, githubLogin: "devon" }, ADDR(), "", chain);
+  markInReview(b.id, 41);
+  await releaseByMerge(b.id, chain);
+  applyTxnOutcome(txnByKey(`release:${b.taskId}`)!.id, { status: "success" });
+
+  const events = getBounty(b.id)!.events!;
+  const kinds = events.map((e) => e.kind);
+  assert.deepEqual(kinds, [
+    "created",
+    "funding_submitted",
+    "funded",
+    "applied",
+    "application_approved",
+    "accepted",
+    "pr_opened",
+    "payout_submitted",
+    "paid",
+  ]);
+  const approved = events.find((e) => e.kind === "application_approved")!;
+  assert.equal(approved.actor, "maya", "the approving sponsor is recorded");
+  assert.equal(approved.subject, "devon", "…and who was picked");
+  assert.equal(events.find((e) => e.kind === "applied")!.actor, "devon");
+  assert.ok(events.every((e) => typeof e.at === "number" && e.at > 0));
+  // markInReview backfilled the submission moment for the webhook path.
+  assert.ok(getBounty(b.id)!.submittedAt, "webhook-inferred PR link stamps submittedAt");
+});
+
+test("activity log: expiry refund records refund_submitted(expired) then refunded", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await delegate(b.id, chain);
+  const r = await refundBounty(b.id, "expired", chain);
+  assert.equal(r.ok, true);
+  applyTxnOutcome(txnByKey(`refund:${b.taskId}`)!.id, { status: "success" });
+  const kinds = getBounty(b.id)!.events!.map((e) => e.kind);
+  assert.ok(kinds.includes("refund_submitted"));
+  assert.ok(kinds.includes("refunded"));
+  assert.equal(
+    getBounty(b.id)!.events!.find((e) => e.kind === "refund_submitted")!.detail,
+    "expired"
+  );
+});
+
+test("withdrawApplication: pending only, own application, removes it + logs", () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
+
+  // Someone else can't withdraw it (no application of theirs).
+  assert.equal(withdrawApplication(b.id, { githubId: 8, githubLogin: "rival" }).reason, "no_such_application");
+
+  const r = withdrawApplication(b.id, { githubId: 9, githubLogin: "devon" });
+  assert.equal(r.ok, true);
+  assert.equal(getBounty(b.id)!.applications.length, 0);
+  assert.ok(getBounty(b.id)!.events!.some((e) => e.kind === "application_withdrawn" && e.actor === "devon"));
+
+  // Approved applications can't be withdrawn.
+  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
+  approveApplication(b.id, 9, "maya");
+  assert.equal(withdrawApplication(b.id, { githubId: 9, githubLogin: "devon" }).reason, "not_pending_approved");
 });
 
 test("delete: undelegated refunds once; delegated cannot be deleted", async () => {

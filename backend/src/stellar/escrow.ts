@@ -35,12 +35,15 @@ export async function buildCreateEscrowXdr(
 export async function buildReleaseXdr(
   sponsorAddress: string,
   taskId: string,
-  contributorAddress: string
+  contributorAddress: string,
+  memoText: string = ""
 ): Promise<string> {
-  const tx = await buildEscrowInvoke(sponsorAddress, "release", [
-    taskIdScVal(taskId),
-    addressScVal(contributorAddress),
-  ]);
+  const tx = await buildEscrowInvoke(
+    sponsorAddress,
+    "release",
+    [taskIdScVal(taskId), addressScVal(contributorAddress)],
+    { memoText }
+  );
   return tx.toXDR();
 }
 
@@ -57,12 +60,16 @@ const ADMIN_TX_FEE = "1000"; // 10 × the 100-stroop BASE_FEE minimum
 const adminTxOpts = { timeoutSeconds: ADMIN_TX_TIMEOUT_S, fee: ADMIN_TX_FEE };
 
 /** Backend releases the escrow to the contributor on PR merge (admin arbiter). */
-export async function adminRelease(taskId: string, contributorAddress: string): Promise<SendResult> {
+export async function adminRelease(
+  taskId: string,
+  contributorAddress: string,
+  memoText: string = ""
+): Promise<SendResult> {
   const tx = await buildEscrowInvoke(
     adminAddress(),
     "admin_release",
     [taskIdScVal(taskId), addressScVal(contributorAddress)],
-    adminTxOpts
+    { ...adminTxOpts, memoText }
   );
   tx.sign(adminKeypair());
   return sendSignedTx(tx);

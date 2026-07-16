@@ -76,7 +76,7 @@ async function seedDelegated(issueNumber = 7) {
   applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
   applyToBounty(b.id, { githubId: DELEGATE, githubLogin: "dev" });
   approveApplication(b.id, DELEGATE);
-  await acceptAndStartClock(b.id, { githubId: DELEGATE, githubLogin: "dev" }, ADDR(), fakeChain);
+  await acceptAndStartClock(b.id, { githubId: DELEGATE, githubLogin: "dev" }, ADDR(), "", fakeChain);
   return getBounty(b.id)!;
 }
 

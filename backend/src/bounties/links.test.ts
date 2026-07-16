@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { applyUrl, mintBountyLinkToken, verifyBountyLinkToken, fundingUrl, cancelUrl } from "./links.js";
+import { config } from "../config.js";
 
 test("token verifies only for the matching bounty + purpose", () => {
   const tok = mintBountyLinkToken("bounty-123", "fund");
@@ -33,8 +34,11 @@ test("URLs embed the bounty id + a verifying token", () => {
   assert.equal(verifyBountyLinkToken(cu.searchParams.get("token")!, "cancel"), "abc");
 });
 
-test("apply URL is tokenless — it lives in a public comment", () => {
+test("apply URL is tokenless and points at the contributor app's discovery page", () => {
   const au = new URL(applyUrl("abc"));
-  assert.match(au.pathname, /\/bounties\/abc\/apply$/);
+  assert.match(au.pathname, /\/bounties\/abc$/);
   assert.equal(au.search, "");
+  assert.equal(au.origin, new URL(config.contributorOrigin).origin);
+  // Fund/cancel links stay on the sponsor dashboard.
+  assert.equal(new URL(fundingUrl("abc")).origin, new URL(config.webOrigin).origin);
 });

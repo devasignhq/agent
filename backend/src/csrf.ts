@@ -29,7 +29,7 @@
 // skipping the check there also keeps the Vite dev proxy and the cookie-minting
 // test scripts working without pinning WEB_ORIGIN to an exact value.
 import type { Request, Response, NextFunction } from "express";
-import { config } from "./config.js";
+import { allowedWebOrigins, config } from "./config.js";
 
 // Methods that can't change state (GET/HEAD) or are the CORS preflight (OPTIONS,
 // handled by cors() and answered before this runs). Everything else is gated.
@@ -53,8 +53,9 @@ export function enforceSameOrigin(req: Request, res: Response, next: NextFunctio
   if (!config.secureCookies || SAFE_METHODS.has(req.method)) return next();
   const origin = requestOrigin(req);
   // Present-but-foreign Origin/Referer ⇒ cross-site request ⇒ reject. Absent ⇒
-  // non-browser client (see header note above) ⇒ allow.
-  if (origin !== null && origin !== config.webOrigin) {
+  // non-browser client (see header note above) ⇒ allow. Both first-party
+  // frontends (sponsor dashboard + contributor app) are legitimate callers.
+  if (origin !== null && !allowedWebOrigins().includes(origin)) {
     res.status(403).json({ error: "bad_origin" });
     return;
   }

@@ -32,15 +32,19 @@ function runner() {
 
 const WEB = "https://www.devasign.ai";
 
+const CONTRIB = "https://contributors.devasign.ai";
+
 // Run fn with prod-like config (SameSite=None ⇒ guard active), then restore so
 // the shared config object doesn't bleed across tests.
 function withProd(webOrigin: string, fn: () => void) {
-  const secure = config.secureCookies, origin = config.webOrigin;
+  const secure = config.secureCookies, origin = config.webOrigin, contrib = config.contributorOrigin;
   (config as any).secureCookies = true;
   (config as any).webOrigin = webOrigin;
+  (config as any).contributorOrigin = CONTRIB;
   try { fn(); } finally {
     (config as any).secureCookies = secure;
     (config as any).webOrigin = origin;
+    (config as any).contributorOrigin = contrib;
   }
 }
 
@@ -60,6 +64,24 @@ test("prod: matching Origin passes through", () => {
     enforceSameOrigin(fakeReq("POST", { Origin: WEB }), res, r.next);
     assert.equal(r.passed(), true);
     assert.equal(res.statusCode, 200);
+  });
+});
+
+test("prod: the contributor app's origin passes through (two-origin allowlist)", () => {
+  withProd(WEB, () => {
+    const res = fakeRes(), r = runner();
+    enforceSameOrigin(fakeReq("POST", { Origin: CONTRIB }), res, r.next);
+    assert.equal(r.passed(), true);
+    assert.equal(res.statusCode, 200);
+  });
+});
+
+test("prod: a foreign origin is still rejected with both first-party origins configured", () => {
+  withProd(WEB, () => {
+    const res = fakeRes(), r = runner();
+    enforceSameOrigin(fakeReq("POST", { Origin: "https://contributors.devasign.ai.evil.com" }), res, r.next);
+    assert.equal(res.statusCode, 403);
+    assert.equal(r.passed(), false);
   });
 });
 

@@ -28,6 +28,7 @@ import {
   handleBountyPROpened,
   maybeHandleBountyComment,
 } from "../bounties/webhooks.js";
+import { resolveBountyForPR } from "../bounties/prlink.js";
 
 // A GitHub webhook signature header: "sha256=" + lowercase hex HMAC-SHA256.
 // Validating the shape up front means timingSafeEqual always compares
@@ -440,13 +441,21 @@ function findPRReview(repoFullName: string | undefined, prNumber: number | undef
 // using the install token, and enqueue a full review so the criteria pipeline
 // catches up. Returns null when we can't resolve the install or the repo —
 // e.g. the comment is on a repo this server doesn't track.
-async function ensurePRReview(
+// Exported for the contributor app's explicit bounty-submission path
+// (routes/bounties.ts POST /bounties/:id/submit), which needs the same
+// materialize-or-reuse behavior outside a webhook.
+export async function ensurePRReview(
   repoFullName: string,
   prNumber: number | undefined,
   ghInstallationId: number | undefined,
   // GitHub id of whoever triggered this (comment / review author). The review is
   // counted against them when they're a DevAsign install-member.
-  triggerActorGithubId?: number
+  triggerActorGithubId?: number,
+  // attributeToOwner: a bounty assignee is an EXTERNAL contributor — never an
+  // install-member — so the member gate below would always skip their PR. A
+  // bounty submission is the sponsor's product usage, so it's attributed (and
+  // plan/cap-gated) to the install owner instead of the trigger actor.
+  opts: { attributeToOwner?: boolean } = {}
 ) {
   const existing = findPRReview(repoFullName, prNumber);
   if (existing) return existing;
@@ -502,7 +511,9 @@ async function ensurePRReview(
   // install keeps the onboarding grace window — review now, attribute nobody.
   const install = db.find("installations", (i) => i.id === repo.installationId);
   const ownerUserId = install?.userId || "";
-  const attributedUserId = attributedUserFor(install, triggerActorGithubId);
+  const attributedUserId = opts.attributeToOwner
+    ? ownerUserId || null
+    : attributedUserFor(install, triggerActorGithubId);
   if (ownerUserId) {
     // If the commenter isn't a DevAsign install-member — an outside collaborator,
     // or a member who never adopted the install — there's no quota to count it
@@ -1072,7 +1083,18 @@ function handlePullRequest(event: any) {
   // (handled in handleIssueComment). Reached only on the new-row path: the
   // reopen/ready/synchronize branches above reuse an existing row, so a PR
   // already in scope keeps re-reviewing.
+  // A bounty assignee's delivering PR is always auto-reviewed: the contributor
+  // app promises verdicts against the bounty's locked criteria, and the author
+  // identity is verified against the bounty's assignee even though they're an
+  // external contributor the plan gate would otherwise skip. Attribution stays
+  // with the install owner (gateUserId fallback) — the sponsor's usage.
+  const deliveredBounty = resolveBountyForPR(repoFullName, pullReq.body || "");
+  const isBountyDelivery =
+    !!deliveredBounty &&
+    deliveredBounty.assigneeGithubId != null &&
+    String(pullReq.user?.id) === String(deliveredBounty.assigneeGithubId);
   if (
+    !isBountyDelivery &&
     !shouldAutoReviewOpenedPR({
       ownerUserId,
       prAuthorLogin: pullReq.user?.login || "",

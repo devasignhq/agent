@@ -82,7 +82,7 @@ async function fundOpenDelegate(id: string) {
   applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "success" });
   applyToBounty(id, { githubId: 5, githubLogin: "dev" });
   approveApplication(id, 5);
-  await acceptAndStartClock(id, { githubId: 5, githubLogin: "dev" }, ADDR(), chain);
+  await acceptAndStartClock(id, { githubId: 5, githubLogin: "dev" }, ADDR(), "", chain);
 }
 
 beforeEach(() => {
