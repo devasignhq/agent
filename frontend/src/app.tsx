@@ -645,8 +645,14 @@ const AppContent = () => {
     // Bounty deep links (the bot comment's Apply CTA, and the sponsor's
     // Fund/Cancel links) must render for ANY signed-in user — a contributor
     // has no GitHub App installation and would otherwise be trapped in
-    // onboarding, never reaching the page the link points at.
-    if (/^\/bounties\/[^/]+\/(apply|fund|cancel)$/.test(location.pathname)) {
+    // onboarding, never reaching the page the link points at. The signed-in
+    // check is already guaranteed by the early returns above; it's restated
+    // here so the bypass can never leak the app shell to a signed-out visitor
+    // if those returns are ever reordered.
+    if (
+      auth.status === "signed_in" &&
+      /^\/bounties\/[^/]+\/(apply|fund|cancel)$/.test(location.pathname)
+    ) {
       setStage("app");
       return;
     }
