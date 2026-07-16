@@ -20,6 +20,7 @@ import {
   adminRelease,
   buildCreateEscrowXdr,
   buildReleaseXdr,
+  getEscrow,
   hasUsdcTrustline,
 } from "../stellar/escrow.js";
 import { parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
@@ -39,6 +40,7 @@ export type EscrowChain = {
   adminRelease(taskId: string, contributor: string): Promise<SendResult>;
   adminRefund(taskId: string): Promise<SendResult>;
   hasUsdcTrustline(address: string): Promise<boolean>;
+  getEscrow(taskId: string): Promise<unknown>;
 };
 
 export const defaultChain: EscrowChain = {
@@ -47,6 +49,7 @@ export const defaultChain: EscrowChain = {
   adminRelease,
   adminRefund,
   hasUsdcTrustline,
+  getEscrow,
 };
 
 // ── small helpers ────────────────────────────────────────────────────────────
@@ -548,6 +551,91 @@ export async function deleteBounty(
 
 export function pendingTxns(): EscrowTransaction[] {
   return db.filter("escrowTransactions", (t) => t.status === "pending");
+}
+
+/**
+ * PENDING_FUNDING bounties with no live (pending/confirmed) escrow txn row.
+ * Most are simply not funded yet — but one whose funding-submit broadcast the
+ * create_escrow tx and then lost the recorded row before it became durable
+ * (flush failing + restart) looks identical locally while USDC already sits in
+ * escrow on-chain. The keeper checks these against the chain and adopts the
+ * escrow when it exists; a `failed` row does NOT exclude a bounty, because an
+ * aged-out "not included" verdict can be wrong about a tx that later landed.
+ */
+export function unfundedPendingBounties(): Bounty[] {
+  return db.filter(
+    "bounties",
+    (b) =>
+      b.status === "PENDING_FUNDING" &&
+      !db.find(
+        "escrowTransactions",
+        (t) => t.idempotencyKey === `escrow:${b.taskId}` && t.status !== "failed"
+      )
+  );
+}
+
+// Best-effort creator address from a get_escrow record (scValToNative shape).
+function escrowCreator(escrow: unknown): string | null {
+  const c = (escrow as { creator?: unknown } | null)?.creator;
+  if (typeof c !== "string") return null;
+  try {
+    assertValidAddress(c);
+    return c;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Adopt an escrow that exists on-chain for a bounty still PENDING_FUNDING with
+ * no local record of the funding tx (the record was lost before it became
+ * durable). Repairs/creates the confirmed escrow txn row and opens the bounty.
+ * The tx hash is unknown — the row that held it is what was lost — so the row
+ * carries a recovery note instead.
+ */
+export function adoptOnchainEscrow(bountyId: string, escrow: unknown): LifecycleResult {
+  const b = getBounty(bountyId);
+  if (!b) return { ok: false, reason: "not_found" };
+  if (b.status !== "PENDING_FUNDING") return { ok: true, reason: `already_${b.status.toLowerCase()}` };
+  const key = `escrow:${b.taskId}`;
+  const existing = findTxnByKey(key);
+  if (existing && existing.status !== "failed") {
+    // A live row exists — the normal confirm path owns this bounty.
+    return { ok: true, reason: `already_${existing.status}`, hash: existing.hash ?? undefined };
+  }
+  const creator = escrowCreator(escrow);
+  const note = "escrow recovered from on-chain state (local funding record was lost)";
+  if (existing) {
+    db.update("escrowTransactions", (t) => t.id === existing.id, {
+      status: "confirmed",
+      error: null,
+      note,
+      confirmedAt: Date.now(),
+    });
+  } else {
+    insertTxn({
+      bountyId,
+      githubLogin: null,
+      kind: "escrow",
+      idempotencyKey: key,
+      signer: "sponsor",
+      sourceAccount: creator ?? b.sponsorAddress,
+      status: "confirmed",
+      hash: null,
+      ledger: null,
+      amountStroops: b.amountStroops,
+      dir: "out",
+      note,
+      error: null,
+      confirmedAt: Date.now(),
+    });
+  }
+  const bounty = patchBounty(bountyId, {
+    status: "OPEN",
+    onchainStatus: "Open",
+    ...(creator ? { sponsorAddress: creator } : {}),
+  });
+  return { ok: true, reason: "recovered", bounty: bounty ?? undefined };
 }
 
 /** Bounties whose delivery clock has elapsed and should be refunded to the sponsor. */
