@@ -401,3 +401,113 @@ test("stall-breaker still fires for a wedged NON-EMPTY backlog (narrowed reset d
   assert.ok(generation >= 2, "stall-breaker fired and rebuilt the pool for the non-empty backlog");
   assert.equal(dbHealth().pendingWrites, 0, "backlog fully drained after recovery");
 });
+
+test("a PERSISTENT silent wedge escalates to 'degraded' instead of spinning forever", async () => {
+  // Every generation's INSERT hangs forever, so rebuilding the pool never fixes it
+  // — the prod livelock. After `stallEscalateAfter` silent breaks the breaker must
+  // stop spinning and record a REAL failure so /health goes degraded and the
+  // heartbeat owns recovery (instead of the every-50s STALLED spam with no error).
+  let generation = 0;
+  const poolFactory = () => {
+    generation++;
+    const runQuery = (sql: string) =>
+      String(sql).trim().toLowerCase().startsWith("insert")
+        ? new Promise(() => {}) // hang forever, on EVERY generation
+        : Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+
+  await initDb({
+    poolFactory: poolFactory as never,
+    flushWatchdogMs: 200,
+    stallBreakMs: 250,
+    stallCheckMs: 20,
+    backoffMs: 5,
+    stallEscalateAfter: 2, // escalate on the 2nd silent break
+  });
+
+  db.insert("notifications", row("w1"));
+  void flushPending(); // drains w1 into the hung flush; wedges silently
+
+  // Before escalation the wedge is silent (no failure recorded). Wait for the
+  // breaker to give up spinning and flip write-through to degraded.
+  const deadline = Date.now() + 5000;
+  while (dbHealth().writeThrough !== "degraded" && Date.now() < deadline) await delay(20);
+
+  const h = dbHealth();
+  assert.equal(h.writeThrough, "degraded", "persistent silent wedge escalated to degraded");
+  assert.ok(h.consecutiveFlushFailures > 0, "a real failure was recorded on escalation");
+  assert.notEqual(h.lastFlushError, null, "the wedge is now surfaced, not 'NO error recorded'");
+  assert.ok(generation >= 2, "the breaker rebuilt at least once before escalating");
+});
+
+test("a transient silent wedge self-heals on the first break without escalating", async () => {
+  // gen-0 hangs; the rebuilt gen-1 is healthy. Recovery happens on break #1, well
+  // below stallEscalateAfter, so it must NOT read as degraded afterwards.
+  let generation = 0;
+  const stored = new Set<string>();
+  const poolFactory = () => {
+    const myGen = generation++;
+    const runQuery = (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert")) {
+        if (myGen === 0) return new Promise(() => {}); // gen-0 hangs; gen-1 works
+        for (let i = 0; i < (params?.length ?? 0); i += 2) stored.add(String(params![i]));
+      }
+      return Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    };
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+
+  await initDb({
+    poolFactory: poolFactory as never,
+    flushWatchdogMs: 200,
+    stallBreakMs: 250,
+    stallCheckMs: 20,
+    backoffMs: 5,
+    stallEscalateAfter: 3, // recovery on break #1 is well below this
+  });
+
+  db.insert("notifications", row("t1"));
+  void flushPending(); // wedges on gen-0
+
+  const deadline = Date.now() + 5000;
+  while (!stored.has("t1") && Date.now() < deadline) await delay(20);
+
+  assert.equal(stored.has("t1"), true, "trapped write recovered on the rebuilt healthy pool");
+  assert.ok(generation >= 2, "exactly the break-#1 rebuild happened");
+  const h = dbHealth();
+  assert.equal(h.writeThrough, "ok", "a one-off wedge that self-healed must NOT read as degraded");
+  assert.equal(h.consecutiveFlushFailures, 0, "recovered before escalation — no failure recorded");
+});
+
+test("a hanging pool.connect() is bounded by connectTimeoutMs and surfaces as a failure", async () => {
+  // connect() never resolves — the Neon/PgBouncer startup-handshake stall the pool's
+  // connectionTimeoutMillis can miss. With a large watchdog, ONLY the app-level
+  // connect bound can end it; without it, this would hang to the 45s watchdog.
+  const poolFactory = () => ({
+    connect: () => new Promise(() => {}), // connect hangs forever
+    query: async () => ({ rows: [] as Array<{ data: unknown }> }),
+    end: async () => {},
+    on: () => {},
+  });
+
+  await initDb({
+    poolFactory: poolFactory as never,
+    flushWatchdogMs: 5_000, // large: only connectTimeoutMs can end the connect
+    stallBreakMs: 6_000, // above the watchdog; the breaker won't fire within this test
+    connectTimeoutMs: 60,
+    backoffMs: 5,
+  });
+
+  db.insert("notifications", row("c1"));
+
+  const deadline = Date.now() + 3000;
+  while (dbHealth().consecutiveFlushFailures === 0 && Date.now() < deadline) await delay(20);
+
+  const h = dbHealth();
+  assert.ok(h.consecutiveFlushFailures > 0, "the bounded connect surfaced as a failure, not a 45s hang");
+  assert.equal(h.writeThrough, "degraded", "degraded + alertable, not stuck silent");
+  assert.notEqual(h.lastFlushError, null, "the real connect failure is surfaced");
+});

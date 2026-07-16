@@ -12,6 +12,7 @@
 // write-through-cache behaviour, just durably and off-box.
 import { v4 as uuid } from "uuid";
 import pg from "pg";
+import type { PoolClient } from "pg";
 import { config, isEncryptionConfigured } from "./config.js";
 import { isUnstorableDataError, sanitizeForJsonb } from "./db-sanitize.js";
 import { isSealed, open, seal } from "./crypto/secret-box.js";
@@ -291,6 +292,13 @@ let stallBreakerTimer: NodeJS.Timeout | null = null;
 const DEFAULT_STALL_BREAK_MS = 20_000;
 let stallBreakMs = DEFAULT_STALL_BREAK_MS;
 let stallCheckOverrideMs: number | null = null; // tests drive a fast check cadence
+// Consecutive silent breaks in the CURRENT incident. When force-recovery keeps
+// firing with no forward progress, this trips escalation: record a real failure so
+// /health goes "degraded" and the backoff heartbeat owns recovery, instead of
+// spinning + spamming every ~50s forever. Reset by onFlushOk on real progress.
+let consecutiveStallBreaks = 0;
+const DEFAULT_STALL_ESCALATE_AFTER = 3;
+let stallEscalateAfter = DEFAULT_STALL_ESCALATE_AFTER;
 
 // --- Write-through health (surfaced via dbHealth() -> /api/health) ----------
 // The old flush re-staged a failed batch and retried it forever; because the
@@ -343,6 +351,12 @@ const DEFAULT_STALL_THRESHOLD_MS = 60_000;
 // waiting tens of seconds; production always uses the defaults above.
 let flushWatchdogMs = DEFAULT_FLUSH_WATCHDOG_MS;
 let stallThresholdMs = DEFAULT_STALL_THRESHOLD_MS;
+// Bound pool.connect() at the app layer. `connectionTimeoutMillis` (libpq) doesn't
+// reliably cover a stall AFTER the TCP connect — a Neon/PgBouncer startup-handshake
+// hang — which otherwise wedges the flush silently until the 45s watchdog. Kept
+// at/below the watchdog; overridable via initDb for tests.
+const DEFAULT_CONNECT_TIMEOUT_MS = 10_000;
+let connectTimeoutMs = DEFAULT_CONNECT_TIMEOUT_MS;
 
 // When the oldest still-pending write was first staged (null = backlog empty).
 // Drives stall detection without timestamping every row: set on the first stage
@@ -359,6 +373,7 @@ function pendingCount(): number {
 function onFlushOk(): void {
   const wasFailing = consecutiveFlushFailures > 0;
   consecutiveFlushFailures = 0;
+  consecutiveStallBreaks = 0; // real progress ends any in-flight silent-wedge incident
   lastFlushError = null;
   lastFlushProgressAt = Date.now(); // real forward progress — resets the stall-breaker clock
   // A successful flush is forward progress, so reset the stall clock. If writes
@@ -382,7 +397,14 @@ function recordFlushFailure(message: string): void {
   consecutiveFlushFailures++;
   lastFlushError = message;
   lastFlushErrorAt = Date.now();
-  console.error(`[db] flush failed — ${message}`);
+  // Throttle the log the same way logFlushError does (shared clock): the heartbeat
+  // retries this path on backoff, so we don't want to trade the STALLED spam for
+  // failure spam. The counters/health above are always updated — only the log gates.
+  const now = Date.now();
+  if (now - lastErrorLoggedAt >= 10_000) {
+    lastErrorLoggedAt = now;
+    console.error(`[db] flush failed — ${message}`);
+  }
 }
 
 function quarantineRow(name: keyof DB, row: unknown, err: unknown): void {
@@ -543,6 +565,12 @@ function buildPool(): PgPool {
     // Bound a connect attempt so a suspended/unreachable Neon endpoint can't hang
     // a flush (or the shutdown drain) — the retry/heartbeat/rebuild handle waiting.
     connectionTimeoutMillis: 10_000,
+    // Recycle idle pooled connections before an intermediary (Neon/Render proxy,
+    // PgBouncer) can silently drop one and hand a dead connection to the next write
+    // — the "reused idle connection hangs" trigger behind the silent write-through
+    // wedge. keepAliveInitialDelayMillis starts TCP keepalive probes promptly.
+    idleTimeoutMillis: 10_000,
+    keepAliveInitialDelayMillis: 10_000,
     // Bound the QUERY too, not just connect: a flush query on a half-open socket
     // would otherwise hang forever and wedge the flusher (see runFlush).
     statement_timeout: DB_STATEMENT_TIMEOUT_MS,
@@ -591,15 +619,42 @@ function logFlushError(err: unknown): void {
 // authoritative in-memory state, so even writes trapped in the abandoned flush
 // come back — nothing is lost.
 function breakStall(): void {
-  const stalledForMs = Date.now() - lastFlushProgressAt;
-  console.error(
-    `[db] write-through STALLED ${Math.round(stalledForMs / 1000)}s with ${pendingCount()} ` +
-      `write(s) pending and NO error recorded — force-recovering (abandon wedged flush, ` +
-      `reconcile snapshot, rebuild pool, re-flush).`
-  );
+  consecutiveStallBreaks++;
   flushEpoch++; // cancel the wedged loop so it can't run concurrently with the fresh flush
   flushing = null; // release the single-flight lock so a fresh flush can run
   reconcileAll(); // re-stage everything from memory (recovers writes trapped in the abandoned flush)
+
+  if (consecutiveStallBreaks >= stallEscalateAfter) {
+    // Force-recovery hasn't taken after several tries — the wedge is persistent, not
+    // a one-off blip. Stop spinning (and spamming) every ~50s: record a REAL failure
+    // so /health flips to "degraded" (alertable), the stall-breaker's own
+    // `consecutiveFlushFailures > 0` guard self-disables it, and the backoff heartbeat
+    // owns recovery. The next flush's watchdog/connect-timeout finally surfaces the
+    // underlying DB error instead of "NO error recorded".
+    console.error(
+      `[db] write-through wedged silently through ${consecutiveStallBreaks} recovery attempts — ` +
+        `escalating to degraded and handing off to the backoff heartbeat.`
+    );
+    recordFlushFailure(
+      `silent write-through wedge (no error surfaced after ${consecutiveStallBreaks} recoveries)`
+    );
+    rebuildPool("stall breaker: escalating persistent silent wedge");
+    lastFlushProgressAt = Date.now();
+    startHeartbeat();
+    void runFlush();
+    return;
+  }
+
+  // First break of an incident: log once (the intermediate breaks stay quiet), then
+  // force-recover. A transient wedge clears here on the fresh pool's first flush.
+  if (consecutiveStallBreaks === 1) {
+    const stalledForMs = Date.now() - lastFlushProgressAt;
+    console.error(
+      `[db] write-through STALLED ${Math.round(stalledForMs / 1000)}s with ${pendingCount()} ` +
+        `write(s) pending and NO error recorded — force-recovering (abandon wedged flush, ` +
+        `reconcile snapshot, rebuild pool, re-flush).`
+    );
+  }
   rebuildPool("stall breaker: silent write-through wedge");
   lastFlushProgressAt = Date.now(); // give the forced flush room before re-tripping
   void runFlush();
@@ -796,7 +851,7 @@ async function persistBatch(
   upserts: Array<[keyof DB, unknown[]]>,
   deletes: Array<[keyof DB, string[]]>
 ): Promise<void> {
-  const client = await pool!.connect();
+  const client = await connectBounded("flush connect");
   try {
     await client.query("begin");
     for (const [name, rows] of upserts) {
@@ -883,8 +938,8 @@ async function persistIsolating(
   upserts: Array<[keyof DB, unknown[]]>,
   deletes: Array<[keyof DB, string[]]>
 ): Promise<"ok" | Batch> {
-  const client = await pool!.connect().catch((err) => {
-    logFlushError(err); // surface the connect failure (e.g. ECONNREFUSED / timeout)
+  const client = await connectBounded("isolate connect").catch((err) => {
+    logFlushError(err); // surface the connect failure (e.g. ECONNREFUSED / timeout / bounded)
     return null;
   });
   if (!client) return { upserts, deletes }; // can't even connect -> all transient
@@ -950,6 +1005,25 @@ function withTimeout<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
       }
     );
   });
+}
+
+// Bound pool.connect() at the app layer. `connectionTimeoutMillis` (libpq) doesn't
+// reliably cover a stall AFTER the TCP connect — a Neon/PgBouncer startup-handshake
+// hang — which would otherwise wedge the flush silently until the 45s watchdog. If
+// the bound fires, release a late-resolving client so a wedged-then-recovered
+// connect can't leak a checked-out client from the pool.
+async function connectBounded(label: string): Promise<PoolClient> {
+  const p = pool!.connect();
+  let timedOut = false;
+  p.then((c) => {
+    if (timedOut) c.release();
+  }).catch(() => {});
+  try {
+    return await withTimeout(p, connectTimeoutMs, label);
+  } catch (err) {
+    timedOut = true;
+    throw err;
+  }
 }
 
 async function runFlush(): Promise<void> {
@@ -1129,6 +1203,8 @@ export async function initDb(opts?: {
   backoffMs?: number;
   stallBreakMs?: number;
   stallCheckMs?: number;
+  stallEscalateAfter?: number;
+  connectTimeoutMs?: number;
 }): Promise<void> {
   // Reset health counters so each boot (and each test that re-inits) starts clean.
   consecutiveFlushFailures = 0;
@@ -1146,6 +1222,11 @@ export async function initDb(opts?: {
   // silent wedge (one the watchdog never resolved).
   stallBreakMs = Math.max(opts?.stallBreakMs ?? DEFAULT_STALL_BREAK_MS, flushWatchdogMs + 1);
   stallCheckOverrideMs = opts?.stallCheckMs ?? null;
+  stallEscalateAfter = opts?.stallEscalateAfter ?? DEFAULT_STALL_ESCALATE_AFTER;
+  // Cap at the whole-flush watchdog: connect is a subset of persistBatch, which the
+  // watchdog already bounds, so a connectTimeoutMs above it would never fire (the
+  // watchdog rejects first) — leaving the connect-specific bound dead.
+  connectTimeoutMs = Math.min(opts?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, flushWatchdogMs);
   lastFlushProgressAt = Date.now();
   // Drop any write-through state from a previous run so a re-init (tests, mainly)
   // never inherits a wedged in-flight flush promise, stale timers, or staged rows.
@@ -1163,6 +1244,7 @@ export async function initDb(opts?: {
   flushEpoch++; // cancel any in-flight flush loop from a prior run (tests re-init)
   flushing = null;
   firstStagedAt = null;
+  consecutiveStallBreaks = 0;
   // Coherence poller + stall-breaker + watermarks are per-connection; drop any
   // from a prior run.
   stopCoherence();
