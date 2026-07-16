@@ -2,7 +2,7 @@
 // Run: node --import tsx/esm --test src/bounties/links.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mintBountyLinkToken, verifyBountyLinkToken, fundingUrl, cancelUrl } from "./links.js";
+import { applyUrl, mintBountyLinkToken, verifyBountyLinkToken, fundingUrl, cancelUrl } from "./links.js";
 
 test("token verifies only for the matching bounty + purpose", () => {
   const tok = mintBountyLinkToken("bounty-123", "fund");
@@ -31,4 +31,10 @@ test("URLs embed the bounty id + a verifying token", () => {
   const cu = new URL(cancelUrl("abc"));
   assert.match(cu.pathname, /\/bounties\/abc\/cancel$/);
   assert.equal(verifyBountyLinkToken(cu.searchParams.get("token")!, "cancel"), "abc");
+});
+
+test("apply URL is tokenless — it lives in a public comment", () => {
+  const au = new URL(applyUrl("abc"));
+  assert.match(au.pathname, /\/bounties\/abc\/apply$/);
+  assert.equal(au.search, "");
 });

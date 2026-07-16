@@ -500,6 +500,15 @@ const AppContent = () => {
     if (url.searchParams.get("auth") !== "ok") return;
     url.searchParams.delete("auth");
     window.history.replaceState({}, "", url.pathname + url.search);
+    // If the full-page sign-in started from a deep link (stashed by
+    // signInPopup's blocked-popup branch), return the user there.
+    try {
+      const returnTo = localStorage.getItem("devasign_return_to");
+      if (returnTo) {
+        localStorage.removeItem("devasign_return_to");
+        if (returnTo.startsWith("/")) navigate(returnTo, { replace: true });
+      }
+    } catch { /* storage unavailable — stay on the default page */ }
     auth.reload();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -593,6 +602,12 @@ const AppContent = () => {
       "width=620,height=760,menubar=no,toolbar=no,location=yes"
     );
     if (!popup) {
+      // Full-page OAuth loses the current URL (the callback redirects to
+      // /?auth=ok) — stash it so the return effect can put the user back,
+      // e.g. on a bounty apply/fund deep link they arrived on signed out.
+      try {
+        localStorage.setItem("devasign_return_to", window.location.pathname + window.location.search);
+      } catch { /* storage unavailable — worst case we land on the default page */ }
       auth.signIn();
       return;
     }
@@ -627,6 +642,14 @@ const AppContent = () => {
     // Valid session the backend couldn't resolve (likely data loss on redeploy).
     // Show a retry screen, NOT sign-in — re-auth here would orphan the account.
     if (auth.status === "unavailable") { setStage("unavailable"); return; }
+    // Bounty deep links (the bot comment's Apply CTA, and the sponsor's
+    // Fund/Cancel links) must render for ANY signed-in user — a contributor
+    // has no GitHub App installation and would otherwise be trapped in
+    // onboarding, never reaching the page the link points at.
+    if (/^\/bounties\/[^/]+\/(apply|fund|cancel)$/.test(location.pathname)) {
+      setStage("app");
+      return;
+    }
     if (forceStage) { setStage(forceStage); return; }
     setStage((s) => {
       // Sticky: once in onboarding or app, stay there until forceStage moves us.
@@ -634,7 +657,7 @@ const AppContent = () => {
       if (hasInstall === null) return "loading";
       return hasInstall ? "app" : "onboarding";
     });
-  }, [auth.status, hasInstall, forceStage]);
+  }, [auth.status, hasInstall, forceStage, location.pathname]);
 
   // Apply tweaks
   React.useEffect(() => {
@@ -743,6 +766,7 @@ const AppContent = () => {
             <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
             <Route path="/bounties/:id/fund" element={<BountiesPage isMobile={isMobile} isFunding />} />
             <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
+            <Route path="/bounties/:id/apply" element={<BountiesPage isMobile={isMobile} isApplying />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/agent" replace />} />

@@ -6,7 +6,7 @@
 // owner asked for. All calls are best-effort (the gh helpers swallow + log).
 import type { Bounty } from "../types.js";
 import { postPRCommentReturningId, updatePRComment } from "../github/app.js";
-import { cancelUrl, fundingUrl } from "./links.js";
+import { applyUrl, cancelUrl, fundingUrl } from "./links.js";
 
 function ownerName(bounty: Bounty): [string, string] {
   const [owner, name] = bounty.repo.split("/");
@@ -34,7 +34,13 @@ export function renderStatusBody(bounty: Bounty): string {
   const dev = bounty.assigneeGithubLogin ? `@${bounty.assigneeGithubLogin}` : "the contributor";
   switch (bounty.status) {
     case "OPEN":
-      return `🤖 **DevAsign Bounty** — ✅ funded. **${amt}** is held in escrow. Contributors can apply; approve one to delegate the work.`;
+      return [
+        `🤖 **DevAsign Bounty** — ✅ funded. **${amt}** is held in escrow.`,
+        ``,
+        `**[🚀 Apply for this bounty →](${applyUrl(bounty.id)})**`,
+        ``,
+        `<sub>Applying takes a minute — sign in with GitHub and introduce yourself. The sponsor approves one applicant to delegate the work; once their PR merges within the ${bounty.deliveryDays}-day window, the escrow pays out automatically.</sub>`,
+      ].join("\n");
     case "DELEGATED": {
       const due = bounty.deadlineAt ? ` Delivery due by ${new Date(bounty.deadlineAt).toUTCString()}.` : "";
       return `🤖 **DevAsign Bounty** — 👤 delegated to ${dev}.${due} Merge their PR to release the ${amt}, or it refunds when the window elapses.`;
