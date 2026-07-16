@@ -42,6 +42,10 @@ export const globalLimiter = rateLimit({
   skip: (req) =>
     req.path === "/api/health" ||
     req.path === "/health" ||
+    // The notifications SSE stream is one long-lived connection per tab, not a
+    // burst of requests; counting it (and its reconnects) against the flood cap
+    // would only risk throttling a legitimate live client.
+    req.path === "/api/notifications/stream" ||
     req.path.startsWith("/api/webhooks/"),
 });
 

@@ -23,6 +23,7 @@ import {
   notifyForReview,
   unreadCountForUser,
 } from "../notifications.js";
+import { addClient, removeClient } from "../notifications-stream.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 
@@ -1383,7 +1384,8 @@ api.get("/audit", (req, res) => {
 
 // --- Notifications (bell + popover) ---
 
-// Frontend polls this every ~10s (visibility-aware) to refresh the bell.
+// Snapshot for the bell — the frontend fetches this on load and whenever the
+// live stream below signals a change (with a slow fallback poll as a backstop).
 api.get("/notifications", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
@@ -1391,6 +1393,30 @@ api.get("/notifications", (req, res) => {
     items: notificationsForUser(user.id, 50),
     unreadCount: unreadCountForUser(user.id),
   });
+});
+
+// Server-Sent Events stream: pushes a lightweight "notifications-changed" signal
+// the instant a notification is created (or marked read) for this user, so the
+// dashboard refetches on demand instead of polling on a timer. GET, so it sails
+// past the CSRF guard, the durability barrier and the json parser untouched; the
+// path is exempted from globalLimiter (rate-limit.ts) since it's one long-lived
+// connection. See notifications-stream.ts.
+api.get("/notifications/stream", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  res.set({
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache, no-transform",
+    Connection: "keep-alive",
+    // Defeat proxy response buffering (nginx-style) so frames flush immediately.
+    "X-Accel-Buffering": "no",
+  });
+  res.flushHeaders();
+  // Establish the stream and tell the browser how long to wait before
+  // reconnecting if it drops (EventSource handles the reconnect itself).
+  res.write("retry: 5000\n\n");
+  addClient(user.id, res);
+  req.on("close", () => removeClient(user.id, res));
 });
 
 // "Mark all read" button. Returns how many rows were actually flipped — the
