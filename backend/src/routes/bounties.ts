@@ -130,16 +130,19 @@ export function getBountyHandler(req: Request, res: Response) {
   const b = getBounty(String(req.params.id));
   if (!b) return void res.status(404).json({ error: "not_found" });
   const sponsor = isSponsor(b, user.id);
-  const isApplicant =
-    user.githubId != null &&
-    (b.assigneeGithubId === user.githubId ||
-      b.applications.some((a) => a.githubId === user.githubId));
-  if (!sponsor && !isApplicant) {
-    return void res.status(403).json({ error: "forbidden" });
-  }
-  // Funding links only for the sponsor — an applicant must not receive a token
-  // that can cancel the bounty.
-  res.json({ bounty: sponsor ? withSponsorLinks(b) : b });
+  // Any signed-in user may read a bounty — it's advertised on a public GitHub
+  // issue and the bot comment's Apply CTA points contributors here. Two things
+  // stay sponsor-scoped: the fund/cancel links (a token that can cancel the
+  // bounty must never leave the sponsor) and the applicant list (non-sponsors
+  // see only their OWN applications, which is what the apply page needs to
+  // render an "already applied" state).
+  if (sponsor) return void res.json({ bounty: withSponsorLinks(b) });
+  res.json({
+    bounty: {
+      ...b,
+      applications: b.applications.filter((a) => a.githubId === user.githubId),
+    },
+  });
 }
 bounties.get("/bounties/:id", getBountyHandler);
 

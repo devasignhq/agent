@@ -99,3 +99,34 @@ test("sponsor detail carries the links; an applicant's detail does not", () => {
   getBountyHandler(authedReq(sponsorId, { id: bounty.id }), sres2);
   assert.equal(sres2.body.bounty.fundingUrl, undefined, "no links once funded (OPEN)");
 });
+
+test("any signed-in user can read a bounty; applications stay scoped", () => {
+  const { sponsorId, applicantId, applicantGh, bounty } = seed();
+  recordFunding(bounty.id, "G".padEnd(56, "A"), { hash: "H", status: "pending" } as any);
+  const txn = db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${bounty.taskId}`)!;
+  applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
+  applyToBounty(bounty.id, { githubId: applicantGh, githubLogin: "applicant" });
+
+  // A stranger (no installation, never applied) can read the bounty — this is
+  // where the bot comment's Apply CTA lands — but gets no sponsor links and no
+  // other user's applications.
+  const strangerId = uuid();
+  db.insert("users", { id: strangerId, githubId: 424242, githubLogin: "stranger", email: "x@x.z", plan: "free", createdAt: Date.now() } as any);
+  const res = fakeRes();
+  getBountyHandler(authedReq(strangerId, { id: bounty.id }), res);
+  assert.equal(res.statusCode, 200, "stranger can read the advertised bounty");
+  assert.equal(res.body.bounty.fundingUrl, undefined);
+  assert.equal(res.body.bounty.cancelUrl, undefined);
+  assert.deepEqual(res.body.bounty.applications, [], "another user's application is not leaked");
+
+  // The applicant sees exactly their own application (drives "already applied").
+  const ares = fakeRes();
+  getBountyHandler(authedReq(applicantId, { id: bounty.id }), ares);
+  assert.equal(ares.body.bounty.applications.length, 1);
+  assert.equal(ares.body.bounty.applications[0].githubId, applicantGh);
+
+  // The sponsor still sees the full list.
+  const sres = fakeRes();
+  getBountyHandler(authedReq(sponsorId, { id: bounty.id }), sres);
+  assert.equal(sres.body.bounty.applications.length, 1);
+});

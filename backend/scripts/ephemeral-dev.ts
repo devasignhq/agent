@@ -43,7 +43,7 @@ db.insert("installations", {
 });
 // One awaiting-funding bounty on the seeded installation so the Bounties page
 // (list, drawer, in-app Fund/Cancel links) renders with real data.
-const { createBounty } = await import("../src/bounties/service.js");
+const { createBounty, recordFunding, applyTxnOutcome } = await import("../src/bounties/service.js");
 createBounty({
   source: "github",
   installationId: 1,
@@ -56,6 +56,36 @@ createBounty({
   deliveryDays: 5,
   sponsorUserId: "ephemeral-user-1",
 });
+// …and one FUNDED (OPEN) bounty so the contributor apply flow (the bot
+// comment's Apply CTA → /bounties/:id/apply) is exercisable end-to-end.
+const openBounty = createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 2,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/2",
+  title: "Funded demo bounty (ephemeral)",
+  description: "Already escrowed — contributors can apply.",
+  amountUsdc: 250,
+  deliveryDays: 7,
+  sponsorUserId: "ephemeral-user-1",
+});
+recordFunding(openBounty.id, "G".padEnd(56, "A"), { hash: "H_EPHEMERAL", status: "pending" });
+const escrowTxn = db.find(
+  "escrowTransactions",
+  (t) => t.idempotencyKey === `escrow:${openBounty.taskId}`
+)!;
+applyTxnOutcome(escrowTxn.id, { status: "success", ledger: 1 });
+// A contributor identity (GitHub id, NO installation) for the apply flow — also
+// exercises the app's onboarding bypass on bounty deep links.
+db.insert("users", {
+  id: "ephemeral-contributor-1",
+  githubId: 424242,
+  githubLogin: "ephemeral-contributor",
+  email: "contributor@example.com",
+  plan: "free",
+  createdAt: Date.now(),
+});
 
 // Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the
 // cookie through the same helper the server verifies — a hand-rolled value won't
@@ -64,3 +94,7 @@ const { signSession } = await import("../src/github/oauth.js");
 console.log(
   `[ephemeral] seeded user ephemeral-user-1 — cookie: devasign_session=${signSession("ephemeral-user-1")}`
 );
+console.log(
+  `[ephemeral] seeded contributor ephemeral-contributor-1 — cookie: devasign_session=${signSession("ephemeral-contributor-1")}`
+);
+console.log(`[ephemeral] funded bounty apply page: http://localhost:3001/bounties/${openBounty.id}/apply`);

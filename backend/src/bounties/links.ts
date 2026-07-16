@@ -53,3 +53,15 @@ export function cancelUrl(bountyId: string): string {
   const token = mintBountyLinkToken(bountyId, "cancel");
   return `${webBase()}/bounties/${bountyId}/cancel?token=${encodeURIComponent(token)}`;
 }
+
+/**
+ * Frontend page where a contributor applies for a funded bounty (the bot
+ * comment's CTA). Deliberately TOKENLESS: the link sits in a public GitHub
+ * comment for an unbounded audience, and a minted token's TTL would rot it.
+ * Applying is guarded by session auth + GitHub identity + the service's
+ * OPEN-status check instead, and the comment is edited away from the OPEN
+ * state once the bounty is delegated, so the link self-retires.
+ */
+export function applyUrl(bountyId: string): string {
+  return `${webBase()}/bounties/${bountyId}/apply`;
+}
