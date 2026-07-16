@@ -65,12 +65,18 @@ export async function adminRefund(taskId: string): Promise<SendResult> {
 
 // ── Reads (simulation-only; admin address is a throwaway source) ──────────────
 
-/** The on-chain escrow record for a task, or null if it doesn't exist. */
+/**
+ * The on-chain escrow record for a task, or null if it doesn't exist. A missing
+ * escrow surfaces as a contract error in the simulation (get_escrow returns
+ * Result<TaskEscrow, Error>); anything else — RPC down, network blip — rethrows,
+ * because callers (cancel, orphan recovery) must not mistake it for "no escrow".
+ */
 export async function getEscrow(taskId: string): Promise<unknown> {
   try {
     return await simulateEscrowRead(adminAddress(), "get_escrow", [taskIdScVal(taskId)]);
-  } catch {
-    return null;
+  } catch (err) {
+    if (err instanceof Error && /Error\(Contract/.test(err.message)) return null;
+    throw err;
   }
 }
 

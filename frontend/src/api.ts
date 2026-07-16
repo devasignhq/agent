@@ -343,8 +343,9 @@ export type Bounty = {
   refundTxHash?: string | null;
   createdAt: number;
   updatedAt: number;
-  // Signed Fund/Cancel links, present only on sponsor reads of a
-  // PENDING_FUNDING bounty (the in-app fallback for the GitHub confirm comment).
+  // Signed Fund/Cancel links, present only on sponsor reads. fundingUrl is
+  // minted while PENDING_FUNDING; cancelUrl also while OPEN (cancelling a
+  // funded bounty refunds its escrow to the sponsor).
   fundingUrl?: string;
   cancelUrl?: string;
 };
@@ -544,8 +545,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ token, signedXdr }),
     }),
+  // Cancel (token from the Cancel link). outcome "cancelled" = plain discard
+  // (nothing escrowed); "submitted" = refund tx broadcast (hash present);
+  // "already_*" = idempotent replay.
   cancelBounty: (id: string, token: string) =>
-    request<{ ok: true }>(`/api/bounties/${id}/cancel`, {
+    request<{ ok: true; outcome: string; hash?: string; bounty?: Bounty }>(`/api/bounties/${id}/cancel`, {
       method: "POST",
       body: JSON.stringify({ token }),
     }),

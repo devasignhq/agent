@@ -22,7 +22,7 @@ import {
   approveApplication,
   buildFundingTx,
   buildSponsorReleaseTx,
-  cancelPending,
+  cancelBounty,
   createBounty,
   deleteBounty,
   getBounty,
@@ -67,17 +67,20 @@ function isSponsor(bounty: Bounty, userId: string): boolean {
 function failStatus(reason: string): number {
   if (reason === "not_found") return 404;
   if (reason.startsWith("already_") || reason === "in_flight") return 409;
+  if (reason === "funding_in_flight") return 409; // retriable: keeper confirms within a tick
   return 400;
 }
 
 // A PENDING_FUNDING bounty is only actionable through its signed Fund/Cancel
 // links. The GitHub confirm comment is the usual carrier, but posting it can
 // fail (e.g. the App lacks Issues:write) — so sponsor-facing reads mint fresh
-// links too, making the app's Bounties page a full fallback. Sponsor-only:
+// links too, making the app's Bounties page a full fallback. A funded (OPEN)
+// bounty keeps its Cancel link: cancelling it refunds the escrow. Sponsor-only:
 // callers must scope to the sponsor before applying this.
 function withSponsorLinks(b: Bounty): Bounty & { fundingUrl?: string; cancelUrl?: string } {
-  if (b.status !== "PENDING_FUNDING") return b;
-  return { ...b, fundingUrl: fundingUrl(b.id), cancelUrl: cancelUrl(b.id) };
+  if (b.status === "PENDING_FUNDING") return { ...b, fundingUrl: fundingUrl(b.id), cancelUrl: cancelUrl(b.id) };
+  if (b.status === "OPEN") return { ...b, cancelUrl: cancelUrl(b.id) };
+  return b;
 }
 
 function summarize(list: Bounty[]) {
@@ -221,13 +224,20 @@ bounties.post("/bounties/:id/funding-submit", async (req, res) => {
   res.json({ ok: true, hash: r.hash, status: r.reason });
 });
 
-bounties.post("/bounties/:id/cancel", (req, res) => {
+bounties.post("/bounties/:id/cancel", async (req, res) => {
   const bountyId = verifyBountyLinkToken(String(req.body?.token || ""), "cancel");
   if (bountyId !== req.params.id) return void res.status(403).json({ error: "invalid_token" });
-  const r = cancelPending(bountyId);
+  const b = getBounty(bountyId);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  // Refund needs the chain unless it's an unfunded PENDING_FUNDING discard.
+  if (b.status !== "PENDING_FUNDING" && !requireStellar(res)) return;
+  const r = await cancelBounty(bountyId, "deleted");
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
-  if (r.bounty) void updateStatusComment(r.bounty);
-  res.json({ ok: true, bounty: r.bounty });
+  const bounty = getBounty(bountyId);
+  // On "submitted" only a refund tx was broadcast — the comment re-syncs to
+  // "cancelled" when the keeper confirms it; don't flash an interim state.
+  if (bounty && r.reason !== "submitted") void updateStatusComment(bounty);
+  res.json({ ok: true, outcome: r.reason, hash: r.hash, bounty });
 });
 
 // --- applications + delegation ---
