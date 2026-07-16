@@ -22,6 +22,7 @@ import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { bounties } from "./routes/bounties.js";
+import { closeAllStreams } from "./notifications-stream.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
@@ -248,6 +249,7 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
     console.log(`\n[server] ${signal} received — draining and flushing pending writes…`);
     try {
       server.close();
+      closeAllStreams(); // end open SSE streams so clients reconnect to the next instance
       await Promise.all([shutdownDb(), shutdownStatsig()]);
     } catch (err) {
       console.error("[server] error during shutdown", err);

@@ -13,7 +13,8 @@ import { WorkflowPage } from "./screen-workflow";
 import { BountiesPage } from "./screen-bounties";
 import { SettingsPage } from "./screens-rest";
 import { useAuth } from "./auth-context";
-import { api, oauthStartUrl } from "./api";
+import { api, apiBase, oauthStartUrl } from "./api";
+import { startNotificationsStream } from "./notifications-stream";
 import { registerPopup, closePopup } from "./popup-registry";
 import { useRecentReviews } from "./recent-reviews";
 
@@ -108,10 +109,12 @@ function ago(ms) {
   return `${w}w`;
 }
 
-// Polls /api/notifications. Visibility-aware: 10s while focused, 60s when the
-// tab is hidden (matches the cadence the agent screen already uses). The
+// Live notifications via a Server-Sent Events stream: the backend pushes a
+// "changed" signal the moment a notification is created (or marked read) and we
+// refetch on it, so there's no steady polling. A slow 60s fallback poll is kept
+// as a backstop for a dropped/blocked stream and the brief deploy window. The
 // returned `markAllRead` flips every unread row server-side and updates local
-// state optimistically so the badge clears without waiting for the next poll.
+// state optimistically so the badge clears without waiting for a refetch.
 function useNotifications(enabled) {
   const [items, setItems] = React.useState([]);
   const [unreadCount, setUnreadCount] = React.useState(0);
@@ -134,27 +137,23 @@ function useNotifications(enabled) {
       setUnreadCount(0);
       return;
     }
-    let alive = true;
-    let timer = null;
-    const tick = async () => {
-      if (!alive) return;
-      await refresh();
-      if (!alive) return;
-      const delay = document.visibilityState === "visible" ? 10_000 : 60_000;
-      timer = setTimeout(tick, delay);
-    };
-    tick();
+    // Paint immediately on mount/sign-in, then let the live stream drive refreshes.
+    void refresh();
+    const stream = startNotificationsStream({
+      openSource: () =>
+        new EventSource(`${apiBase}/api/notifications/stream`, { withCredentials: true }),
+      refresh: () => void refresh(),
+      scheduleFallback: (fn, ms) => setInterval(fn, ms),
+      clearFallback: (h) => clearInterval(h),
+    });
+    // Also refetch when the tab regains focus (cheap, and catches anything missed
+    // while the stream was backgrounded).
     const onVis = () => {
-      if (document.visibilityState === "visible") {
-        // Refresh immediately on tab focus and reset the timer.
-        if (timer) clearTimeout(timer);
-        tick();
-      }
+      if (document.visibilityState === "visible") void refresh();
     };
     document.addEventListener("visibilitychange", onVis);
     return () => {
-      alive = false;
-      if (timer) clearTimeout(timer);
+      stream.stop();
       document.removeEventListener("visibilitychange", onVis);
     };
   }, [enabled, refresh]);

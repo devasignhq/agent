@@ -1,9 +1,11 @@
 // App-level notifications that drive the bell + popover in the dashboard.
 // Server-stored so the unread badge stays consistent across tabs and the
-// notification feed survives page reloads. Frontend polls /api/notifications
-// every 10s (visibility-aware) — there's no SSE layer to leverage.
+// notification feed survives page reloads. Creation and read-state changes push
+// a live "changed" signal to the user's open SSE streams (notifications-stream.ts)
+// so the dashboard refetches on demand instead of polling on a timer.
 import { v4 as uuid } from "uuid";
 import { db } from "./db.js";
+import { notifyUser } from "./notifications-stream.js";
 import type { Notification, NotificationKind } from "./types.js";
 
 // Insert a notification row for a specific user. Returns the inserted row,
@@ -29,6 +31,7 @@ export function pushNotification(
     readAt: null,
   };
   db.insert("notifications", row);
+  notifyUser(userId); // push the live "changed" signal to this user's open streams
   return row;
 }
 
@@ -78,5 +81,8 @@ export function markAllRead(userId: string): number {
   for (const row of unread) {
     db.update("notifications", (n) => n.id === row.id, { readAt: now });
   }
+  // Let other open tabs of the same user clear their badge without waiting on
+  // the fallback poll. Only signal when something actually flipped.
+  if (unread.length > 0) notifyUser(userId);
   return unread.length;
 }
