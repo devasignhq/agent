@@ -634,6 +634,9 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
     status: "OPEN",
     onchainStatus: "Open",
     ...(creator ? { sponsorAddress: creator } : {}),
+    // An aged-out "failed" verdict cleared escrowTxHash on the bounty; the row
+    // we just flipped back to confirmed still holds the hash — restore it.
+    ...(existing?.hash ? { escrowTxHash: existing.hash } : {}),
   });
   return { ok: true, reason: "recovered", bounty: bounty ?? undefined };
 }

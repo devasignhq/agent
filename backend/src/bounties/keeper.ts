@@ -32,6 +32,10 @@ const PENDING_MAX_AGE_MS = 10 * 60 * 1000;
 // a chain simulation.
 const ORPHAN_MIN_AGE_MS = 60 * 1000;
 const ORPHAN_RECHECK_MS = 5 * 60 * 1000;
+// Cap the chain reads per tick so a backlog of aged candidates can't block the
+// keeper loop or hammer the RPC node; the throttle stamps rotate coverage to
+// the remaining candidates on subsequent ticks.
+const ORPHAN_MAX_CHECKS_PER_TICK = 10;
 
 export type KeeperDeps = {
   confirm: (hash: string) => Promise<ConfirmResult>;
@@ -130,12 +134,15 @@ async function recoverOrphanedFunding(deps: KeeperDeps): Promise<void> {
   // Drop throttle entries for bounties that are no longer candidates so the map
   // can't grow without bound.
   const ids = new Set(candidates.map((b) => b.id));
-  for (const id of lastOrphanCheck.keys()) if (!ids.has(id)) lastOrphanCheck.delete(id);
+  for (const id of [...lastOrphanCheck.keys()]) if (!ids.has(id)) lastOrphanCheck.delete(id);
+  let checkedThisTick = 0;
   for (const b of candidates) {
+    if (checkedThisTick >= ORPHAN_MAX_CHECKS_PER_TICK) break;
     const now = deps.now();
     if (now - b.createdAt < ORPHAN_MIN_AGE_MS) continue;
     if (now - (lastOrphanCheck.get(b.id) ?? 0) < ORPHAN_RECHECK_MS) continue;
     lastOrphanCheck.set(b.id, now);
+    checkedThisTick++;
     let escrow: unknown;
     try {
       escrow = await deps.chain.getEscrow(b.taskId);

@@ -155,6 +155,23 @@ test("orphaned funding is recovered from on-chain state → OPEN", async () => {
   assert.equal(txn.hash, null); // the row that held the hash is what was lost
 });
 
+test("an aged-out 'failed' funding that actually landed is recovered, hash restored", async () => {
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_LOST", status: "pending" });
+  // The keeper aged the tx out (not included in time) — but it later landed.
+  applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "failed", error: "not_included_timeout" });
+  assert.equal(getBounty(b.id)!.escrowTxHash, null); // cleared by the failed verdict
+
+  await runTick(keeperDeps({}, PAST_MIN_AGE, { async getEscrow() { return { creator: ADDR() }; } }));
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.status, "OPEN");
+  assert.equal(after.escrowTxHash, "H_LOST"); // restored from the repaired row
+  const txn = txnByKey(`escrow:${b.taskId}`)!;
+  assert.equal(txn.status, "confirmed");
+  assert.equal(txn.hash, "H_LOST");
+});
+
 test("a genuinely unfunded bounty stays PENDING_FUNDING", async () => {
   const b = mkBounty();
 
