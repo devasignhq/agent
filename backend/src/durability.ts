@@ -20,7 +20,7 @@
 // testable (see durability.test.ts), in particular the headers-already-sent
 // branch.
 import type { NextFunction, Request, Response } from "express";
-import { dbHealth, flushPending } from "./db.js";
+import { flushPending, persistenceFailing } from "./db.js";
 
 type EndFn = (...args: unknown[]) => unknown;
 
@@ -63,7 +63,11 @@ export function finishNotDurable(res: Response, origEnd: EndFn, args: unknown[])
 // the real db functions below, so runtime behaviour is unchanged.
 export type DurabilityDeps = {
   flushPending: () => Promise<void>;
-  pendingWrites: () => number;
+  // True only when writes are genuinely failing to persist (a flush errored and
+  // hasn't recovered) — NOT merely a non-zero global backlog, which is normal
+  // under concurrent load and drains on its own. Gating the 503 on this instead
+  // of the global pending count is what stops the spurious `not_durable`.
+  persistenceFailing: () => boolean;
 };
 
 // Methods that never change state. These are served from the in-memory cache and
@@ -87,11 +91,14 @@ export function makeDurabilityBarrier(deps: DurabilityDeps) {
       gated = true;
       deps.flushPending().then(
         () => {
-          // Writes that genuinely couldn't be persisted (DB unreachable) must not
-          // be acknowledged as success. finishNotDurable handles the already-sent
-          // case by forwarding the buffered body instead of dropping it — so this
-          // branch is correct whether or not headers have gone out.
-          if (deps.pendingWrites() > 0) return finishNotDurable(res, origEnd, args);
+          // flushPending() has drained THIS request's writes to Postgres (its loop
+          // runs until the backlog it saw is empty). Only fail the response if the
+          // flush genuinely couldn't persist — a real outage, surfaced by
+          // persistenceFailing(). A non-zero global backlog from a concurrent
+          // keeper/worker write is NOT a failure and must not 503 this request.
+          // finishNotDurable handles the already-sent case by forwarding the
+          // buffered body instead of dropping it — correct either way.
+          if (deps.persistenceFailing()) return finishNotDurable(res, origEnd, args);
           return origEnd(...args);
         },
         (err) => {
@@ -108,5 +115,5 @@ export function makeDurabilityBarrier(deps: DurabilityDeps) {
 // Production middleware: the real store-backed durability barrier.
 export const durabilityBarrier = makeDurabilityBarrier({
   flushPending,
-  pendingWrites: () => dbHealth().pendingWrites,
+  persistenceFailing,
 });

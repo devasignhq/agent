@@ -14,6 +14,7 @@ import {
   approveApplication,
   acceptAndStartClock,
   releaseByMerge,
+  refundBounty,
   getBounty,
   applyTxnOutcome,
   type EscrowChain,
@@ -278,4 +279,67 @@ test("expired bounty already released is NOT refunded", async () => {
 
   await runTick(keeperDeps({})); // sweep should skip it (release txn exists)
   assert.equal(txnByKey(`refund:${b.taskId}`), null);
+});
+
+test("a pending row with no hash ages out to failed (can never be confirmed)", async () => {
+  const b = mkBounty();
+  // A funding submit that recorded a pending row but never got a hash back — it
+  // can never be polled, so it must not pin the bounty PENDING_FUNDING forever.
+  recordFunding(b.id, ADDR(), { hash: undefined as unknown as string, status: "pending" });
+  assert.equal(txnByKey(`escrow:${b.taskId}`)!.hash, null, "precondition: no hash");
+
+  // now() far in the future → past PENDING_MAX_AGE_MS.
+  await runTick(keeperDeps({}, () => Date.now() + 20 * 60 * 1000));
+
+  const after = txnByKey(`escrow:${b.taskId}`)!;
+  assert.equal(after.status, "failed");
+  assert.equal(after.error, "missing_hash_timeout");
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING"); // retryable / orphan-recoverable
+});
+
+test("an accepted-but-dropped admin refund is rebuilt + rebroadcast before it ages out", async () => {
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  await refundBounty(b.id, "expired", chain); // admin refund, hash H_REF
+  assert.equal(txnByKey(`refund:${b.taskId}`)!.hash, "H_REF");
+
+  // now() past RESUBMIT_STALE_MS (150s) but under PENDING_MAX_AGE_MS (10m), and the
+  // confirm still returns not_found → the keeper rebuilds a FRESH envelope.
+  let resubmits = 0;
+  await runTick(
+    keeperDeps({}, () => Date.now() + 3 * 60 * 1000, {
+      async adminRefund() {
+        resubmits++;
+        return { hash: "H_REF2", status: "pending" };
+      },
+    })
+  );
+
+  assert.equal(resubmits, 1, "rebuilt + rebroadcast exactly once");
+  const row = txnByKey(`refund:${b.taskId}`)!;
+  assert.equal(row.status, "pending", "still pending — not failed, not confirmed");
+  assert.equal(row.hash, "H_REF2", "row repointed at the fresh envelope's hash");
+  assert.equal(getBounty(b.id)!.refundTxHash, "H_REF2");
+});
+
+test("a dropped admin refund still ages out to failed once past the max age", async () => {
+  // Resubmit is a best-effort bridge, NOT a substitute for the final backstop:
+  // past PENDING_MAX_AGE_MS the row must still fail (retryable), not resubmit forever.
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  await refundBounty(b.id, "expired", chain);
+
+  let resubmits = 0;
+  await runTick(
+    keeperDeps({}, () => Date.now() + 20 * 60 * 1000, {
+      async adminRefund() {
+        resubmits++;
+        return { hash: "H_REF2", status: "pending" };
+      },
+    })
+  );
+
+  assert.equal(resubmits, 0, "age-out wins over resubmit past the max age");
+  assert.equal(txnByKey(`refund:${b.taskId}`)!.status, "failed");
+  assert.equal(getBounty(b.id)!.pendingOp, null); // guard cleared → retryable
 });

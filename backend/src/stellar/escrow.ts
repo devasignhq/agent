@@ -46,19 +46,31 @@ export async function buildReleaseXdr(
 
 // ── Admin-signed operations (signed server-side, broadcast immediately) ───────
 
+// Admin settlement txns (admin_release/admin_refund) build with a higher inclusion
+// fee and shorter timebounds than the BASE_FEE/300s default. Shorter timebounds
+// make a dropped admin tx provably dead sooner, so the keeper can rebuild and
+// resubmit a FRESH envelope without ever having two live at once (the invariant
+// that keeps resubmit double-settle-safe). The 10× inclusion fee (~0.0001 XLM,
+// paid by the platform admin account) improves inclusion odds under surge pricing.
+const ADMIN_TX_TIMEOUT_S = 120;
+const ADMIN_TX_FEE = "1000"; // 10 × the 100-stroop BASE_FEE minimum
+const adminTxOpts = { timeoutSeconds: ADMIN_TX_TIMEOUT_S, fee: ADMIN_TX_FEE };
+
 /** Backend releases the escrow to the contributor on PR merge (admin arbiter). */
 export async function adminRelease(taskId: string, contributorAddress: string): Promise<SendResult> {
-  const tx = await buildEscrowInvoke(adminAddress(), "admin_release", [
-    taskIdScVal(taskId),
-    addressScVal(contributorAddress),
-  ]);
+  const tx = await buildEscrowInvoke(
+    adminAddress(),
+    "admin_release",
+    [taskIdScVal(taskId), addressScVal(contributorAddress)],
+    adminTxOpts
+  );
   tx.sign(adminKeypair());
   return sendSignedTx(tx);
 }
 
 /** Backend refunds the escrow to the sponsor on delete/expiry (admin arbiter, funds → creator only). */
 export async function adminRefund(taskId: string): Promise<SendResult> {
-  const tx = await buildEscrowInvoke(adminAddress(), "admin_refund", [taskIdScVal(taskId)]);
+  const tx = await buildEscrowInvoke(adminAddress(), "admin_refund", [taskIdScVal(taskId)], adminTxOpts);
   tx.sign(adminKeypair());
   return sendSignedTx(tx);
 }

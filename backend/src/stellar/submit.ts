@@ -18,7 +18,18 @@ export type ConfirmResult =
 export async function sendSignedTx(
   tx: Stellar.Transaction | Stellar.FeeBumpTransaction
 ): Promise<SendResult> {
-  const send = await server().sendTransaction(tx);
+  // TRY_AGAIN_LATER means the node did NOT durably queue the tx — its hash would
+  // poll not_found forever if we recorded it as "pending". Resend the same (still
+  // valid) envelope a few times before giving up; a persistent TRY_AGAIN_LATER is
+  // returned as an error so the caller records a RETRYABLE `failed` row instead of
+  // a dead-hash `pending` row. (For admin txns the keeper also rebuilds+resubmits
+  // a fresh envelope — this just avoids stranding the first attempt.)
+  const MAX_TRY_AGAIN = 3;
+  let send = await server().sendTransaction(tx);
+  for (let attempt = 1; send.status === "TRY_AGAIN_LATER" && attempt <= MAX_TRY_AGAIN; attempt++) {
+    await new Promise((r) => setTimeout(r, 1000));
+    send = await server().sendTransaction(tx);
+  }
   if (send.status === "ERROR") {
     return {
       hash: send.hash,
@@ -26,8 +37,10 @@ export async function sendSignedTx(
       error: safeJson(send.errorResult) || "sendTransaction returned ERROR",
     };
   }
-  // PENDING (and the transient TRY_AGAIN_LATER / DUPLICATE) all mean "submitted";
-  // the keeper polls getTransaction from here.
+  if (send.status === "TRY_AGAIN_LATER") {
+    return { hash: send.hash, status: "error", error: "try_again_later" };
+  }
+  // PENDING / DUPLICATE both mean "submitted"; the keeper polls getTransaction.
   return { hash: send.hash, status: "pending" };
 }
 
