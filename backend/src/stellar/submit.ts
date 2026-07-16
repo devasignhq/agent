@@ -4,13 +4,13 @@
 // Nothing here blocks a request thread waiting for ledger inclusion — the
 // bounty's escrowTransactions row is the durable record the keeper reconciles.
 import * as Stellar from "@stellar/stellar-sdk";
-import { Api } from "@stellar/stellar-sdk/rpc";
+import { config } from "../config.js";
 import { server, networkPassphrase } from "./client.js";
 
 export type SendResult = { hash: string; status: "pending" | "error"; error?: string };
 
 export type ConfirmResult =
-  | { status: "success"; ledger?: number; returnValue?: Stellar.xdr.ScVal }
+  | { status: "success"; ledger?: number }
   | { status: "failed"; error: string }
   | { status: "not_found" };
 
@@ -43,15 +43,53 @@ export function parseTxSource(signedXdr: string): string {
   return (tx as Stellar.Transaction).source;
 }
 
-/** One non-blocking status check for a submitted tx hash. */
+// Cap a confirmation poll so a hung RPC socket can't stall the keeper tick (the
+// SDK's rpc Server sets no HTTP timeout). Well above a healthy getTransaction.
+const CONFIRM_TIMEOUT_MS = 15_000;
+
+type RawTxStatus = "SUCCESS" | "FAILED" | "NOT_FOUND";
+type RawGetTransaction = { status: RawTxStatus; ledger?: number; resultXdr?: string };
+
+/**
+ * Read the RPC's raw `getTransaction` JSON and return ONLY the top-level
+ * `status`/`ledger`/`resultXdr` — deliberately never decoding `resultMetaXdr`.
+ *
+ * Since Protocol 23 the RPC returns transaction metadata as `TransactionMetaV4`,
+ * which older @stellar/stellar-sdk builds can't parse: `server().getTransaction`
+ * eagerly decodes the meta and throws `TypeError: Bad union switch: 4`, which
+ * wedged confirmation for every funded bounty (it never reached SUCCESS, so the
+ * bounty never left PENDING_FUNDING). The keeper only needs the status, so we
+ * skip the meta entirely — this also stays resilient to future meta-version bumps.
+ * Returns null on any transport error / timeout / malformed body; the caller
+ * treats that as "not yet confirmed" and retries on the next tick.
+ */
+async function rawGetTransaction(hash: string): Promise<RawGetTransaction | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), CONFIRM_TIMEOUT_MS);
+  try {
+    const res = await fetch(config.stellar.rpcUrl, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "getTransaction", params: { hash } }),
+      signal: controller.signal,
+    });
+    if (!res.ok) return null; // transient RPC/proxy error — retry next tick
+    const body = (await res.json()) as { result?: RawGetTransaction };
+    if (!body?.result || typeof body.result.status !== "string") return null;
+    return body.result;
+  } catch {
+    return null; // network error / timeout / abort — retry next tick
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** One non-blocking status check for a submitted tx hash. Never throws. */
 export async function confirmTransaction(hash: string): Promise<ConfirmResult> {
-  const r = await server().getTransaction(hash);
-  if (r.status === Api.GetTransactionStatus.SUCCESS) {
-    return { status: "success", ledger: r.ledger, returnValue: r.returnValue };
-  }
-  if (r.status === Api.GetTransactionStatus.FAILED) {
-    return { status: "failed", error: safeJson(r.resultXdr) || "transaction FAILED" };
-  }
+  const raw = await rawGetTransaction(hash);
+  if (!raw) return { status: "not_found" }; // couldn't reach/parse the RPC — retryable
+  if (raw.status === "SUCCESS") return { status: "success", ledger: raw.ledger };
+  if (raw.status === "FAILED") return { status: "failed", error: raw.resultXdr || "transaction FAILED" };
   return { status: "not_found" };
 }
 

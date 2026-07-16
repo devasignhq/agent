@@ -103,6 +103,48 @@ test("keeper confirms a pending payout → PAID", async () => {
   assert.equal(txnByKey(`release:${b.taskId}`)!.status, "confirmed");
 });
 
+test("keeper confirms a pending FUNDING tx → OPEN (the Protocol-23 stuck-PENDING fix)", async () => {
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_ESCROW", status: "pending" });
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING");
+
+  await runTick(keeperDeps({ H_ESCROW: { status: "success", ledger: 3633553 } }));
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.status, "OPEN");
+  assert.equal(after.onchainStatus, "Open");
+  assert.equal(txnByKey(`escrow:${b.taskId}`)!.status, "confirmed");
+});
+
+test("a persistently-throwing confirm ages the tx out so orphan recovery can adopt it", async () => {
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_ESCROW", status: "pending" });
+
+  // A confirm that always throws, and now() past the max age: the row must not
+  // stay `pending` forever (which would also lock out orphan recovery).
+  const throwing: KeeperDeps = {
+    chain,
+    now: () => Date.now() + 20 * 60 * 1000,
+    async confirm() {
+      throw new TypeError("Bad union switch: 4");
+    },
+  };
+  await runTick(throwing);
+  assert.equal(txnByKey(`escrow:${b.taskId}`)!.status, "failed"); // aged out, retryable
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING");
+
+  // With the row now `failed`, a later tick's orphan recovery adopts the escrow
+  // that actually exists on-chain → OPEN. (Spaced past the 5-min orphan recheck
+  // throttle that the first tick's recovery pass already consumed.)
+  const sponsor = ADDR();
+  await runTick(keeperDeps({}, () => Date.now() + 30 * 60 * 1000, {
+    async getEscrow() {
+      return { creator: sponsor };
+    },
+  }));
+  assert.equal(getBounty(b.id)!.status, "OPEN");
+});
+
 test("keeper sweeps an expired bounty → refund submitted, then confirmed → CANCELLED", async () => {
   const b = mkBounty();
   await fundOpenDelegate(b.id);
