@@ -99,16 +99,17 @@ async function confirmPending(deps: KeeperDeps): Promise<void> {
     }
     if (outcome.status === "not_found") {
       if (deps.now() - txn.createdAt > PENDING_MAX_AGE_MS) {
-        applyTxnOutcome(txn.id, { status: "failed", error: "not_included_timeout" });
+        await applyTxnOutcome(txn.id, { status: "failed", error: "not_included_timeout" }, deps.chain);
         await syncComment(txn.bountyId);
       }
       continue;
     }
-    applyTxnOutcome(
+    await applyTxnOutcome(
       txn.id,
       outcome.status === "success"
         ? { status: "success", ledger: outcome.ledger }
-        : { status: "failed", error: outcome.error }
+        : { status: "failed", error: outcome.error },
+      deps.chain
     );
     await syncComment(txn.bountyId);
   }

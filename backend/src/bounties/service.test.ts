@@ -207,6 +207,8 @@ test("delete: undelegated refunds once; delegated cannot be deleted", async () =
   fundAndConfirm(b1.id);
   const d1 = await deleteBounty(b1.id, chain);
   assert.equal(d1.ok, true);
+  assert.equal(d1.bounty?.status, "OPEN"); // refund submitted, not yet confirmed
+  assert.equal(d1.bounty?.pendingOp, "refunding");
   const d2 = await deleteBounty(b1.id, chain);
   assert.equal(d2.reason, "already_pending");
   assert.equal(calls.adminRefund, 1);
@@ -302,15 +304,46 @@ test("cancelBounty: chain probe failure aborts — never cancel blind", async ()
   assert.equal(calls.adminRefund, 0);
 });
 
-test("a late escrow confirm never resurrects a cancelled bounty", () => {
+test("a late escrow confirm on a cancelled bounty auto-refunds instead of stranding funds", async () => {
+  const { chain, calls } = fakeChain();
   const b = mkBounty();
   recordFunding(b.id, ADDR(), { hash: "H_ESCROW", status: "pending" });
-  // Cancel lands in the sub-second window before the funding row confirms.
+  // Cancel lands in the sub-second window between broadcast and recordFunding.
   db.update("bounties", (x) => x.id === b.id, { status: "CANCELLED", cancelReason: "deleted" });
-  applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "success" });
+  await applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "success" }, chain);
+
+  // The escrow IS funded on-chain: reconciled to OPEN and a refund submitted.
+  assert.equal(txnByKey(`escrow:${b.taskId}`)!.status, "confirmed");
+  assert.equal(calls.adminRefund, 1);
+  const mid = getBounty(b.id)!;
+  assert.equal(mid.status, "OPEN");
+  assert.equal(mid.pendingOp, "refunding");
+  const refund = txnByKey(`refund:${b.taskId}`)!;
+  assert.equal(refund.status, "pending");
+
+  // Refund confirms → CANCELLED for good.
+  await applyTxnOutcome(refund.id, { status: "success" }, chain);
+  assert.equal(getBounty(b.id)!.status, "CANCELLED");
+  assert.equal(getBounty(b.id)!.pendingOp, null);
+});
+
+test("a late escrow confirm on a cancelled bounty stays OPEN (retriable) if the auto-refund fails", async () => {
+  const { chain, calls } = fakeChain({ async adminRefund() { throw new Error("rpc down"); } });
+  const b = mkBounty();
+  recordFunding(b.id, ADDR(), { hash: "H_ESCROW", status: "pending" });
+  db.update("bounties", (x) => x.id === b.id, { status: "CANCELLED", cancelReason: "deleted" });
+  await applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "success" }, chain);
+
   const after = getBounty(b.id)!;
-  assert.equal(after.status, "CANCELLED"); // not flipped back to OPEN
-  assert.equal(txnByKey(`escrow:${b.taskId}`)!.status, "confirmed"); // row still reconciled
+  assert.equal(after.status, "OPEN"); // truthful — funded, cancel/refund retriable
+  assert.equal(after.pendingOp, null); // guard released, not stuck
+  assert.equal(calls.adminRefund, 0); // the throwing override never reached the counter
+
+  // The sponsor's retried cancel now takes the normal refund path.
+  const { chain: healthy, calls: healthyCalls } = fakeChain();
+  const retry = await cancelBounty(b.id, "deleted", healthy);
+  assert.equal(retry.reason, "submitted");
+  assert.equal(healthyCalls.adminRefund, 1);
 });
 
 test("refund + release can't both fire (single-flight) and refund can't follow payout", async () => {

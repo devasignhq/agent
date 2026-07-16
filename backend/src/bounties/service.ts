@@ -555,7 +555,10 @@ export async function cancelBounty(
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status === "CANCELLED") return { ok: true, reason: "already_cancelled", bounty: b };
   if (b.status === "PAID") return { ok: false, reason: "already_paid" };
-  if (b.status === "OPEN") return refundBounty(bountyId, reason, chain);
+  if (b.status === "OPEN") {
+    const r = await refundBounty(bountyId, reason, chain);
+    return { ...r, bounty: getBounty(bountyId) ?? undefined };
+  }
   if (b.status !== "PENDING_FUNDING") return { ok: false, reason: "delegated_cannot_delete" };
   // Never mark CANCELLED while a funding tx is in flight — the keeper confirms
   // it within a tick, after which a retried cancel takes the refund path.
@@ -579,7 +582,8 @@ export async function cancelBounty(
     if (escrow) {
       const adopted = adoptOnchainEscrow(bountyId, escrow);
       if (!adopted.ok) return adopted;
-      return refundBounty(bountyId, reason, chain);
+      const r = await refundBounty(bountyId, reason, chain);
+      return { ...r, bounty: getBounty(bountyId) ?? undefined };
     }
   }
   return cancelPending(bountyId);
@@ -707,11 +711,14 @@ export function expiredBounties(now = Date.now()): Bounty[] {
  *   escrow  confirmed → OPEN (funded)         | failed → back to PENDING_FUNDING
  *   payout  confirmed → PAID                   | failed → clear guard, stay pre-paid
  *   refund  confirmed → CANCELLED              | failed → clear guard, stay pre-refund
+ * An escrow confirm on an already-CANCELLED bounty (cancel raced the funding
+ * broadcast) reopens it and auto-submits a refund so the funds can't strand.
  */
-export function applyTxnOutcome(
+export async function applyTxnOutcome(
   txnId: string,
-  outcome: { status: "success"; ledger?: number } | { status: "failed"; error: string }
-): void {
+  outcome: { status: "success"; ledger?: number } | { status: "failed"; error: string },
+  chain: EscrowChain = defaultChain
+): Promise<void> {
   const txn = db.find("escrowTransactions", (t) => t.id === txnId);
   if (!txn || txn.status !== "pending") return;
   const b = txn.bountyId ? getBounty(txn.bountyId) : null;
@@ -723,10 +730,21 @@ export function applyTxnOutcome(
     });
     if (!b) return;
     if (txn.kind === "escrow") {
-      // Only advance from PENDING_FUNDING — a late funding confirm must never
-      // resurrect a bounty that was cancelled in the interim.
       if (b.status === "PENDING_FUNDING") {
         patchBounty(b.id, { status: "OPEN", onchainStatus: "Open" });
+      } else if (b.status === "CANCELLED") {
+        // The bounty was cancelled while this funding tx was in flight (the
+        // sub-second submitFunding race): the escrow IS funded on-chain, so
+        // reconcile to OPEN and honor the cancel by refunding immediately —
+        // leaving it CANCELLED would strand the sponsor's USDC, since orphan
+        // recovery only considers PENDING_FUNDING bounties.
+        patchBounty(b.id, { status: "OPEN", onchainStatus: "Open" });
+        const refund = await refundBounty(b.id, "deleted", chain);
+        if (!refund.ok) {
+          // Stays OPEN — truthful (it is funded), and the sponsor's Cancel
+          // button works on OPEN, so a failed auto-refund is retriable.
+          console.warn(`[bounty] auto-refund after late funding confirm on ${b.code}: ${refund.reason}`);
+        }
       }
     } else if (txn.kind === "payout") {
       patchBounty(b.id, { status: "PAID", onchainStatus: "Completed", pendingOp: null });
