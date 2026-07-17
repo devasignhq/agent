@@ -9,6 +9,7 @@ import {
   __setGuardedTransportForTests,
   fetchGuarded,
   hostMatches,
+  isObviouslyNonPublicHost,
   isPrivateIp,
   resolvePublicUrl,
 } from "./ssrf.js";
@@ -51,6 +52,12 @@ test("isPrivateIp covers the ranges an SSRF actually targets", () => {
     "2001:db8::1", // IPv6 documentation (compressed)
     "2001:0db8::1", // IPv6 documentation (padded — the form a bare startsWith misses)
     "2001:db8:0:0:0:0:0:1", // IPv6 documentation (expanded)
+    "192.0.0.1", // IETF protocol assignments 192.0.0.0/24
+    "192.0.2.5", // TEST-NET-1 192.0.2.0/24
+    "198.51.100.9", // TEST-NET-2 198.51.100.0/24
+    "203.0.113.4", // TEST-NET-3 203.0.113.0/24
+    "198.18.0.1", // benchmarking 198.18.0.0/15
+    "198.19.255.255", // benchmarking, upper half
   ]) {
     assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
   }
@@ -61,9 +68,33 @@ test("isPrivateIp covers the ranges an SSRF actually targets", () => {
     "223.255.255.255", // last unicast before the multicast block
     "2606:4700::1111", // public IPv6 (Cloudflare)
     "2000::1", // global-unicast start (2000::/3)
+    "192.0.1.1", // between 192.0.0.0/24 and TEST-NET-1 — public
+    "198.17.255.255", // just below the benchmarking /15
+    "198.20.0.1", // just above the benchmarking /15
+    "203.0.114.1", // just above TEST-NET-3
   ]) {
     assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
   }
+});
+
+// url.hostname bracket-wraps an IPv6 literal ([::1]); net.isIP and dns.lookup
+// both reject the bracketed form. Without stripping, a private IPv6 literal
+// only fails closed by accident (the bracketed string errors in dns.lookup) and
+// a PUBLIC IPv6 literal can't be fetched at all. Lock in the bracket handling.
+test("IPv6 literals are unbracketed before classification/resolution", async () => {
+  // Fast-path pre-filter: the bracketed form the URL parser actually emits.
+  assert.equal(isObviouslyNonPublicHost("[::1]"), true);
+  assert.equal(isObviouslyNonPublicHost("[fd00::1]"), true);
+  assert.equal(isObviouslyNonPublicHost("[2001:db8::1]"), true);
+  assert.equal(isObviouslyNonPublicHost("[2606:4700::1111]"), false); // public
+
+  // Private literals reject via the isPrivateIp path (not "could not resolve").
+  for (const u of ["http://[::1]/", "http://[fd00::1]/", "http://[2001:db8::1]/"]) {
+    await assert.rejects(resolvePublicUrl(u), /private/i, `expected ${u} to be rejected as private`);
+  }
+  // A public IPv6 literal must resolve and pin to itself — the functional fix.
+  const ok = await resolvePublicUrl("http://[2606:4700::1111]/");
+  assert.deepEqual(ok.addrs, [{ address: "2606:4700::1111", family: 6 }]);
 });
 
 test("resolvePublicUrl rejects private/metadata/scheme abuse, pins a public literal", async () => {

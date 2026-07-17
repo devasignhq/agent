@@ -60,12 +60,17 @@ export function hostMatches(host: string, apex: string): boolean {
 export function isPrivateIp(ip: string): boolean {
   const v = ip.replace(/^::ffff:/i, ""); // unwrap IPv4-mapped IPv6
   if (net.isIPv4(v)) {
-    const [a, b] = v.split(".").map(Number);
+    const [a, b, c] = v.split(".").map(Number);
     if (a === 0 || a === 10 || a === 127) return true;
     if (a === 169 && b === 254) return true; // link-local + cloud metadata
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
     if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a === 192 && b === 0 && c === 0) return true; // IETF protocol assignments 192.0.0.0/24
+    if (a === 192 && b === 0 && c === 2) return true; // TEST-NET-1 192.0.2.0/24
+    if (a === 198 && b === 51 && c === 100) return true; // TEST-NET-2 198.51.100.0/24
+    if (a === 203 && b === 0 && c === 113) return true; // TEST-NET-3 203.0.113.0/24
+    if (a === 198 && (b === 18 || b === 19)) return true; // benchmarking 198.18.0.0/15
     if (a >= 224) return true; // multicast 224.0.0.0/4 + reserved/broadcast 240.0.0.0/4
     return false;
   }
@@ -84,6 +89,14 @@ export function isPrivateIp(ip: string): boolean {
 // Names that never belong to a public host, so they need no DNS round-trip.
 const INTERNAL_NAME_RE = /^(localhost|.*\.local|.*\.internal)$/i;
 
+// WHATWG URL.hostname wraps an IPv6 literal in brackets ("[::1]"), but net.isIP
+// and dns.lookup both want it bare — without stripping, an IPv6 literal misses
+// the IP fast-path entirely (net.isIP returns 0), so a loopback looks like a name
+// to resolve. Brackets are unambiguous: a URL host has them only for IPv6.
+function unbracketHost(hostname: string): string {
+  return hostname.startsWith("[") && hostname.endsWith("]") ? hostname.slice(1, -1) : hostname;
+}
+
 /**
  * Synchronous, DNS-free reject for hosts that cannot possibly be public: private
  * IP literals and internal-only names. For callers that want a cheap pre-filter
@@ -93,7 +106,8 @@ const INTERNAL_NAME_RE = /^(localhost|.*\.local|.*\.internal)$/i;
  * address looks fine here. resolvePublicUrl() + fetchGuarded() are the boundary.
  */
 export function isObviouslyNonPublicHost(hostname: string): boolean {
-  return net.isIP(hostname) ? isPrivateIp(hostname) : INTERNAL_NAME_RE.test(hostname);
+  const h = unbracketHost(hostname);
+  return net.isIP(h) ? isPrivateIp(h) : INTERNAL_NAME_RE.test(h);
 }
 
 // SSRF guard: only fetch public http(s) hosts. Rejects non-http(s) schemes,
@@ -110,7 +124,9 @@ export async function resolvePublicUrl(raw: string): Promise<{ url: URL; addrs: 
   if (url.protocol !== "http:" && url.protocol !== "https:") {
     throw new Error("only http(s) URLs are allowed");
   }
-  const host = url.hostname;
+  // Bare host for classification/resolution: url.hostname keeps the brackets on
+  // an IPv6 literal, which both net.isIP and dns.lookup reject.
+  const host = unbracketHost(url.hostname);
   if (net.isIP(host)) {
     if (isPrivateIp(host)) throw new Error("URL points at a private address");
     return { url, addrs: [{ address: host, family: net.isIPv6(host) ? 6 : 4 }] };
