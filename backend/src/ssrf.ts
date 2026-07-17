@@ -66,12 +66,18 @@ export function isPrivateIp(ip: string): boolean {
     if (a === 172 && b >= 16 && b <= 31) return true;
     if (a === 192 && b === 168) return true;
     if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
+    if (a >= 224) return true; // multicast 224.0.0.0/4 + reserved/broadcast 240.0.0.0/4
     return false;
   }
   const lower = ip.toLowerCase();
   if (lower === "::1" || lower === "::") return true;
   if (lower.startsWith("fe80")) return true; // link-local
   if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA fc00::/7
+  if (lower.startsWith("ff")) return true; // multicast ff00::/8
+  // Documentation 2001:db8::/32 (RFC 3849). Match the second hextet with optional
+  // leading zeros so the compressed (2001:db8:), padded (2001:0db8:) and expanded
+  // forms all hit — a bare startsWith("2001:db8:") lets 2001:0db8::1 slip through.
+  if (/^2001:0*db8:/.test(lower)) return true;
   return false;
 }
 

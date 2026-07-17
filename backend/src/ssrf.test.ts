@@ -43,11 +43,27 @@ test("isPrivateIp covers the ranges an SSRF actually targets", () => {
     "fe80::1",
     "fd00::1",
     "::ffff:127.0.0.1", // IPv4-mapped loopback
+    "224.0.0.1", // IPv4 multicast start
+    "239.255.255.255", // IPv4 multicast end
+    "240.0.0.1", // IPv4 reserved/experimental
+    "255.255.255.255", // IPv4 broadcast
+    "ff02::1", // IPv6 multicast
+    "2001:db8::1", // IPv6 documentation (compressed)
+    "2001:0db8::1", // IPv6 documentation (padded — the form a bare startsWith misses)
+    "2001:db8:0:0:0:0:0:1", // IPv6 documentation (expanded)
   ]) {
     assert.equal(isPrivateIp(ip), true, `${ip} should be private`);
   }
-  assert.equal(isPrivateIp(PUB_A), false);
-  assert.equal(isPrivateIp("8.8.8.8"), false);
+  // Boundaries that must STAY public — the blocks above must not overreach.
+  for (const ip of [
+    PUB_A,
+    "8.8.8.8",
+    "223.255.255.255", // last unicast before the multicast block
+    "2606:4700::1111", // public IPv6 (Cloudflare)
+    "2000::1", // global-unicast start (2000::/3)
+  ]) {
+    assert.equal(isPrivateIp(ip), false, `${ip} should be public`);
+  }
 });
 
 test("resolvePublicUrl rejects private/metadata/scheme abuse, pins a public literal", async () => {
