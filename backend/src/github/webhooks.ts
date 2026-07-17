@@ -3,7 +3,7 @@
 import crypto from "node:crypto";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
-import { config } from "../config.js";
+import { config, isProductionLike } from "../config.js";
 import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
@@ -39,11 +39,13 @@ const GITHUB_SIG_RE = /^sha256=[0-9a-f]{64}$/;
 function verifySignature(rawBody: Buffer, signature: string | undefined): boolean {
   if (!config.github.webhookSecret) {
     // Fail CLOSED with no secret — mirrors the Linear receiver. The server.ts
-    // boot guard already refuses https deployments without a secret; this
-    // covers every other misconfiguration. Local dev without a secret can
-    // opt in explicitly (and only on a non-https origin) via
-    // ALLOW_UNSIGNED_WEBHOOKS=1.
-    return config.github.allowUnsignedWebhooks && !config.secureCookies;
+    // boot guard already refuses production deployments without a secret; this
+    // covers every other misconfiguration, so it has to key off the same signal
+    // the boot guard does. Gating on !secureCookies alone would fall open on a
+    // NODE_ENV=production deploy that forgot WEB_ORIGIN — the precise case the
+    // boot guard was widened to catch. Local dev without a secret can opt in
+    // explicitly via ALLOW_UNSIGNED_WEBHOOKS=1.
+    return config.github.allowUnsignedWebhooks && !isProductionLike();
   }
   if (!signature || !GITHUB_SIG_RE.test(signature)) return false;
   const expected =

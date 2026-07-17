@@ -11,8 +11,12 @@ import {
   isGithubAppConfigured,
   isGithubWebhookConfigured,
   isLLMLive,
+  isProductionLike,
+  isSessionSecretShort,
   isSlackEnvConfigured,
   isStatsigConfigured,
+  sessionSecretLength,
+  sessionSecretProblem,
 } from "./config.js";
 import { initStatsig, shutdownStatsig } from "./statsig.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
@@ -33,31 +37,60 @@ import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 
-// Session cookies are JWTs signed with SESSION_SECRET; the default placeholder is
-// public, so signing with it in prod would be no better than not signing at all.
-// secureCookies (an https WEB_ORIGIN) is our prod signal — refuse to boot rather
-// than mint forgeable sessions. Local/ephemeral dev runs over http, so unaffected.
-if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
-  throw new Error(
-    "SESSION_SECRET must be set to a real secret in production (WEB_ORIGIN is https). " +
-      "Refusing to boot with the 'dev-secret-replace-me' placeholder."
-  );
+// Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
+// fund/cancel/approve links in bounties/links.ts. A secret that is public (either
+// committed placeholder) or short enough to grind offline lets anyone mint a
+// cookie for any user id, so refuse to boot rather than serve forgeable sessions.
+// Local/ephemeral dev and `npm test` trip neither prod signal, so they keep using
+// the dev fallback untouched.
+const HOW_TO_GENERATE =
+  'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"';
+
+if (isProductionLike()) {
+  const problem = sessionSecretProblem(config.sessionSecret);
+  if (problem) {
+    throw new Error(
+      `SESSION_SECRET is unusable in production: ${problem}. ` +
+        `Refusing to boot — sessions signed with it are forgeable by anyone. ${HOW_TO_GENERATE}`
+    );
+  }
+  // SESSION_SECRET_PREVIOUS is verification-only, but a token signed with a
+  // public old secret still verifies, so it needs the same bar. This is a real
+  // trap, not a hypothetical: rotating off a placeholder by moving it here (to
+  // avoid dropping live sessions) is the natural reading of the error above, and
+  // it would quietly leave the hole wide open.
+  for (const previous of config.sessionSecretPrevious) {
+    const previousProblem = sessionSecretProblem(previous);
+    if (previousProblem) {
+      throw new Error(
+        `SESSION_SECRET_PREVIOUS contains an entry that is unusable in production: ${previousProblem}. ` +
+          "Refusing to boot — cookies signed with that entry would still verify. Remove it; " +
+          "sessions signed with it expire on their own within 7 days."
+      );
+    }
+  }
+  if (isSessionSecretShort(config.sessionSecret)) {
+    console.warn(
+      `[server] ⚠ SESSION_SECRET is only ${sessionSecretLength(config.sessionSecret)} characters. ` +
+        `It is accepted, but rotate it to a 32-byte random value when convenient. ${HOW_TO_GENERATE}`
+    );
+  }
 }
 
 // GitHub signs every webhook with GITHUB_APP_WEBHOOK_SECRET, and the receiver
 // verifies that HMAC before trusting an event (github/webhooks.ts). With no
 // secret the receiver now FAILS CLOSED (rejects every delivery) — but a prod
 // deployment silently dropping all webhooks is still broken, so keep the same
-// prod signal as the session guard above (https WEB_ORIGIN): refuse to boot.
-// In local dev (http) we only warn; unsigned events can be explicitly allowed
-// with ALLOW_UNSIGNED_WEBHOOKS=1 (never honored on an https origin).
-if (config.secureCookies && !isGithubWebhookConfigured()) {
+// prod signal as the session guard above: refuse to boot.
+// In local dev we only warn; unsigned events can be explicitly allowed with
+// ALLOW_UNSIGNED_WEBHOOKS=1 (never honored in a production-like environment).
+if (isProductionLike() && !isGithubWebhookConfigured()) {
   throw new Error(
-    "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https). " +
+    "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https, or NODE_ENV=production). " +
       "Refusing to boot: without it the GitHub webhook receiver would accept forged, unsigned events."
   );
 }
-if (!config.secureCookies && !isGithubWebhookConfigured()) {
+if (!isProductionLike() && !isGithubWebhookConfigured()) {
   console.warn(
     config.github.allowUnsignedWebhooks
       ? "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset and ALLOW_UNSIGNED_WEBHOOKS=1 — " +
@@ -73,12 +106,12 @@ if (!config.secureCookies && !isGithubWebhookConfigured()) {
 // NOT throw on a missing DATABASE_URL — it silently falls back to an in-memory
 // store (db.ts), which serves reads fine but persists nothing, so EVERYTHING is
 // wiped on the next redeploy. That failure mode has bitten prod before (see the
-// self-heal note in github/oauth.ts). Same prod signal as the guards above
-// (https WEB_ORIGIN): refuse to boot rather than run a production deploy on a
-// throwaway store. Local/ephemeral dev (http origin) is unaffected.
-if (config.secureCookies && !config.databaseUrl) {
+// self-heal note in github/oauth.ts). Same prod signal as the guards above:
+// refuse to boot rather than run a production deploy on a throwaway store.
+// Local/ephemeral dev trips neither signal and is unaffected.
+if (isProductionLike() && !config.databaseUrl) {
   throw new Error(
-    "DATABASE_URL must be set in production (WEB_ORIGIN is https). Refusing to boot: " +
+    "DATABASE_URL must be set in production (WEB_ORIGIN is https, or NODE_ENV=production). Refusing to boot: " +
       "without it the server runs an in-memory store that is silently wiped on every redeploy."
   );
 }
