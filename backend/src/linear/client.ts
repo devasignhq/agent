@@ -6,6 +6,8 @@
 // key (the `LINEAR_API_KEY` dev fallback) uses the raw key with no scheme. Pass
 // `{ bearer: false }` for the latter.
 
+import { fetchGuarded, hostMatches } from "../ssrf.js";
+
 const LINEAR_GRAPHQL = "https://api.linear.app/graphql";
 
 export type LinearComment = { body: string; user?: string };
@@ -261,26 +263,59 @@ export async function fetchLinearTeams(
   }
 }
 
+/**
+ * Exactly linear.app or a *.linear.app subdomain. Must be asked of a parsed
+ * URL's `hostname`. This used to be a `/\blinear\.app\b/` test, which matched
+ * `linear.app.evil.com` — so a ticket linking there was handed the workspace's
+ * OAuth token. Never match a host by substring; see hostMatches in ssrf.ts.
+ */
+export function isLinearHost(hostname: string): boolean {
+  return hostMatches(hostname, "linear.app");
+}
+
+// Files referenced from a ticket are attacker-reachable: anyone who can file an
+// issue or comment in the workspace chooses this URL. Cap the bytes and the wall
+// clock — the review worker drains serially, so one stalled fetch stalls reviews.
+const MAX_LINEAR_FILE_BYTES = 10 * 1024 * 1024; // 10 MB (pipeline skips past this anyway)
+const LINEAR_FILE_TIMEOUT_MS = 15_000;
+
 // Download a file referenced from an issue (a PDF/image dropped into the
 // description, or an attachment URL). Linear-hosted uploads require the auth
 // header; external URLs are fetched anonymously. Best-effort — returns null on
 // any failure so the review just proceeds without that file.
+//
+// The URL comes from ticket text, so it goes through the shared SSRF guard
+// (ssrf.ts): every hop is re-validated against private/loopback/metadata ranges
+// and the socket is pinned to the addresses we checked.
 export async function downloadLinearFile(
   token: string,
   url: string,
   opts: { bearer?: boolean } = {}
 ): Promise<{ base64: string; mediaType: string; size: number } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), LINEAR_FILE_TIMEOUT_MS);
   try {
     const auth = opts.bearer === false ? token : `Bearer ${token}`;
-    const isLinearHosted = /\blinear\.app\b/i.test(new URL(url).host);
-    const res = await fetch(url, isLinearHosted ? { headers: { Authorization: auth } } : {});
-    if (!res.ok) return null;
-    const mediaType = (res.headers.get("content-type") || "").split(";")[0].trim();
-    const buf = Buffer.from(await res.arrayBuffer());
-    return { base64: buf.toString("base64"), mediaType, size: buf.length };
+    const { buf, contentType } = await fetchGuarded(url, {
+      signal: controller.signal,
+      maxBytes: MAX_LINEAR_FILE_BYTES,
+      // Recomputed per redirect hop against the URL actually being requested.
+      // Both directions matter: a Linear upload 302s to a presigned S3 URL that
+      // must NOT see the token (S3 rejects the extra Authorization header), and
+      // a hop to any non-Linear host must never be handed our credentials.
+      headersFor: (u): Record<string, string> =>
+        isLinearHost(u.hostname) ? { Authorization: auth } : {},
+    });
+    return {
+      base64: buf.toString("base64"),
+      mediaType: contentType.split(";")[0].trim(),
+      size: buf.length,
+    };
   } catch (err) {
     console.warn("[linear] file download failed:", url, err);
     return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

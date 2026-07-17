@@ -13,10 +13,12 @@ import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview, pushNotification } from "../notifications.js";
 import { config } from "../config.js";
+import { isObviouslyNonPublicHost } from "../ssrf.js";
 import { type MaintainerComment } from "../queue.js";
 import {
   downloadLinearFile,
   fetchLinearIssueContext,
+  isLinearHost,
   searchLinearIssues,
   type LinearIssueContext,
   type LinearIssueCandidate,
@@ -1675,8 +1677,29 @@ export function linearSourcesFromIssue(issue: LinearIssueContext): IngestedSourc
 
 // True for files we can hand to the model: Linear-hosted uploads, or any URL
 // with a PDF/image extension.
-function isLinearFileUrl(url: string): boolean {
-  return /\blinear\.app\b/i.test(url) || /\.(pdf|png|jpe?g|webp|gif)(?:\?|#|$)/i.test(url);
+// Candidate file URLs come out of ticket text, so anyone who can comment picks
+// them. Both halves of this used to be substring tests against the whole URL:
+// `/\blinear\.app\b/` matched `linear.app.evil.com` (and any URL merely
+// mentioning linear.app in a query string), and the extension test had no host
+// restriction at all, so `http://169.254.169.254/latest/meta-data/x.png` was a
+// "Linear file". Match the parsed hostname, and the extension against the PATH
+// only. downloadLinearFile puts every hop through the SSRF guard regardless —
+// this is the narrow gate in front of it, not the security boundary.
+export function isLinearFileUrl(url: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  // Drop the obviously-internal ones here rather than let them burn one of the
+  // three download slots below (a ticket full of metadata URLs would otherwise
+  // starve the real attachments). Only the cheap cases — a host that merely
+  // resolves private is caught by the guard inside downloadLinearFile.
+  if (isObviouslyNonPublicHost(u.hostname)) return false;
+  if (isLinearHost(u.hostname)) return true;
+  return /\.(pdf|png|jpe?g|webp|gif)$/i.test(u.pathname);
 }
 
 // Gather candidate file URLs from the issue body, comments, and attachments.
