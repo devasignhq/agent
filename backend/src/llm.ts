@@ -118,6 +118,8 @@ function recordUsage(
 
 export type LLMMessage = { role: "user" | "assistant"; content: string };
 
+export type CompletionResult = { text: string; stopReason: string | null };
+
 export async function complete(opts: {
   system?: string;
   messages: LLMMessage[];
@@ -125,7 +127,20 @@ export async function complete(opts: {
   cacheSystem?: boolean; // hint to use prompt caching when we re-use the system prompt
   model?: string;        // override the default; e.g. "claude-haiku-4-5" for per-file index summaries
 }): Promise<string> {
-  if (!client) return mockComplete(opts);
+  return (await completeWithMeta(opts)).text;
+}
+
+// Like complete(), but also surfaces the API's stop_reason so callers can tell
+// a complete response from one cut off at max_tokens (a truncated JSON payload
+// can otherwise still "parse" via a smaller embedded object).
+export async function completeWithMeta(opts: {
+  system?: string;
+  messages: LLMMessage[];
+  maxTokens?: number;
+  cacheSystem?: boolean;
+  model?: string;
+}): Promise<CompletionResult> {
+  if (!client) return { text: mockComplete(opts), stopReason: "end_turn" };
 
   const sys = opts.system
     ? opts.cacheSystem
@@ -160,7 +175,7 @@ export async function complete(opts: {
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("\n");
-  return text;
+  return { text, stopReason: resp.stop_reason ?? null };
 }
 
 // Deterministic, structurally-correct mock so the rest of the pipeline can run
@@ -197,16 +212,24 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
   }
 
   if (system?.includes("PR review") || last.includes("Review this PR")) {
+    // Echo the criterion ids from the prompt's leading `# Criteria` section
+    // (buildCriteriaSection renders `- ${id}: ${text}`) so seeded ids like
+    // bounty-1..N get verdicts that actually merge back onto the criteria —
+    // hardcoded "1".."4" would zero-match them and trip the empty-verdict guard.
+    const critSection = last.split(/\n(?=# )/)[0] || "";
+    const promptIds = [...critSection.matchAll(/^- ([^\s:]+):/gm)].map((m) => m[1]);
+    const ids = promptIds.length ? promptIds : ["1", "2", "3", "4"];
+    const metCount = Math.ceil(ids.length / 2);
+    const unmetIds = ids.slice(metCount);
     return JSON.stringify({
-      verdict: "changes_requested",
+      verdict: unmetIds.length ? "changes_requested" : "passed",
       summary:
         "The diff covers the main path, but two acceptance criteria are not yet visibly satisfied. See per-criterion notes.",
-      criteria: [
-        { id: "1", met: true, evidence: "src/handler.ts updated to cover the new path." },
-        { id: "2", met: true, evidence: "No tests were removed; existing assertions still hold." },
-        { id: "3", met: false, evidence: "Button label still reads 'Submit' instead of 'Send for review'." },
-        { id: "4", met: false, evidence: "Empty-state error from the ticket is not handled in the new branch." },
-      ],
+      criteria: ids.map((id, i) =>
+        i < metCount
+          ? { id, met: true, evidence: "src/handler.ts updated to cover the new path." }
+          : { id, met: false, evidence: "Button label still reads 'Submit' instead of 'Send for review'." }
+      ),
       comments: [
         {
           path: "src/handler.ts",
@@ -216,7 +239,7 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       ],
       suggestions: [
         {
-          criterionId: "3",
+          criterionId: unmetIds[0] ?? "3",
           title: "Rename the submit button label",
           rationale: "The ticket specifies 'Send for review' as the user-facing copy; update the JSX label.",
           codeExample: "<button>Send for review</button>",
@@ -239,7 +262,7 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
             "```",
         },
         {
-          criterionId: "4",
+          criterionId: unmetIds[1] ?? unmetIds[0] ?? "4",
           title: "Handle the empty-state branch",
           rationale: "Return early with the empty payload before the main path so the new branch matches the ticket.",
           codeExample: "if (!items.length) return { items: [] };",

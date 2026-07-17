@@ -43,6 +43,21 @@ test("unmet criterion WITHOUT evidence: still gets a status, requirement, and a 
   assert.doesNotMatch(body, EMOJI);
 });
 
+test("criterion with NO verdict (met:null) renders 'Could not be evaluated', not a false 'Not met'", () => {
+  const body = formatReviewBody(
+    "Gate installation claiming on ownership.",
+    [crit({ met: null, evidence: null })],
+    []
+  );
+  assert.match(body, /\*\*C1 — Could not be evaluated\*\*/);
+  assert.match(body, /- Required: Personal claims succeed/);
+  assert.match(body, /- Why: The reviewer could not evaluate this requirement against the diff/);
+  // It must NOT claim positive evidence of failure.
+  assert.doesNotMatch(body, /C1 — Not met/);
+  assert.doesNotMatch(body, /doesn't yet show this requirement being satisfied/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
 test("regressed criterion: rendered under 'Previously met — now broken' with Required + What broke", () => {
   const c = crit({ evidence: "the ownership check was removed in this commit." });
   const prior = new Map([["C1", { met: true, evidence: "added the check" }]]);

@@ -8,7 +8,7 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { dismissPRReview, dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
 import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
-import { complete, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
+import { complete, completeWithMeta, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
 import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview, pushNotification } from "../notifications.js";
@@ -1939,8 +1939,9 @@ async function reviewDiff(
   // Keep the head of the diff; mark when we drop the tail so the model reads a
   // missing hunk as "not shown" rather than "not done" (which, combined with the
   // prior-verdict anchoring above, is what stops truncation from regressing a
-  // previously-met criterion).
-  const DIFF_CAP = 60_000;
+  // previously-met criterion). Sized to fit the free tier's Haiku 200K-token
+  // context (~75-100K tokens of diff) with room for criteria/guidance/output.
+  const DIFF_CAP = 300_000;
   const diffTruncated = context.diff.length > DIFF_CAP;
   const diffBody =
     context.diff.slice(0, DIFF_CAP) +
@@ -1961,23 +1962,76 @@ async function reviewDiff(
       .slice(0, 6)
       .map((s) => `## ${s.kind}\n${s.text.slice(0, 2000)}`)
       .join("\n\n");
-  const raw = await complete({
-    system,
-    cacheSystem: true,
-    messages: [{ role: "user", content: userText }],
-  });
-  const parsed = tryParseJSON(raw, {
-    verdict: "changes_requested",
-    summary: "",
-    criteria: [],
-    comments: [],
-    suggestions: [],
-  });
+  // A silently-truncated verdict is worse than a failed review: the old path
+  // parsed to `criteria: []`, the merge defaulted every criterion to met:null,
+  // and the PR got a confidently-wrong all-unmet comment. So: generous output
+  // budget, retry once bigger, and if the verdict is still truncated or doesn't
+  // cover the criteria we asked about, throw — runReviewJob's catch marks the
+  // review errored and posts the failure banner instead.
+  const expectedIds = criteria.map((c) => c.id);
+  const ATTEMPT_MAX_TOKENS = [16_384, 32_768];
+  let verdict: ReviewVerdict | null = null;
+  for (const [i, maxTokens] of ATTEMPT_MAX_TOKENS.entries()) {
+    const { text, stopReason } = await completeWithMeta({
+      system,
+      cacheSystem: true,
+      maxTokens,
+      messages: [{ role: "user", content: userText }],
+    });
+    verdict = stopReason === "max_tokens" ? null : parseReviewVerdict(text, expectedIds);
+    if (verdict) break;
+    if (i < ATTEMPT_MAX_TOKENS.length - 1) {
+      log(review.id, "review", "Review verdict truncated or unparseable — retrying with a larger output budget", {
+        detail: `stop_reason=${stopReason}; attempt ${i + 1} used max_tokens=${maxTokens}`,
+      });
+    }
+  }
+  if (!verdict) {
+    if (criteria.length > 0) {
+      throw new Error(
+        "PR review verdict was truncated or unparseable after retry; refusing to post an all-unmet verdict"
+      );
+    }
+    // Spec-less PR (no criteria to fail): keep the old lenient empty fallback.
+    verdict = { summary: "", criteria: [], comments: [], suggestions: [] };
+  }
+  return verdict;
+}
+
+export type ReviewVerdict = {
+  summary: string;
+  criteria: Array<{ id: string; met: boolean; evidence: string }>;
+  comments: Array<{ path: string; line: number; body: string }>;
+  suggestions: ReviewSuggestion[];
+};
+
+// Parse the review model's JSON verdict. Returns null — rather than a lenient
+// empty fallback — when the text has no parseable JSON object, or when
+// `expectedIds` is non-empty and NONE of the returned criteria ids match it
+// (same trim+lowercase normalization the merge step uses): an empty or
+// disjoint criteria list would otherwise default every criterion to unmet.
+export function parseReviewVerdict(raw: string, expectedIds: string[]): ReviewVerdict | null {
+  const match = raw.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  let parsed: any;
+  try {
+    parsed = JSON.parse(match[0]);
+  } catch {
+    return null;
+  }
+  if (!parsed || typeof parsed !== "object") return null;
+  const criteria = Array.isArray(parsed.criteria) ? parsed.criteria : [];
+  if (expectedIds.length > 0) {
+    const norm = (id: unknown) => String(id ?? "").trim().toLowerCase();
+    const expected = new Set(expectedIds.map(norm));
+    const anyMatch = criteria.some((c: any) => expected.has(norm(c?.id)));
+    if (!anyMatch) return null;
+  }
   return {
     summary: parsed.summary || "",
-    criteria: parsed.criteria || [],
-    comments: parsed.comments || [],
-    suggestions: (parsed.suggestions || []).map((s: any) => ({
+    criteria,
+    comments: Array.isArray(parsed.comments) ? parsed.comments : [],
+    suggestions: (Array.isArray(parsed.suggestions) ? parsed.suggestions : []).map((s: any) => ({
       criterionId: String(s.criterionId || ""),
       title: String(s.title || ""),
       rationale: String(s.rationale || ""),
@@ -2084,9 +2138,18 @@ export function formatReviewBody(
       ""
     );
     for (const c of unmet) {
-      lines.push(`- **${c.id} — Not met**`);
-      lines.push(`  - Required: ${c.text}`);
-      lines.push(`  - Why it's not met: ${reasonOrFallback(c.evidence)}`);
+      // met:null means the model returned no verdict for this criterion (as
+      // opposed to positively judging it unmet) — say that honestly instead of
+      // asserting a failure we have no evidence for. It still blocks approval.
+      if (c.met === null) {
+        lines.push(`- **${c.id} — Could not be evaluated**`);
+        lines.push(`  - Required: ${c.text}`);
+        lines.push(`  - Why: ${(c.evidence || "").trim() || "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it)."}`);
+      } else {
+        lines.push(`- **${c.id} — Not met**`);
+        lines.push(`  - Required: ${c.text}`);
+        lines.push(`  - Why it's not met: ${reasonOrFallback(c.evidence)}`);
+      }
     }
     lines.push("");
   }
@@ -2330,7 +2393,14 @@ function buildConsolidatedFixPrompt(args: {
     lines.push("");
     unmetCriteria.forEach((c, i) => {
       lines.push(`### ${i + 1}. Required: ${c.text} (${c.id})`);
-      lines.push(`What's wrong now: ${reasonOrFallback(c.evidence)}`);
+      lines.push(
+        `What's wrong now: ${
+          c.met === null
+            ? (c.evidence || "").trim() ||
+              "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it) — verify it holds and make it pass."
+            : reasonOrFallback(c.evidence)
+        }`
+      );
       lines.push("");
       lines.push("How to fix:");
       // Match suggestions to this criterion by NORMALIZED id (trim + lowercase),
