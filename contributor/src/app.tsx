@@ -4,6 +4,7 @@
 // react-router routing in place of the demo stage machine.
 import React from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation, useParams } from "react-router-dom";
+import { Analytics } from '@vercel/analytics/react';
 import { api, apiBase } from "./api";
 import type { AppNotification } from "./api";
 import { useAuth } from "./auth-context";
@@ -368,6 +369,7 @@ export default function App() {
         )}
         <Route path="*" element={<Navigate to="/dashboard" replace />} />
       </Routes>
+      <Analytics />
     </BountiesProvider>
   );
 }
