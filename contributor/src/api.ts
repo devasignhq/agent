@@ -1,0 +1,317 @@
+// Typed API client for the DevAsign backend — contributor-app surface only.
+// In dev the app (Vite, :3002) talks to the backend (:8787) directly with
+// credentials. localhost:3002 ↔ localhost:8787 is same-site (eTLD+1 =
+// localhost), so the SameSite=Lax session cookie set on
+// /api/auth/github/callback flows on XHR. In prod the API is deployed at
+// https://api.devasign.ai so it stays same-site with
+// https://contributors.devasign.ai and the session cookie remains first-party.
+// Set VITE_API_BASE to override; the PROD fallback below encodes that origin so
+// a missing build-time env var can't silently ship localhost.
+
+const API_BASE =
+  (import.meta as any).env?.VITE_API_BASE ??
+  ((import.meta as any).env?.PROD ? "https://api.devasign.ai" : "http://localhost:8787");
+
+export const apiBase = API_BASE;
+
+// GitHub OAuth start URL for THIS app: `app=contributor` makes the backend
+// redirect back to the contributor origin after the callback, and `returnTo`
+// (a same-app path like "/bounties/:id?apply=1") lands the user exactly where
+// they started — the discovery page auto-opens the apply modal on return.
+export function oauthStartUrl(returnTo: string = "/"): string {
+  const u = new URL(`${API_BASE}/api/auth/github`);
+  u.searchParams.set("app", "contributor");
+  u.searchParams.set("returnTo", returnTo);
+  return u.toString();
+}
+
+export class ApiError extends Error {
+  status: number;
+  body: unknown;
+  constructor(status: number, message: string, body?: unknown) {
+    super(message);
+    this.status = status;
+    this.body = body;
+  }
+}
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const res = await fetch(`${API_BASE}${path}`, {
+    credentials: "include",
+    ...init,
+    headers: {
+      Accept: "application/json",
+      ...(init.body ? { "Content-Type": "application/json" } : {}),
+      ...(init.headers || {}),
+    },
+  });
+  const text = await res.text();
+  const body = text ? safeParse(text) : null;
+  if (!res.ok) {
+    const message =
+      (body && typeof body === "object" && "error" in (body as any) && (body as any).error) ||
+      `HTTP ${res.status}`;
+    throw new ApiError(res.status, String(message), body);
+  }
+  return body as T;
+}
+
+function safeParse(s: string): unknown {
+  try {
+    return JSON.parse(s);
+  } catch {
+    return s;
+  }
+}
+
+// --- Domain types (mirror backend/src/types.ts) ---
+
+export type User = {
+  id: string;
+  githubId: number | null;
+  githubLogin: string;
+  email: string;
+  avatarUrl?: string;
+  plan: "free" | "pro" | "max";
+  createdAt: number;
+  stellarPayoutAddress?: string;
+  stellarPayoutMemo?: string;
+  stellarPayoutTrustline?: boolean;
+};
+
+export type Subscription = Record<string, unknown>;
+
+export type BountyStatus =
+  | "PENDING_FUNDING"
+  | "OPEN"
+  | "DELEGATED"
+  | "IN_REVIEW"
+  | "PAID"
+  | "CANCELLED"
+  | "DISPUTED";
+
+export type BountyApplication = {
+  githubId: number;
+  githubLogin: string;
+  note?: string;
+  appliedAt: number;
+  status: "pending" | "approved" | "accepted" | "rejected";
+};
+
+export type SupportingLink = { type: string; url: string; addedAt: number };
+export type SubmissionRejection = { reason: string; byLogin: string; at: number };
+
+// One entry in the bounty's append-only activity log (mirrors backend
+// BountyEvent; already filtered server-side to this contributor's view).
+export type BountyEventKind =
+  | "created" | "funding_submitted" | "funded" | "applied"
+  | "application_approved" | "application_rejected" | "application_withdrawn"
+  | "accepted" | "pr_opened" | "submitted" | "review_completed"
+  | "payout_requested" | "submission_rejected" | "rejection_accepted"
+  | "payout_submitted" | "paid" | "refund_submitted" | "refunded" | "cancelled";
+
+export type BountyEvent = {
+  at: number;
+  kind: BountyEventKind;
+  actor?: string | null;
+  subject?: string | null;
+  detail?: string | null;
+};
+
+// Compact AI-review projection carried on every contributor bounty row.
+export type ReviewProjection = {
+  prTitle: string;
+  summary: string | null;
+  counts: { met: number; unmet: number; pending: number; total: number };
+};
+
+// The unauthenticated discovery payload (backend bounties/public-view.ts).
+export type PublicBounty = {
+  id: string;
+  code: string;
+  repo: string;
+  issueNumber: number;
+  issueUrl: string;
+  title: string;
+  description: string;
+  acceptance: string[];
+  amountUsdc: number;
+  status: BountyStatus;
+  deliveryDays: number;
+  createdAt: number;
+  applicantCount: number;
+  escrow: { txHash: string | null; contractId: string | null; fundedAt: number | null };
+};
+
+// The contributor-scoped bounty view (backend routes/contributor.ts).
+export type ContributorBounty = {
+  id: string;
+  code: string;
+  source: "github" | "linear";
+  repo: string;
+  issueNumber: number;
+  issueUrl: string;
+  title: string;
+  description: string;
+  acceptance: string[];
+  amountUsdc: number;
+  deliveryDays: number;
+  status: BountyStatus;
+  createdAt: number;
+  updatedAt: number;
+  applicantCount: number;
+  myApplication: BountyApplication | null;
+  isAssignee: boolean;
+  assigneeGithubLogin: string | null;
+  assigneeAddress: string | null;
+  assigneeMemo: string | null;
+  acceptedAt: number | null;
+  deadlineAt: number | null;
+  prNumber: number | null;
+  submittedAt: number | null;
+  supportingLinks: SupportingLink[];
+  payoutRequestedAt: number | null;
+  rejection: SubmissionRejection | null;
+  cancelReason: string | null;
+  escrowTxHash: string | null;
+  payoutTxHash: string | null;
+  escrowContract: string | null;
+  sponsorLogin: string | null;
+  events: BountyEvent[];
+  fundedAt: number | null;
+  awardedAt: number | null;
+  paidAt: number | null;
+  refundedAt: number | null;
+  review: ReviewProjection | null;
+};
+
+export type ContributorSummary = {
+  active: number;
+  applied: number;
+  completed: number;
+  inEscrowUsdc: number;
+  lifetimeEarnedUsdc: number;
+};
+
+export type PayoutTransaction = {
+  id: string;
+  bountyId: string | null;
+  code: string | null;
+  title: string | null;
+  repo: string | null;
+  issueNumber: number | null;
+  amountUsdc: number;
+  status: "pending" | "confirmed" | "failed";
+  hash: string | null;
+  createdAt: number;
+  confirmedAt: number | null;
+  dest: { address: string | null; memo: string | null };
+};
+
+// Per-criterion AI review verdict (backend GET /api/bounties/:id/review).
+export type ReviewCriterion = {
+  n: number;
+  text: string;
+  status: "met" | "unmet" | "pending";
+  finding: string | null;
+};
+
+export type BountyReview = {
+  status: string;
+  prTitle: string;
+  summary: string | null;
+  headSha: string;
+  prNumber: number;
+  additions: number | null;
+  deletions: number | null;
+  changedFiles: number | null;
+  updatedAt: number;
+  counts: { met: number; unmet: number; pending: number; total: number };
+  criteria: ReviewCriterion[];
+  extraCriteria: ReviewCriterion[];
+};
+
+export type AppNotification = {
+  id: string;
+  kind: "review" | "blocker" | "system" | "bounty";
+  title: string;
+  meta: string;
+  link?: string;
+  createdAt: number;
+  readAt: number | null;
+};
+
+// --- API surface ---
+
+export const api = {
+  // Session
+  me: () => request<{ user: User; subscription: Subscription | null }>("/api/me"),
+  signOut: () => request<{ ok: true }>("/api/auth/signout", { method: "POST" }),
+
+  // Discovery (public + session reads)
+  publicBounty: (id: string) =>
+    request<{ bounty: PublicBounty; explorerBase: string }>(`/api/bounties/${id}/public`),
+  bounty: (id: string) =>
+    request<{ bounty: { id: string; status: BountyStatus; applications: BountyApplication[] } }>(
+      `/api/bounties/${id}`
+    ),
+
+  // Apply / accept
+  applyToBounty: (id: string, note?: string) =>
+    request<{ ok: true }>(`/api/bounties/${id}/apply`, {
+      method: "POST",
+      body: JSON.stringify(note ? { note } : {}),
+    }),
+  acceptBounty: (id: string, address: string, memo: string) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/accept`, {
+      method: "POST",
+      body: JSON.stringify({ address, memo }),
+    }),
+
+  // My bounties + workspace actions
+  contributorBounties: () =>
+    request<{ bounties: ContributorBounty[]; summary: ContributorSummary; explorerBase: string }>(
+      "/api/contributor/bounties"
+    ),
+  withdrawApplication: (id: string) =>
+    request<{ ok: true; bounty?: unknown }>(`/api/bounties/${id}/withdraw-application`, {
+      method: "POST",
+    }),
+  submitWork: (id: string, prUrl: string, links: Array<{ type: string; url: string }>) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/submit`, {
+      method: "POST",
+      body: JSON.stringify({ prUrl, links }),
+    }),
+  updateLinks: (id: string, links: Array<{ type: string; url: string }>) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/links`, {
+      method: "POST",
+      body: JSON.stringify({ links }),
+    }),
+  requestPayout: (id: string) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/request-payout`, {
+      method: "POST",
+    }),
+  acceptRejection: (id: string) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/accept-rejection`, {
+      method: "POST",
+    }),
+  bountyReview: (id: string) => request<{ review: BountyReview }>(`/api/bounties/${id}/review`),
+
+  // Wallet
+  setPayoutWallet: (address: string, memo: string) =>
+    request<{ ok: true; address: string; memo: string; trustline: boolean }>(
+      "/api/me/payout-address",
+      { method: "POST", body: JSON.stringify({ address, memo }) }
+    ),
+  removePayoutWallet: () =>
+    request<{ ok: true }>("/api/me/payout-address", { method: "DELETE" }),
+  contributorTransactions: () =>
+    request<{ transactions: PayoutTransaction[]; explorerBase: string }>(
+      "/api/contributor/transactions"
+    ),
+
+  // Notifications
+  notifications: () =>
+    request<{ items: AppNotification[]; unreadCount: number }>("/api/notifications"),
+  markNotificationsRead: () => request<{ ok: true }>("/api/notifications/read", { method: "POST" }),
+};

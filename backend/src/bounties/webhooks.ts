@@ -6,6 +6,7 @@
 import { db, flushPending } from "../db.js";
 import { isStellarConfigured } from "../config.js";
 import { installationPermissions } from "../github/app.js";
+import { ensurePRReview } from "../github/webhooks.js";
 import type { Bounty, Integration } from "../types.js";
 import { createLinearComment } from "../linear/client.js";
 import { looksLikeBountyCommand, parseBountyCommand } from "./parse.js";
@@ -113,6 +114,7 @@ export function maybeHandleBountyComment(event: any): boolean {
     description: typeof event.issue?.body === "string" ? event.issue.body : "",
     amountUsdc: cmd.amountUsdc,
     deliveryDays: cmd.deliveryDays,
+    createdByLogin: event.comment?.user?.login ?? null,
   });
   console.log(
     `[bounty] created ${bounty.code} for ${repo}#${issueNumber} ($${cmd.amountUsdc}, ${cmd.deliveryDays}d)`
@@ -245,5 +247,13 @@ export function handleBountyPROpened(event: any): void {
         console.warn(`[bounty] status comment failed for ${fresh.code}:`, err);
       }
     })();
+    // Make sure the AI review runs: the bounty assignee is an external
+    // contributor, so the regular `opened` path won't auto-review their PR
+    // (shouldAutoReviewOpenedPR only covers owners/team). Attribute the review
+    // to the install owner — a bounty review is the sponsor's product usage.
+    // The pipeline then seeds the bounty's locked acceptance criteria.
+    void ensurePRReview(repo, pr.number, event.installation?.id, undefined, {
+      attributeToOwner: true,
+    }).catch((err) => console.warn(`[bounty] ensurePRReview failed for ${bounty.code}:`, err));
   }
 }

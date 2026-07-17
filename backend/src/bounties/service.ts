@@ -11,7 +11,7 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config, isStellarConfigured } from "../config.js";
-import type { Bounty, BountyApplication, BountyCancelReason, EscrowTransaction } from "../types.js";
+import type { Bounty, BountyApplication, BountyCancelReason, BountyEvent, EscrowTransaction } from "../types.js";
 import { taskIdForBounty } from "./taskid.js";
 import { assertBountyAmount, stroopsToUsdcNumber, usdcToStroops } from "../stellar/amount.js";
 import { assertValidAddress } from "../stellar/scval.js";
@@ -24,6 +24,7 @@ import {
   hasUsdcTrustline,
 } from "../stellar/escrow.js";
 import { parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
+import { pushNotification } from "../notifications.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -36,8 +37,8 @@ export type EscrowChain = {
     issueUrl: string,
     amountStroops: bigint
   ): Promise<string>;
-  buildReleaseXdr(sponsor: string, taskId: string, contributor: string): Promise<string>;
-  adminRelease(taskId: string, contributor: string): Promise<SendResult>;
+  buildReleaseXdr(sponsor: string, taskId: string, contributor: string, memo?: string): Promise<string>;
+  adminRelease(taskId: string, contributor: string, memo?: string): Promise<SendResult>;
   adminRefund(taskId: string): Promise<SendResult>;
   hasUsdcTrustline(address: string): Promise<boolean>;
   getEscrow(taskId: string): Promise<unknown>;
@@ -76,6 +77,31 @@ function insertTxn(row: Omit<EscrowTransaction, "id" | "createdAt">): EscrowTran
   return db.insert("escrowTransactions", { id: uuid(), createdAt: Date.now(), ...row });
 }
 
+// ── activity log ─────────────────────────────────────────────────────────────
+// Every lifecycle moment appends a BountyEvent so the contributor app's
+// timeline shows the real history (who did what, when) instead of synthesizing
+// it from a handful of timestamps. Append-only; capped as a runaway guard
+// (drop-oldest — the recent tail is what the timeline shows anyway).
+const EVENT_CAP = 100;
+
+export function recordBountyEvent(
+  bountyId: string,
+  kind: BountyEvent["kind"],
+  opts: { actor?: string | null; subject?: string | null; detail?: string | null; at?: number } = {}
+): void {
+  const b = getBounty(bountyId);
+  if (!b) return;
+  const event: BountyEvent = {
+    at: opts.at ?? Date.now(),
+    kind,
+    actor: opts.actor ?? null,
+    subject: opts.subject ?? null,
+    detail: opts.detail ?? null,
+  };
+  const events = [...(b.events ?? []), event].slice(-EVENT_CAP);
+  patchBounty(bountyId, { events });
+}
+
 export type LifecycleResult = { ok: boolean; reason: string; hash?: string; bounty?: Bounty };
 
 // ── creation + funding ───────────────────────────────────────────────────────
@@ -93,6 +119,9 @@ export type CreateBountyInput = {
   amountUsdc: number;
   deliveryDays: number;
   sponsorUserId?: string | null;
+  // GitHub login of whoever created the bounty (comment author / app user) —
+  // only used for the activity log; the comment path otherwise loses it.
+  createdByLogin?: string | null;
 };
 
 /** Create a PENDING_FUNDING bounty. No chain call — funding is a separate, sponsor-signed step. */
@@ -137,6 +166,14 @@ export function createBounty(input: CreateBountyInput): Bounty {
     refundTxHash: null,
     cancelReason: null,
     pendingOp: null,
+    events: [
+      {
+        at: now,
+        kind: "created",
+        actor: input.createdByLogin ?? null,
+        detail: `${stroopsToUsdcNumber(amountStroops)} USDC · ${input.deliveryDays}-day delivery`,
+      },
+    ],
     createdAt: now,
     updatedAt: now,
   };
@@ -198,7 +235,9 @@ export function recordFunding(
     confirmedAt: null,
   });
   if (failed) return { ok: false, reason: "send_error", hash: send.hash };
-  const bounty = patchBounty(bountyId, { sponsorAddress, escrowTxHash: send.hash });
+  patchBounty(bountyId, { sponsorAddress, escrowTxHash: send.hash });
+  recordBountyEvent(bountyId, "funding_submitted", { actor: "sponsor" });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "submitted", hash: send.hash, bounty: bounty ?? undefined };
 }
 
@@ -249,7 +288,9 @@ export function cancelPending(bountyId: string): LifecycleResult {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status !== "PENDING_FUNDING") return { ok: false, reason: `not_pending_${b.status.toLowerCase()}` };
-  const bounty = patchBounty(bountyId, { status: "CANCELLED", cancelReason: "deleted" });
+  patchBounty(bountyId, { status: "CANCELLED", cancelReason: "deleted" });
+  recordBountyEvent(bountyId, "cancelled", { detail: "discarded before funding" });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "cancelled", bounty: bounty ?? undefined };
 }
 
@@ -277,12 +318,25 @@ export function applyToBounty(
   };
   if (idx >= 0) apps[idx] = app;
   else apps.push(app);
-  const bounty = patchBounty(bountyId, { applications: apps });
+  patchBounty(bountyId, { applications: apps });
+  recordBountyEvent(bountyId, "applied", {
+    actor: applicant.githubLogin,
+    subject: applicant.githubLogin,
+  });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "applied", bounty: bounty ?? undefined };
 }
 
-/** Sponsor approves an application; the contributor may then accept. */
-export function approveApplication(bountyId: string, githubId: number): LifecycleResult {
+/**
+ * Sponsor approves an application; the contributor may then accept.
+ * `actorLogin` (the approving sponsor) is recorded on the activity log — the
+ * route layer knows it and previously discarded it.
+ */
+export function approveApplication(
+  bountyId: string,
+  githubId: number,
+  actorLogin?: string | null
+): LifecycleResult {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status !== "OPEN") return { ok: false, reason: `not_open_${b.status.toLowerCase()}` };
@@ -296,18 +350,62 @@ export function approveApplication(bountyId: string, githubId: number): Lifecycl
   if (!apps.some((a) => a.githubId === githubId && a.status === "approved")) {
     return { ok: false, reason: "no_such_application" };
   }
-  const bounty = patchBounty(bountyId, { applications: apps });
+  patchBounty(bountyId, { applications: apps });
+  const applicant = apps.find((a) => a.githubId === githubId);
+  recordBountyEvent(bountyId, "application_approved", {
+    actor: actorLogin ?? null,
+    subject: applicant?.githubLogin ?? null,
+    detail: applicant ? `@${applicant.githubLogin} picked` : null,
+  });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "approved", bounty: bounty ?? undefined };
 }
 
-export function rejectApplication(bountyId: string, githubId: number): LifecycleResult {
+export function rejectApplication(
+  bountyId: string,
+  githubId: number,
+  actorLogin?: string | null
+): LifecycleResult {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   const apps = b.applications.map((a) =>
     a.githubId === githubId ? { ...a, status: "rejected" as const } : a
   );
-  const bounty = patchBounty(bountyId, { applications: apps });
+  patchBounty(bountyId, { applications: apps });
+  const applicant = apps.find((a) => a.githubId === githubId);
+  recordBountyEvent(bountyId, "application_rejected", {
+    actor: actorLogin ?? null,
+    subject: applicant?.githubLogin ?? null,
+    detail: applicant ? `@${applicant.githubLogin}'s application` : null,
+  });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "rejected", bounty: bounty ?? undefined };
+}
+
+/**
+ * A contributor withdraws their own PENDING application (the design's
+ * "Withdraw application" CTA). Approved/accepted applications can't be
+ * withdrawn this way — that's a conversation with the sponsor.
+ */
+export function withdrawApplication(
+  bountyId: string,
+  contributor: { githubId: number; githubLogin: string }
+): LifecycleResult {
+  const b = getBounty(bountyId);
+  if (!b) return { ok: false, reason: "not_found" };
+  if (b.status !== "OPEN") return { ok: false, reason: `not_open_${b.status.toLowerCase()}` };
+  const app = b.applications.find((a) => a.githubId === contributor.githubId);
+  if (!app) return { ok: false, reason: "no_such_application" };
+  if (app.status !== "pending") return { ok: false, reason: `not_pending_${app.status}` };
+  patchBounty(bountyId, {
+    applications: b.applications.filter((a) => a.githubId !== contributor.githubId),
+  });
+  recordBountyEvent(bountyId, "application_withdrawn", {
+    actor: contributor.githubLogin,
+    subject: contributor.githubLogin,
+  });
+  const bounty = getBounty(bountyId);
+  return { ok: true, reason: "withdrawn", bounty: bounty ?? undefined };
 }
 
 /**
@@ -320,6 +418,7 @@ export async function acceptAndStartClock(
   bountyId: string,
   contributor: { githubId: number; githubLogin: string; userId?: string },
   payoutAddress: string,
+  payoutMemo: string = "",
   chain: EscrowChain = defaultChain
 ): Promise<LifecycleResult> {
   const b = getBounty(bountyId);
@@ -339,22 +438,30 @@ export async function acceptAndStartClock(
   const apps = b.applications.map((a) =>
     a.githubId === contributor.githubId ? { ...a, status: "accepted" as const } : a
   );
-  const bounty = patchBounty(bountyId, {
+  patchBounty(bountyId, {
     status: "DELEGATED",
     applications: apps,
     assigneeGithubId: contributor.githubId,
     assigneeGithubLogin: contributor.githubLogin,
     assigneeAddress: payoutAddress,
+    assigneeMemo: payoutMemo || null,
     acceptedAt: now,
     deadlineAt: now + b.deliveryDays * DAY_MS,
+  });
+  recordBountyEvent(bountyId, "accepted", {
+    actor: contributor.githubLogin,
+    detail: `${b.deliveryDays}-day delivery clock started`,
+    at: now,
   });
   // Persist the payout wallet on the user (links githubLogin ↔ address always).
   if (contributor.userId) {
     db.update("users", (u) => u.id === contributor.userId, {
       stellarPayoutAddress: payoutAddress,
+      stellarPayoutMemo: payoutMemo,
       stellarPayoutTrustline: true,
     });
   }
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "delegated", bounty: bounty ?? undefined };
 }
 
@@ -365,7 +472,21 @@ export function markInReview(bountyId: string, prNumber: number): LifecycleResul
   if (b.status !== "DELEGATED" && b.status !== "IN_REVIEW") {
     return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
   }
-  const bounty = patchBounty(bountyId, { status: "IN_REVIEW", prNumber });
+  // A webhook-inferred PR link counts as the submission moment too — the
+  // contributor app's stage machine and timeline key off submittedAt.
+  const isNewLink = b.status !== "IN_REVIEW" || b.prNumber !== prNumber;
+  patchBounty(bountyId, {
+    status: "IN_REVIEW",
+    prNumber,
+    ...(b.submittedAt ? {} : { submittedAt: Date.now() }),
+  });
+  if (isNewLink) {
+    recordBountyEvent(bountyId, "pr_opened", {
+      actor: b.assigneeGithubLogin ?? null,
+      detail: `PR #${prNumber}`,
+    });
+  }
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "in_review", bounty: bounty ?? undefined };
 }
 
@@ -407,7 +528,7 @@ export async function releaseByMerge(
   if (!acquire(bountyId, "releasing")) return { ok: false, reason: "in_flight" };
   let send: SendResult;
   try {
-    send = await chain.adminRelease(b.taskId, b.assigneeAddress);
+    send = await chain.adminRelease(b.taskId, b.assigneeAddress, b.assigneeMemo ?? "");
   } catch (err) {
     releaseGuard(bountyId);
     return { ok: false, reason: "chain_error", hash: undefined };
@@ -427,12 +548,18 @@ export async function releaseByMerge(
     note: `release to @${b.assigneeGithubLogin} on merge`,
     error: send.error ?? null,
     confirmedAt: null,
+    destAddress: b.assigneeAddress,
+    destMemo: b.assigneeMemo ?? null,
   });
   if (send.status === "error") {
     releaseGuard(bountyId);
     return { ok: false, reason: "send_error", hash: send.hash };
   }
   patchBounty(bountyId, { payoutTxHash: send.hash });
+  recordBountyEvent(bountyId, "payout_submitted", {
+    actor: "system",
+    detail: "release on merge",
+  });
   return { ok: true, reason: "submitted", hash: send.hash };
 }
 
@@ -449,7 +576,7 @@ export async function buildSponsorReleaseTx(
   if (!b.assigneeAddress) return { ok: false, reason: "no_payout_address" };
   if (!b.sponsorAddress) return { ok: false, reason: "no_sponsor_address" };
   if (b.pendingOp) return { ok: false, reason: "in_flight" };
-  const xdr = await chain.buildReleaseXdr(b.sponsorAddress, b.taskId, b.assigneeAddress);
+  const xdr = await chain.buildReleaseXdr(b.sponsorAddress, b.taskId, b.assigneeAddress, b.assigneeMemo ?? "");
   return { ok: true, reason: "built", xdr };
 }
 
@@ -476,11 +603,17 @@ export function recordSponsorRelease(bountyId: string, send: SendResult): Lifecy
     amountStroops: b.amountStroops,
     dir: "out",
     note: `release to @${b.assigneeGithubLogin} (sponsor-approved)`,
+    destAddress: b.assigneeAddress ?? null,
+    destMemo: b.assigneeMemo ?? null,
     error: send.error ?? null,
     confirmedAt: null,
   });
   if (failed) return { ok: false, reason: "send_error", hash: send.hash };
   patchBounty(bountyId, { payoutTxHash: send.hash, pendingOp: "releasing" });
+  recordBountyEvent(bountyId, "payout_submitted", {
+    actor: "sponsor",
+    detail: "in-app approval",
+  });
   return { ok: true, reason: "submitted", hash: send.hash };
 }
 
@@ -536,6 +669,7 @@ export async function refundBounty(
     return { ok: false, reason: "send_error", hash: send.hash };
   }
   patchBounty(bountyId, { refundTxHash: send.hash, cancelReason: reason });
+  recordBountyEvent(bountyId, "refund_submitted", { actor: "system", detail: reason });
   return { ok: true, reason: "submitted", hash: send.hash };
 }
 
@@ -680,7 +814,7 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
       confirmedAt: Date.now(),
     });
   }
-  const bounty = patchBounty(bountyId, {
+  patchBounty(bountyId, {
     status: "OPEN",
     onchainStatus: "Open",
     ...(creator ? { sponsorAddress: creator } : {}),
@@ -688,6 +822,11 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
     // we just flipped back to confirmed still holds the hash — restore it.
     ...(existing?.hash ? { escrowTxHash: existing.hash } : {}),
   });
+  recordBountyEvent(bountyId, "funded", {
+    actor: "system",
+    detail: "recovered from on-chain state",
+  });
+  const bounty = getBounty(bountyId);
   return { ok: true, reason: "recovered", bounty: bounty ?? undefined };
 }
 
@@ -732,6 +871,7 @@ export async function applyTxnOutcome(
     if (txn.kind === "escrow") {
       if (b.status === "PENDING_FUNDING") {
         patchBounty(b.id, { status: "OPEN", onchainStatus: "Open" });
+        recordBountyEvent(b.id, "funded", { actor: "system", detail: "escrow confirmed on-chain" });
       } else if (b.status === "CANCELLED") {
         // The bounty was cancelled while this funding tx was in flight (the
         // sub-second submitFunding race): the escrow IS funded on-chain, so
@@ -748,8 +888,29 @@ export async function applyTxnOutcome(
       }
     } else if (txn.kind === "payout") {
       patchBounty(b.id, { status: "PAID", onchainStatus: "Completed", pendingOp: null });
+      recordBountyEvent(b.id, "paid", {
+        actor: "system",
+        detail: `${b.amountUsdc} USDC released to @${b.assigneeGithubLogin ?? "contributor"}`,
+      });
+      // Tell the contributor the money moved — the contributor app's wallet page.
+      if (b.assigneeGithubId != null) {
+        const dev = db.find("users", (u) => u.githubId === b.assigneeGithubId);
+        if (dev) {
+          pushNotification(
+            dev.id,
+            "bounty",
+            `${b.code} paid out — ${b.amountUsdc} USDC`,
+            `${b.repo}#${b.issueNumber} — sent to your registered wallet`,
+            { link: "/wallet" }
+          );
+        }
+      }
     } else if (txn.kind === "refund") {
       patchBounty(b.id, { status: "CANCELLED", onchainStatus: "Cancelled", pendingOp: null });
+      recordBountyEvent(b.id, "refunded", {
+        actor: "system",
+        detail: b.cancelReason ?? null,
+      });
     }
     return;
   }

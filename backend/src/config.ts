@@ -29,6 +29,13 @@ function loadStellarKey(): string {
 export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
+  // The contributor (developer) app's origin — a second first-party frontend
+  // (contributors.devasign.ai in prod; the Vite dev server on :3002 locally).
+  // Must be a devasign.ai subdomain in prod: the session cookie is set on
+  // api.devasign.ai with SameSite=None and stays first-party only within the
+  // same site. Feeds allowedWebOrigins() below (CORS + CSRF) and the OAuth
+  // return-to-initiating-app redirect in github/oauth.ts.
+  contributorOrigin: process.env.CONTRIBUTOR_ORIGIN || "http://localhost:3002",
   // Cross-site session cookies need SameSite=None; Secure, which is only valid
   // (and only wanted) once the dashboard is served over https — i.e. prod. In
   // local dev WEB_ORIGIN is http://localhost, so cookies stay SameSite=Lax.
@@ -161,6 +168,13 @@ export const config = {
     friendbotUrl: process.env.STELLAR_FRIENDBOT_URL || "https://friendbot.stellar.org",
   },
 };
+
+// Every first-party web origin (sponsor dashboard + contributor app), deduped.
+// The single source of truth for the CORS allowlist and the same-origin CSRF
+// check — a new frontend origin gets added here and nowhere else.
+export const allowedWebOrigins = (): string[] => [
+  ...new Set([config.webOrigin, config.contributorOrigin].filter(Boolean)),
+];
 
 export const isDbConfigured = () => Boolean(config.databaseUrl);
 // At-rest encryption for integration tokens. When false, seal/open no-op and

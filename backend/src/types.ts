@@ -16,6 +16,10 @@ export type User = {
   // last checked (a payout to a trustline-less account would trap on-chain).
   stellarPayoutAddress?: string;
   stellarPayoutTrustline?: boolean;
+  // Optional memo attached to the payout wallet (e.g. an exchange deposit memo).
+  // MEMO_TEXT semantics: ≤ 28 bytes UTF-8 (see stellar/memo.ts). Cleared together
+  // with the address when the contributor removes their wallet.
+  stellarPayoutMemo?: string;
 };
 
 export type Installation = {
@@ -297,6 +301,12 @@ export type PRReview = {
   // via attributedUserFor() (github/installations.ts). Optional/null on rows
   // written before per-user attribution, and when no member could be attributed.
   attributedUserId?: string | null;
+  // The bounty this PR delivers, when the review's criteria were seeded from a
+  // bounty's locked acceptance list (see review/pipeline.ts stage b). Lets the
+  // contributor-facing verdict endpoint pick the right review row and lets the
+  // pipeline notify the bounty assignee when verdicts land. Absent on ordinary
+  // (non-bounty) reviews and rows written before bounties existed.
+  bountyId?: string | null;
   createdAt: number;
   updatedAt: number;
 };
@@ -382,7 +392,7 @@ export type AuthAuditEntry = {
 // Mirrors the existing UI shape (kind drives dot color via NOTIF_DOT in
 // frontend/src/app.tsx); `createdAt` is a number so the frontend can render
 // relative time itself.
-export type NotificationKind = "review" | "blocker" | "system";
+export type NotificationKind = "review" | "blocker" | "system" | "bounty";
 
 export type Notification = {
   id: string;
@@ -430,7 +440,57 @@ export type BountyStatus =
 // Open → Cancelled). Null until the escrow is funded on-chain.
 export type OnchainStatus = "Open" | "Completed" | "Cancelled" | "Disputed";
 
-export type BountyCancelReason = "deleted" | "expired" | "disputed";
+export type BountyCancelReason = "deleted" | "expired" | "disputed" | "rejected";
+
+// A supporting link the contributor attached to their submission (demo video,
+// design doc, screen recording, …) — free-form type label + URL, sanitized by
+// bounties/submission.ts before it's stored.
+export type SupportingLink = { type: string; url: string; addedAt: number };
+
+// A sponsor's rejection of the submitted work. The bounty STAYS IN_REVIEW —
+// rejection is a flag on the review stage, not a status: the contributor can
+// rework and resubmit, accept the verdict (→ refund), or dispute (future).
+export type SubmissionRejection = { reason: string; byLogin: string; at: number };
+
+// One entry in a bounty's append-only activity log — every lifecycle moment
+// the contributor app's timeline renders. Written by recordBountyEvent()
+// (bounties/service.ts) at each transition; absent entirely on legacy rows
+// (the frontend synthesizes a coarse timeline from timestamps as a fallback).
+export type BountyEventKind =
+  | "created"
+  | "funding_submitted"
+  | "funded"
+  | "applied"
+  | "application_approved"
+  | "application_rejected"
+  | "application_withdrawn"
+  | "accepted"
+  | "pr_opened"
+  | "submitted"
+  | "review_completed"
+  | "payout_requested"
+  | "submission_rejected"
+  | "rejection_accepted"
+  | "payout_submitted"
+  | "paid"
+  | "refund_submitted"
+  | "refunded"
+  | "cancelled";
+
+export type BountyEvent = {
+  at: number;
+  kind: BountyEventKind;
+  // Who did it: a githubLogin, "system" for keeper/admin actions, or null when
+  // the actor is unknown (legacy paths, token-scoped links).
+  actor?: string | null;
+  // Who the event is ABOUT when that differs from the actor — e.g. the
+  // applicant's login on application_approved (actor = the sponsor). Drives
+  // the contributor view's privacy filter: application events are only shown
+  // to the contributor they concern.
+  subject?: string | null;
+  // Short human-readable context (rejection reason, "3 of 5 criteria met", …).
+  detail?: string | null;
+};
 
 // A contributor's application to work a bounty. The sponsor must approve one
 // (status "approved") before that contributor can accept (status "accepted",
@@ -469,9 +529,21 @@ export type Bounty = {
   assigneeGithubId?: number | null;
   assigneeGithubLogin?: string | null;
   assigneeAddress?: string | null; // the accepted contributor's payout G…, snapshotted at acceptance
+  assigneeMemo?: string | null; // the payout memo snapshotted alongside assigneeAddress (may be unset on old rows)
   acceptedAt?: number | null;
   deadlineAt?: number | null; // acceptedAt + deliveryDays; the keeper refunds past this
   prNumber?: number | null; // the delivering PR
+  // Contributor-app submission surface (all optional; old rows load unchanged):
+  // when the contributor explicitly submitted via the app (vs. webhook-inferred),
+  // any supporting links they attached, when they requested payout, and the
+  // sponsor's standing rejection of the submitted work (null/absent = none).
+  submittedAt?: number | null;
+  supportingLinks?: SupportingLink[];
+  payoutRequestedAt?: number | null;
+  rejection?: SubmissionRejection | null;
+  // Append-only activity log (see BountyEvent). Capped at EVENT_CAP entries in
+  // recordBountyEvent; absent on rows written before the log existed.
+  events?: BountyEvent[];
   botCommentId?: number | null; // the DevAsign confirm/status comment on the issue (so we can edit it)
   escrowTxHash?: string | null;
   payoutTxHash?: string | null;
@@ -509,6 +581,12 @@ export type EscrowTransaction = {
   error?: string | null;
   createdAt: number;
   confirmedAt?: number | null;
+  // Payout destination snapshot: the exact wallet (address + memo) this payout
+  // was sent to, frozen at send time — the contributor's wallet ledger stays
+  // truthful even after they change or remove their registered wallet. Only set
+  // on kind:"payout" rows written after this field existed.
+  destAddress?: string | null;
+  destMemo?: string | null;
 };
 
 export type DB = {

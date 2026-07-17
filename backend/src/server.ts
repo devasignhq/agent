@@ -5,6 +5,7 @@ import morgan from "morgan";
 import { securityHeaders } from "./security.js";
 
 import {
+  allowedWebOrigins,
   config,
   isDiscordEnvConfigured,
   isGithubAppConfigured,
@@ -22,6 +23,7 @@ import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
 import { api } from "./routes/api.js";
 import { bounties } from "./routes/bounties.js";
+import { contributor } from "./routes/contributor.js";
 import { closeAllStreams } from "./notifications-stream.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
@@ -103,7 +105,7 @@ app.set("trust proxy", 1);
 app.use(securityHeaders);
 
 app.use(morgan("dev"));
-app.use(cors({ origin: config.webOrigin, credentials: true }));
+app.use(cors({ origin: allowedWebOrigins(), credentials: true }));
 app.use(cookieParser());
 
 // Broad per-IP flood shield, applied after CORS so handled preflights don't burn
@@ -173,6 +175,7 @@ app.get("/api/auth/linear/callback", authLimiter, finishLinearOAuth);
 // API
 app.use("/api", api);
 app.use("/api", bounties);
+app.use("/api", contributor);
 
 // Convenience: where the GitHub-app-install button on onboarding sends users.
 app.get("/api/install/redirect", (_req, res) => {

@@ -12,8 +12,18 @@ import { isStellarConfigured } from "../config.js";
 import { getSessionUser } from "../github/oauth.js";
 import { installationsForUser, userInInstall } from "../github/installations.js";
 import { assertValidAddress } from "../stellar/scval.js";
+import { validateMemo } from "../stellar/memo.js";
+import { hasUsdcTrustline } from "../stellar/escrow.js";
 import { networkPassphrase } from "../stellar/client.js";
 import { cancelUrl, fundingUrl, verifyBountyLinkToken } from "../bounties/links.js";
+import { publicBountyView } from "../bounties/public-view.js";
+import { explorerBase } from "./contributor.js";
+import { parsePrUrl, sanitizeLinks, validateSubmission } from "../bounties/submission.js";
+import { criteriaCounts, findBountyReview, partitionBountyCriteria } from "../bounties/review-lookup.js";
+import { publicLimiter } from "../rate-limit.js";
+import { gh } from "../github/app.js";
+import { ensurePRReview } from "../github/webhooks.js";
+import { pushNotification } from "../notifications.js";
 import { updateStatusComment } from "../bounties/botcomment.js";
 import { postAndRecordConfirmComment } from "../bounties/webhooks.js";
 import {
@@ -26,9 +36,13 @@ import {
   createBounty,
   deleteBounty,
   getBounty,
+  markInReview,
+  recordBountyEvent,
+  refundBounty,
   rejectApplication,
   submitFunding,
   submitSponsorRelease,
+  withdrawApplication,
 } from "../bounties/service.js";
 
 export const bounties = Router();
@@ -127,6 +141,22 @@ bounties.get("/bounties/transactions", (req, res) => {
   res.json({ transactions: txns });
 });
 
+// Unauthenticated public read for the contributor app's discovery page — a
+// developer landing from a GitHub link sees the bounty before signing in. The
+// payload is the strict allowlist in bounties/public-view.ts (no applicants, no
+// sponsor/assignee identity or wallets, no links). Registered BEFORE
+// /bounties/:id so the extra path segment can't be shadowed. 404s for bounties
+// with nothing to advertise (unfunded or cancelled) and for unknown ids alike,
+// so the endpoint can't be used to distinguish "exists but hidden" from "gone".
+bounties.get("/bounties/:id/public", publicLimiter, (req, res) => {
+  const b = getBounty(String(req.params.id));
+  if (!b || b.status === "PENDING_FUNDING" || b.status === "CANCELLED") {
+    return void res.status(404).json({ error: "not_found" });
+  }
+  const escrowTxn = db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${b.taskId}`);
+  res.json({ bounty: publicBountyView(b, escrowTxn), explorerBase: explorerBase() });
+});
+
 export function getBountyHandler(req: Request, res: Response) {
   const user = requireUser(req, res);
   if (!user) return;
@@ -182,6 +212,7 @@ bounties.post("/bounties", (req, res) => {
       amountUsdc,
       deliveryDays,
       sponsorUserId: user.id,
+      createdByLogin: user.githubLogin || null,
     });
     // Same confirm comment as the comment-command path, so the funding links
     // reach the issue no matter how the bounty was created. Off the request
@@ -265,11 +296,24 @@ bounties.post("/bounties/:id/applications/:githubId/:action", (req, res) => {
   const action = req.params.action;
   const r =
     action === "approve"
-      ? approveApplication(b.id, githubId)
+      ? approveApplication(b.id, githubId, user.githubLogin)
       : action === "reject"
-        ? rejectApplication(b.id, githubId)
+        ? rejectApplication(b.id, githubId, user.githubLogin)
         : { ok: false, reason: "bad_action" };
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  // Tell the applicant they were picked — the contributor app's "awarded" alert.
+  if (action === "approve") {
+    const applicant = db.find("users", (u) => u.githubId === githubId);
+    if (applicant) {
+      pushNotification(
+        applicant.id,
+        "bounty",
+        `You were picked for ${b.code}`,
+        `${b.repo}#${b.issueNumber} — ${b.title}. Accept to start the clock.`,
+        { link: "/dashboard" }
+      );
+    }
+  }
   res.json({ ok: true, bounty: r.bounty });
 });
 
@@ -280,10 +324,13 @@ bounties.post("/bounties/:id/accept", async (req, res) => {
   if (!requireStellar(res)) return;
   if (user.githubId == null) return void res.status(400).json({ error: "no_github_identity" });
   const address = String(req.body?.address || "");
+  const memoCheck = validateMemo(req.body?.memo);
+  if (!memoCheck.ok) return void res.status(400).json({ error: "invalid_memo" });
   const r = await acceptAndStartClock(
     req.params.id,
     { githubId: user.githubId, githubLogin: user.githubLogin, userId: user.id },
-    address
+    address,
+    memoCheck.memo
   );
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
   if (r.bounty) void updateStatusComment(r.bounty); // reflect "delegated" on the issue
@@ -337,9 +384,247 @@ bounties.delete("/bounties/:id", async (req, res) => {
   res.json({ ok: true, bounty: r.bounty });
 });
 
+// --- contributor submission surface (explicit submit / links / payout ask) ---
+
+// The contributor's view of a bounty row: their own applications only (mirrors
+// getBountyHandler's non-sponsor branch) and no sponsor links.
+function contributorFacing(b: Bounty, githubId: number | null) {
+  return { ...b, applications: b.applications.filter((a) => a.githubId === githubId) };
+}
+
+// The DevAsign user row for a bounty's assignee, for notifications.
+function assigneeUser(b: Bounty) {
+  if (b.assigneeGithubId == null) return null;
+  return db.find("users", (u) => u.githubId === b.assigneeGithubId);
+}
+
+// Explicit "submit work": the assignee pastes their PR URL (+ optional
+// supporting links). Verifies the PR on GitHub — it must exist in the bounty's
+// repo and be authored by the assignee (same identity rule as the webhook path,
+// bounties/webhooks.ts) — then marks the bounty IN_REVIEW and makes sure a
+// review row exists so the criteria pipeline runs. Coexists with the
+// webhook-inferred path: re-submitting the same PR just records links/timestamp.
+bounties.post("/bounties/:id/submit", async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  const parsed = parsePrUrl(req.body?.prUrl);
+  if (!parsed) return void res.status(400).json({ error: "invalid_pr_url" });
+  const check = validateSubmission(b, user, parsed);
+  if (!check.ok) {
+    const status = check.reason === "not_assignee" ? 403 : 400;
+    return void res.status(status).json({ error: check.reason });
+  }
+  let pr: any;
+  try {
+    pr = await gh<any>(b.installationId, `/repos/${b.repo}/pulls/${parsed.prNumber}`);
+  } catch {
+    return void res.status(400).json({ error: "pr_not_found" });
+  }
+  if (!pr || pr.user?.id !== b.assigneeGithubId) {
+    return void res.status(403).json({ error: "pr_author_mismatch" });
+  }
+  const r = markInReview(b.id, parsed.prNumber);
+  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  const links = sanitizeLinks(req.body?.links);
+  db.update("bounties", (x) => x.id === b.id, {
+    submittedAt: Date.now(),
+    ...(links.length ? { supportingLinks: links } : {}),
+    updatedAt: Date.now(),
+  });
+  recordBountyEvent(b.id, "submitted", {
+    actor: user.githubLogin,
+    detail: `PR #${parsed.prNumber}${links.length ? ` + ${links.length} supporting link${links.length === 1 ? "" : "s"}` : ""}`,
+  });
+  const updated = getBounty(b.id);
+  // Materialize + enqueue the AI review for this PR (reuses an existing row).
+  // Attributed to the install owner: the assignee is an external contributor.
+  void ensurePRReview(b.repo, parsed.prNumber, b.installationId, undefined, {
+    attributeToOwner: true,
+  }).catch((err) => console.warn(`[bounty] ensurePRReview failed for ${b.code}:`, err));
+  if (updated) void updateStatusComment(updated);
+  res.json({ ok: true, bounty: contributorFacing(updated ?? b, user.githubId) });
+});
+
+// Add/replace the supporting links on an in-flight submission.
+bounties.post("/bounties/:id/links", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (user.githubId == null || b.assigneeGithubId !== user.githubId) {
+    return void res.status(403).json({ error: "not_assignee" });
+  }
+  if (b.status !== "DELEGATED" && b.status !== "IN_REVIEW") {
+    return void res.status(400).json({ error: `bad_status_${b.status.toLowerCase()}` });
+  }
+  const links = sanitizeLinks(req.body?.links);
+  const updated = db.update("bounties", (x) => x.id === b.id, {
+    supportingLinks: links,
+    updatedAt: Date.now(),
+  });
+  res.json({ ok: true, bounty: contributorFacing(updated ?? b, user.githubId) });
+});
+
+// The contributor withdraws their own pending application (the design's
+// "Withdraw application" CTA on the Bounties page).
+bounties.post("/bounties/:id/withdraw-application", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  if (user.githubId == null) return void res.status(400).json({ error: "no_github_identity" });
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  const r = withdrawApplication(b.id, { githubId: user.githubId, githubLogin: user.githubLogin });
+  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  res.json({ ok: true, bounty: r.bounty ? contributorFacing(r.bounty, user.githubId) : undefined });
+});
+
+// The contributor asks the sponsor to release payment (all criteria green).
+// Purely a signal — funds still move only via the sponsor's Freighter release
+// or the merge-triggered admin release. Idempotent: re-asking just re-notifies.
+bounties.post("/bounties/:id/request-payout", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (user.githubId == null || b.assigneeGithubId !== user.githubId) {
+    return void res.status(403).json({ error: "not_assignee" });
+  }
+  if (b.status !== "IN_REVIEW") {
+    return void res.status(400).json({ error: `bad_status_${b.status.toLowerCase()}` });
+  }
+  db.update("bounties", (x) => x.id === b.id, {
+    payoutRequestedAt: Date.now(),
+    updatedAt: Date.now(),
+  });
+  recordBountyEvent(b.id, "payout_requested", { actor: user.githubLogin });
+  const updated = getBounty(b.id);
+  if (b.sponsorUserId) {
+    pushNotification(
+      b.sponsorUserId,
+      "bounty",
+      `@${user.githubLogin} requested payout on ${b.code}`,
+      `${b.repo}#${b.issueNumber} — ${b.title}`,
+      { link: "/bounties" }
+    );
+  }
+  res.json({ ok: true, bounty: contributorFacing(updated ?? b, user.githubId) });
+});
+
+// The sponsor rejects the submitted work, with a required reason. The bounty
+// STAYS IN_REVIEW — rejection is a flag on the review stage, so the contributor
+// can rework and resubmit, accept the verdict (refund), or dispute (future).
+bounties.post("/bounties/:id/reject-submission", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(b, user.id)) return void res.status(403).json({ error: "forbidden" });
+  if (b.status !== "IN_REVIEW") {
+    return void res.status(400).json({ error: `bad_status_${b.status.toLowerCase()}` });
+  }
+  const reason = String(req.body?.reason || "").trim().slice(0, 2000);
+  if (!reason) return void res.status(400).json({ error: "missing_reason" });
+  db.update("bounties", (x) => x.id === b.id, {
+    rejection: { reason, byLogin: user.githubLogin, at: Date.now() },
+    updatedAt: Date.now(),
+  });
+  recordBountyEvent(b.id, "submission_rejected", {
+    actor: user.githubLogin,
+    detail: reason.slice(0, 140),
+  });
+  const updated = getBounty(b.id);
+  const dev = assigneeUser(b);
+  if (dev) {
+    pushNotification(
+      dev.id,
+      "bounty",
+      `Your submission on ${b.code} was rejected`,
+      `${b.repo}#${b.issueNumber} — ${reason.slice(0, 140)}`,
+      { link: "/dashboard" }
+    );
+  }
+  res.json({ ok: true, bounty: updated ?? b });
+});
+
+// The contributor accepts the sponsor's rejection verdict: the escrow refunds
+// to the sponsor and the bounty closes. Terminal — requires a standing rejection.
+bounties.post("/bounties/:id/accept-rejection", async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  if (!requireStellar(res)) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (user.githubId == null || b.assigneeGithubId !== user.githubId) {
+    return void res.status(403).json({ error: "not_assignee" });
+  }
+  if (!b.rejection) return void res.status(400).json({ error: "no_rejection" });
+  recordBountyEvent(b.id, "rejection_accepted", { actor: user.githubLogin });
+  const r = await refundBounty(b.id, "rejected");
+  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  const after = getBounty(b.id);
+  if (after) void updateStatusComment(after);
+  if (b.sponsorUserId) {
+    pushNotification(
+      b.sponsorUserId,
+      "bounty",
+      `@${user.githubLogin} accepted the rejection on ${b.code}`,
+      `${b.repo}#${b.issueNumber} — escrow refund submitted`,
+      { link: "/bounties" }
+    );
+  }
+  res.json({ ok: true, bounty: after ? contributorFacing(after, user.githubId) : undefined });
+});
+
+// The AI review verdicts for a bounty's delivering PR, shaped for the
+// contributor app's criteria view. Assignee or sponsor only — this is a
+// deliberate subset of the maintainer review surface (no logs, no task
+// internals), and unlike routes/api.ts getReviewHandler it does NOT require
+// installation membership (contributors have none).
+bounties.get("/bounties/:id/review", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  const isAssignee = user.githubId != null && b.assigneeGithubId === user.githubId;
+  if (!isAssignee && !isSponsor(b, user.id)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const review = findBountyReview(b);
+  if (!review) return void res.status(404).json({ error: "no_review" });
+
+  // bounty-N criteria in acceptance order; anything else (criteria appended by
+  // later pushes / maintainer comments) surfaces as "additional findings".
+  const toView = (c: (typeof review.criteria)[number], n: number) => ({
+    n,
+    text: c.text,
+    status: c.met === true ? "met" : c.met === false ? "unmet" : "pending",
+    finding: c.evidence ?? null,
+  });
+  const { main, rest } = partitionBountyCriteria(review);
+  res.json({
+    review: {
+      status: review.status,
+      prTitle: review.prTitle,
+      // The pipeline's natural-language verdict — the design's "review line".
+      summary: review.verdict ?? null,
+      headSha: review.headSha,
+      prNumber: review.prNumber,
+      additions: review.additions,
+      deletions: review.deletions,
+      changedFiles: review.changedFiles,
+      updatedAt: review.updatedAt,
+      counts: criteriaCounts(main),
+      criteria: main.map((c, i) => toView(c, i + 1)),
+      extraCriteria: rest.map((c, i) => toView(c, i + 1)),
+    },
+  });
+});
+
 // --- contributor payout wallet registration ---
 
-bounties.post("/me/payout-address", (req, res) => {
+bounties.post("/me/payout-address", async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
   const address = String(req.body?.address || "");
@@ -348,6 +633,29 @@ bounties.post("/me/payout-address", (req, res) => {
   } catch {
     return void res.status(400).json({ error: "invalid_address" });
   }
-  db.update("users", (u) => u.id === user.id, { stellarPayoutAddress: address });
-  res.json({ ok: true, address });
+  const memoCheck = validateMemo(req.body?.memo);
+  if (!memoCheck.ok) return void res.status(400).json({ error: "invalid_memo" });
+  // Best-effort trustline probe: cache the answer for a warning badge in the
+  // contributor app, but NEVER block registration on it — Horizon flakiness
+  // returns true (see hasUsdcTrustline), and the hard check stays at accept.
+  const trustline = await hasUsdcTrustline(address);
+  db.update("users", (u) => u.id === user.id, {
+    stellarPayoutAddress: address,
+    stellarPayoutMemo: memoCheck.memo,
+    stellarPayoutTrustline: trustline,
+  });
+  res.json({ ok: true, address, memo: memoCheck.memo, trustline });
+});
+
+// Remove the registered wallet entirely (payouts pause until a new one is added;
+// past payouts keep their own dest snapshots on the transaction rows).
+bounties.delete("/me/payout-address", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  db.update("users", (u) => u.id === user.id, {
+    stellarPayoutAddress: undefined,
+    stellarPayoutMemo: undefined,
+    stellarPayoutTrustline: undefined,
+  });
+  res.json({ ok: true });
 });

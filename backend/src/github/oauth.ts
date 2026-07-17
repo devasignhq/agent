@@ -11,11 +11,36 @@ import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
 import { track } from "../statsig.js";
 
 const STATE_TTL_MS = 5 * 60 * 1000;
-const pendingState = new Map<string, number>(); // state -> expiresAt
+// Each pending state entry remembers which first-party app started the flow
+// (origin, resolved server-side from the whitelist — never from client input)
+// and an optional same-app path to land back on, so finishOAuth can return the
+// user to the app/page that initiated sign-in (e.g. a contributor's bounty
+// discovery page) instead of always bouncing to the sponsor dashboard.
+type PendingOAuth = { expiresAt: number; origin: string; returnTo: string };
+const pendingState = new Map<string, PendingOAuth>();
 
 function pruneState() {
   const now = Date.now();
-  for (const [k, exp] of pendingState) if (exp < now) pendingState.delete(k);
+  for (const [k, v] of pendingState) if (v.expiresAt < now) pendingState.delete(k);
+}
+
+// Which frontend origin an `?app=` key maps to. Unknown keys fall back to the
+// sponsor dashboard, preserving the pre-multi-app behavior bit for bit.
+function originForApp(app: string | undefined): string {
+  return app === "contributor" ? config.contributorOrigin : config.webOrigin;
+}
+
+// A safe same-app return path: must be a single-slash-rooted path (rejects
+// absolute URLs, protocol-relative `//evil.com`, backslash tricks, and schemes)
+// so the post-login redirect can never leave the initiating origin. Exported
+// for tests. Anything suspicious degrades to "/".
+export function sanitizeReturnTo(raw: string | undefined): string {
+  if (!raw || typeof raw !== "string") return "/";
+  if (!raw.startsWith("/") || raw.startsWith("//") || raw.includes("\\")) return "/";
+  // A colon before any ?/# could smuggle a scheme through some parsers.
+  const pathOnly = raw.split(/[?#]/, 1)[0];
+  if (pathOnly.includes(":")) return "/";
+  return raw;
 }
 
 // Session cookie attributes. In prod the dashboard (www.devasign.ai) and API
@@ -79,7 +104,12 @@ export function startOAuth(req: Request, res: Response) {
   }
   pruneState();
   const state = uuid();
-  pendingState.set(state, Date.now() + STATE_TTL_MS);
+  const { app, returnTo } = (req.query ?? {}) as { app?: string; returnTo?: string };
+  pendingState.set(state, {
+    expiresAt: Date.now() + STATE_TTL_MS,
+    origin: originForApp(app),
+    returnTo: sanitizeReturnTo(returnTo),
+  });
   // Bind the state to *this* browser (login-CSRF defense). The pending-state map
   // alone can't distinguish the browser that started the flow from a victim's:
   // an attacker could start the flow, capture a valid (code, state), and replay
@@ -159,7 +189,8 @@ export async function finishOAuth(req: Request, res: Response) {
   // set on the browser that started the flow (see startOAuth). The map check
   // alone can't tell the victim's browser from the attacker's.
   const cookieState = req.cookies?.github_oauth_state;
-  if (!code || !state || !pendingState.has(state) || state !== cookieState) {
+  const pending = state ? pendingState.get(state) : undefined;
+  if (!code || !state || !pending || state !== cookieState) {
     res.status(400).send("Invalid OAuth state");
     return;
   }
@@ -339,7 +370,12 @@ export async function finishOAuth(req: Request, res: Response) {
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
   // navigation the frontend just strips the query and renders normally.
-  res.redirect(`${config.webOrigin}/?auth=ok`);
+  // The destination is the app that STARTED the flow (captured in startOAuth):
+  // the contributor app's return path (e.g. /bounties/:id?apply=1) keeps its
+  // own query params, with auth=ok appended alongside them.
+  const dest = new URL(pending.returnTo, pending.origin);
+  dest.searchParams.set("auth", "ok");
+  res.redirect(dest.toString());
 }
 
 // GitHub API call with the user-to-server OAuth token. Returns the parsed JSON,

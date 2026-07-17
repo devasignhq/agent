@@ -59,6 +59,16 @@ export const authLimiter = rateLimit({
   limit: 50,
 });
 
+// Unauthenticated public reads (the contributor app's bounty discovery page).
+// Bounty ids are unguessable uuids and the payload is a PII-free allowlist
+// (bounties/public-view.ts), so the only concern is scraping/enumeration cost;
+// 120/min clears a burst of legitimate landings from a popular GitHub issue.
+export const publicLimiter = rateLimit({
+  ...shared,
+  windowMs: 60_000,
+  limit: 120,
+});
+
 // The expensive bucket: routes that can enqueue an LLM job — criteria synthesis
 // on a new attachment, a review re-run, a repo re-index, a reviews sync. This is
 // the actual DoS-cost ceiling. A real user clicking around won't approach

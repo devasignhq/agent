@@ -25,23 +25,27 @@ export async function buildEscrowInvoke(
   sourceAddress: string,
   method: string,
   args: Stellar.xdr.ScVal[],
-  opts: { timeoutSeconds?: number; fee?: string } = {}
+  opts: { timeoutSeconds?: number; fee?: string; memoText?: string } = {}
 ): Promise<Stellar.Transaction> {
   // Admin-signed ops (admin_refund/admin_release) pass a higher inclusion fee and
   // shorter timebounds so a dropped tx is provably dead sooner and the keeper can
   // safely rebuild+resubmit a fresh envelope. Client-signed builds keep the
   // BASE_FEE / 300s defaults (the sponsor pays and re-signs on their own retry).
-  const { timeoutSeconds = 300, fee = BASE_FEE } = opts;
+  // memoText (payout releases) rides the envelope as MEMO_TEXT — best-effort
+  // deposit attribution for exchange-hosted wallets; ≤ 28 bytes, pre-validated
+  // by stellar/memo.ts, and skipped entirely when empty.
+  const { timeoutSeconds = 300, fee = BASE_FEE, memoText = "" } = opts;
   const srv = server();
   const account = await srv.getAccount(sourceAddress);
   const contract = new Contract(escrowContractId());
-  const tx = new TransactionBuilder(account, {
+  const builder = new TransactionBuilder(account, {
     fee,
     networkPassphrase: networkPassphrase(),
   })
     .addOperation(contract.call(method, ...args))
-    .setTimeout(timeoutSeconds)
-    .build();
+    .setTimeout(timeoutSeconds);
+  if (memoText) builder.addMemo(Stellar.Memo.text(memoText));
+  const tx = builder.build();
   // prepareTransaction simulates and, on success, returns an assembled tx. On a
   // simulation error it throws — surface a readable message.
   return await srv.prepareTransaction(tx);

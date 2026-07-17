@@ -11,7 +11,7 @@ import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from
 import { complete, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
 import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
-import { notifyForReview } from "../notifications.js";
+import { notifyForReview, pushNotification } from "../notifications.js";
 import { config } from "../config.js";
 import { type MaintainerComment } from "../queue.js";
 import {
@@ -27,7 +27,9 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User, Vulnerability } from "../types.js";
+import type { Bounty, Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User, Vulnerability } from "../types.js";
+import { resolveBountyForPR } from "../bounties/prlink.js";
+import { recordBountyEvent } from "../bounties/service.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
 import {
   appendAddedCriteria,
@@ -312,7 +314,26 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     );
     let endGoal = task.endGoal;
     let criteria: Criterion[] = [];
-    if (context.linearSeedCriteria.length && review.criteria.length === 0) {
+    // Persist the bounty linkage whenever one resolves — re-reviews included —
+    // so the contributor verdict endpoint and the assignee notification below
+    // can find this row even if the link was first seen on a later push.
+    if (context.bountyId && review.bountyId !== context.bountyId) {
+      setStatus(review.id, { bountyId: context.bountyId });
+      review.bountyId = context.bountyId;
+    }
+    if (context.bountySeedCriteria.length && review.criteria.length === 0) {
+      // Bounty PR: the acceptance list was LOCKED at funding and shown to the
+      // contributor as "we review against exactly this list" — use it verbatim
+      // and skip synthesis entirely. Priority above the Linear seed: a bounty
+      // that references a Linear-linked issue still reviews against the bounty.
+      criteria = context.bountySeedCriteria.map((c) => ({ ...c, met: null, evidence: null }));
+      endGoal = context.bountyEndGoal || endGoal || "";
+      db.update("tasks", (t) => t.id === task.id, { endGoal });
+      log(review.id, "criteria", "Criteria seeded from bounty (locked at funding)", {
+        detail: endGoal,
+        meta: { count: criteria.length, source: "bounty", bountyId: context.bountyId },
+      });
+    } else if (context.linearSeedCriteria.length && review.criteria.length === 0) {
       // Reuse the criteria DevAsign synthesized when the Linear ticket was
       // opened — keeps the PR review consistent with what the team saw on the
       // ticket and skips a redundant synthesis call.
@@ -779,6 +800,34 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       notifyTitle,
       `${repo.owner}/${repo.name} — ${review.prTitle}`
     );
+    // Bounty PR: also tell the CONTRIBUTOR (the bounty assignee) their verdicts
+    // landed — they don't get install-owner notifications. Shows in the
+    // contributor app's bell with a dashboard link.
+    if (review.bountyId) {
+      const bounty = db.find("bounties", (b) => b.id === review.bountyId);
+      const metCount = filledCriteria.filter((c) => c.met === true).length;
+      if (bounty) {
+        // Activity log: the review verdict is a lifecycle moment the
+        // contributor's timeline shows ("DevAsign review — X of N met").
+        recordBountyEvent(bounty.id, "review_completed", {
+          actor: "system",
+          detail: `${metCount} of ${filledCriteria.length} criteria met`,
+        });
+      }
+      const assignee =
+        bounty?.assigneeGithubId != null
+          ? db.find("users", (u) => u.githubId === bounty.assigneeGithubId)
+          : null;
+      if (bounty && assignee) {
+        pushNotification(
+          assignee.id,
+          "bounty",
+          `${bounty.code} review complete — ${metCount} of ${filledCriteria.length} criteria met`,
+          `${bounty.repo}#${review.prNumber} — ${review.prTitle}`,
+          { link: "/dashboard", reviewId: review.id }
+        );
+      }
+    }
 
     // d. Output: GitHub Check Run + the single verdict comment (+ bodyless
     //    approval / stale-approval dismissal) + broadcast
@@ -992,6 +1041,14 @@ type Context = {
   // review without re-synthesizing. Empty when nothing was cached.
   linearSeedCriteria: Criterion[];
   linearSeedEndGoal: string | null;
+  // The bounty this PR delivers (explicit prNumber link from the contributor's
+  // submission, or a closing-keyword ref), when one exists. Its LOCKED
+  // acceptance list seeds the review verbatim — the bounty page promised the
+  // contributor "DevAsign reviews your PR against exactly this list", so
+  // synthesis must never rewrite it. Takes priority over the Linear seed.
+  bountyId: string | null;
+  bountySeedCriteria: Criterion[];
+  bountyEndGoal: string | null;
   // Repo-scoped guidance materials (Workflow "Ingest context" node), distilled
   // to one authoritative block and injected into the criteria + review steps.
   // Empty string when the repo has none ready.
@@ -1012,6 +1069,9 @@ async function ingestContext(
   let linkedLinearIssue: { id: string; identifier: string; url: string } | null = null;
   let linearSeedCriteria: Criterion[] = [];
   let linearSeedEndGoal: string | null = null;
+  let bountyId: string | null = null;
+  let bountySeedCriteria: Criterion[] = [];
+  let bountyEndGoal: string | null = null;
   // Collect videos referenced anywhere — PR body, issue bodies, attachments.
   // `source` lets the log distinguish what surfaced the URL; de-duped by URL
   // before Gemini runs so a Loom embedded in both the PR and the issue is
@@ -1245,6 +1305,38 @@ async function ingestContext(
     }
   }
 
+  // The bounty this PR delivers, if any: the explicit prNumber link (set by
+  // markInReview via the PR webhook or the contributor's /submit endpoint)
+  // wins; otherwise a closing-keyword ref in the PR body. Only live
+  // (DELEGATED/IN_REVIEW) bounties count — a paid or cancelled bounty must not
+  // re-seed criteria. DB-only, so it works even when the PR fetch failed.
+  const repoFullName = `${repo.owner}/${repo.name}`;
+  const isLive = (b: Bounty) => b.status === "DELEGATED" || b.status === "IN_REVIEW";
+  let linkedBounty =
+    db.find(
+      "bounties",
+      (b) => b.repo === repoFullName && b.prNumber === review.prNumber && isLive(b)
+    ) ?? null;
+  if (!linkedBounty) {
+    const byRef = resolveBountyForPR(repoFullName, prBody);
+    if (byRef && isLive(byRef)) linkedBounty = byRef;
+  }
+  if (linkedBounty) {
+    bountyId = linkedBounty.id;
+    bountyEndGoal =
+      linkedBounty.title +
+      (linkedBounty.description ? ` — ${linkedBounty.description.split("\n")[0]}` : "");
+    // Locked acceptance list → seed criteria with stable `bounty-N` ids (the
+    // prefix-tolerant id parse in appendAddedCriteria keeps later additive
+    // criteria numbering intact alongside these).
+    bountySeedCriteria = linkedBounty.acceptance.map((text, i) => ({
+      id: `bounty-${i + 1}`,
+      text,
+      met: null,
+      evidence: null,
+    }));
+  }
+
   // Repo-scoped guidance materials the maintainer attached on the Workflow
   // "Ingest context" node. Distilled once at add-time; injected here as one
   // authoritative block (threaded into the criteria + review prompts) and also
@@ -1266,6 +1358,9 @@ async function ingestContext(
     linkedLinearIssue,
     linearSeedCriteria,
     linearSeedEndGoal,
+    bountyId,
+    bountySeedCriteria,
+    bountyEndGoal,
     guidance,
   };
 }
