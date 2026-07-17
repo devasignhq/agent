@@ -99,6 +99,14 @@ test("bounty PR: criteria seeded verbatim from the locked acceptance list, synth
     assert.equal(c.id, `bounty-${i + 1}`);
     assert.equal(c.text, ACCEPTANCE[i], "acceptance text is used verbatim");
   });
+  // Regression: verdicts must actually attach to the bounty-N ids. When the
+  // review model answers with ids that don't match (or the verdict JSON is
+  // truncated), every criterion used to silently default to met:null and the PR
+  // read "all criteria not met"; reviewDiff now fails loudly instead.
+  assert.ok(
+    review.criteria.some((c) => c.met !== null),
+    "review verdicts merged onto the seeded bounty-N criteria"
+  );
 
   const logs = db.filter("reviewLogs", (l) => l.reviewId === reviewId);
   assert.ok(
