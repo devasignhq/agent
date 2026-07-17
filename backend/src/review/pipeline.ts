@@ -123,9 +123,14 @@ function emitFindingLog(
 }
 
 function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
-  // Compose a body that includes rationale and (optionally) the codeExample so
-  // the timeline shows the same information the GitHub PR body does.
+  // Compose a body that includes rationale and (optionally) the suggestedChange
+  // diff and codeExample so the timeline shows the same information the GitHub
+  // PR body does.
   const bodyParts = [s.rationale];
+  if (s.suggestedChange) {
+    const fence = codeFence(s.suggestedChange);
+    bodyParts.push(`${fence}diff\n${s.suggestedChange}\n${fence}`);
+  }
   if (s.codeExample) {
     const fence = codeFence(s.codeExample);
     bodyParts.push(`${fence}${fenceLang(s.language)}\n${s.codeExample}\n${fence}`);
@@ -138,6 +143,9 @@ function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
       criterionId: s.criterionId,
       title: s.title,
       body: bodyParts.join("\n\n"),
+      ...(s.path ? { path: s.path } : {}),
+      ...(s.line ? { line: s.line } : {}),
+      ...(s.suggestedChange ? { suggestedChange: s.suggestedChange } : {}),
       ...(s.fixPrompt ? { fixPrompt: s.fixPrompt } : {}),
     },
   });
@@ -2072,7 +2080,10 @@ export function parseReviewVerdict(raw: string, expectedIds: string[]): ReviewVe
       title: String(s.title || ""),
       rationale: String(s.rationale || ""),
       path: s.path ? String(s.path) : undefined,
-      line: s.line != null && Number.isFinite(Number(s.line)) ? Number(s.line) : undefined,
+      line:
+        s.line != null && Number.isInteger(Number(s.line)) && Number(s.line) > 0
+          ? Number(s.line)
+          : undefined,
       suggestedChange: s.suggestedChange ? String(s.suggestedChange) : undefined,
       codeExample: s.codeExample ? String(s.codeExample) : undefined,
       language: s.language ? String(s.language) : undefined,
@@ -2528,6 +2539,10 @@ function buildConsolidatedFixPrompt(args: {
             // usable from the fields we do have.
             lines.push(`**${s.title}**`);
             if (s.rationale) lines.push(s.rationale);
+            if (s.suggestedChange) {
+              lines.push("");
+              appendCodeBlock(lines, s.suggestedChange, "diff");
+            }
             if (s.codeExample) {
               lines.push("");
               appendCodeBlock(lines, s.codeExample, s.language);

@@ -45,6 +45,15 @@ test("valid JSON with matching ids parses and shapes every field", () => {
   assert.equal(v.suggestions[0].suggestedChange, "+ if (!isValidMemo(memo)) throw new Error();");
 });
 
+test("suggestion line numbers that aren't positive integers are dropped", () => {
+  for (const bad of [42.5, -1, 0, "abc"]) {
+    const raw = validVerdict.replace('"line":42', `"line":${JSON.stringify(bad)}`);
+    const v = parseReviewVerdict(raw, ["bounty-1", "bounty-2"]);
+    assert.ok(v);
+    assert.equal(v.suggestions[0].line, undefined, `line=${bad} should be dropped`);
+  }
+});
+
 test("a fenced ```json wrapper still parses", () => {
   const v = parseReviewVerdict("```json\n" + validVerdict + "\n```", ["bounty-1"]);
   assert.ok(v);
