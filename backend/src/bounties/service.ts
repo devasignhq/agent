@@ -23,7 +23,7 @@ import {
   getEscrow,
   hasUsdcTrustline,
 } from "../stellar/escrow.js";
-import { parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
+import { parseInvokeContractCall, parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
 import { pushNotification } from "../notifications.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -267,6 +267,38 @@ export async function submitFunding(bountyId: string, signedXdr: string): Promis
   return recordFunding(bountyId, source, send);
 }
 
+/**
+ * Reject a sponsor-release envelope that doesn't do EXACTLY what we're about to
+ * record. recordSponsorRelease writes the payout row from the bounty's own fields
+ * (task, assignee, sponsor) without ever reading the envelope, so a mismatched
+ * XDR would let the backend mark THIS bounty paid off some other transaction's
+ * hash — e.g. a sponsor of two bounties submitting bounty A's signed release to
+ * bounty B. Confirm the decoded call is release(b.taskId, b.assigneeAddress) on
+ * b.contractId, sourced by b.sponsorAddress, before broadcasting. Returns the
+ * reason to fail with, or null when it matches.
+ */
+export function releaseEnvelopeMismatch(
+  signedXdr: string,
+  b: Bounty
+): "bad_xdr" | "xdr_mismatch" | null {
+  let call;
+  try {
+    call = parseInvokeContractCall(signedXdr);
+  } catch {
+    return "bad_xdr";
+  }
+  // Nothing to match against → refuse rather than record an unverifiable payout.
+  if (!b.sponsorAddress || !b.assigneeAddress) return "xdr_mismatch";
+  const matches =
+    call.source === b.sponsorAddress &&
+    call.contractId === b.contractId &&
+    call.functionName === "release" &&
+    call.args.length === 2 &&
+    call.args[0] === b.taskId &&
+    call.args[1] === b.assigneeAddress;
+  return matches ? null : "xdr_mismatch";
+}
+
 /** Broadcast a sponsor's Freighter-signed `release` (in-app approve) and record it. */
 export async function submitSponsorRelease(
   bountyId: string,
@@ -279,6 +311,10 @@ export async function submitSponsorRelease(
     return { ok: true, reason: `already_${existing.status}`, hash: existing.hash ?? undefined };
   }
   if (b.pendingOp) return { ok: false, reason: "in_flight" };
+  // Verify the client-signed envelope matches this bounty before broadcasting —
+  // the payout row is recorded from b's fields, not the XDR (see the helper).
+  const mismatch = releaseEnvelopeMismatch(signedXdr, b);
+  if (mismatch) return { ok: false, reason: mismatch };
   const send = await sendSignedXdr(signedXdr);
   return recordSponsorRelease(bountyId, send);
 }

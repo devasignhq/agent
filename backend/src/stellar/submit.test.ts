@@ -6,7 +6,30 @@
 //   node --import tsx/esm --test src/stellar/submit.test.ts
 import { test, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { confirmTransaction } from "./submit.js";
+import * as Stellar from "@stellar/stellar-sdk";
+import { confirmTransaction, parseInvokeContractCall } from "./submit.js";
+
+const { Keypair, Account, TransactionBuilder, Contract, StrKey, Address, Operation, Asset, nativeToScVal, BASE_FEE, Networks } = Stellar;
+const CONTRACT = StrKey.encodeContract(Buffer.alloc(32, 7));
+
+// Build a signed one-op `contract.call(fn, ...args)` envelope offline (no RPC),
+// the same shape build.ts produces for a Freighter-signed release.
+function invokeXdr(opts: {
+  source: string;
+  contract?: string;
+  fn?: string;
+  args?: Stellar.xdr.ScVal[];
+}): string {
+  const contract = new Contract(opts.contract ?? CONTRACT);
+  const tx = new TransactionBuilder(new Account(opts.source, "1"), {
+    fee: BASE_FEE,
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(contract.call(opts.fn ?? "release", ...(opts.args ?? [])))
+    .setTimeout(300)
+    .build();
+  return tx.toXDR();
+}
 
 const realFetch = globalThis.fetch;
 afterEach(() => {
@@ -69,4 +92,71 @@ test("malformed body (no result.status) → not_found", async () => {
     },
   })) as unknown as typeof fetch;
   assert.deepEqual(await confirmTransaction("abc"), { status: "not_found" });
+});
+
+// --- parseInvokeContractCall: decode a signed envelope's single invoke ---
+
+test("decodes source, contract, function and native args of a release invoke", () => {
+  const sponsor = Keypair.random().publicKey();
+  const contributor = Keypair.random().publicKey();
+  const xdr = invokeXdr({
+    source: sponsor,
+    fn: "release",
+    args: [nativeToScVal("T".repeat(25), { type: "string" }), new Address(contributor).toScVal()],
+  });
+  const call = parseInvokeContractCall(xdr);
+  assert.equal(call.source, sponsor);
+  assert.equal(call.contractId, CONTRACT);
+  assert.equal(call.functionName, "release");
+  assert.deepEqual(call.args, ["T".repeat(25), contributor]);
+});
+
+test("rejects a non-invoke (classic) operation", () => {
+  const kp = Keypair.random();
+  const tx = new TransactionBuilder(new Account(kp.publicKey(), "1"), {
+    fee: BASE_FEE,
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(Operation.payment({ destination: Keypair.random().publicKey(), asset: Asset.native(), amount: "1" }))
+    .setTimeout(300)
+    .build();
+  assert.throws(() => parseInvokeContractCall(tx.toXDR()), /invokeHostFunction/);
+});
+
+test("rejects a multi-operation envelope", () => {
+  const kp = Keypair.random();
+  const contract = new Contract(CONTRACT);
+  const tx = new TransactionBuilder(new Account(kp.publicKey(), "1"), {
+    fee: BASE_FEE,
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(contract.call("release", nativeToScVal("x", { type: "string" })))
+    .addOperation(Operation.payment({ destination: Keypair.random().publicKey(), asset: Asset.native(), amount: "1" }))
+    .setTimeout(300)
+    .build();
+  assert.throws(() => parseInvokeContractCall(tx.toXDR()), /exactly one operation/);
+});
+
+test("rejects a fee-bump envelope", () => {
+  const innerKp = Keypair.random();
+  const contract = new Contract(CONTRACT);
+  const inner = new TransactionBuilder(new Account(innerKp.publicKey(), "1"), {
+    fee: BASE_FEE,
+    networkPassphrase: Networks.TESTNET,
+  })
+    .addOperation(contract.call("release", nativeToScVal("x", { type: "string" })))
+    .setTimeout(300)
+    .build();
+  inner.sign(innerKp);
+  const fb = TransactionBuilder.buildFeeBumpTransaction(
+    Keypair.random(),
+    (Number(BASE_FEE) * 2).toString(),
+    inner,
+    Networks.TESTNET
+  );
+  assert.throws(() => parseInvokeContractCall(fb.toXDR()), /fee-bump/);
+});
+
+test("rejects garbage that is not a valid envelope", () => {
+  assert.throws(() => parseInvokeContractCall("not-a-valid-xdr"));
 });
