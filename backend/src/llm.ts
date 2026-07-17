@@ -3,6 +3,7 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { config, isGeminiLive, isLLMLive } from "./config.js";
+import { hostMatches } from "./ssrf.js";
 
 const client = isLLMLive() ? new Anthropic({ apiKey: config.llm.apiKey }) : null;
 
@@ -540,12 +541,9 @@ export type VideoSummary = {
   unreliable: boolean;         // true when we couldn't actually watch it
 };
 
-// Match a parsed hostname against a provider's apex domain and any subdomain.
-// hostMatches("www.youtube.com", "youtube.com") → true, but
-// hostMatches("youtube.com.evil.com", "youtube.com") → false.
-function hostMatches(host: string, apex: string): boolean {
-  return host === apex || host.endsWith("." + apex);
-}
+// hostMatches (apex-or-subdomain host check) lives in ssrf.ts — one definition
+// of "is this host theirs?" for every caller. The Linear attachment path is what
+// happened when there were two.
 
 // Classify a video URL by its *parsed hostname*, not a substring match. A raw
 // regex like /youtube\.com\// matches the string anywhere — including a path or

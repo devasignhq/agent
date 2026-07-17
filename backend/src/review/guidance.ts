@@ -6,13 +6,8 @@
 // that text on the Repository (no object storage, no raw PDF bytes). Every
 // review then injects the distilled guidance via buildGuidanceSection().
 
-import { lookup } from "node:dns/promises";
-import net from "node:net";
-import http from "node:http";
-import https from "node:https";
-import type { IncomingMessage } from "node:http";
-
 import { db } from "../db.js";
+import { fetchGuarded } from "../ssrf.js";
 import type { RepoGuidanceItem, Repository } from "../types.js";
 import {
   GUIDANCE_EXTRACT_SYSTEM,
@@ -174,162 +169,30 @@ function isPdfBytes(buf: Buffer): boolean {
   return buf.length >= 5 && buf.toString("latin1", 0, 5) === "%PDF-";
 }
 
-type PinnedAddr = { address: string; family: number };
-type DocResult = { status: number; location: string | null; contentType: string; body: Buffer };
-// One request to an already-validated, IP-pinned host. Overridable for tests.
-type DocTransport = (url: URL, addrs: PinnedAddr[], signal: AbortSignal) => Promise<DocResult>;
+// Fetch a documentation URL behind the shared SSRF guard (ssrf.ts): every
+// redirect hop is re-validated and each socket is pinned to the addresses just
+// checked, so neither a redirect to a private/metadata address nor a DNS-rebind
+// between validation and connect can reach it. The doc-specific bits — the size
+// cap, the Accept headers — stay here; the security lives in ssrf.ts.
+const DOC_HEADERS = {
+  "User-Agent": "devasign-guidance",
+  Accept: "text/html,application/pdf,text/plain,*/*",
+};
 
-// Fetch a documentation URL behind the SSRF guard, following redirects manually
-// and re-validating every hop. The decisive anti-SSRF control is that each hop
-// resolves+validates the host ONCE and then pins the socket to exactly those
-// IPs (see nodeHttpTransport), so neither a redirect to a private/metadata
-// address nor a DNS-rebind between validation and connect can reach it.
 async function fetchGuardedDoc(
   initialUrl: string,
   signal: AbortSignal
 ): Promise<{ buf: Buffer; contentType: string }> {
-  let current = initialUrl;
-  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
-    const { url, addrs } = await resolvePublicUrl(current);
-    const res = await docTransport(url, addrs, signal);
-    if (res.status >= 300 && res.status < 400 && res.status !== 304) {
-      if (!res.location) throw new Error(`redirect with no location (HTTP ${res.status})`);
-      // Resolve relative redirects against the URL we just requested, then loop
-      // back so the new host is itself validated + pinned before we connect.
-      current = new URL(res.location, url).toString();
-      continue;
-    }
-    if (res.status < 200 || res.status >= 300) throw new Error(`fetch failed (HTTP ${res.status})`);
-    return { buf: res.body, contentType: res.contentType };
-  }
-  throw new Error("too many redirects");
-}
-
-// Lock a connection's DNS resolution to the pre-validated addresses, so the
-// socket cannot be steered to a different (private) IP than the one we checked.
-// Matches the net.connect `lookup` contract (dns.lookup-style, with `all`).
-export function pinnedLookup(addrs: PinnedAddr[]) {
-  return (_hostname: string, options: any, cb: any) => {
-    if (options && options.all) cb(null, addrs);
-    else cb(null, addrs[0].address, addrs[0].family);
-  };
-}
-
-// The real transport: a GET over node:http/https, pinned to `addrs` via the
-// `lookup` option (so there is no second DNS resolution to rebind), with SNI +
-// cert validation still keyed off the URL hostname. `Accept-Encoding: identity`
-// keeps the body uncompressed so we can read it without a decompressor.
-const nodeHttpTransport: DocTransport = (url, addrs, signal) =>
-  new Promise<DocResult>((resolve, reject) => {
-    if (signal.aborted) return reject(new Error("request timed out"));
-    const mod = url.protocol === "https:" ? https : http;
-    const req = mod.request(
-      url,
-      {
-        method: "GET",
-        lookup: pinnedLookup(addrs),
-        // Absolute deadline (set by the caller) — aborts connect, headers AND
-        // the body read, so a slow-drip server can't hold the socket open.
-        signal,
-        headers: {
-          "User-Agent": "devasign-guidance",
-          Accept: "text/html,application/pdf,text/plain,*/*",
-          "Accept-Encoding": "identity",
-        },
-      },
-      (res: IncomingMessage) => {
-        const status = res.statusCode || 0;
-        const location = res.headers.location ?? null;
-        const contentType = String(res.headers["content-type"] || "").toLowerCase();
-        // Read the (capped) body even on redirects so the socket drains/frees.
-        readCappedNodeStream(res, MAX_DOC_BYTES)
-          .then((body) => resolve({ status, location, contentType, body }))
-          .catch((err) => reject(asTimeoutOnAbort(err)));
-      }
-    );
-    req.on("error", (err) => reject(asTimeoutOnAbort(err)));
-    req.end();
+  return fetchGuarded(initialUrl, {
+    signal,
+    maxBytes: MAX_DOC_BYTES,
+    maxRedirects: MAX_REDIRECTS,
+    headersFor: () => DOC_HEADERS,
   });
-
-// Map Node's AbortError (fired when our absolute-timeout signal trips) onto the
-// existing "request timed out" message so the errored item reads consistently.
-function asTimeoutOnAbort(err: any): Error {
-  if (err?.name === "AbortError" || err?.code === "ABORT_ERR") return new Error("request timed out");
-  return err instanceof Error ? err : new Error(String(err));
 }
 
-// Indirection so tests can stand in a fake transport without real sockets.
-let docTransport: DocTransport = nodeHttpTransport;
-export function __setDocTransportForTests(t: DocTransport | null): void {
-  docTransport = t || nodeHttpTransport;
-}
-
-// Read a Node response stream, stopping (and destroying it) once it exceeds
-// maxBytes so a surprise multi-GB body can't blow up memory.
-async function readCappedNodeStream(res: IncomingMessage, maxBytes: number): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of res) {
-    const buf = chunk as Buffer;
-    total += buf.length;
-    if (total > maxBytes) {
-      res.destroy();
-      throw new Error("document is too large");
-    }
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks);
-}
-
-// SSRF guard: only fetch public http(s) hosts. Rejects non-http(s) schemes,
-// obvious internal names, and any hostname that resolves to a private, loopback,
-// link-local (incl. cloud metadata 169.254.169.254) or ULA address. Returns the
-// validated addresses so the caller can pin the connection to them.
-export async function resolvePublicUrl(raw: string): Promise<{ url: URL; addrs: PinnedAddr[] }> {
-  let url: URL;
-  try {
-    url = new URL(raw);
-  } catch {
-    throw new Error("invalid URL");
-  }
-  if (url.protocol !== "http:" && url.protocol !== "https:") {
-    throw new Error("only http(s) URLs are allowed");
-  }
-  const host = url.hostname;
-  if (net.isIP(host)) {
-    if (isPrivateIp(host)) throw new Error("URL points at a private address");
-    return { url, addrs: [{ address: host, family: net.isIPv6(host) ? 6 : 4 }] };
-  }
-  if (/^(localhost|.*\.local|.*\.internal)$/i.test(host)) {
-    throw new Error("URL host is not public");
-  }
-  let addrs: PinnedAddr[];
-  try {
-    addrs = await lookup(host, { all: true });
-  } catch {
-    throw new Error("could not resolve host");
-  }
-  if (!addrs.length) throw new Error("could not resolve host");
-  for (const a of addrs) {
-    if (isPrivateIp(a.address)) throw new Error("URL resolves to a private address");
-  }
-  return { url, addrs };
-}
-
-function isPrivateIp(ip: string): boolean {
-  const v = ip.replace(/^::ffff:/i, ""); // unwrap IPv4-mapped IPv6
-  if (net.isIPv4(v)) {
-    const [a, b] = v.split(".").map(Number);
-    if (a === 0 || a === 10 || a === 127) return true;
-    if (a === 169 && b === 254) return true; // link-local + cloud metadata
-    if (a === 172 && b >= 16 && b <= 31) return true;
-    if (a === 192 && b === 168) return true;
-    if (a === 100 && b >= 64 && b <= 127) return true; // CGNAT
-    return false;
-  }
-  const lower = ip.toLowerCase();
-  if (lower === "::1" || lower === "::") return true;
-  if (lower.startsWith("fe80")) return true; // link-local
-  if (lower.startsWith("fc") || lower.startsWith("fd")) return true; // ULA fc00::/7
-  return false;
-}
+// The SSRF guard moved to ssrf.ts so the Linear attachment path could share it
+// rather than reinvent it. Re-exported to keep this module's public surface
+// unchanged — guidance.test.ts drives the doc pipeline through these.
+export { pinnedLookup, resolvePublicUrl } from "../ssrf.js";
+export { __setGuardedTransportForTests as __setDocTransportForTests } from "../ssrf.js";
