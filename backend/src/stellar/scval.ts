@@ -29,6 +29,14 @@ export function isValidPublicKey(addr: string): boolean {
   return StrKey.isValidEd25519PublicKey(addr);
 }
 
+/** True only for a well-formed Soroban contract address (C…). Contracts hold
+ * token balances directly (via the asset contract), so they never use the
+ * classic trustline model — callers that gate on trustlines treat them as
+ * always-receivable. */
+export function isValidContract(addr: string): boolean {
+  return StrKey.isValidContract(addr);
+}
+
 export function addressScVal(addr: string): Stellar.xdr.ScVal {
   assertValidAddress(addr);
   return new Address(addr).toScVal();

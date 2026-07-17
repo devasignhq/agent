@@ -11,7 +11,7 @@ import { config } from "../config.js";
 import { adminAddress, adminKeypair } from "./client.js";
 import { buildEscrowInvoke, simulateEscrowRead } from "./build.js";
 import { sendSignedTx, type SendResult } from "./submit.js";
-import { addressScVal, i128ScVal, isValidPublicKey, stringScVal, taskIdScVal } from "./scval.js";
+import { addressScVal, i128ScVal, isValidContract, isValidPublicKey, stringScVal, taskIdScVal } from "./scval.js";
 
 // ── Client-signed builds (return unsigned prepared XDR for Freighter) ─────────
 
@@ -115,12 +115,17 @@ export async function getUsdcBalance(address: string): Promise<bigint> {
 export async function hasUsdcTrustline(address: string): Promise<boolean> {
   const issuer = config.stellar.usdcIssuer;
   if (!issuer) return true; // no classic trustline model configured
-  // `address` is interpolated into the Horizon path, so reject anything that
-  // isn't a bare classic account id (G…) before the fetch — a value with '/',
-  // '..', or query chars could otherwise steer the request off /accounts/{id}.
-  // Both callers already validate; this is the boundary that makes it safe
-  // regardless. A non-account id can't hold a USDC trustline anyway, so false is
-  // also the correct answer (matches Horizon's 404-for-unknown-account path).
+  // A contract (C…) holds USDC directly via the asset contract, never through a
+  // classic trustline — so the trustline gate doesn't apply and it's always
+  // "receivable" here (a truly unreceivable contract fails at release-time
+  // simulation, the real backstop). Must come before the G-address check.
+  if (isValidContract(address)) return true;
+  // `address` is interpolated into the Horizon path, so reject anything that is
+  // now neither a C-contract (handled above) nor a bare classic account id (G…)
+  // before the fetch — a value with '/', '..', or query chars could otherwise
+  // steer the request off /accounts/{id}. Both callers already validate; this is
+  // the boundary that makes it safe regardless. Malformed input can't receive a
+  // USDC payout, so false is also the correct answer.
   if (!isValidPublicKey(address)) return false;
   try {
     const res = await fetch(

@@ -50,3 +50,12 @@ test("a well-formed G-address is allowed through to the Horizon lookup", async (
   assert.equal(fetched.length, 1, "a valid address should reach exactly one fetch");
   assert.match(fetched[0], new RegExp(`/accounts/${addr}$`), "the address is the final path segment, unaltered");
 });
+
+test("a contract address is allowed and returns true without any fetch", async () => {
+  // Contracts hold USDC via the asset contract, not a classic trustline, so the
+  // Horizon /accounts gate doesn't apply — don't block, and don't probe.
+  const contractAddr = Stellar.StrKey.encodeContract(Buffer.alloc(32, 1));
+  const ok = await hasUsdcTrustline(contractAddr);
+  assert.equal(ok, true, "contract address should be accepted");
+  assert.deepEqual(fetched, [], "no fetch should have been issued for a contract address");
+});
