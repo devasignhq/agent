@@ -442,7 +442,7 @@ bounties.post("/bounties/:id/submit", async (req, res) => {
   // Attributed to the install owner: the assignee is an external contributor.
   void ensurePRReview(b.repo, parsed.prNumber, b.installationId, undefined, {
     attributeToOwner: true,
-  });
+  }).catch((err) => console.warn(`[bounty] ensurePRReview failed for ${b.code}:`, err));
   if (updated) void updateStatusComment(updated);
   res.json({ ok: true, bounty: contributorFacing(updated ?? b, user.githubId) });
 });

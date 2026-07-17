@@ -31,12 +31,19 @@ const WalletModal = ({
   const [warning, setWarning] = React.useState<string | null>(null);
   const ok = isStellarAddr(addr);
   const memoOk = isValidMemo(memo);
+  const timerRef = React.useRef<ReturnType<typeof setTimeout> | null>(null);
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
+
+  // Clear the pending auto-close timer on unmount only. Kept OUT of the keydown
+  // effect above on purpose: onClose is an inline prop (fresh ref every parent
+  // render), so folding this into that effect would let a parent re-render
+  // mid-countdown cancel the timer and leave the modal stuck open.
+  React.useEffect(() => () => { if (timerRef.current) clearTimeout(timerRef.current); }, []);
 
   const save = async () => {
     setBusy(true);
@@ -46,7 +53,7 @@ const WalletModal = ({
       if (!r.trustline) {
         // Saved, but flag it: a payout to a trustline-less account would trap.
         setWarning("Saved — but this wallet doesn't hold a USDC trustline yet. Add one in your wallet app before a payout is due.");
-        setTimeout(() => { onSaved(); onClose(); }, 2600);
+        timerRef.current = setTimeout(() => { onSaved(); onClose(); }, 2600);
         return;
       }
       onSaved();
