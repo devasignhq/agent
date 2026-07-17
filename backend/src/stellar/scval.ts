@@ -22,6 +22,13 @@ export function assertValidAddress(addr: string): void {
   }
 }
 
+/** True only for a well-formed classic account id (G…). Narrower than
+ * assertValidAddress (which also accepts C… contracts) — used where the value is
+ * interpolated into a classic-account URL (Horizon /accounts/{id}). */
+export function isValidPublicKey(addr: string): boolean {
+  return StrKey.isValidEd25519PublicKey(addr);
+}
+
 export function addressScVal(addr: string): Stellar.xdr.ScVal {
   assertValidAddress(addr);
   return new Address(addr).toScVal();

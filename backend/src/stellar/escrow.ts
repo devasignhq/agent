@@ -11,7 +11,7 @@ import { config } from "../config.js";
 import { adminAddress, adminKeypair } from "./client.js";
 import { buildEscrowInvoke, simulateEscrowRead } from "./build.js";
 import { sendSignedTx, type SendResult } from "./submit.js";
-import { addressScVal, i128ScVal, stringScVal, taskIdScVal } from "./scval.js";
+import { addressScVal, i128ScVal, isValidPublicKey, stringScVal, taskIdScVal } from "./scval.js";
 
 // ── Client-signed builds (return unsigned prepared XDR for Freighter) ─────────
 
@@ -115,10 +115,18 @@ export async function getUsdcBalance(address: string): Promise<bigint> {
 export async function hasUsdcTrustline(address: string): Promise<boolean> {
   const issuer = config.stellar.usdcIssuer;
   if (!issuer) return true; // no classic trustline model configured
+  // `address` is interpolated into the Horizon path, so reject anything that
+  // isn't a bare classic account id (G…) before the fetch — a value with '/',
+  // '..', or query chars could otherwise steer the request off /accounts/{id}.
+  // Both callers already validate; this is the boundary that makes it safe
+  // regardless. A non-account id can't hold a USDC trustline anyway, so false is
+  // also the correct answer (matches Horizon's 404-for-unknown-account path).
+  if (!isValidPublicKey(address)) return false;
   try {
-    const res = await fetch(`${config.stellar.horizonUrl.replace(/\/+$/, "")}/accounts/${address}`, {
-      headers: { Accept: "application/json" },
-    });
+    const res = await fetch(
+      `${config.stellar.horizonUrl.replace(/\/+$/, "")}/accounts/${encodeURIComponent(address)}`,
+      { headers: { Accept: "application/json" } }
+    );
     if (res.status === 404) return false; // account doesn't exist → can't receive
     if (!res.ok) return true; // transient Horizon issue → don't block
     const body = (await res.json()) as {

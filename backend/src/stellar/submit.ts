@@ -56,6 +56,47 @@ export function parseTxSource(signedXdr: string): string {
   return (tx as Stellar.Transaction).source;
 }
 
+/** A single-op Soroban contract invocation, decoded from a signed envelope. */
+export type InvokeContractCall = {
+  source: string; // tx source = the signer
+  contractId: string; // C… the invoke targets
+  functionName: string; // e.g. "release"
+  args: unknown[]; // arguments, already scValToNative-decoded (string/bigint/…)
+};
+
+/**
+ * Decode a signed envelope as exactly one `invokeContract` host-function call.
+ * Lets a caller confirm a client-signed envelope does what it claims before
+ * broadcasting it (e.g. that a sponsor "release" targets the right task/assignee).
+ * Throws if the envelope isn't that precise shape — a fee-bump, a multi-op or
+ * non-invoke transaction, or a non-invoke-contract host function — so callers can
+ * treat any throw as a bad/unexpected XDR.
+ */
+export function parseInvokeContractCall(signedXdr: string): InvokeContractCall {
+  const tx = Stellar.TransactionBuilder.fromXDR(signedXdr, networkPassphrase());
+  if (!(tx instanceof Stellar.Transaction)) {
+    throw new Error("envelope is not a simple transaction (fee-bump not accepted)");
+  }
+  if (tx.operations.length !== 1) {
+    throw new Error(`expected exactly one operation, got ${tx.operations.length}`);
+  }
+  const op = tx.operations[0];
+  if (op.type !== "invokeHostFunction") {
+    throw new Error(`expected invokeHostFunction, got ${op.type}`);
+  }
+  const hostFn = op.func;
+  if (hostFn.switch().name !== "hostFunctionTypeInvokeContract") {
+    throw new Error("host function is not an invoke-contract");
+  }
+  const invoke = hostFn.invokeContract();
+  return {
+    source: tx.source,
+    contractId: Stellar.Address.fromScAddress(invoke.contractAddress()).toString(),
+    functionName: invoke.functionName().toString(),
+    args: invoke.args().map((a) => Stellar.scValToNative(a)),
+  };
+}
+
 // Cap a confirmation poll so a hung RPC socket can't stall the keeper tick (the
 // SDK's rpc Server sets no HTTP timeout). Well above a healthy getTransaction.
 const CONFIRM_TIMEOUT_MS = 15_000;
