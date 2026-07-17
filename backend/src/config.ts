@@ -215,21 +215,34 @@ export const isProductionLike = () =>
  * Why `secret` is unfit to sign production sessions, or null if it's usable.
  * Pure and exported so the boot guard and its tests share one definition of
  * "unusable" — see the constants above for the reasoning behind each rule.
+ *
+ * Every rule judges the TRIMMED value, because that is where the entropy is: a
+ * secret pasted into a dashboard field with a stray trailing space is still the
+ * public placeholder plus one guess, and " x " is one character of entropy, not
+ * three. Note we validate the trimmed value but sign with the raw one — deliberate,
+ * and not worth "fixing" by trimming config.sessionSecret at the source: that
+ * would change the signing key under any deploy whose secret has stray
+ * whitespace and log every user out. Judging trimmed is strictly conservative,
+ * so the divergence can only reject secrets, never wave one through.
  */
 export function sessionSecretProblem(secret: string): string | null {
-  if (!secret.trim()) return "it is empty";
-  if (PUBLIC_SESSION_SECRETS.has(secret)) {
-    return `it is ${JSON.stringify(secret)}, a placeholder committed to this repo and therefore public`;
+  const trimmed = secret.trim();
+  if (!trimmed) return "it is empty";
+  if (PUBLIC_SESSION_SECRETS.has(trimmed)) {
+    return `it is ${JSON.stringify(trimmed)}, a placeholder committed to this repo and therefore public`;
   }
-  if (secret.length < MIN_SESSION_SECRET_LENGTH) {
-    return `it is ${secret.length} characters; production requires at least ${MIN_SESSION_SECRET_LENGTH}`;
+  if (trimmed.length < MIN_SESSION_SECRET_LENGTH) {
+    return `it is ${trimmed.length} characters; production requires at least ${MIN_SESSION_SECRET_LENGTH}`;
   }
   return null;
 }
 
 /** True when the secret is usable but shorter than we'd like — warn, don't fail. */
 export const isSessionSecretShort = (secret: string) =>
-  !sessionSecretProblem(secret) && secret.length < RECOMMENDED_SESSION_SECRET_LENGTH;
+  !sessionSecretProblem(secret) && secret.trim().length < RECOMMENDED_SESSION_SECRET_LENGTH;
+
+/** The length the guard actually judged — trimmed, so warnings can't misreport it. */
+export const sessionSecretLength = (secret: string) => secret.trim().length;
 
 export const isDbConfigured = () => Boolean(config.databaseUrl);
 // At-rest encryption for integration tokens. When false, seal/open no-op and

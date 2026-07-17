@@ -31,6 +31,21 @@ test("empty / whitespace-only secrets are rejected", () => {
   assert.ok(sessionSecretProblem("   "));
 });
 
+test("padding a placeholder with whitespace does not smuggle it past the guard", () => {
+  // A stray space pasted into a dashboard field must not turn a public string
+  // into an accepted secret: " dev-secret-replace-me " is the placeholder plus
+  // one guess, and it clears the 16-char floor on raw length alone.
+  assert.ok(sessionSecretProblem(` ${DEV_SESSION_SECRET} `));
+  assert.ok(sessionSecretProblem("\treplace-me-with-a-long-random-string\n"));
+});
+
+test("length is judged on real entropy, not on padding", () => {
+  // 15 real chars + padding to 19 is still 15 chars of entropy → rejected.
+  assert.ok(sessionSecretProblem(`  ${"a".repeat(15)}  `));
+  // Padding must not promote a warn-tier secret to "long enough" either.
+  assert.equal(isSessionSecretShort(`  ${STRONG}  `), true);
+});
+
 test("secrets short enough to grind offline are rejected", () => {
   assert.ok(sessionSecretProblem("x"));
   assert.ok(sessionSecretProblem("hunter2"));

@@ -15,6 +15,7 @@ import {
   isSessionSecretShort,
   isSlackEnvConfigured,
   isStatsigConfigured,
+  sessionSecretLength,
   sessionSecretProblem,
 } from "./config.js";
 import { initStatsig, shutdownStatsig } from "./statsig.js";
@@ -70,8 +71,8 @@ if (isProductionLike()) {
   }
   if (isSessionSecretShort(config.sessionSecret)) {
     console.warn(
-      `[server] ⚠ SESSION_SECRET is only ${config.sessionSecret.length} characters. It is accepted, ` +
-        `but rotate it to a 32-byte random value when convenient. ${HOW_TO_GENERATE}`
+      `[server] ⚠ SESSION_SECRET is only ${sessionSecretLength(config.sessionSecret)} characters. ` +
+        `It is accepted, but rotate it to a 32-byte random value when convenient. ${HOW_TO_GENERATE}`
     );
   }
 }
@@ -80,16 +81,16 @@ if (isProductionLike()) {
 // verifies that HMAC before trusting an event (github/webhooks.ts). With no
 // secret the receiver now FAILS CLOSED (rejects every delivery) — but a prod
 // deployment silently dropping all webhooks is still broken, so keep the same
-// prod signal as the session guard above (https WEB_ORIGIN): refuse to boot.
-// In local dev (http) we only warn; unsigned events can be explicitly allowed
-// with ALLOW_UNSIGNED_WEBHOOKS=1 (never honored on an https origin).
-if (config.secureCookies && !isGithubWebhookConfigured()) {
+// prod signal as the session guard above: refuse to boot.
+// In local dev we only warn; unsigned events can be explicitly allowed with
+// ALLOW_UNSIGNED_WEBHOOKS=1 (never honored in a production-like environment).
+if (isProductionLike() && !isGithubWebhookConfigured()) {
   throw new Error(
-    "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https). " +
+    "GITHUB_APP_WEBHOOK_SECRET must be set in production (WEB_ORIGIN is https, or NODE_ENV=production). " +
       "Refusing to boot: without it the GitHub webhook receiver would accept forged, unsigned events."
   );
 }
-if (!config.secureCookies && !isGithubWebhookConfigured()) {
+if (!isProductionLike() && !isGithubWebhookConfigured()) {
   console.warn(
     config.github.allowUnsignedWebhooks
       ? "[server] ⚠ GITHUB_APP_WEBHOOK_SECRET is unset and ALLOW_UNSIGNED_WEBHOOKS=1 — " +
@@ -105,12 +106,12 @@ if (!config.secureCookies && !isGithubWebhookConfigured()) {
 // NOT throw on a missing DATABASE_URL — it silently falls back to an in-memory
 // store (db.ts), which serves reads fine but persists nothing, so EVERYTHING is
 // wiped on the next redeploy. That failure mode has bitten prod before (see the
-// self-heal note in github/oauth.ts). Same prod signal as the guards above
-// (https WEB_ORIGIN): refuse to boot rather than run a production deploy on a
-// throwaway store. Local/ephemeral dev (http origin) is unaffected.
-if (config.secureCookies && !config.databaseUrl) {
+// self-heal note in github/oauth.ts). Same prod signal as the guards above:
+// refuse to boot rather than run a production deploy on a throwaway store.
+// Local/ephemeral dev trips neither signal and is unaffected.
+if (isProductionLike() && !config.databaseUrl) {
   throw new Error(
-    "DATABASE_URL must be set in production (WEB_ORIGIN is https). Refusing to boot: " +
+    "DATABASE_URL must be set in production (WEB_ORIGIN is https, or NODE_ENV=production). Refusing to boot: " +
       "without it the server runs an in-memory store that is silently wiped on every redeploy."
   );
 }
