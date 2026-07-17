@@ -39,18 +39,18 @@ const ST_LABEL: Record<BountyStatus, string> = {
 const ST_CLS: Record<BountyStatus, string> = {
   PENDING_FUNDING: "warn",
   OPEN: "running",
-  DELEGATED: "nit",
+  DELEGATED: "purple",
   IN_REVIEW: "warn",
-  PAID: "nit",
+  PAID: "cyan",
   CANCELLED: "nit",
   DISPUTED: "danger",
 };
 const ST_DOT: Record<BountyStatus, string> = {
   PENDING_FUNDING: "var(--warn)",
   OPEN: "var(--accent)",
-  DELEGATED: "var(--fg-faint)",
+  DELEGATED: "var(--purple)",
   IN_REVIEW: "var(--warn)",
-  PAID: "var(--green)",
+  PAID: "var(--cyan)",
   CANCELLED: "var(--fg-faint)",
   DISPUTED: "var(--danger)",
 };
@@ -374,7 +374,7 @@ const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hid
 };
 
 const TXN_PILL: Record<EscrowTransaction["status"], { label: string; cls: string }> = {
-  confirmed: { label: "COMPLETED", cls: "running" },
+  confirmed: { label: "COMPLETED", cls: "green" },
   pending: { label: "PENDING", cls: "warn" },
   failed: { label: "FAILED", cls: "danger" },
 };
