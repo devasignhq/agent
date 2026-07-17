@@ -17,7 +17,15 @@ const validVerdict = JSON.stringify({
   ],
   comments: [{ path: "src/app.ts", line: 10, body: "note" }],
   suggestions: [
-    { criterionId: "bounty-2", title: "Validate memos", rationale: "r", fixPrompt: "Fix: ..." },
+    {
+      criterionId: "bounty-2",
+      title: "Validate memos",
+      rationale: "r",
+      path: "backend/src/stellar/memo.ts",
+      line: 42,
+      suggestedChange: "+ if (!isValidMemo(memo)) throw new Error();",
+      fixPrompt: "Fix: ...",
+    },
   ],
 });
 
@@ -31,6 +39,10 @@ test("valid JSON with matching ids parses and shapes every field", () => {
   assert.equal(v.suggestions.length, 1);
   assert.equal(v.suggestions[0].criterionId, "bounty-2");
   assert.equal(v.suggestions[0].codeExample, undefined);
+  // New location/diff fields pass through the explicit mapper.
+  assert.equal(v.suggestions[0].path, "backend/src/stellar/memo.ts");
+  assert.equal(v.suggestions[0].line, 42);
+  assert.equal(v.suggestions[0].suggestedChange, "+ if (!isValidMemo(memo)) throw new Error();");
 });
 
 test("a fenced ```json wrapper still parses", () => {
