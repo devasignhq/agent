@@ -12,6 +12,7 @@ import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLL
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
 import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review/workflow.js";
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
+import { parseIntegrationInput } from "../integrations/validate.js";
 import { detectVideoProvider } from "../llm.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { defaultDeletionDeps, purgeAccount, type DeletionDeps } from "../account.js";
@@ -1147,23 +1148,26 @@ api.get("/integrations", (req, res) => {
   res.json(safe);
 });
 
-api.post("/integrations", (req, res) => {
+// Exported (like meHandler) so the auth + validation + insert wiring is testable
+// without standing up the HTTP server.
+export function createIntegrationHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  const { type, tokens, workspaceMeta } = req.body || {};
-  if (!type || !tokens) return void res.status(400).json({ error: "type_and_tokens_required" });
+  // Whitelist the type, require a well-formed credential, and cap workspaceMeta
+  // before the raw body becomes a row the review/broadcast paths later trust.
+  const parsed = parseIntegrationInput(req.body);
+  if (!parsed.ok) return void res.status(400).json({ error: parsed.error });
   const row = {
     id: uuid(),
     userId: user.id,
-    type,
-    tokens,
-    workspaceMeta: workspaceMeta || {},
+    ...parsed.value,
     createdAt: Date.now(),
   };
   db.insert("integrations", row);
-  track(user, "integration connected", { integration_type: type });
+  track(user, "integration connected", { integration_type: row.type });
   res.json({ ok: true, id: row.id });
-});
+}
+api.post("/integrations", createIntegrationHandler);
 
 api.delete("/integrations/:id", (req, res) => {
   const user = getSessionUser(req);
