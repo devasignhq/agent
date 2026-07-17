@@ -11,8 +11,11 @@ import {
   isGithubAppConfigured,
   isGithubWebhookConfigured,
   isLLMLive,
+  isProductionLike,
+  isSessionSecretShort,
   isSlackEnvConfigured,
   isStatsigConfigured,
+  sessionSecretProblem,
 } from "./config.js";
 import { initStatsig, shutdownStatsig } from "./statsig.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
@@ -33,15 +36,44 @@ import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 
-// Session cookies are JWTs signed with SESSION_SECRET; the default placeholder is
-// public, so signing with it in prod would be no better than not signing at all.
-// secureCookies (an https WEB_ORIGIN) is our prod signal — refuse to boot rather
-// than mint forgeable sessions. Local/ephemeral dev runs over http, so unaffected.
-if (config.secureCookies && config.sessionSecret === "dev-secret-replace-me") {
-  throw new Error(
-    "SESSION_SECRET must be set to a real secret in production (WEB_ORIGIN is https). " +
-      "Refusing to boot with the 'dev-secret-replace-me' placeholder."
-  );
+// Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
+// fund/cancel/approve links in bounties/links.ts. A secret that is public (either
+// committed placeholder) or short enough to grind offline lets anyone mint a
+// cookie for any user id, so refuse to boot rather than serve forgeable sessions.
+// Local/ephemeral dev and `npm test` trip neither prod signal, so they keep using
+// the dev fallback untouched.
+const HOW_TO_GENERATE =
+  'Generate one with: node -e "console.log(require(\'crypto\').randomBytes(32).toString(\'hex\'))"';
+
+if (isProductionLike()) {
+  const problem = sessionSecretProblem(config.sessionSecret);
+  if (problem) {
+    throw new Error(
+      `SESSION_SECRET is unusable in production: ${problem}. ` +
+        `Refusing to boot — sessions signed with it are forgeable by anyone. ${HOW_TO_GENERATE}`
+    );
+  }
+  // SESSION_SECRET_PREVIOUS is verification-only, but a token signed with a
+  // public old secret still verifies, so it needs the same bar. This is a real
+  // trap, not a hypothetical: rotating off a placeholder by moving it here (to
+  // avoid dropping live sessions) is the natural reading of the error above, and
+  // it would quietly leave the hole wide open.
+  for (const previous of config.sessionSecretPrevious) {
+    const previousProblem = sessionSecretProblem(previous);
+    if (previousProblem) {
+      throw new Error(
+        `SESSION_SECRET_PREVIOUS contains an entry that is unusable in production: ${previousProblem}. ` +
+          "Refusing to boot — cookies signed with that entry would still verify. Remove it; " +
+          "sessions signed with it expire on their own within 7 days."
+      );
+    }
+  }
+  if (isSessionSecretShort(config.sessionSecret)) {
+    console.warn(
+      `[server] ⚠ SESSION_SECRET is only ${config.sessionSecret.length} characters. It is accepted, ` +
+        `but rotate it to a 32-byte random value when convenient. ${HOW_TO_GENERATE}`
+    );
+  }
 }
 
 // GitHub signs every webhook with GITHUB_APP_WEBHOOK_SECRET, and the receiver

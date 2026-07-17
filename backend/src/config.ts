@@ -26,6 +26,31 @@ function loadStellarKey(): string {
   return "";
 }
 
+// The fallback used when SESSION_SECRET is unset. Local dev only — it is in the
+// repo, so it is public, and the boot guard in server.ts refuses to start a
+// production deploy that is still signing with it.
+export const DEV_SESSION_SECRET = "dev-secret-replace-me";
+
+// Every session secret that is public knowledge: the dev fallback above and the
+// placeholder .env.example ships. Signing with either is no better than not
+// signing at all — anyone can mint a session cookie for any user id, or a bounty
+// fund/cancel/approve link for any bounty (bounties/links.ts signs those with
+// this same key). .env.example's value belongs here precisely because copying
+// that file to a server is the likeliest way a real deploy ends up with a known
+// secret; matching only the code default would let that path through.
+const PUBLIC_SESSION_SECRETS = new Set([
+  DEV_SESSION_SECRET,
+  "replace-me-with-a-long-random-string",
+]);
+
+// A secret shorter than this can be ground offline against a captured cookie, so
+// it's a boot failure. We *recommend* 32 (`randomBytes(32).toString("hex")` = 64
+// hex chars) and only warn below it: 16+ chars of real randomness is already far
+// out of brute-force range for HS256, and hard-failing at 32 would take a live
+// deploy down on its next boot over a secret that is short but perfectly safe.
+const MIN_SESSION_SECRET_LENGTH = 16;
+const RECOMMENDED_SESSION_SECRET_LENGTH = 32;
+
 export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
@@ -40,7 +65,7 @@ export const config = {
   // (and only wanted) once the dashboard is served over https — i.e. prod. In
   // local dev WEB_ORIGIN is http://localhost, so cookies stay SameSite=Lax.
   secureCookies: (process.env.WEB_ORIGIN || "").startsWith("https://"),
-  sessionSecret: process.env.SESSION_SECRET || "dev-secret-replace-me",
+  sessionSecret: process.env.SESSION_SECRET || DEV_SESSION_SECRET,
   // Old session secrets, accepted for verification only (never for signing) so
   // rotating SESSION_SECRET doesn't invalidate every live session at once. Set
   // SESSION_SECRET to the new key and SESSION_SECRET_PREVIOUS to the old one(s),
@@ -175,6 +200,36 @@ export const config = {
 export const allowedWebOrigins = (): string[] => [
   ...new Set([config.webOrigin, config.contributorOrigin].filter(Boolean)),
 ];
+
+// Are we running a real deployment? Two independent signals, either of which is
+// enough. An https WEB_ORIGIN is the convention the webhook/DB boot guards in
+// server.ts already use, but it can't stand alone for the session guard: a deploy
+// that forgets WEB_ORIGIN silently falls back to http://localhost:5173, which
+// switches that signal off exactly when the guard matters most. NODE_ENV is set
+// to "production" by Render (and most hosts), so it catches that case. Neither is
+// set in local dev or under `npm test`, so both stay on the dev fallback.
+export const isProductionLike = () =>
+  config.secureCookies || process.env.NODE_ENV === "production";
+
+/**
+ * Why `secret` is unfit to sign production sessions, or null if it's usable.
+ * Pure and exported so the boot guard and its tests share one definition of
+ * "unusable" — see the constants above for the reasoning behind each rule.
+ */
+export function sessionSecretProblem(secret: string): string | null {
+  if (!secret.trim()) return "it is empty";
+  if (PUBLIC_SESSION_SECRETS.has(secret)) {
+    return `it is ${JSON.stringify(secret)}, a placeholder committed to this repo and therefore public`;
+  }
+  if (secret.length < MIN_SESSION_SECRET_LENGTH) {
+    return `it is ${secret.length} characters; production requires at least ${MIN_SESSION_SECRET_LENGTH}`;
+  }
+  return null;
+}
+
+/** True when the secret is usable but shorter than we'd like — warn, don't fail. */
+export const isSessionSecretShort = (secret: string) =>
+  !sessionSecretProblem(secret) && secret.length < RECOMMENDED_SESSION_SECRET_LENGTH;
 
 export const isDbConfigured = () => Boolean(config.databaseUrl);
 // At-rest encryption for integration tokens. When false, seal/open no-op and
