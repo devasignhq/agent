@@ -123,9 +123,14 @@ function emitFindingLog(
 }
 
 function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
-  // Compose a body that includes rationale and (optionally) the codeExample so
-  // the timeline shows the same information the GitHub PR body does.
+  // Compose a body that includes rationale and (optionally) the suggestedChange
+  // diff and codeExample so the timeline shows the same information the GitHub
+  // PR body does.
   const bodyParts = [s.rationale];
+  if (s.suggestedChange) {
+    const fence = codeFence(s.suggestedChange);
+    bodyParts.push(`${fence}diff\n${s.suggestedChange}\n${fence}`);
+  }
   if (s.codeExample) {
     const fence = codeFence(s.codeExample);
     bodyParts.push(`${fence}${fenceLang(s.language)}\n${s.codeExample}\n${fence}`);
@@ -138,6 +143,9 @@ function emitSuggestionLog(reviewId: string, s: ReviewSuggestion) {
       criterionId: s.criterionId,
       title: s.title,
       body: bodyParts.join("\n\n"),
+      ...(s.path ? { path: s.path } : {}),
+      ...(s.line ? { line: s.line } : {}),
+      ...(s.suggestedChange ? { suggestedChange: s.suggestedChange } : {}),
       ...(s.fixPrompt ? { fixPrompt: s.fixPrompt } : {}),
     },
   });
@@ -1895,6 +1903,17 @@ type ReviewSuggestion = {
   criterionId: string;
   title: string;
   rationale: string;
+  // Repo-relative file path / 1-based new-file line the suggestion anchors to,
+  // for the "path/to/file.ts (Line N)" heading in the verdict comment.
+  path?: string;
+  line?: number;
+  // Unified-diff-style snippet of the PROPOSED edit (+/- lines, minimal
+  // context). Distinct from fixPrompt's "Relevant diff", which quotes the
+  // CURRENT PR diff hunk verbatim.
+  suggestedChange?: string;
+  // The complete updated function/block with the fix applied when the whole
+  // original is visible in the diff; a minimal snippet otherwise. Never a
+  // full file.
   codeExample?: string;
   // GitHub-flavored-markdown language identifier for `codeExample`, so the
   // fenced block renders colored on GitHub (e.g. "typescript", "python").
@@ -1922,7 +1941,7 @@ async function reviewDiff(
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
     "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string}], " +
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
-    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"codeExample\"?: string, \"language\"?: string, \"fixPrompt\": string}]}. " +
+    "\"suggestions\": [{\"criterionId\": string, \"title\": string, \"rationale\": string, \"path\"?: string, \"line\"?: number, \"suggestedChange\"?: string, \"codeExample\"?: string, \"language\"?: string, \"fixPrompt\": string}]}. " +
     "Be specific about evidence — quote the diff where possible. " +
     "For every criterion you mark met:false, `evidence` MUST be a concrete, non-empty 1-2 sentence explanation of why it is not met: name the function/file and state what the diff currently does (or fails to do) relative to the requirement. Never leave it empty, and never just restate the criterion text back. " +
     // Stateful re-review: each criterion carries the verdict it got on an
@@ -1941,8 +1960,10 @@ async function reviewDiff(
     "positive `summary`. Never manufacture issues to appear thorough. " +
     "For every unmet criterion, include one suggestion describing the smallest practical patch the developer " +
     "could ship in a follow-up commit; prefer best-practice idioms already used in the diff. " +
-    "`codeExample` is optional and must be a minimal snippet, never a full file. " +
+    "`codeExample` is optional. When the complete original function or block being changed is fully visible in the diff, `codeExample` MUST be the complete updated function or block with your suggested fix applied — copy the visible code exactly and change only what the fix requires; never invent lines you cannot see in the diff. When the full function is not visible, fall back to a minimal snippet showing just the changed lines. Never output a full file. " +
     "When you include `codeExample`, set `language` to its GitHub-flavored-markdown language identifier (lowercase, e.g. typescript, tsx, python, go, rust, bash, json, yaml); omit `language` if the snippet has no clear language. " +
+    "Each suggestion SHOULD include `path` (the repo-relative file path exactly as it appears in the diff) and `line` (the 1-based line number in the new version of that file where the fix lands, derived from the hunk headers); omit both only when the suggestion does not map to a specific location. " +
+    "Each suggestion SHOULD include `suggestedChange`: a short unified-diff-style snippet of the proposed edit — added lines prefixed with '+', removed lines prefixed with '-', at most 2-3 unchanged context lines, no @@ hunk headers. This shows your PROPOSED change; it is not the same as fixPrompt's 'Relevant diff', which must keep quoting the current PR diff verbatim. Reference only code visible in the diff. " +
     "Inline `comments` annotate specific diff lines; only emit them when the comment ties to a concrete line. " +
     // fixPrompt: a copy-pasteable prompt for an external AI coding agent
     // (Cursor / Claude Code / Codex). Self-contained — must include the
@@ -2058,6 +2079,12 @@ export function parseReviewVerdict(raw: string, expectedIds: string[]): ReviewVe
       criterionId: String(s.criterionId || ""),
       title: String(s.title || ""),
       rationale: String(s.rationale || ""),
+      path: s.path ? String(s.path) : undefined,
+      line:
+        s.line != null && Number.isInteger(Number(s.line)) && Number(s.line) > 0
+          ? Number(s.line)
+          : undefined,
+      suggestedChange: s.suggestedChange ? String(s.suggestedChange) : undefined,
       codeExample: s.codeExample ? String(s.codeExample) : undefined,
       language: s.language ? String(s.language) : undefined,
       fixPrompt: s.fixPrompt ? String(s.fixPrompt) : undefined,
@@ -2154,26 +2181,72 @@ export function formatReviewBody(
     }
     lines.push("");
   }
+  // Suggestions rendered inline under an unmet criterion below are "consumed" —
+  // they must not repeat in the residual "Suggested changes" section. Regressed
+  // criteria keep their brief format above, so their suggestions stay residual.
+  const consumed = new Set<ReviewSuggestion>();
   if (unmet.length) {
     lines.push("### Acceptance criteria not met");
     lines.push(
-      "These requirements aren't satisfied by the current diff yet — each shows what was required and why it isn't met.",
+      "These requirements aren't satisfied by the current diff yet — each shows what was required, why it isn't met, and a suggested fix.",
       ""
     );
-    for (const c of unmet) {
+    unmet.forEach((c, i) => {
+      const matched = suggestionsForCriterion(c.id, suggestions);
+      for (const s of matched) consumed.add(s);
       // met:null means the model returned no verdict for this criterion (as
       // opposed to positively judging it unmet) — say that honestly instead of
       // asserting a failure we have no evidence for. It still blocks approval.
-      if (c.met === null) {
-        lines.push(`- **${c.id} — Could not be evaluated**`);
-        lines.push(`  - Required: ${c.text}`);
-        lines.push(`  - Why: ${(c.evidence || "").trim() || "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it)."}`);
+      const status = c.met === null ? "Could not be evaluated" : "Not met";
+      const why =
+        c.met === null
+          ? (c.evidence || "").trim() ||
+            "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it)."
+          : reasonOrFallback(c.evidence);
+      // Heading anchors on the first suggestion's file location + title when we
+      // have them; the criterion id + status always follow on the status line.
+      const anchor = matched[0];
+      if (anchor && anchor.path) {
+        const where = `**${anchor.path}**${anchor.line ? ` (Line ${anchor.line})` : ""}`;
+        lines.push(`#### ${i + 1}. ${where}${anchor.title ? ` — ${anchor.title}` : ""}`);
+      } else if (anchor && anchor.title) {
+        lines.push(`#### ${i + 1}. ${anchor.title}`);
       } else {
-        lines.push(`- **${c.id} — Not met**`);
-        lines.push(`  - Required: ${c.text}`);
-        lines.push(`  - Why it's not met: ${reasonOrFallback(c.evidence)}`);
+        lines.push(`#### ${i + 1}. ${c.id} — ${status}`);
       }
-    }
+      lines.push("");
+      lines.push(`**${c.id} — ${status}.** Required: ${c.text}`);
+      lines.push("");
+      if (matched.length === 0) {
+        lines.push(`**Reasoning:** ${why}`);
+        lines.push("");
+      }
+      matched.forEach((s, j) => {
+        // First suggestion's rationale joins the criterion's evidence in one
+        // Reasoning paragraph; later ones stand on their own rationale.
+        const reasoning = [j === 0 ? why : "", s.rationale || ""]
+          .filter(Boolean)
+          .join(" ");
+        if (reasoning) {
+          lines.push(`**Reasoning:** ${reasoning}`);
+          lines.push("");
+        }
+        if (s.suggestedChange) {
+          lines.push("**Suggested Change:**");
+          lines.push("");
+          // Hard-code the diff language tag — the LLM's `language` field
+          // describes `codeExample`, not this snippet.
+          appendCodeBlock(lines, s.suggestedChange, "diff");
+          lines.push("");
+        }
+        if (s.codeExample) {
+          lines.push("**Full Code:**");
+          lines.push("");
+          appendCodeBlock(lines, s.codeExample, s.language);
+          lines.push("");
+        }
+      });
+    });
     lines.push("");
   }
   if (met.length) {
@@ -2221,19 +2294,27 @@ export function formatReviewBody(
     lines.push("");
   }
 
-  if (suggestions.length) {
+  // Only suggestions NOT already rendered under an unmet criterion above land
+  // here (spec-less PRs, suggestions for met/regressed criteria, mismatched
+  // ids). No inline per-suggestion prompts — the consolidated dropdown at the
+  // bottom carries the copyable AI-agent prompt.
+  const residual = suggestions.filter((s) => !consumed.has(s));
+  if (residual.length) {
     lines.push("### Suggested changes");
-    for (const s of suggestions) {
+    for (const s of residual) {
       const heading = s.criterionId
         ? `#### For ${s.criterionId} — ${s.title}`
         : `#### ${s.title}`;
       lines.push(heading);
       if (s.rationale) lines.push(s.rationale);
+      if (s.suggestedChange) {
+        lines.push("");
+        appendCodeBlock(lines, s.suggestedChange, "diff");
+      }
       if (s.codeExample) {
         lines.push("");
         appendCodeBlock(lines, s.codeExample, s.language);
       }
-      appendFixPrompt(lines, s.fixPrompt);
       lines.push("");
     }
   }
@@ -2394,6 +2475,22 @@ function collectConsolidatedFindings(
 // `fixPrompt`s the LLM already produces (each carries File / Symbol / Issue
 // / Suggested approach / Relevant diff) so we incur no extra LLM cost; this
 // is pure string composition.
+// Match suggestions to a criterion by NORMALIZED id (trim + lowercase),
+// mirroring the verdict→criterion merge in runReviewJob. The review LLM can
+// echo `criterionId` in a different case/whitespace than the criterion's id
+// ("C1" vs "c1"); a strict === would drop the patch and fall back to the
+// generic fallbacks. Normalize at the comparison only — not on the stored
+// suggestion — so rendered headings keep the LLM's original casing.
+function suggestionsForCriterion(
+  id: unknown,
+  suggestions: ReviewSuggestion[]
+): ReviewSuggestion[] {
+  const cid = String(id ?? "").trim().toLowerCase();
+  return suggestions.filter(
+    (s) => String(s.criterionId ?? "").trim().toLowerCase() === cid
+  );
+}
+
 function buildConsolidatedFixPrompt(args: {
   prTitle: string;
   repoFullName: string;
@@ -2426,17 +2523,7 @@ function buildConsolidatedFixPrompt(args: {
       );
       lines.push("");
       lines.push("How to fix:");
-      // Match suggestions to this criterion by NORMALIZED id (trim + lowercase),
-      // mirroring the verdict→criterion merge in runReviewJob. The review LLM can
-      // echo `criterionId` in a different case/whitespace than the criterion's id
-      // ("C1" vs "c1"); a strict === would drop the patch and fall back to the
-      // generic "no specific patch" line. Normalize at the comparison only — not
-      // on the stored suggestion — so the "### Suggested changes" heading keeps the
-      // LLM's original casing.
-      const cid = String(c.id ?? "").trim().toLowerCase();
-      const relevant = suggestions.filter(
-        (s) => String(s.criterionId ?? "").trim().toLowerCase() === cid
-      );
+      const relevant = suggestionsForCriterion(c.id, suggestions);
       if (relevant.length === 0) {
         lines.push("No specific patch was suggested for this criterion. Implement the change so the Required behavior above holds, using \"What's wrong now\" as the starting point, then verify the criterion passes.");
         lines.push("");
@@ -2452,6 +2539,10 @@ function buildConsolidatedFixPrompt(args: {
             // usable from the fields we do have.
             lines.push(`**${s.title}**`);
             if (s.rationale) lines.push(s.rationale);
+            if (s.suggestedChange) {
+              lines.push("");
+              appendCodeBlock(lines, s.suggestedChange, "diff");
+            }
             if (s.codeExample) {
               lines.push("");
               appendCodeBlock(lines, s.codeExample, s.language);

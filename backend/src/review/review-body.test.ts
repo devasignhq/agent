@@ -18,27 +18,27 @@ const crit = (over: Partial<Criterion> = {}): Criterion => ({
   ...over,
 });
 
-test("unmet criterion WITH evidence: status + required + why", () => {
+test("unmet criterion WITH evidence: numbered entry with status + required + reasoning", () => {
   const c = crit({
     evidence:
       "linkInstallationHandler links the installation without comparing account.id to the caller's githubId.",
   });
   const body = formatReviewBody("Gate installation claiming on ownership.", [c], []);
   assert.match(body, /### Acceptance criteria not met/);
-  assert.match(body, /\*\*C1 — Not met\*\*/);
-  assert.match(body, /- Required: Personal claims succeed when account\.id/);
-  assert.match(body, /- Why it's not met: linkInstallationHandler links the installation/);
+  assert.match(body, /#### 1\. C1 — Not met/);
+  assert.match(body, /\*\*C1 — Not met\.\*\* Required: Personal claims succeed when account\.id/);
+  assert.match(body, /\*\*Reasoning:\*\* linkInstallationHandler links the installation/);
   assert.doesNotMatch(body, EMOJI);
 });
 
 test("unmet criterion WITHOUT evidence: still gets a status, requirement, and a fallback reason", () => {
   const body = formatReviewBody("Gate installation claiming on ownership.", [crit()], []);
-  assert.match(body, /\*\*C1 — Not met\*\*/);
-  assert.match(body, /- Required: Personal claims succeed/);
+  assert.match(body, /#### 1\. C1 — Not met/);
+  assert.match(body, /\*\*C1 — Not met\.\*\* Required: Personal claims succeed/);
   // reasonOrFallback fills the gap so the item is never bare.
   assert.match(
     body,
-    /- Why it's not met: The current diff doesn't yet show this requirement being satisfied\./
+    /\*\*Reasoning:\*\* The current diff doesn't yet show this requirement being satisfied\./
   );
   assert.doesNotMatch(body, EMOJI);
 });
@@ -49,12 +49,90 @@ test("criterion with NO verdict (met:null) renders 'Could not be evaluated', not
     [crit({ met: null, evidence: null })],
     []
   );
-  assert.match(body, /\*\*C1 — Could not be evaluated\*\*/);
-  assert.match(body, /- Required: Personal claims succeed/);
-  assert.match(body, /- Why: The reviewer could not evaluate this requirement against the diff/);
+  assert.match(body, /#### 1\. C1 — Could not be evaluated/);
+  assert.match(body, /\*\*C1 — Could not be evaluated\.\*\* Required: Personal claims succeed/);
+  assert.match(
+    body,
+    /\*\*Reasoning:\*\* The reviewer could not evaluate this requirement against the diff/
+  );
   // It must NOT claim positive evidence of failure.
   assert.doesNotMatch(body, /C1 — Not met/);
   assert.doesNotMatch(body, /doesn't yet show this requirement being satisfied/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("unmet criterion with a full suggestion: file heading, Reasoning, Suggested Change diff, Full Code", () => {
+  const c = crit({ evidence: "no ownership comparison is performed." });
+  const suggestion = {
+    criterionId: "C1",
+    title: "Gate the claim on verified ownership",
+    rationale: "Compare account.id to the caller's githubId before linking.",
+    path: "backend/src/routes/install.ts",
+    line: 42,
+    suggestedChange:
+      '+  if (account.id !== caller.githubId) {\n+    return res.status(403).json({ error: "not_owner" });\n+  }',
+    codeExample: "async function linkInstallationHandler(req, res) {\n  // updated\n}",
+    language: "typescript",
+    fixPrompt: "Fix: gate claim on ownership\n\nExpected behavior:\nReject with 403.",
+  };
+  const body = formatReviewBody(
+    "Gate installation claiming on ownership.",
+    [c],
+    [suggestion],
+    EMPTY_HOLISTIC,
+    { prTitle: "Gate installation claiming", repoFullName: "devasign/app" }
+  );
+  // Screenshot-style heading: numbered, file path + line, one-line title.
+  assert.match(
+    body,
+    /#### 1\. \*\*backend\/src\/routes\/install\.ts\*\* \(Line 42\) — Gate the claim on verified ownership/
+  );
+  assert.match(body, /\*\*C1 — Not met\.\*\* Required: Personal claims succeed/);
+  // Reasoning merges the criterion evidence with the suggestion rationale.
+  assert.match(
+    body,
+    /\*\*Reasoning:\*\* no ownership comparison is performed\. Compare account\.id to the caller's githubId/
+  );
+  assert.match(body, /\*\*Suggested Change:\*\*/);
+  assert.match(body, /```diff\n\+ {2}if \(account\.id !== caller\.githubId\)/);
+  assert.match(body, /\*\*Full Code:\*\*/);
+  assert.match(body, /```typescript\nasync function linkInstallationHandler/);
+  // The suggestion was consumed inline — no residual section, no inline prompt.
+  assert.doesNotMatch(body, /### Suggested changes/);
+  assert.doesNotMatch(body, /\*\*Prompt for your AI agent:\*\*/);
+  // The consolidated dropdown still carries the copyable prompt.
+  assert.match(body, /One prompt to fix all of this/);
+  assert.match(body, /Fix: gate claim on ownership/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("orphan suggestion (no matching unmet criterion) renders under 'Suggested changes' without an inline prompt", () => {
+  const suggestion = {
+    criterionId: "C9",
+    title: "Tighten the retry loop",
+    rationale: "Only retry on 5xx responses.",
+    suggestedChange: "-  if (err) retry();\n+  if (err.status >= 500) retry();",
+    fixPrompt: "Fix: scope retry to 5xx",
+  };
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [suggestion]);
+  assert.match(body, /### Suggested changes/);
+  assert.match(body, /#### For C9 — Tighten the retry loop/);
+  assert.match(body, /```diff\n- {2}if \(err\) retry\(\);/);
+  assert.doesNotMatch(body, /\*\*Prompt for your AI agent:\*\*/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("suggestedChange containing a triple-backtick run is wrapped in a wider fence", () => {
+  const c = crit({ evidence: "docs fence is malformed." });
+  const suggestion = {
+    criterionId: "C1",
+    title: "Fix the docs fence",
+    rationale: "Close the code fence.",
+    suggestedChange: "+ ```js\n+ const x = 1;\n+ ```",
+  };
+  const body = formatReviewBody("Some goal.", [c], [suggestion]);
+  // codeFence must widen past the inner ``` run so GitHub doesn't close early.
+  assert.match(body, /````+diff\n\+ ```js/);
   assert.doesNotMatch(body, EMOJI);
 });
 
