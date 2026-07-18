@@ -48,6 +48,7 @@ body {
   font-family: var(--sans);
   font-size: 14px;
   line-height: 1.45;
+  zoom: 1.1;
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "ss01", "cv11";
 }
@@ -142,17 +143,15 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   align-items: center;
   gap: 10px;
   padding: 7px 10px;
-  color: var(--fg-dim);
+  color: #ffffff;
   font-size: 13px;
   cursor: pointer;
   border-left: 2px solid transparent;
   border-radius: 0;
 }
-.sb-item:hover { background: var(--bg-2); color: var(--fg); }
-.sb-item.active { background: var(--bg-2); color: var(--fg); border-left-color: var(--accent); }
+.sb-item:hover { background: var(--bg-2); color: #ffffff; }
+.sb-item.active { background: var(--bg-2); color: var(--accent); border-left-color: var(--accent); }
 .sb-item .icon { width: 16px; height: 16px; flex-shrink: 0; display: grid; place-items: center; color: currentColor; }
-.sb-item .kbd { margin-left: auto; font-family: var(--mono); font-size: 10px; color: var(--fg-faint); }
-.sb-item.active .kbd { color: var(--fg-mute); }
 
 .sb-foot {
   margin-top: auto;
@@ -3288,7 +3287,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   width: 18px; height: 18px;
   display: grid; place-items: center;
   border: 1px solid var(--line-2);
-  margin-top: 1px;
+  align-self: center;
 }
 .ac-row.met .ac-check { background: var(--accent); border-color: var(--accent); color: #052413; }
 .ac-row.unmet .ac-check { color: var(--danger); border-color: rgba(255,90,95,0.4); }

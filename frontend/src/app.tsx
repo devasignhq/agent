@@ -33,10 +33,10 @@ const useIsMobile = () => {
 export { useIsMobile };
 
 const NAV = [
-  { key: "agent",     name: "Agents",    icon: "agent",     kbd: "g a" },
-  { key: "workflow",  name: "Workflow",  icon: "workflow",  kbd: "g w" },
-  { key: "bounty",    name: "Bounty",    icon: "bounties",  kbd: "g b" },
-  { key: "settings",  name: "Settings",  icon: "settings",  kbd: "g s" },
+  { key: "agent",     name: "Agents",    icon: "agent" },
+  { key: "workflow",  name: "Workflow",  icon: "workflow" },
+  { key: "bounty",    name: "Bounty",    icon: "bounties" },
+  { key: "settings",  name: "Settings",  icon: "settings" },
 ];
 
 const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
@@ -55,7 +55,6 @@ const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
              onClick={() => setCurrent(n.key)}>
           <span className="icon"><Icon name={n.icon} size={15}/></span>
           <span className="sb-label">{n.name}</span>
-          <span className="kbd">{n.kbd}</span>
         </div>
       ))}
     </div>
@@ -672,24 +671,6 @@ const AppContent = () => {
     root.style.setProperty("--accent-glow", t.accent + "26");
     root.style.setProperty("--mono", FONT_OPTIONS[t.mono] || FONT_OPTIONS["Geist Mono"]);
   }, [t.accent, t.mono]);
-
-  // Keyboard shortcuts: g + (a/d/b/w/s)
-  React.useEffect(() => {
-    let last = 0, lastKey = "";
-    const onKey = (e) => {
-      if (stage !== "app") return;
-      if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
-      const now = Date.now();
-      if (e.key === "g") { lastKey = "g"; last = now; return; }
-      if (lastKey === "g" && now - last < 800) {
-        const map = { a: "agent", w: "workflow", b: "bounty", s: "settings" };
-        if (map[e.key]) { setCurrent(map[e.key]); e.preventDefault(); }
-        lastKey = "";
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [stage]);
 
   if (stage === "loading") {
     return (
