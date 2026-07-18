@@ -1,6 +1,9 @@
 /* DevAsign — terminal/CLI dark theme */
 
 :root {
+  /* Global UI scale (see body{zoom}). Full-height shells divide their vh math
+     by this so the app still fits the viewport exactly and never overscrolls. */
+  --zoom: 1.1;
   --bg: #0a0b0d;
   --bg-1: #0f1114;
   --bg-2: #14171b;
@@ -54,7 +57,7 @@ body {
   line-height: 1.45;
   /* Non-standard property (unsupported in Firefox); scales the whole UI up a step.
      Prefer rem/em-based scaling if broader browser support is ever needed. */
-  zoom: 1.1;
+  zoom: var(--zoom);
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "ss01", "cv11";
 }
@@ -81,7 +84,16 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 ::-webkit-scrollbar-corner { background: transparent; }
 
 /* Layout */
-.app { display: grid; grid-template-columns: auto 1fr; height: 100vh; }
+/* The app shell is exactly one viewport tall (the /var(--zoom) compensates for
+   body{zoom} inflating vh units) and clips anything that would poke past it,
+   so the document itself can never grow a page-level scrollbar — panels that
+   have more content than fits scroll internally (.content, pane bodies). */
+.app {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  height: calc(100vh / var(--zoom));
+  overflow: hidden;
+}
 .app.density-compact { --pad: 12px; --row-h: 28px; font-size: 13px; }
 .app.density-cozy { --pad: 20px; --row-h: 36px; font-size: 14px; }
 
@@ -93,6 +105,12 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   display: flex;
   flex-direction: column;
   transition: width 0.18s ease;
+  /* Never let the sidebar grow past the app shell: it fills the shell's
+     height exactly, so the footer (username) is always on-screen. Only if
+     the window is shorter than the sidebar's own content does it scroll
+     internally — the page never scrolls because of it. */
+  min-height: 0;
+  overflow-y: auto;
 }
 .sidebar.icon-only { width: 56px; }
 .sb-head {
@@ -427,7 +445,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 
 /* Auth screen */
 .auth-shell {
-  min-height: 100vh;
+  min-height: calc(100vh / var(--zoom));
   display: grid;
   grid-template-columns: 1fr 1fr;
   background: var(--bg);
@@ -494,7 +512,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 
 /* Onboarding */
 .ob-shell {
-  min-height: 100vh;
+  min-height: calc(100vh / var(--zoom));
   display: grid;
   grid-template-columns: 280px 1fr;
   background: var(--bg);
@@ -832,7 +850,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .agent-shell {
   display: flex;
   flex-direction: column;
-  height: calc(100vh - 48px);
+  height: calc(100vh / var(--zoom) - 48px);
   padding: 16px;
   gap: 12px;
   min-height: 0;
@@ -848,7 +866,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   display: grid;
   grid-template-columns: 1fr 1fr;
   gap: 16px;
-  height: calc(100vh - 48px - 24px);
+  height: calc(100vh / var(--zoom) - 48px - 24px);
   padding: 16px;
 }
 
