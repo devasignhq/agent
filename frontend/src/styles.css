@@ -7,8 +7,11 @@
   --bg-3: #1a1e23;
   --line: #1f242a;
   --line-2: #2a3038;
+  --white: #ffffff;
   --fg: #e6e8eb;
-  --sidebar-fg: #ffffff;
+  /* Sidebar text/icons: intentionally pure white (brighter than --fg) for
+     max legibility against the dark rail; derives from the --white primitive. */
+  --sidebar-fg: var(--white);
   --fg-dim: #a0a6ad;
   --fg-mute: #6b7280;
   --fg-faint: #4b5563;
