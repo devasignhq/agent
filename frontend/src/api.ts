@@ -440,11 +440,6 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
-  syncReviews: () =>
-    request<{ ok: true; discovered: number; enqueued: number; errors: Array<{ repo: string; message: string }> }>(
-      `/api/reviews/sync`,
-      { method: "POST", body: "{}" }
-    ),
 
   // tasks
   task: (id: string) => request<Task>(`/api/tasks/${id}`),
