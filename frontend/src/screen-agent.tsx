@@ -366,7 +366,7 @@ const RepoSelect = ({ value, onChange, options }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // PR queue (left rail)
 // ────────────────────────────────────────────────────────────────────────────
-const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", onSync, syncing, repoFilter, onRepoChange, repoOptions = [] }) => {
+const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", repoFilter, onRepoChange, repoOptions = [] }) => {
   const active = reviews.filter((p) => p.status === "running").length;
   const queued = reviews.filter((p) => p.status === "queued").length;
   return (
@@ -376,16 +376,6 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
         <h3 className="card-title">Review queue</h3>
         <div className="flex gap-2 items-center">
           <span className="pill running"><i className="dot pulse"></i> {active} running</span>
-          {onSync && (
-            <button
-              className="btn sm ghost"
-              title="Re-pull open PRs from connected repos"
-              onClick={onSync}
-              disabled={syncing}
-            >
-              <Icon name="spark" size={11} /> {syncing ? "…" : "Sync"}
-            </button>
-          )}
         </div>
       </div>
       <div className="mute mono" style={{ fontSize: 11, marginTop: 6 }}>
@@ -402,12 +392,10 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", on
           <div style={{ textAlign: "center", maxWidth: 280 }}>
             <Icon name="git" size={20} color="var(--fg-mute)" />
             <div className="mono" style={{ fontSize: 13, marginTop: 10 }}>
-              {syncing ? "Syncing open PRs…" : "No open PRs to review"}
+              No open PRs to review
             </div>
             <div className="mute" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>
-              {syncing
-                ? "Pulling open PRs from your connected repos…"
-                : "No open PRs found on connected repos. Click Sync to retry, or open a PR on GitHub."}
+              No open PRs found on connected repos. Open a PR on GitHub to start a review.
             </div>
           </div>
         </div>
@@ -716,16 +704,11 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
           <span className="mono mute" style={{ fontSize: 11 }}>
             {sources.length} source{sources.length === 1 ? "" : "s"}
           </span>
-          <button className="btn sm ghost"><Icon name="spark" size={11} /> Re-ingest</button>
         </div>
       </div>
 
       <div className="agent-pane-body goal-panel-body">
-        <h2 className="drawer-title" style={{ fontSize: 16 }}>{goal.title}</h2>
-        <div className="flex gap-2 items-center" style={{ marginBottom: 18, flexWrap: "wrap" }}>
-          <span className="pill info"><i className="dot"></i> {goal.ticket.id}</span>
-          <span className="pill"><i className="dot"></i> {goal.ticket.source}</span>
-        </div>
+        <h2 className="drawer-title" style={{ fontSize: 16, marginBottom: 18 }}>{goal.title}</h2>
 
         <div className="drawer-section">
           <div className="drawer-label">sources analyzed</div>
@@ -1463,8 +1446,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   const [pickedId, setPickedId] = React.useState(null);     // backend review.id (uuid)
   const [detail, setDetail] = React.useState(null);         // { review, logs, task }
   const [error, setError] = React.useState(null);
-  const [syncing, setSyncing] = React.useState(false);
-  const [syncStats, setSyncStats] = React.useState(null);   // { discovered, enqueued, errors }
 
   const refreshList = React.useCallback(async () => {
     try {
@@ -1476,23 +1457,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       setError(err.message || String(err));
     }
   }, []);
-
-  // On mount, pull every open PR from every connected repo into the queue.
-  // The endpoint is idempotent — PRs we've already seen are skipped, and only
-  // the newly-discovered ones are enqueued for review.
-  const syncOpenPRs = React.useCallback(async () => {
-    setSyncing(true);
-    try {
-      const r = await api.syncReviews();
-      setSyncStats(r);
-      await refreshList();
-    } catch (err) {
-      setError(err.message || String(err));
-    } finally {
-      setSyncing(false);
-    }
-  }, [refreshList]);
-  React.useEffect(() => { syncOpenPRs(); }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Live queue refresh. Poll continuously so PRs that arrive on the backend
   // via webhook (which inserts a new prReview row) show up in the queue
@@ -1535,55 +1499,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [refreshList]);
-
-  // Periodic auto-sync from GitHub. Webhook delivery is best-effort —
-  // localhost setups without a tunnel never receive them, and even healthy
-  // tunnels lose events during reconnects or server restarts. Calling the
-  // existing `POST /api/reviews/sync` endpoint on a slow timer closes that
-  // gap: it pulls open PRs directly from every connected repo and inserts
-  // any rows the webhook handler missed. The endpoint is idempotent — PRs
-  // we've already seen are skipped, so this is cheap to run repeatedly.
-  //
-  // 30s is the worst-case discovery latency; the fast queue refresh
-  // (~6s) still picks up any newly-inserted row well before the next
-  // sync tick. Runs silently — does NOT flip the `syncing` flag, so the
-  // "Sync" button and the stat-tile "syncing…" hint stay reserved for
-  // explicit user-initiated syncs.
-  React.useEffect(() => {
-    let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const runSync = async () => {
-      try {
-        const r = await api.syncReviews();
-        if (!cancelled) setSyncStats(r);
-        // The queue refresh effect picks up the new rows on its own
-        // cadence — no need to call refreshList() here.
-      } catch {
-        // Swallow: transient sync errors (rate limit, network blip)
-        // shouldn't take the page down. If the failure is persistent the
-        // queue simply won't grow, and the user can hit "Sync" manually
-        // to surface the error via syncOpenPRs's banner path.
-      }
-    };
-    const tick = async () => {
-      if (cancelled) return;
-      if (document.visibilityState === "visible") await runSync();
-      if (cancelled) return;
-      timer = setTimeout(tick, 30_000);
-    };
-    // Don't run immediately on mount — the existing syncOpenPRs() already
-    // fires on mount, so we just schedule the first periodic tick.
-    timer = setTimeout(tick, 30_000);
-    const onVisible = () => {
-      if (document.visibilityState === "visible") runSync();
-    };
-    document.addEventListener("visibilitychange", onVisible);
-    return () => {
-      cancelled = true;
-      if (timer) clearTimeout(timer);
-      document.removeEventListener("visibilitychange", onVisible);
-    };
-  }, []);
 
   // Is the selected review still in flight? Read from the queue's live list
   // (kept fresh by the queue poll), so it flips to false the moment the review
@@ -1904,7 +1819,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         <div className="stat">
           <div className="stat-label">open PR reviews</div>
           <div className="stat-value">{stats.openReviews}</div>
-          <div className="stat-delta">{syncing ? "syncing…" : "in flight"}</div>
+          <div className="stat-delta">in flight</div>
         </div>
         <div className="stat">
           <div className="stat-label">reviews passed</div>
@@ -1920,18 +1835,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       {error && (
         <div className="card" style={{ padding: 12, marginBottom: 12, borderColor: "var(--danger)" }}>
           <div className="mono" style={{ color: "var(--danger)", fontSize: 12 }}>API error: {error}</div>
-        </div>
-      )}
-      {syncStats?.errors?.length > 0 && (
-        <div className="card" style={{ padding: 12, marginBottom: 12, borderColor: "var(--warn)" }}>
-          <div className="mono" style={{ color: "var(--warn)", fontSize: 12, marginBottom: 4 }}>
-            Couldn't sync {syncStats.errors.length} repo{syncStats.errors.length === 1 ? "" : "s"}:
-          </div>
-          {syncStats.errors.slice(0, 3).map((e, i) => (
-            <div key={i} className="mute mono" style={{ fontSize: 11 }}>
-              {e.repo}: {e.message}
-            </div>
-          ))}
         </div>
       )}
 
@@ -1965,8 +1868,6 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           onPick={handlePick}
           reviews={filteredReviews}
           workspace={repos[0] ? repos[0].owner : "no repos yet"}
-          onSync={syncOpenPRs}
-          syncing={syncing}
           repoFilter={repoFilter}
           onRepoChange={setRepoFilter}
           repoOptions={repoOptions}
@@ -1976,18 +1877,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           <div className="agent-pane-head">
             <div className="flex gap-3 items-center">
               <h3 className="card-title">Review log{pr ? ` · ${pr.repo}#${pr.id}` : ""}</h3>
-              <span className="pill"><i className="dot"></i> {events.length} events</span>
               {pr?.status === "running" && <span className="pill info"><i className="dot pulse"></i> live</span>}
-            </div>
-            <div className="flex gap-2 items-center">
-              <button
-                className="btn sm ghost"
-                onClick={() => pickedId && api.rerunReview(pickedId).then(refreshList).catch((e) => alert(`Re-run failed: ${e.message || e}`))}
-                disabled={!pickedId}
-                title="Re-queue this review"
-              >
-                <Icon name="spark" size={11} /> Re-run
-              </button>
             </div>
           </div>
           <div
