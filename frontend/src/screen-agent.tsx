@@ -728,11 +728,6 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
         </div>
 
         <div className="drawer-section">
-          <div className="drawer-label">summary</div>
-          <p style={{ fontSize: 13, color: "var(--fg-dim)", lineHeight: 1.6 }}>{goal.ticket.summary}</p>
-        </div>
-
-        <div className="drawer-section">
           <div className="drawer-label">sources analyzed</div>
           {sources.length === 0 && (
             <div className="mute mono" style={{ fontSize: 12, padding: "6px 0" }}>
@@ -800,8 +795,8 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
             <div className="ac-row" style={{ opacity: 0.85 }}>
                 <div className="ac-check"><Icon name="check" size={11} /></div>
                 <div>
-                  <div style={{ fontSize: 13 }}>No acceptance criteria — reviewed for correctness only.</div>
-                  <div className="mute mono" style={{ fontSize: 11, marginTop: 3 }}>
+                  <div style={{ fontSize: 13, color: "var(--fg)" }}>No acceptance criteria — reviewed for correctness only.</div>
+                  <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>
                     Add an end goal on the PR (description, Loom, or screenshot + notes) to enable criteria checks.
                   </div>
                 </div>
@@ -813,9 +808,9 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                   {a.met ? <Icon name="check" size={11} /> : a.regressed ? <Icon name="warn" size={11} /> : <span className="mono">!</span>}
                 </div>
                 <div>
-                  <div style={{ fontSize: 13 }}>{a.text}</div>
-                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
-                  {a.note && <div className="mute mono" style={{ fontSize: 11, marginTop: 3 }}>{a.note}</div>}
+                  <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
+                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
+                  {a.note && <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>{a.note}</div>}
                 </div>
                 <span className="mono mute" style={{ fontSize: 10, justifySelf: "end" }}>AC-{a.id}</span>
               </div>
