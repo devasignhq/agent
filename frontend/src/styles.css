@@ -8,6 +8,7 @@
   --line: #1f242a;
   --line-2: #2a3038;
   --fg: #e6e8eb;
+  --sidebar-fg: #ffffff;
   --fg-dim: #a0a6ad;
   --fg-mute: #6b7280;
   --fg-faint: #4b5563;
@@ -48,6 +49,8 @@ body {
   font-family: var(--sans);
   font-size: 14px;
   line-height: 1.45;
+  /* Non-standard property (unsupported in Firefox); scales the whole UI up a step.
+     Prefer rem/em-based scaling if broader browser support is ever needed. */
   zoom: 1.1;
   -webkit-font-smoothing: antialiased;
   font-feature-settings: "ss01", "cv11";
@@ -143,13 +146,13 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   align-items: center;
   gap: 10px;
   padding: 7px 10px;
-  color: #ffffff;
+  color: var(--sidebar-fg);
   font-size: 13px;
   cursor: pointer;
   border-left: 2px solid transparent;
   border-radius: 0;
 }
-.sb-item:hover { background: var(--bg-2); color: #ffffff; }
+.sb-item:hover { background: var(--bg-2); color: var(--sidebar-fg); }
 .sb-item.active { background: var(--bg-2); color: var(--accent); border-left-color: var(--accent); }
 .sb-item .icon { width: 16px; height: 16px; flex-shrink: 0; display: grid; place-items: center; color: currentColor; }
 

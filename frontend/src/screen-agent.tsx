@@ -796,7 +796,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                 <div className="ac-check"><Icon name="check" size={11} /></div>
                 <div>
                   <div style={{ fontSize: 13, color: "var(--fg)" }}>No acceptance criteria — reviewed for correctness only.</div>
-                  <div className="mute mono" style={{ fontSize: 12.5, marginTop: 3 }}>
+                  <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>
                     Add an end goal on the PR (description, Loom, or screenshot + notes) to enable criteria checks.
                   </div>
                 </div>
@@ -809,8 +809,8 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                 </div>
                 <div>
                   <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
-                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 12.5, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
-                  {a.note && <div className="mute mono" style={{ fontSize: 12.5, marginTop: 3 }}>{a.note}</div>}
+                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
+                  {a.note && <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>{a.note}</div>}
                 </div>
                 <span className="mono mute" style={{ fontSize: 10, justifySelf: "end" }}>AC-{a.id}</span>
               </div>
