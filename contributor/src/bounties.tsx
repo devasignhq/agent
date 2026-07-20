@@ -388,7 +388,7 @@ export function BountiesPage() {
           </div>
         </div>
         {list.map(({ b, st }) => (
-          <div key={b.id} className={`c-bp-item ${st.key} ${sel && sel.b.id === b.id ? "sel" : ""}`} onClick={() => setSelId(b.id)}>
+          <div key={b.id} className={`c-bp-item st-${st.key} ${sel && sel.b.id === b.id ? "sel" : ""}`} onClick={() => setSelId(b.id)}>
             <div className="c-bp-item-top">
               <span className="c-bp-item-repo">{b.repo}#{b.issueNumber}</span>
               <span className="c-bp-item-amt">{b.amountUsdc.toLocaleString()}<span className="u">USDC</span></span>
