@@ -1,0 +1,56 @@
+{
+  "_readme": [
+    "Corpus for `npm run eval:criteria`. Public GitHub issues only — the harness",
+    "fetches them unauthenticated, so private issues will simply 404 and skip.",
+    "",
+    "The default set below is third-party issues chosen to span the axes that",
+    "actually stress the prompt: a concrete bug, an API-rename that names real",
+    "symbols, a scoped feature request, a sprawling issue that tempts",
+    "out-of-scope criteria, a near-empty body, and a title-only issue.",
+    "",
+    "`repoRoot` is optional and points at a LOCAL checkout of that same repo. It",
+    "makes the harness synthesise an approximate file index (leading comments +",
+    "regex-extracted exports, no API cost) and feed it as `repo_context` — the",
+    "only way to exercise the `invented_from_context` failure mode. Pair it only",
+    "with issues from that repo; feeding one project's issue another project's",
+    "file summaries produces meaningless flags.",
+    "",
+    "For a real pre-ship check, replace these with issues from YOUR repos and set",
+    "repoRoot on each, so the eval measures the prompt on the codebases it will",
+    "actually run against."
+  ],
+  "issues": [
+    {
+      "url": "https://github.com/expressjs/express/issues/7362",
+      "note": "concrete bug, clear repro — the easy case; criteria should be tight"
+    },
+    {
+      "url": "https://github.com/expressjs/express/issues/7365",
+      "note": "detailed bug with spec references — tempts over-long criteria"
+    },
+    {
+      "url": "https://github.com/axios/axios/issues/11070",
+      "note": "internal-implementation bug — tempts dictates_implementation"
+    },
+    {
+      "url": "https://github.com/vitejs/vite/issues/22977",
+      "note": "names a real exported symbol — checks the path/export hint path"
+    },
+    {
+      "url": "https://github.com/vitejs/vite/issues/22980",
+      "note": "scoped feature request; a UI ask that tempts not_pr_verifiable"
+    },
+    {
+      "url": "https://github.com/vitejs/vite/issues/22957",
+      "note": "long and sprawling — the main out_of_scope risk"
+    },
+    {
+      "url": "https://github.com/expressjs/express/issues/7370",
+      "note": "vague, almost no content — should yield few criteria or none"
+    },
+    {
+      "url": "https://github.com/expressjs/express/issues/7383",
+      "note": "empty body, title only — must NOT invent requirements"
+    }
+  ]
+}

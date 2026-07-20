@@ -1,7 +1,9 @@
 // Statsig server SDK singleton — the backend's analytics sink (successor to
-// the removed PostHog client). All call sites go through track(), which
-// no-ops while the client is unconfigured/uninitialized and never throws:
-// analytics is best-effort and must not break a request path.
+// the removed PostHog client) and feature-gate source. Analytics call sites go
+// through track(), which no-ops while the client is unconfigured/uninitialized
+// and never throws: analytics is best-effort and must not break a request path.
+// Gates go through checkGate(), which deliberately does NOT share that no-op
+// rule — see the comment there.
 import { Statsig, StatsigUser } from "@statsig/statsig-node-core";
 import { config, isStatsigConfigured } from "./config.js";
 import type { User } from "./types.js";
@@ -63,6 +65,51 @@ export function track(
     client.logEvent(toStatsigUser(user), event, null, normalizeMetadata(metadata));
   } catch (err) {
     console.warn(`[statsig] failed to log "${event}":`, err);
+  }
+}
+
+/**
+ * Every feature gate this backend reads, in one place so the set is greppable
+ * and the names stay consistent with the Statsig console. snake_case to match
+ * everything else Statsig-facing here (pr_number, github_login, est_cost_usd).
+ */
+export const GATES = {
+  /** Draft acceptance criteria when a bounty is created (bounties/criteria-job.ts). */
+  bountyCriteriaDrafting: "bounty_criteria_drafting",
+} as const;
+
+/**
+ * Feature-gate check — the first in this codebase, so it sets the pattern.
+ *
+ * The obvious implementation is track()'s `if (!client) return` no-op guard,
+ * but a gate is not an event sink and copying it would be wrong: `client` is
+ * null in local dev AND across the entire test suite (nothing outside
+ * server.ts calls initStatsig), so a bare fail-closed gate would silently
+ * disable the gated feature everywhere except production. Three states, not
+ * two:
+ *
+ *   unconfigured      -> `fallback`. No provider means "no rollout control
+ *                        available", NOT "no features": dev, tests and
+ *                        self-hosted installs keep working.
+ *   configured        -> the console is the only authority. An unknown or
+ *                        disabled gate is false, which is the exposure control.
+ *   init failed/throw -> false. Fail CLOSED, so a Statsig outage can never
+ *                        silently switch on a half-rolled-out feature in prod.
+ *
+ * Sync, like track(): the node-core SDK's checkGate returns a boolean, not a
+ * promise. Deliberately does NOT lazily initialize — the test script blanks
+ * ANTHROPIC_API_KEY/GEMINI_API_KEY but not STATSIG_SECRET_KEY, so a developer
+ * with that var exported would start making real network calls during
+ * `npm test`. Init stays owned by server.ts.
+ */
+export function checkGate(user: User | string, gate: string, fallback = false): boolean {
+  if (!isStatsigConfigured()) return fallback;
+  if (!client) return false;
+  try {
+    return client.checkGate(toStatsigUser(user), gate);
+  } catch (err) {
+    console.warn(`[statsig] gate check failed for "${gate}":`, err);
+    return false;
   }
 }
 

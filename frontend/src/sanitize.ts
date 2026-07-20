@@ -1,6 +1,6 @@
 // Framework-agnostic text-safety helpers for the agent composer. Kept DOM-free
 // (no DOMPurify import here) so they can be unit-tested under `node --test`,
-// which has no jsdom — mirrors the workflow-save.ts extraction pattern. The
+// which has no jsdom — mirrors the optimistic-save.ts extraction pattern. The
 // DOMPurify wiring that consumes SANITIZE_ALLOWED_* lives in screen-agent.tsx,
 // since DOMPurify needs a browser DOM and its methods don't exist under bare node.
 

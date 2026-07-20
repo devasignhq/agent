@@ -10,7 +10,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "seed": "tsx scripts/seed.ts",
     "dev:ephemeral": "tsx scripts/ephemeral-dev.ts",
-    "test": "ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test 'src/**/*.test.ts'"
+    "test": "ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts'",
+    "eval:criteria": "tsx scripts/eval-criteria.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",

@@ -75,12 +75,25 @@ export type GuidanceIngestJob = {
   attempts: number;
 };
 
+// Draft a bounty's acceptance criteria from its issue + the repo index, right
+// after creation. Drains in the review bucket, NOT the index bucket: a sponsor
+// is about to follow the "Fund bounty" link out of a GitHub comment and would
+// otherwise sit behind a multi-minute repo index build.
+export type BountyCriteriaJob = {
+  id: string;
+  type: "bounty_criteria";
+  payload: { bountyId: string };
+  enqueuedAt: number;
+  attempts: number;
+};
+
 export type Job =
   | ReviewJob
   | MaintainerFeedbackJob
   | IndexJob
   | LinearIngestJob
-  | GuidanceIngestJob;
+  | GuidanceIngestJob
+  | BountyCriteriaJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -114,6 +127,26 @@ export function enqueueMaintainerFeedback(
     id: uuid(),
     type: "maintainer_feedback",
     payload: { reviewId, comment },
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.reviews.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueBountyCriteria(bountyId: string): BountyCriteriaJob {
+  // Idempotent, for the same reason enqueueReview is: a webhook redelivery or a
+  // re-comment could ask twice, and a second job would burn a second LLM call
+  // to overwrite the first one's answer.
+  const waiting = pending.reviews.find(
+    (j): j is BountyCriteriaJob => j.type === "bounty_criteria" && j.payload.bountyId === bountyId
+  );
+  if (waiting) return waiting;
+  const job: BountyCriteriaJob = {
+    id: uuid(),
+    type: "bounty_criteria",
+    payload: { bountyId },
     enqueuedAt: Date.now(),
     attempts: 0,
   };

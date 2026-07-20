@@ -6,7 +6,12 @@
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= node --import tsx/esm --test src/queue.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { enqueueMaintainerFeedback, enqueueReview, queueSnapshot } from "./queue.js";
+import {
+  enqueueBountyCriteria,
+  enqueueMaintainerFeedback,
+  enqueueReview,
+  queueSnapshot,
+} from "./queue.js";
 
 test("enqueueReview dedupes a review that is already pending", () => {
   const first = enqueueReview("review-1");
@@ -33,4 +38,28 @@ test("maintainer-feedback jobs are not collapsed into review jobs", () => {
     sourceEvent: "issue_comment",
   });
   assert.equal(queueSnapshot().reviews, before + 1);
+});
+
+// ── bounty criteria drafting ─────────────────────────────────────────────────
+// Same idempotency argument as enqueueReview: a webhook redelivery or a
+// re-comment can ask twice, and the second job would burn another LLM call
+// only to overwrite the first one's answer.
+test("enqueueBountyCriteria dedupes a bounty that is already pending", () => {
+  const first = enqueueBountyCriteria("bounty-1");
+  const second = enqueueBountyCriteria("bounty-1");
+  assert.equal(second.id, first.id);
+});
+
+test("different bounties still enqueue independently", () => {
+  const before = queueSnapshot().reviews;
+  enqueueBountyCriteria("bounty-2");
+  assert.equal(queueSnapshot().reviews, before + 1);
+});
+
+test("criteria jobs drain in the reviews bucket, never behind an index build", () => {
+  const before = queueSnapshot();
+  enqueueBountyCriteria("bounty-3");
+  const after = queueSnapshot();
+  assert.equal(after.reviews, before.reviews + 1, "a sponsor is waiting on this");
+  assert.equal(after.index, before.index, "must not queue behind a multi-minute repo index");
 });

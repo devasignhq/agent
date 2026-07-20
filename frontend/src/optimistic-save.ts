@@ -1,7 +1,10 @@
-// The durability-aware "optimistic save" state machine for the Workflow screen,
-// lifted out of the React component (screen-workflow.tsx) so it can be unit-tested
-// without a DOM — see workflow-save.test.ts. The component's save() is a thin
-// wrapper that binds these dependencies to React state setters and refs.
+// The durability-aware "optimistic save" state machine, lifted out of React so
+// it can be unit-tested without a DOM — see optimistic-save.test.ts. Callers
+// bind these dependencies to their own state setters and refs.
+//
+// Used by the Workflow screen (a RepoWorkflow, scoped by repo) and by the bounty
+// funding page (the acceptance list, scoped by bounty). Generic in the value
+// because the machine never inspects it — only stores, repaints and reverts it.
 //
 // Behaviour: paint `next` immediately. If persistence succeeds, confirm durable.
 // If it fails with a TRANSIENT durability blip (HTTP 503 not_durable — the backend
@@ -10,9 +13,8 @@
 // ONCE after a short delay; if that re-confirm also 503s, leave the optimistic
 // state but swap the notice for a terminal "saving in the background" note instead
 // of an endless spinner. Any other failure reverts and shows the error. All
-// deferred state is scoped to the save's target repo + a monotonic token, so a
-// newer save — or switching repos mid-save — can't bleed into the current UI.
-import type { RepoWorkflow } from "./api";
+// deferred state is scoped to the save's target + a monotonic token, so a newer
+// save — or switching target mid-save — can't bleed into the current UI.
 
 // Delay before the single re-confirm after a transient not_durable. The barrier
 // only 503s after exhausting its own multi-second retry loop, so an immediate
@@ -29,21 +31,24 @@ export function isTransientNotDurable(e: any): boolean {
 // the backend's friendly `body.message` over the raw error code.
 export function saveErrorMessage(e: any): string {
   if (e?.message === "upgrade_required") return "That control is a Pro/Max feature.";
+  if (e?.message === "already_funded") return "This bounty is funded — its criteria are locked.";
   return e?.body?.message || e?.message || "Couldn't save — reverted.";
 }
 
-export type SaveDeps = {
-  repoId: string;
-  // The currently-selected repo, read just before any deferred state is applied. A
-  // save pins its target repo (repoId above); if the user switches repos while it's
-  // in flight, its outcome must NOT bleed into the new repo's UI. Optional — when
-  // omitted only the seq token guards currency (used by tests that ignore repos).
-  activeRepoId?: () => string;
-  // The current workflow at call time — restored verbatim on a hard failure.
-  getPrev: () => RepoWorkflow | null;
-  // Persist the workflow (production binds api.setRepoWorkflow).
-  persist: (repoId: string, next: RepoWorkflow) => Promise<unknown>;
-  setWf: (wf: RepoWorkflow | null) => void;
+export type SaveDeps<T> = {
+  // What this save targets: a repo id on the Workflow screen, a bounty id on the
+  // funding page. Pinned per save so a stale outcome can be discarded.
+  scopeId: string;
+  // The currently-selected target, read just before any deferred state is applied.
+  // If the user switches while a save is in flight, its outcome must NOT bleed
+  // into the new target's UI. Optional — when omitted only the seq token guards
+  // currency (used by tests that ignore scoping).
+  activeScopeId?: () => string;
+  // The current value at call time — restored verbatim on a hard failure.
+  getPrev: () => T | null;
+  // Persist it (production binds api.setRepoWorkflow / api.setBountyAcceptance).
+  persist: (scopeId: string, next: T) => Promise<unknown>;
+  setValue: (value: T | null) => void;
   setErr: (msg: string | null) => void;
   setPending: (pending: boolean) => void;
   // Monotonic token: each save claims the next value; a stale save/retry whose
@@ -55,28 +60,23 @@ export type SaveDeps = {
   retryDelayMs?: number;
 };
 
-export async function runSave(
-  deps: SaveDeps,
-  next: RepoWorkflow,
-  isRetry = false
-): Promise<void> {
-  if (!deps.repoId) return;
+export async function runSave<T>(deps: SaveDeps<T>, next: T, isRetry = false): Promise<void> {
+  if (!deps.scopeId) return;
   const seq = ++deps.seqRef.current; // claim latest; stale callbacks below no-op
   const prev = deps.getPrev();
   // Deferred state (success / transient / scheduled retry) may only be applied
   // while this save is STILL the relevant one: no newer save has claimed the token
-  // AND the user hasn't switched away from the repo it targets. Either miss means
-  // its outcome would bleed the old repo's state into whatever is on screen now.
+  // AND the user hasn't switched away from the target it applies to. Either miss
+  // means its outcome would bleed old state into whatever is on screen now.
   const stillCurrent = () =>
-    seq === deps.seqRef.current &&
-    (!deps.activeRepoId || deps.activeRepoId() === deps.repoId);
-  deps.setWf(next);
+    seq === deps.seqRef.current && (!deps.activeScopeId || deps.activeScopeId() === deps.scopeId);
+  deps.setValue(next);
   deps.setErr(null);
   try {
-    await deps.persist(deps.repoId, next);
+    await deps.persist(deps.scopeId, next);
     if (stillCurrent()) deps.setPending(false); // confirmed durable
   } catch (e: any) {
-    if (!stillCurrent()) return; // superseded by a newer save or a repo switch
+    if (!stillCurrent()) return; // superseded by a newer save or a target switch
     if (isTransientNotDurable(e)) {
       if (isRetry) {
         // The single re-confirm ALSO hit a transient 503. Don't sit in 'queued'
@@ -94,7 +94,7 @@ export async function runSave(
       return;
     }
     deps.setPending(false);
-    deps.setWf(prev); // hard failure — revert
+    deps.setValue(prev); // hard failure — revert
     deps.setErr(saveErrorMessage(e));
   }
 }

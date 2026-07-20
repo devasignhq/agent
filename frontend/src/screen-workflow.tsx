@@ -25,7 +25,7 @@ import {
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
 import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow, type RepoGuidanceItem } from "./api";
-import { runSave } from "./workflow-save";
+import { runSave } from "./optimistic-save";
 import { useAuth } from "./auth-context";
 
 type StageKey = "holistic" | "deferrals" | "docs";
@@ -904,17 +904,17 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
 
   // Optimistic save with durability-aware error handling: paint `next` immediately,
   // keep it on a transient `not_durable` (re-confirming once), revert on a hard
-  // failure. The state machine lives in runSave (workflow-save.ts) so it can be
+  // failure. The state machine lives in runSave (optimistic-save.ts) so it can be
   // unit-tested without a DOM; here we just bind it to React state + refs.
   const save = React.useCallback(
     (next: RepoWorkflow, isRetry = false) =>
       runSave(
         {
-          repoId,
-          activeRepoId: () => repoIdRef.current,
+          scopeId: repoId,
+          activeScopeId: () => repoIdRef.current,
           getPrev: () => wf,
           persist: (id, n) => api.setRepoWorkflow(id, n),
-          setWf,
+          setValue: setWf,
           setErr,
           setPending,
           seqRef: saveSeq,

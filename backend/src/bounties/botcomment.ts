@@ -28,6 +28,34 @@ export function renderConfirmBody(bounty: Bounty): string {
   ].join("\n");
 }
 
+// How many criteria to spell out on the issue before pointing at the app. The
+// list is capped at 12 server-side, so this only trims the longest ones — but a
+// bot comment that dwarfs the issue it sits under is its own problem.
+const COMMENT_CRITERIA_CAP = 8;
+
+/**
+ * The locked acceptance list, as markdown lines for the funded comment. Empty
+ * when there is nothing to show (legacy bounties, a failed draft, or a sponsor
+ * who cleared the list), so the comment reads exactly as it did before.
+ *
+ * Worth putting on the issue rather than only in the app: this is the contract a
+ * contributor is paid against, and they should be able to read it before
+ * deciding to apply — not after signing in.
+ */
+function renderAcceptance(bounty: Bounty): string[] {
+  const criteria = bounty.acceptance ?? [];
+  if (!criteria.length) return [];
+  const shown = criteria.slice(0, COMMENT_CRITERIA_CAP);
+  const rest = criteria.length - shown.length;
+  return [
+    ``,
+    `**Acceptance criteria** — your PR is reviewed against exactly this list:`,
+    ``,
+    ...shown.map((c) => `- ${c}`),
+    ...(rest > 0 ? [`- …and ${rest} more, shown in full on the bounty page.`] : []),
+  ];
+}
+
 /** The current-state body the confirmation comment is edited to as the bounty advances. */
 export function renderStatusBody(bounty: Bounty): string {
   const amt = `$${bounty.amountUsdc} USDC`;
@@ -38,6 +66,7 @@ export function renderStatusBody(bounty: Bounty): string {
         `🤖 **DevAsign Bounty** — ✅ funded. **${amt}** is held in escrow.`,
         ``,
         `**[🚀 Apply for this bounty →](${applyUrl(bounty.id)})**`,
+        ...renderAcceptance(bounty),
         ``,
         `<sub>Applying takes a minute — sign in with GitHub and introduce yourself. The sponsor approves one applicant to delegate the work; once their PR merges within the ${bounty.deliveryDays}-day window, the escrow pays out automatically.</sub>`,
       ].join("\n");
