@@ -247,6 +247,9 @@ export const api = {
   // Session
   me: () => request<{ user: User; subscription: Subscription | null }>("/api/me"),
   signOut: () => request<{ ok: true }>("/api/auth/signout", { method: "POST" }),
+  // Immediate, permanent purge of the account and all its data (server also
+  // clears the session cookie).
+  deleteAccount: () => request<{ ok: true }>("/api/me", { method: "DELETE" }),
 
   // Discovery (public + session reads)
   publicBounty: (id: string) =>

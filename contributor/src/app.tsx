@@ -5,7 +5,7 @@
 import React from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation, useParams } from "react-router-dom";
 import { api, apiBase } from "./api";
-import type { AppNotification } from "./api";
+import type { AppNotification, User } from "./api";
 import { useAuth } from "./auth-context";
 import { BountiesProvider, useBounties } from "./data-context";
 import { startNotificationsStream } from "./notifications-stream";
@@ -16,6 +16,7 @@ import { AuthGate } from "./auth-gate";
 import { Dashboard } from "./dashboard";
 import { BountiesPage } from "./bounties";
 import { WalletPage } from "./wallet";
+import { SettingsPage } from "./settings";
 import { bountyStage, STAGE_LABEL } from "./model.ts";
 
 const MOBILE_BP = 820;
@@ -154,7 +155,6 @@ const NotificationsPopover = ({
 
 // ── Sidebar ──────────────────────────────────────────────────────────────────
 const Sidebar = ({ route, go }: { route: string; go: (key: string) => void }) => {
-  const auth = useAuth();
   const { bounties } = useBounties();
   const recent = bounties.slice(0, 3);
   return (
@@ -193,17 +193,87 @@ const Sidebar = ({ route, go }: { route: string; go: (key: string) => void }) =>
           </div>
         </>
       )}
+    </div>
+  );
+};
 
-      <div className="sb-foot">
-        <div className="sb-avatar">
-          {auth.user?.avatarUrl
-            ? <img src={auth.user.avatarUrl} alt="" style={{ width: "100%", height: "100%", borderRadius: "inherit", objectFit: "cover" }} />
-            : (auth.user?.githubLogin?.[0] || "?").toUpperCase()}
+// ── User account popover (anchored under the topbar user button) ─────────────
+const USER_MENU = [
+  { id: "settings", label: "Settings", meta: "Account · Support", icon: "settings", kind: "nav" },
+  { id: "signout", label: "Sign out", meta: "End session", icon: "logout", kind: "danger" },
+] as const;
+
+const UserPopover = ({
+  onClose,
+  onSignOut,
+  onNavigate,
+  user,
+}: {
+  onClose: () => void;
+  onSignOut: () => void;
+  onNavigate: () => void;
+  user: User | null;
+}) => {
+  const ref = React.useRef<HTMLDivElement>(null);
+  React.useEffect(() => {
+    const onDoc = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    // Defer the outside-click listener a tick so the click that opened the
+    // popover (on the toggle button, outside this ref) doesn't instantly close it.
+    const t = setTimeout(() => document.addEventListener("mousedown", onDoc), 0);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      clearTimeout(t);
+      document.removeEventListener("mousedown", onDoc);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [onClose]);
+
+  const handle = (id: (typeof USER_MENU)[number]["id"]) => {
+    if (id === "signout") onSignOut();
+    if (id === "settings") onNavigate();
+    onClose();
+  };
+
+  return (
+    <div ref={ref} className="user-pop" role="menu" aria-label="Account">
+      <div className="user-pop-head">
+        <div className="user-pop-avatar">
+          {user?.avatarUrl
+            ? <img src={user.avatarUrl} alt="" style={{ width: "100%", height: "100%", borderRadius: "inherit", objectFit: "cover" }} />
+            : (user?.githubLogin || "?").charAt(0).toUpperCase()}
         </div>
-        <div className="sb-foot-text col" style={{ flex: 1, minWidth: 0 }}>
-          <span style={{ color: "var(--fg)", fontSize: 12 }}>@{auth.user?.githubLogin}</span>
-          <span style={{ fontSize: 10 }}>contributor</span>
+        <div className="user-pop-id">
+          <div className="user-pop-name">{user?.githubLogin || "Signed in"}</div>
+          <div className="user-pop-mail">{user?.email || ""}</div>
         </div>
+        <span className="user-pop-status" aria-label="Online"></span>
+      </div>
+      <div className="user-pop-org">
+        <span className="user-pop-org-label">plan</span>
+        <span className="user-pop-org-name">{user?.plan || "free"}</span>
+        <span className="user-pop-org-role">contributor</span>
+      </div>
+      <div className="user-pop-list">
+        {USER_MENU.map((item) => (
+          <button
+            key={item.id}
+            role="menuitem"
+            className={`user-row ${item.kind === "danger" ? "danger" : ""}`}
+            onClick={() => handle(item.id)}
+          >
+            <span className="user-row-ico"><Icon name={item.icon} size={13} /></span>
+            <span className="user-row-body">
+              <span className="user-row-label">{item.label}</span>
+              <span className="user-row-meta">{item.meta}</span>
+            </span>
+            <span className="user-row-chev">›</span>
+          </button>
+        ))}
       </div>
     </div>
   );
@@ -214,9 +284,11 @@ const TopBar = ({ route, isMobile }: { route: string; isMobile: boolean }) => {
   const auth = useAuth();
   const navigate = useNavigate();
   const notif = useNotifications(auth.status === "signed_in");
-  const [open, setOpen] = React.useState(false);
+  const [notifOpen, setNotifOpen] = React.useState(false);
+  const [userOpen, setUserOpen] = React.useState(false);
   const labels: Record<string, string> = {
     dashboard: "Dashboard", bounties: "Bounties", wallet: "Wallet", disputes: "Disputes",
+    settings: "Settings",
   };
   return (
     <div className="topbar">
@@ -227,29 +299,41 @@ const TopBar = ({ route, isMobile }: { route: string; isMobile: boolean }) => {
         <span className="now">{labels[route] ?? route}</span>
       </div>
       <div className="topbar-spacer"></div>
-      <div className="topbar-actions" style={{ position: "relative" }}>
-        <button className="btn ghost sm" style={{ position: "relative" }} aria-label="Notifications"
-          onClick={() => setOpen((v) => !v)}>
-          <Icon name="bell" size={13} />
-          {notif.unreadCount > 0 && (
-            <i style={{ position: "absolute", top: 5, right: 6, width: 6, height: 6, background: "var(--accent)", borderRadius: "50%" }}></i>
+      <div className="topbar-actions">
+        <div style={{ position: "relative" }}>
+          <button className={`btn ghost sm ${notifOpen ? "is-active" : ""}`}
+            style={{ position: "relative" }} aria-label="Notifications"
+            onClick={() => setNotifOpen((v) => !v)}>
+            <Icon name="bell" size={13} />
+            {notif.unreadCount > 0 && (
+              <i style={{ position: "absolute", top: 5, right: 6, width: 6, height: 6, background: "var(--accent)", borderRadius: "50%" }}></i>
+            )}
+          </button>
+          {notifOpen && (
+            <NotificationsPopover
+              items={notif.items}
+              unreadCount={notif.unreadCount}
+              onMarkAllRead={notif.markAllRead}
+              onNavigate={(link) => navigate(link)}
+              onClose={() => setNotifOpen(false)}
+            />
           )}
-        </button>
-        {open && (
-          <NotificationsPopover
-            items={notif.items}
-            unreadCount={notif.unreadCount}
-            onMarkAllRead={notif.markAllRead}
-            onNavigate={(link) => navigate(link)}
-            onClose={() => setOpen(false)}
-          />
-        )}
-        <button className="sb-avatar avatar-btn" style={{ width: 28, height: 28 }}
-          onClick={() => void auth.signOut()} title="Sign out" aria-label="Sign out">
-          {auth.user?.avatarUrl
-            ? <img src={auth.user.avatarUrl} alt="" style={{ width: "100%", height: "100%", borderRadius: "inherit", objectFit: "cover" }} />
-            : (auth.user?.githubLogin?.[0] || "?").toUpperCase()}
-        </button>
+        </div>
+        <div style={{ position: "relative" }}>
+          <button className={`btn ghost sm ${userOpen ? "is-active" : ""}`}
+            onClick={() => setUserOpen((v) => !v)}
+            aria-label="Account menu" aria-haspopup="menu" aria-expanded={userOpen}>
+            <Icon name="user" size={13} />
+          </button>
+          {userOpen && (
+            <UserPopover
+              onClose={() => setUserOpen(false)}
+              onSignOut={() => void auth.signOut()}
+              onNavigate={() => navigate("/settings")}
+              user={auth.user}
+            />
+          )}
+        </div>
       </div>
     </div>
   );
@@ -310,7 +394,7 @@ const UnavailableScreen = () => {
 };
 
 const LoadingScreen = () => (
-  <div style={{ display: "grid", placeItems: "center", height: "100vh" }}>
+  <div style={{ display: "grid", placeItems: "center", height: "calc(100vh / var(--zoom))" }}>
     <span className="mono mute" style={{ fontSize: 12 }}>loading…</span>
   </div>
 );
@@ -357,6 +441,8 @@ export default function App() {
         <Route path="/dashboard" element={<Shell route="dashboard"><Dashboard /></Shell>} />
         <Route path="/bounties" element={<Shell route="bounties"><BountiesPage /></Shell>} />
         <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
+        <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
+        <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
         {FLAGS.disputes && (
           <Route path="/disputes" element={
             <Shell route="disputes">
