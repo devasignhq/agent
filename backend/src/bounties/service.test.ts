@@ -6,7 +6,7 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@stellar/stellar-sdk";
-import { db } from "../db.js";
+import { db, onRowChange } from "../db.js";
 import type { EscrowTransaction } from "../types.js";
 import {
   createBounty,
@@ -272,6 +272,46 @@ test("activity log: the full lifecycle appends dated, attributed events", async 
   assert.ok(events.every((e) => typeof e.at === "number" && e.at > 0));
   // markInReview backfilled the submission moment for the webhook path.
   assert.ok(getBounty(b.id)!.submittedAt, "webhook-inferred PR link stamps submittedAt");
+});
+
+test("markInReview: a repeated PR link writes nothing (GitHub resends on every push)", async () => {
+  // GitHub re-delivers `synchronize` on EVERY push to the PR, and patchBounty
+  // bumps updatedAt + version unconditionally — so without a guard a 20-commit
+  // branch produced 20 identical row writes. That is now also 20 live-refresh
+  // pushes to every watching client, so the no-op has to be free.
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
+  approveApplication(b.id, 9, "maya");
+  await acceptAndStartClock(b.id, { githubId: 9, githubLogin: "devon" }, ADDR(), "", chain);
+
+  markInReview(b.id, 41);
+  const afterFirst = getBounty(b.id)!;
+  assert.equal(afterFirst.status, "IN_REVIEW");
+  assert.equal(afterFirst.prNumber, 41);
+
+  let writes = 0;
+  const off = onRowChange(({ collection }) => {
+    if (collection === "bounties") writes++;
+  });
+  markInReview(b.id, 41); // same PR, three more pushes
+  markInReview(b.id, 41);
+  markInReview(b.id, 41);
+  off();
+  assert.equal(writes, 0, "a re-delivery for the same PR must not write");
+  assert.equal(getBounty(b.id)!.updatedAt, afterFirst.updatedAt, "updatedAt is untouched");
+  assert.equal(getBounty(b.id)!.events!.filter((e) => e.kind === "pr_opened").length, 1);
+
+  // A genuinely new PR number still moves the row.
+  let writesForNewPr = 0;
+  const off2 = onRowChange(({ collection }) => {
+    if (collection === "bounties") writesForNewPr++;
+  });
+  markInReview(b.id, 42);
+  off2();
+  assert.ok(writesForNewPr > 0, "a different PR is a real change");
+  assert.equal(getBounty(b.id)!.prNumber, 42);
 });
 
 test("activity log: expiry refund records refund_submitted(expired) then refunded", async () => {

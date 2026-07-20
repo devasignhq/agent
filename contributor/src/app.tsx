@@ -4,11 +4,11 @@
 // react-router routing in place of the demo stage machine.
 import React from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation, useParams } from "react-router-dom";
-import { api, apiBase } from "./api";
+import { api } from "./api";
 import type { AppNotification, User } from "./api";
 import { useAuth } from "./auth-context";
 import { BountiesProvider, useBounties } from "./data-context";
-import { startNotificationsStream } from "./notifications-stream";
+import { LiveProvider, useLiveTopic } from "./live-context";
 import { Icon } from "./icons";
 import { FLAGS } from "./flags";
 import { Discovery } from "./discovery";
@@ -37,7 +37,7 @@ const NAV: Array<{ key: string; name: string; icon: string }> = [
   { key: "wallet", name: "Wallet", icon: "coins" },
 ];
 
-// ── Live notifications (SSE + slow fallback poll; house pattern) ─────────────
+// ── Live notifications (bell state; the stream itself lives in LiveProvider) ──
 function useNotifications(enabled: boolean) {
   const [items, setItems] = React.useState<AppNotification[]>([]);
   const [unreadCount, setUnreadCount] = React.useState(0);
@@ -48,9 +48,13 @@ function useNotifications(enabled: boolean) {
       setItems(data.items);
       setUnreadCount(data.unreadCount);
     } catch (err: any) {
-      if (err?.status !== 401) console.warn("[notifications] poll failed:", err);
+      if (err?.status !== 401) console.warn("[notifications] refresh failed:", err);
     }
   }, [enabled]);
+  // The connection, the fallback poll and the tab-visible refresh all moved to
+  // LiveProvider — one stream per tab, shared with the bounties and wallet
+  // refetches. This hook only declares which topic the bell cares about.
+  useLiveTopic("notifications", () => void refresh());
   React.useEffect(() => {
     if (!enabled) {
       setItems([]);
@@ -58,21 +62,6 @@ function useNotifications(enabled: boolean) {
       return;
     }
     void refresh();
-    const stream = startNotificationsStream({
-      openSource: () =>
-        new EventSource(`${apiBase}/api/notifications/stream`, { withCredentials: true }),
-      refresh: () => void refresh(),
-      scheduleFallback: (fn: () => void, ms: number) => setInterval(fn, ms),
-      clearFallback: (h: any) => clearInterval(h),
-    });
-    const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => {
-      stream.stop();
-      document.removeEventListener("visibilitychange", onVis);
-    };
   }, [enabled, refresh]);
   const markAllRead = React.useCallback(async () => {
     const now = Date.now();
@@ -437,27 +426,31 @@ function DiscoveryRoute() {
 }
 
 export default function App() {
+  // LiveProvider wraps BountiesProvider (which subscribes to it) and sits above
+  // <Routes> so navigating never tears down and re-opens the SSE connection.
   return (
-    <BountiesProvider>
-      <Routes>
-        <Route path="/bounties/:id" element={<DiscoveryRoute />} />
-        <Route path="/auth" element={<AuthGate />} />
-        <Route path="/dashboard" element={<Shell route="dashboard"><Dashboard /></Shell>} />
-        <Route path="/bounties" element={<Shell route="bounties"><BountiesPage /></Shell>} />
-        <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
-        <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
-        <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
-        {FLAGS.disputes && (
-          <Route path="/disputes" element={
-            <Shell route="disputes">
-              <React.Suspense fallback={<LoadingScreen />}>
-                <DisputePage />
-              </React.Suspense>
-            </Shell>
-          } />
-        )}
-        <Route path="*" element={<Navigate to="/dashboard" replace />} />
-      </Routes>
-    </BountiesProvider>
+    <LiveProvider>
+      <BountiesProvider>
+        <Routes>
+          <Route path="/bounties/:id" element={<DiscoveryRoute />} />
+          <Route path="/auth" element={<AuthGate />} />
+          <Route path="/dashboard" element={<Shell route="dashboard"><Dashboard /></Shell>} />
+          <Route path="/bounties" element={<Shell route="bounties"><BountiesPage /></Shell>} />
+          <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
+          <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
+          <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
+          {FLAGS.disputes && (
+            <Route path="/disputes" element={
+              <Shell route="disputes">
+                <React.Suspense fallback={<LoadingScreen />}>
+                  <DisputePage />
+                </React.Suspense>
+              </Shell>
+            } />
+          )}
+          <Route path="*" element={<Navigate to="/dashboard" replace />} />
+        </Routes>
+      </BountiesProvider>
+    </LiveProvider>
   );
 }

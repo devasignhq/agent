@@ -14,6 +14,17 @@ const API_BASE =
 
 export const apiBase = API_BASE;
 
+// A stable id for THIS browser tab, sent on every mutation and on the SSE stream
+// URL. It lets the backend skip pushing a live-refresh frame back to the tab
+// that caused the write — that tab already refetches explicitly, so the frame
+// would only buy a second, redundant fetch. Every other tab, including this
+// user's own, still gets it. Per-tab (not persisted) by design: a new tab is a
+// new subscriber.
+export const tabId: string =
+  typeof crypto !== "undefined" && "randomUUID" in crypto
+    ? crypto.randomUUID()
+    : `t-${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+
 // GitHub OAuth start URL for THIS app: `app=contributor` makes the backend
 // redirect back to the contributor origin after the callback, and `returnTo`
 // (a same-app path like "/bounties/:id?apply=1") lands the user exactly where
@@ -41,6 +52,7 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
     ...init,
     headers: {
       Accept: "application/json",
+      "X-Devasign-Tab": tabId,
       ...(init.body ? { "Content-Type": "application/json" } : {}),
       ...(init.headers || {}),
     },
