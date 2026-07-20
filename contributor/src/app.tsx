@@ -215,12 +215,15 @@ const UserPopover = ({
   user: User | null;
 }) => {
   const ref = React.useRef<HTMLDivElement>(null);
+  const onCloseRef = React.useRef(onClose);
+  onCloseRef.current = onClose;
+
   React.useEffect(() => {
     const onDoc = (e: MouseEvent) => {
-      if (ref.current && !ref.current.contains(e.target as Node)) onClose();
+      if (ref.current && !ref.current.contains(e.target as Node)) onCloseRef.current();
     };
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onClose();
+      if (e.key === "Escape") onCloseRef.current();
     };
     // Defer the outside-click listener a tick so the click that opened the
     // popover (on the toggle button, outside this ref) doesn't instantly close it.
@@ -231,7 +234,7 @@ const UserPopover = ({
       document.removeEventListener("mousedown", onDoc);
       document.removeEventListener("keydown", onKey);
     };
-  }, [onClose]);
+  }, []);
 
   const handle = (id: (typeof USER_MENU)[number]["id"]) => {
     if (id === "signout") onSignOut();
@@ -322,6 +325,7 @@ const TopBar = ({ route, isMobile }: { route: string; isMobile: boolean }) => {
         <div style={{ position: "relative" }}>
           <button className={`btn ghost sm ${userOpen ? "is-active" : ""}`}
             onClick={() => setUserOpen((v) => !v)}
+            onMouseDown={(e) => e.stopPropagation()}
             aria-label="Account menu" aria-haspopup="menu" aria-expanded={userOpen}>
             <Icon name="user" size={13} />
           </button>

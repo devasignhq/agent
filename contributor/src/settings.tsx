@@ -212,7 +212,7 @@ const SetSupport = () => (
       <div className="card-head"><h3 className="card-title">Support channels</h3></div>
       <div>
         {SUPPORT_CHANNELS.map((s) => (
-          <div key={s.name} className="row" style={{ display: "grid", gridTemplateColumns: "40px 1fr auto", gap: 14, height: 64 }}>
+          <div key={s.name} className="row" style={{ display: "grid", gridTemplateColumns: "40px 1fr auto", gap: 14, minHeight: 64 }}>
             <div className="integ-icon"><Icon name={s.i} size={14} /></div>
             <div>
               <div className="mono" style={{ fontSize: 13 }}>{s.name}</div>

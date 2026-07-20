@@ -299,7 +299,7 @@ export function deleteConfirmOk(
   phrase: string
 ): boolean {
   if (!githubLogin) return false;
-  const nameOk = name.trim().toLowerCase() === githubLogin.toLowerCase();
+  const nameOk = name.trim().toLowerCase() === githubLogin.trim().toLowerCase();
   const phraseOk = phrase.trim().toLowerCase() === DELETE_PHRASE;
   return nameOk && phraseOk;
 }
