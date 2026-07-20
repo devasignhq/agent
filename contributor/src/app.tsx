@@ -4,7 +4,8 @@
 // react-router routing in place of the demo stage machine.
 import React from "react";
 import { Routes, Route, Navigate, useNavigate, useLocation, useParams } from "react-router-dom";
-import { api } from "./api";
+import { Analytics } from '@vercel/analytics/react';
+import { api, apiBase } from "./api";
 import type { AppNotification, User } from "./api";
 import { useAuth } from "./auth-context";
 import { BountiesProvider, useBounties } from "./data-context";
@@ -429,28 +430,27 @@ export default function App() {
   // LiveProvider wraps BountiesProvider (which subscribes to it) and sits above
   // <Routes> so navigating never tears down and re-opens the SSE connection.
   return (
-    <LiveProvider>
-      <BountiesProvider>
-        <Routes>
-          <Route path="/bounties/:id" element={<DiscoveryRoute />} />
-          <Route path="/auth" element={<AuthGate />} />
-          <Route path="/dashboard" element={<Shell route="dashboard"><Dashboard /></Shell>} />
-          <Route path="/bounties" element={<Shell route="bounties"><BountiesPage /></Shell>} />
-          <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
-          <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
-          <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
-          {FLAGS.disputes && (
-            <Route path="/disputes" element={
-              <Shell route="disputes">
-                <React.Suspense fallback={<LoadingScreen />}>
-                  <DisputePage />
-                </React.Suspense>
-              </Shell>
-            } />
-          )}
-          <Route path="*" element={<Navigate to="/dashboard" replace />} />
-        </Routes>
-      </BountiesProvider>
-    </LiveProvider>
+    <BountiesProvider>
+      <Routes>
+        <Route path="/bounties/:id" element={<DiscoveryRoute />} />
+        <Route path="/auth" element={<AuthGate />} />
+        <Route path="/dashboard" element={<Shell route="dashboard"><Dashboard /></Shell>} />
+        <Route path="/bounties" element={<Shell route="bounties"><BountiesPage /></Shell>} />
+        <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
+        <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
+        <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
+        {FLAGS.disputes && (
+          <Route path="/disputes" element={
+            <Shell route="disputes">
+              <React.Suspense fallback={<LoadingScreen />}>
+                <DisputePage />
+              </React.Suspense>
+            </Shell>
+          } />
+        )}
+        <Route path="*" element={<Navigate to="/dashboard" replace />} />
+      </Routes>
+      <Analytics />
+    </BountiesProvider>
   );
 }
