@@ -2,7 +2,7 @@
 // Agent page — parallel PR reviews, switcher, log + terminal, goal drawer
 import React from "react";
 import DOMPurify from "dompurify";
-import { escapeHtml, safeUrl, SANITIZE_ALLOWED_TAGS, SANITIZE_ALLOWED_ATTR } from "./sanitize";
+import { escapeHtml, safeUrl, sourceLink, SANITIZE_ALLOWED_TAGS, SANITIZE_ALLOWED_ATTR } from "./sanitize";
 import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
@@ -736,23 +736,30 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
               : s.flavor === "info" ? "var(--info)"
               : s.flavor === "active" ? "var(--accent)"
               : "var(--fg-mute)";
+            // Untrusted at render time: see sourceLink in sanitize.ts. An
+            // unsafe URL yields an empty href and renders as plain text.
+            const { href, shown: shownUrl } = sourceLink(s.url);
             return (
               <div key={i} className="source-card">
                 <div className="source-head">
                   <Icon name={s.icon} size={14} color={flavorVar} />
                   <span className="mono" style={{ fontSize: 12 }}>{s.label}</span>
-                  {s.url && (
+                  {s.url && (href ? (
                     <a
-                      href={s.url}
+                      href={href}
                       target="_blank"
                       rel="noopener noreferrer"
                       className="mono mute"
                       style={{ fontSize: 11, textDecoration: "underline" }}
                       title={s.url}
                     >
-                      {s.url.length > 40 ? s.url.slice(0, 38) + "…" : s.url}
+                      {shownUrl}
                     </a>
-                  )}
+                  ) : (
+                    <span className="mono mute" style={{ fontSize: 11 }} title={s.url}>
+                      {shownUrl}
+                    </span>
+                  ))}
                   {s.unreliable && (
                     <span className="pill warn" style={{ marginLeft: 6 }}>
                       <i className="dot"></i> unreliable
