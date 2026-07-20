@@ -72,6 +72,11 @@ function seed() {
 const attCount = (id: string) =>
   db.find("tasks", (t) => t.id === id)!.attachments.length;
 
+const lastAtt = (id: string): any => {
+  const list = db.find("tasks", (t) => t.id === id)!.attachments;
+  return list[list.length - 1];
+};
+
 // --- GET /tasks/:id ---
 
 test("GET /tasks/:id: rejects a signed-out caller with 401", () => {
@@ -227,6 +232,43 @@ test("POST /tasks/:id/attachments: a real link and a url-less text note still pa
   addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), textRes);
   assert.equal(textRes.statusCode, 200);
   assert.equal(attCount(ghTaskId), 3);
+});
+
+// The stored value must be the validated one, so a padded URL is not persisted
+// with whitespace still on it (the guidance route trims the same way).
+test("POST /tasks/:id/attachments: trims the url before validating and storing", () => {
+  const { ownerId, ghTaskId } = seed();
+  const res = fakeRes();
+  addTaskAttachmentHandler(
+    authedReq(ownerId, { id: ghTaskId }, { kind: "loom", url: "  https://www.loom.com/share/deadbeef  " }),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(lastAtt(ghTaskId).url, "https://www.loom.com/share/deadbeef");
+});
+
+// Whitespace-only is indistinguishable from "no url" for an optional field, so
+// it stores as absent rather than persisting a junk empty string.
+test("POST /tasks/:id/attachments: a whitespace-only url is stored as absent", () => {
+  const { ownerId, ghTaskId } = seed();
+  const res = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", url: "   ", note: "hi" }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(lastAtt(ghTaskId).url, undefined);
+});
+
+// A non-string url is a malformed request, not an absent one. Coercing it to
+// "absent" would 200 the call and silently drop the link the client thinks it
+// attached, so it has to keep failing the check.
+test("POST /tasks/:id/attachments: a non-string url is rejected, not silently dropped", () => {
+  const { ownerId, ghTaskId } = seed();
+  for (const url of [12345, { href: "https://x.com" }, ["https://x.com"], true]) {
+    const res = fakeRes();
+    addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "loom", url }), res);
+    assert.equal(res.statusCode, 400, `expected 400 for ${JSON.stringify(url)}`);
+    assert.equal(res.body.error, "invalid_url");
+  }
+  assert.equal(attCount(ghTaskId), 1, "nothing persisted");
 });
 
 // --- DELETE /tasks/:taskId/attachments/:attachmentId ---

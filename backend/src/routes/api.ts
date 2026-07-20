@@ -1014,13 +1014,21 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
     repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
   if (!owns) return void res.status(403).json({ error: "forbidden" });
-  const { kind, url, note } = req.body || {};
+  const { kind, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
   // `url` is optional — a `kind: "text"` message from the composer carries only
   // a note. When one IS present it gets stored, echoed back to the agent page,
   // and rendered there as a link, so it has to clear the same bar as a guidance
   // URL. See isStorableLinkUrl: this is an XSS/storage check, not an SSRF one.
-  if (url !== undefined && url !== null && url !== "" && !isStorableLinkUrl(url)) {
+  //
+  // Trim first so the value we validate is the value we store, matching the
+  // guidance route. Whitespace-only collapses to "absent" (the field is
+  // optional), but a NON-string url deliberately stays as-is so it still fails
+  // the check below — silently treating it as absent would 200 the request and
+  // drop the link, leaving the client believing it saved one.
+  const rawUrl = req.body?.url;
+  const url = typeof rawUrl === "string" ? rawUrl.trim() || undefined : rawUrl;
+  if (url !== undefined && url !== null && !isStorableLinkUrl(url)) {
     return void res.status(400).json({ error: "invalid_url" });
   }
   const att = { id: uuid(), kind, url, note, createdAt: Date.now() };
