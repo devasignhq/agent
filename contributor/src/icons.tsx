@@ -40,6 +40,7 @@ const Icon = ({ name, size = 16, color = "currentColor", style }: IconProps) => 
     case "circle":     return <svg {...p}><circle cx="8" cy="8" r="6"/></svg>;
     case "dot":        return <svg {...p}><circle cx="8" cy="8" r="3" fill={color}/></svg>;
     case "spark":      return <svg {...p}><path d="M8 2v3M8 11v3M2 8h3M11 8h3M4 4l2 2M10 10l2 2M4 12l2-2M10 6l2-2"/></svg>;
+    case "discord":    return <svg {...p}><path d="M4 5l1-1 3-.5 3 .5 1 1c1 2 1 5 .5 7l-2 1-.5-1.5M4 5c-1 2-1 5-.5 7l2 1 .5-1.5"/><circle cx="6.5" cy="9" r=".7" fill={color}/><circle cx="9.5" cy="9" r=".7" fill={color}/></svg>;
     case "lock":       return <svg {...p}><rect x="3" y="7" width="10" height="7"/><path d="M5 7V5a3 3 0 016 0v2"/></svg>;
     case "user":       return <svg {...p}><circle cx="8" cy="5" r="3"/><path d="M2 14c0-3 2.5-5 6-5s6 2 6 5"/></svg>;
     case "bell":       return <svg {...p}><path d="M4 11V7a4 4 0 018 0v4l1 2H3l1-2zM6.5 14a1.5 1.5 0 003 0"/></svg>;

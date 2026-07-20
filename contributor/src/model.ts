@@ -285,3 +285,21 @@ export function reviewHeadline(review: BountyReview | null): string | null {
 export function allCriteriaMet(review: BountyReview | null): boolean {
   return !!review && review.counts.total > 0 && review.counts.met === review.counts.total;
 }
+
+// ── account deletion ─────────────────────────────────────────────────────────
+
+// Two-factor confirm gate for the destructive delete-account button: the user
+// must retype their own GitHub login (case-insensitive) AND the literal phrase.
+// A missing/empty login keeps the gate shut even when both fields are blank.
+export const DELETE_PHRASE = "delete my account";
+
+export function deleteConfirmOk(
+  githubLogin: string | undefined,
+  name: string,
+  phrase: string
+): boolean {
+  if (!githubLogin) return false;
+  const nameOk = name.trim().toLowerCase() === githubLogin.trim().toLowerCase();
+  const phraseOk = phrase.trim().toLowerCase() === DELETE_PHRASE;
+  return nameOk && phraseOk;
+}

@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   acceptanceRate,
   bountyStage,
+  deleteConfirmOk,
   groupBounties,
   isStellarAddr,
   isValidMemo,
@@ -221,4 +222,18 @@ test("display helpers", () => {
   assert.equal(timeLeft(now + 3 * 24 * 3600_000 + 1000, now), "3 days left");
   assert.equal(timeLeft(now + 5 * 3600_000, now), "5h left");
   assert.equal(timeLeft(now - 1, now), "past due");
+});
+
+test("deleteConfirmOk: both factors must match", () => {
+  // happy path — exact, case-insensitive, whitespace-tolerant
+  assert.equal(deleteConfirmOk("octocat", "octocat", "delete my account"), true);
+  assert.equal(deleteConfirmOk("Octocat", "  octocat ", " Delete My Account "), true);
+  // one factor alone is never enough
+  assert.equal(deleteConfirmOk("octocat", "octocat", ""), false);
+  assert.equal(deleteConfirmOk("octocat", "", "delete my account"), false);
+  assert.equal(deleteConfirmOk("octocat", "someone-else", "delete my account"), false);
+  assert.equal(deleteConfirmOk("octocat", "octocat", "delete my acct"), false);
+  // missing login keeps the gate shut even with blank inputs
+  assert.equal(deleteConfirmOk(undefined, "", ""), false);
+  assert.equal(deleteConfirmOk("", "", "delete my account"), false);
 });
