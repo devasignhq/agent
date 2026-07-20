@@ -1,4 +1,5 @@
-// Unit tests for the Workflow durability-aware save state machine (workflow-save.ts).
+// Unit tests for the durability-aware optimistic-save state machine
+// (optimistic-save.ts), shared by the Workflow screen and the bounty funding page.
 // These lock down the behaviour added for transient `not_durable` 503s: keep the
 // optimistic state + show a "queued" notice + re-confirm once, the monotonic
 // saveSeq supersession guard, the unchanged hard-failure revert path, and the two
@@ -7,7 +8,7 @@
 // 'queued' state rather than spin forever (criterion 8).
 //
 // No DOM / React needed — runSave takes plain dependency callbacks. Run with:
-//   node --test src/workflow-save.test.ts        (Node >=22 strips the types)
+//   node --test src/optimistic-save.test.ts        (Node >=22 strips the types)
 //   npm test                                     (globs all src/**/*.test.ts)
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -16,10 +17,10 @@ import {
   isTransientNotDurable,
   saveErrorMessage,
   RETRY_DELAY_MS,
-} from "./workflow-save.ts";
+} from "./optimistic-save.ts";
 
 // A workflow distinct from the harness's `prev`, so a deep-equality check on the
-// recorded setWf calls can tell an optimistic paint apart from a revert.
+// recorded setValue calls can tell an optimistic paint apart from a revert.
 const NEXT: any = {
   version: 1,
   trigger: { onSynchronize: false, skipDrafts: true, skipBots: true },
@@ -47,18 +48,18 @@ function transientError(): any {
 // attempt's outcome (throw to reject); `scheduleRetry` captures the re-confirm
 // callback instead of arming a real timer so tests drive it synchronously.
 function makeHarness(overrides: any = {}) {
-  const calls = { setWf: [] as any[], setErr: [] as any[], setPending: [] as boolean[] };
+  const calls = { setValue: [] as any[], setErr: [] as any[], setPending: [] as boolean[] };
   const scheduled: Array<{ fn: () => void; ms: number }> = [];
   let persistCalls = 0;
   const prev = "prev" in overrides ? overrides.prev : baseWf();
   const deps = {
-    repoId: "repo-1",
+    scopeId: "scope-1",
     getPrev: () => prev,
     persist: async (id: string, n: any) => {
       persistCalls++;
       return overrides.persist ? overrides.persist(persistCalls, id, n) : { ok: true };
     },
-    setWf: (wf: any) => calls.setWf.push(wf),
+    setValue: (wf: any) => calls.setValue.push(wf),
     setErr: (m: any) => calls.setErr.push(m),
     setPending: (p: boolean) => calls.setPending.push(p),
     seqRef: overrides.seqRef ?? { current: 0 },
@@ -80,7 +81,7 @@ test("transient not_durable: keeps optimistic state, shows pending, schedules ON
   const h = makeHarness({ persist: () => { throw transientError(); } });
   await runSave(h.deps, NEXT);
 
-  assert.deepEqual(h.calls.setWf, [NEXT], "only the optimistic paint — must NOT revert");
+  assert.deepEqual(h.calls.setValue, [NEXT], "only the optimistic paint — must NOT revert");
   assert.deepEqual(h.calls.setErr, [null], "no hard error surfaced");
   assert.deepEqual(h.calls.setPending, [true], "calm 'queued' notice shown");
   assert.equal(h.scheduled.length, 1, "exactly one re-confirm scheduled");
@@ -95,7 +96,7 @@ test("hard failure: reverts to prev and surfaces the backend's friendly message"
   const h = makeHarness({ persist: () => { throw err; } });
   await runSave(h.deps, NEXT);
 
-  assert.deepEqual(h.calls.setWf, [NEXT, h.prev], "optimistic paint, then revert to prev");
+  assert.deepEqual(h.calls.setValue, [NEXT, h.prev], "optimistic paint, then revert to prev");
   assert.deepEqual(h.calls.setPending, [false], "pending cleared on a hard failure");
   assert.equal(h.calls.setErr.at(-1), "Something went wrong on our end.", "friendly message, not the raw code");
   assert.equal(h.scheduled.length, 0, "no retry for a non-transient error");
@@ -109,7 +110,7 @@ test("upgrade_required: tailored Pro/Max copy and revert", async () => {
   const h = makeHarness({ persist: () => { throw err; } });
   await runSave(h.deps, NEXT);
 
-  assert.deepEqual(h.calls.setWf, [NEXT, h.prev]);
+  assert.deepEqual(h.calls.setValue, [NEXT, h.prev]);
   assert.equal(h.calls.setErr.at(-1), "That control is a Pro/Max feature.");
 });
 
@@ -117,7 +118,7 @@ test("happy path: confirms durable, no revert, no notice, no retry", async () =>
   const h = makeHarness({ persist: () => ({ ok: true }) });
   await runSave(h.deps, NEXT);
 
-  assert.deepEqual(h.calls.setWf, [NEXT], "no revert");
+  assert.deepEqual(h.calls.setValue, [NEXT], "no revert");
   assert.deepEqual(h.calls.setErr, [null]);
   assert.deepEqual(h.calls.setPending, [false], "confirmed durable");
   assert.equal(h.scheduled.length, 0);
@@ -134,7 +135,7 @@ test("supersession: a newer save makes the stale in-flight save no-op when it se
   reject(transientError());          // the stale attempt now fails
   await run;
 
-  assert.deepEqual(h.calls.setWf, [NEXT], "stale save must NOT revert");
+  assert.deepEqual(h.calls.setValue, [NEXT], "stale save must NOT revert");
   assert.deepEqual(h.calls.setPending, [], "stale save toggles no pending/durable state");
   assert.deepEqual(h.calls.setErr, [null], "stale save surfaces no error");
   assert.equal(h.scheduled.length, 0, "stale save schedules no retry");
@@ -146,7 +147,7 @@ test("criterion 8 — a re-confirm that still 503s leaves 'queued' (not stuck) w
 
   assert.deepEqual(h.calls.setPending, [false], "clears the 'queued' spinner — must not stay stuck");
   assert.match(String(h.calls.setErr.at(-1)), /saving in the background/i, "calm terminal note");
-  assert.deepEqual(h.calls.setWf, [NEXT], "optimistic state kept — no revert");
+  assert.deepEqual(h.calls.setValue, [NEXT], "optimistic state kept — no revert");
   assert.equal(h.scheduled.length, 0, "a retry never schedules another retry");
 });
 
@@ -161,7 +162,7 @@ test("scheduled re-confirm runs and clears the notice once durable", async () =>
 
   assert.equal(h.persistCount(), 2, "re-confirm persisted again");
   assert.deepEqual(h.calls.setPending, [true, false], "notice cleared after the retry confirmed durable");
-  assert.deepEqual(h.calls.setWf, [NEXT, NEXT], "no revert across the retry");
+  assert.deepEqual(h.calls.setValue, [NEXT, NEXT], "no revert across the retry");
 });
 
 test("scheduled re-confirm is suppressed if a newer save superseded it", async () => {
@@ -177,48 +178,50 @@ test("scheduled re-confirm is suppressed if a newer save superseded it", async (
   assert.equal(h.persistCount(), 1, "superseded re-confirm did not persist again");
 });
 
-test("criterion 7 — a stale FAILED save does not touch the new repo's UI after a repo switch", async () => {
+// `active` must START equal to deps.scopeId, or the save was never current and
+// these would pass for the wrong reason — proving nothing about the switch.
+test("criterion 7 — a stale FAILED save does not touch the new target's UI after a switch", async () => {
   let reject!: (e: any) => void;
   const inflight = new Promise((_res, rej) => { reject = rej; });
-  let active = "repo-1";
+  let active = "scope-1";
   const h = makeHarness({
-    deps: { repoId: "repo-1", activeRepoId: () => active },
+    deps: { scopeId: "scope-1", activeScopeId: () => active },
     persist: () => inflight,
   });
 
-  const run = runSave(h.deps, NEXT); // targets repo-1, then awaits persist
-  active = "repo-2";                 // user switches repos mid-flight
+  const run = runSave(h.deps, NEXT); // targets scope-1, then awaits persist
+  active = "scope-2";                // user switches target mid-flight
   reject(transientError());          // the stale attempt now fails
   await run;
 
-  assert.deepEqual(h.calls.setWf, [NEXT], "no revert bled into repo-2");
-  assert.deepEqual(h.calls.setPending, [], "no 'queued' notice on repo-2");
-  assert.deepEqual(h.calls.setErr, [null], "no stale error on repo-2");
-  assert.equal(h.scheduled.length, 0, "no retry scheduled for the abandoned repo-1");
+  assert.deepEqual(h.calls.setValue, [NEXT], "no revert bled into scope-2");
+  assert.deepEqual(h.calls.setPending, [], "no 'queued' notice on scope-2");
+  assert.deepEqual(h.calls.setErr, [null], "no stale error on scope-2");
+  assert.equal(h.scheduled.length, 0, "no retry scheduled for the abandoned scope-1");
 });
 
-test("criterion 7 — a stale SUCCEEDED save does not clear the new repo's notice after a switch", async () => {
+test("criterion 7 — a stale SUCCEEDED save does not clear the new target's notice after a switch", async () => {
   let resolve!: (v: any) => void;
   const inflight = new Promise((res) => { resolve = res; });
-  let active = "repo-1";
+  let active = "scope-1";
   const h = makeHarness({
-    deps: { repoId: "repo-1", activeRepoId: () => active },
+    deps: { scopeId: "scope-1", activeScopeId: () => active },
     persist: () => inflight,
   });
 
   const run = runSave(h.deps, NEXT);
-  active = "repo-2";                 // switched away before persist resolved
+  active = "scope-2";                // switched away before persist resolved
   resolve({ ok: true });
   await run;
 
-  assert.deepEqual(h.calls.setPending, [], "did not flip pending on repo-2");
+  assert.deepEqual(h.calls.setPending, [], "did not flip pending on scope-2");
 });
 
-test("no repo selected: does nothing", async () => {
-  const h = makeHarness({ deps: { repoId: "" } });
+test("no target selected: does nothing", async () => {
+  const h = makeHarness({ deps: { scopeId: "" } });
   await runSave(h.deps, NEXT);
 
-  assert.deepEqual(h.calls.setWf, []);
+  assert.deepEqual(h.calls.setValue, []);
   assert.equal(h.persistCount(), 0);
 });
 

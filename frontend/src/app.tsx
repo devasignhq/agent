@@ -11,6 +11,7 @@ import { Auth, Onboarding } from "./screens-onboarding";
 import { AgentPage } from "./screen-agent";
 import { WorkflowPage } from "./screen-workflow";
 import { BountiesPage } from "./screen-bounties";
+import { FundBountyPage } from "./screen-fund-bounty";
 import { SettingsPage } from "./screens-rest";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
@@ -442,7 +443,11 @@ const AppContent = () => {
   const location = useLocation();
   const navigate = useNavigate();
   const PAGE_KEYS = ["agent", "workflow", "bounty", "settings"];
-  const seg = location.pathname.split("/")[1];
+  const rawSeg = location.pathname.split("/")[1];
+  // The bounty deep links from the bot comment (/bounties/:id/fund|cancel|apply)
+  // are PLURAL, so they miss the singular nav key and would fall through to the
+  // "agent" default — highlighting the wrong sidebar item on arrival.
+  const seg = rawSeg === "bounties" ? "bounty" : rawSeg;
   const current = PAGE_KEYS.includes(seg) ? seg : "agent";
   const setCurrent = React.useCallback((key) => navigate("/" + key), [navigate]);
   // The Workflow screen's selected repo name, surfaced for the header breadcrumb
@@ -737,7 +742,7 @@ const AppContent = () => {
             <Route path="/agent"    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
             <Route path="/workflow" element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
             <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
-            <Route path="/bounties/:id/fund" element={<BountiesPage isMobile={isMobile} isFunding />} />
+            <Route path="/bounties/:id/fund" element={<FundBountyPage />} />
             <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
             <Route path="/bounties/:id/apply" element={<BountiesPage isMobile={isMobile} isApplying />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />

@@ -337,7 +337,14 @@ export type Bounty = {
   issueUrl: string;
   title: string;
   description: string;
+  // The acceptance contract. Editable only while PENDING_FUNDING; frozen once
+  // the escrow is committed. Order is load-bearing — the backend seeds review
+  // criteria from it positionally.
   acceptance: string[];
+  // AI drafting state. Absent on rows written before drafting existed; treat
+  // undefined as "ready".
+  acceptanceState?: "generating" | "ready" | "errored";
+  acceptanceEndGoal?: string | null;
   sponsorAddress?: string | null;
   taskId: string;
   amountUsdc: number;
@@ -552,6 +559,15 @@ export const api = {
     request<{ ok: true; hash?: string; status: string }>(`/api/bounties/${id}/funding-submit`, {
       method: "POST",
       body: JSON.stringify({ token, signedXdr }),
+    }),
+  // Edit the acceptance list before funding. Session + sponsor only — NOT
+  // token-scoped like the funding calls above, because that token rides in a
+  // public GitHub comment and rewriting the contract must not be possible for
+  // anyone who can read the issue. 409 `already_funded` once the escrow lands.
+  setBountyAcceptance: (id: string, acceptance: string[]) =>
+    request<{ bounty: Bounty }>(`/api/bounties/${id}/acceptance`, {
+      method: "PATCH",
+      body: JSON.stringify({ acceptance }),
     }),
   // Cancel (token from the Cancel link). outcome "cancelled" = plain discard
   // (nothing escrowed); "submitted" = refund tx broadcast (hash present);

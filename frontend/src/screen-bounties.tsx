@@ -1,9 +1,11 @@
 // Bounties page — sponsor-facing dashboard. Wired to the backend bounty API
 // (frontend/src/api.ts): the header stats, bounty table, transaction history, and
 // the per-bounty drawer all render live data from `api.bounties()` +
-// `api.bountyTransactions()`. The Fund and Cancel routes (/bounties/:id/fund,
-// /bounties/:id/cancel — reached from the GitHub bot comment links) mount this
-// page with isFunding/isCancelling and drive the matching escrow flow.
+// `api.bountyTransactions()`. The Cancel and Apply routes (/bounties/:id/cancel,
+// /bounties/:id/apply — reached from the GitHub bot comment links) mount this
+// page with isCancelling/isApplying and overlay the matching modal. Funding is
+// NOT here: it needs the acceptance-criteria review step, so it has its own
+// page (screen-fund-bounty.tsx).
 //
 // Layout: a header (title + escrow balance + top-up/withdraw/create actions), a
 // 6-stat grid, filter tabs + search, and a two-column body — a bounties table on
@@ -12,8 +14,8 @@
 // / Applications.
 import React from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router-dom";
-import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-api";
 import { Icon } from "./icons";
+import { freighterAddress, freighterSign, money, shortHash, stellarTxUrl } from "./bounty-shared";
 import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
 import {
@@ -67,15 +69,12 @@ const TABS: Array<{ key: string; label: string; match: (b: Bounty) => boolean }>
 const PAGE_SIZE = 10;
 const TX_PAGE_SIZE = 10;
 
-const money = (n: number) => `$${n.toLocaleString("en-US")}`;
 // Placeholder shown for monetary values when the balance-eye toggle hides them.
 const MASK = "••••";
 
 // Stellar amounts are i128 "stroops" (1 USDC = 10^7 stroops). Display-only, so a
 // double is fine for the magnitudes bounties use.
 const stroopsToUsdc = (s: string) => (Number(s) || 0) / 1e7;
-const shortHash = (h: string) => (h.length > 18 ? `${h.slice(0, 8)}…${h.slice(-6)}` : h);
-const stellarTxUrl = (h: string) => `https://stellar.expert/explorer/testnet/tx/${h}`;
 const prUrl = (repo: string, pr: number) => `https://github.com/${repo}/pull/${pr}`;
 const fmtDay = (ts?: number | null) =>
   ts ? new Date(ts).toLocaleDateString("en-US", { month: "short", day: "numeric" }) : "";
@@ -85,12 +84,10 @@ const fmtDate = (ts?: number | null) =>
 // ─── Page ───────────────────────────────────────────────────────────────────
 export const BountiesPage = ({
   isMobile,
-  isFunding,
   isCancelling,
   isApplying,
 }: {
   isMobile?: boolean;
-  isFunding?: boolean;
   isCancelling?: boolean;
   isApplying?: boolean;
 }) => {
@@ -329,9 +326,6 @@ export const BountiesPage = ({
 
       {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} onChanged={applyBounty} />}
       {creating && <CreateBountyModal onClose={() => setCreating(false)} />}
-      {isFunding && (
-        <FundBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
-      )}
       {isCancelling && (
         <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
       )}
@@ -716,171 +710,6 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
         })}
       </div>
     </>
-  );
-};
-
-// ─── Freighter (browser wallet) bridge ────────────────────────────────────────
-// We talk to Freighter through its official `@stellar/freighter-api` package
-// rather than sniffing for an injected `window` global: current Freighter builds
-// don't expose a reliable page global, and the extension's content script is
-// injected asynchronously — so global detection produced false "not detected"
-// errors even when the wallet was installed. The package handles the postMessage
-// bridge (and its readiness) for us.
-async function freighterAddress(): Promise<string> {
-  const conn = await isConnected();
-  if (!conn.isConnected) {
-    throw new Error("Freighter wallet not detected. Install it from freighter.app, then reload this page.");
-  }
-  const access = await requestAccess();
-  if (access.error || !access.address) {
-    throw new Error(access.error?.message || "Couldn't read your Freighter wallet address.");
-  }
-  return access.address;
-}
-async function freighterSign(xdr: string, address: string, networkPassphrase: string): Promise<string> {
-  const signed = await signTransaction(xdr, { address, networkPassphrase });
-  if (signed.error || !signed.signedTxXdr) {
-    throw new Error(signed.error?.message || "Transaction signing was cancelled.");
-  }
-  return signed.signedTxXdr;
-}
-
-// ─── Fund modal (from /bounties/:id/fund?token=…) ─────────────────────────────
-const FundBountyModal = ({ id, token, onClose }: { id?: string; token: string | null; onClose: () => void }) => {
-  const [bounty, setBounty] = React.useState<Bounty | null>(null);
-  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "confirming" | "done" | "error">("loading");
-  const [msg, setMsg] = React.useState<string | null>(null);
-  const [hash, setHash] = React.useState<string | null>(null);
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  React.useEffect(() => {
-    let alive = true;
-    if (!id || !token) { setPhase("error"); setMsg("This funding link is missing its bounty id or security token."); return; }
-    (async () => {
-      try {
-        const r = await api.bounty(id);
-        if (!alive) return;
-        setBounty(r.bounty);
-        setPhase("ready");
-      } catch (e: any) {
-        if (!alive) return;
-        setPhase("error");
-        setMsg(e?.message || "Couldn't load this bounty.");
-      }
-    })();
-    return () => { alive = false; };
-  }, [id, token]);
-
-  const fund = async () => {
-    if (!id || !token) return;
-    setPhase("working");
-    setMsg(null);
-    try {
-      const address = await freighterAddress();
-      const { xdr, networkPassphrase } = await api.bountyFundingTx(id, token, address);
-      const signedXdr = await freighterSign(xdr, address, networkPassphrase);
-      try {
-        const res = await api.submitBountyFunding(id, token, signedXdr);
-        setHash(res.hash || null);
-        setPhase("done");
-      } catch (e) {
-        // By this point the signed tx has been BROADCAST — the backend submits to
-        // Stellar before it records anything. A "not_durable" 503 means only that
-        // the backend couldn't persist its record yet (it keeps retrying, and the
-        // keeper reconciles against the chain), so showing "failed" would be
-        // wrong: the USDC is moving into escrow. Watch the bounty until it opens.
-        if (e instanceof ApiError && e.status === 503 && e.message === "not_durable") {
-          setPhase("confirming");
-          return;
-        }
-        throw e;
-      }
-    } catch (e: any) {
-      setMsg(e?.message || "Funding failed.");
-      setPhase("error");
-    }
-  };
-
-  // While confirming, poll the bounty (reads are never gated by the backend's
-  // durability barrier) until the keeper flips it out of PENDING_FUNDING.
-  React.useEffect(() => {
-    if (phase !== "confirming" || !id) return;
-    let alive = true;
-    const t = setInterval(async () => {
-      try {
-        const r = await api.bounty(id);
-        if (!alive) return;
-        setBounty(r.bounty);
-        if (r.bounty.status !== "PENDING_FUNDING") setPhase("done");
-      } catch {
-        // transient — keep polling
-      }
-    }, 4000);
-    return () => {
-      alive = false;
-      clearInterval(t);
-    };
-  }, [phase, id]);
-
-  return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
-        <div className="cb-modal-head">
-          <div className="cb-eyebrow">Fund bounty</div>
-          <h2 className="cb-modal-title">Escrow this bounty</h2>
-          <div className="cb-modal-sub">
-            {bounty
-              ? <>Fund <span className="mono">{bounty.code}</span> — {bounty.title}. You'll sign a create-escrow transaction with your Freighter wallet.</>
-              : "Sign a create-escrow transaction with your Freighter wallet to publish this bounty."}
-          </div>
-        </div>
-
-        {bounty && (
-          <div className="tu-notice" style={{ marginBottom: 16 }}>
-            <Icon name="warn" size={15} />
-            <span><b>{money(bounty.amountUsdc)} USDC</b> will move from your wallet into escrow on Stellar. It's released to the contributor when you merge their PR, or refunded to you if the deadline elapses.</span>
-          </div>
-        )}
-
-        {phase === "done" ? (
-          <div className="wd-success">
-            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
-            <div className="wd-success-title">Escrow funded</div>
-            <div className="wd-success-sub">
-              {bounty ? <>{money(bounty.amountUsdc)} USDC is now escrowed. </> : null}
-              {hash ? <>Tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a>.</> : "The transaction has been submitted."}
-            </div>
-          </div>
-        ) : phase === "confirming" ? (
-          <div className="wd-success">
-            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
-            <div className="wd-success-title">Transaction submitted</div>
-            <div className="wd-success-sub">
-              Your funding transaction was signed and broadcast to Stellar. Waiting for
-              on-chain confirmation — this usually takes under a minute. You can close
-              this window; the bounty opens automatically once the escrow confirms.
-            </div>
-          </div>
-        ) : msg ? (
-          <div className="mono" style={{ fontSize: 12, color: phase === "error" ? "var(--danger)" : "var(--fg-mute)", padding: "4px 0 12px" }}>{msg}</div>
-        ) : null}
-
-        <div className="cb-modal-foot">
-          <button className="btn ghost" onClick={onClose}>{phase === "done" ? "Done" : phase === "confirming" ? "Close" : "Cancel"}</button>
-          {phase !== "done" && phase !== "confirming" && (
-            <button className="btn primary" disabled={phase === "loading" || phase === "working" || !bounty} onClick={fund}>
-              <Icon name="check" size={13} /> {phase === "working" ? "Signing…" : "Fund with Freighter"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
   );
 };
 
