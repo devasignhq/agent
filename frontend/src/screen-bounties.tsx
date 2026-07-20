@@ -15,6 +15,7 @@ import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-api";
 import { Icon } from "./icons";
 import { useAuth } from "./auth-context";
+import { useLiveTopic } from "./live-context";
 import {
   api,
   ApiError,
@@ -144,7 +145,15 @@ export const BountiesPage = ({
     }
   }, []);
 
-  // Poll while anything is settling on-chain (keeper tick is 12s).
+  // Server-driven refresh: a contributor applying, accepting, submitting or
+  // withdrawing all move the bounty, and none of them originate here. `refresh`
+  // rather than `load` on purpose — it skips the loading flash and swallows
+  // transient errors, so a live refetch never blanks the screen.
+  useLiveTopic("bounties", () => void refresh());
+
+  // Poll while anything is settling on-chain (keeper tick is 12s). Kept as a
+  // backstop even though wallet-changed now pushes: this window is short and
+  // money-related, so a missed frame shouldn't leave a payout looking pending.
   const settling = txns.some((t) => t.status === "pending");
   React.useEffect(() => {
     if (!settling) return;

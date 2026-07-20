@@ -44,6 +44,7 @@ import {
   submitSponsorRelease,
   withdrawApplication,
 } from "../bounties/service.js";
+import { sponsorAudience } from "../bounties/live.js";
 
 export const bounties = Router();
 
@@ -283,6 +284,27 @@ bounties.post("/bounties/:id/apply", (req, res) => {
     note: typeof req.body?.note === "string" ? req.body.note : undefined,
   });
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  // Tell the sponsor someone applied — until now this was completely silent, so
+  // a sponsor had no way to learn about a new applicant short of reloading.
+  //
+  // Gated on "applied" specifically: re-applying returns ok with reason
+  // "already_applied" and no bounty, and notifying on that would let a
+  // contributor ring the sponsor's bell by clicking Apply repeatedly.
+  //
+  // An org installation has several sponsors, and each gets their own row —
+  // notifications are per-user, so there is no shared inbox to dedupe against.
+  if (r.reason === "applied" && r.bounty) {
+    const b = r.bounty;
+    for (const sponsorId of sponsorAudience(b)) {
+      pushNotification(
+        sponsorId,
+        "bounty",
+        `@${user.githubLogin} applied to ${b.code}`,
+        `${b.repo}#${b.issueNumber} — ${b.title}`,
+        { link: "/bounty" }
+      );
+    }
+  }
   res.json({ ok: true, bounty: r.bounty });
 });
 
