@@ -14,6 +14,7 @@ import { advancedChanged, effectiveWorkflow, normalizeWorkflow } from "../review
 import { fetchLinearTeams, validateLinearToken } from "../linear/client.js";
 import { parseIntegrationInput } from "../integrations/validate.js";
 import { detectVideoProvider } from "../llm.js";
+import { isObviouslyNonPublicHost } from "../ssrf.js";
 import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalSession } from "../billing/stripe.js";
 import { defaultDeletionDeps, purgeAccount, type DeletionDeps } from "../account.js";
 import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMITS, type Interval } from "../billing/plans.js";
@@ -535,6 +536,37 @@ api.put("/repositories/:id/workflow", (req, res) => {
   res.json({ ok: true, workflow: next });
 });
 
+// Accept only a URL we are willing to STORE and later hand back to a browser as
+// a link. Guidance materials and task attachments both end up rendered as an
+// <a href> on the agent page, so a `javascript:`/`data:` URL stored here is
+// stored XSS — a scheme check at the boundary is what keeps it out.
+//
+// This is NOT the SSRF boundary, and must not be mistaken for one. Nothing
+// fetches a task attachment server-side (summarizeVideo hands the URL to Gemini
+// as prompt text, and only a hostname-allowlisted YouTube link ever becomes a
+// fileUri), and the one path that does fetch — guidance `kind: "doc"` — goes
+// through ssrf.ts's resolvePublicUrl + fetchGuarded, which re-validates and
+// re-pins every redirect hop. That guard is the boundary, by design: it holds at
+// connect time, where a check here cannot.
+//
+// Deliberately DNS-free. Resolving here would put an attacker-controlled lookup
+// in the request handler (latency/DoS), and a resolve-time verdict cannot bind
+// the later fetch anyway — that is the rebinding TOCTOU ssrf.ts exists to close.
+// So we only drop what is decidable offline: bad schemes and hosts that can
+// never be public. It buys a fast, honest 400 instead of an item that fails
+// later in the worker.
+function isStorableLinkUrl(raw: unknown): raw is string {
+  if (typeof raw !== "string" || !raw) return false;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== "http:" && u.protocol !== "https:") return false;
+  return !isObviouslyNonPublicHost(u.hostname);
+}
+
 // --- Per-repo guidance materials (Workflow "Ingest context" node) ---
 //
 // Maintainer-attached videos, doc links and uploaded PDFs that steer every
@@ -632,15 +664,7 @@ api.post("/repositories/:id/guidance", expensiveLimiter, (req, res) => {
   const kind = req.body?.kind;
   const url = typeof req.body?.url === "string" ? req.body.url.trim() : "";
   if (kind !== "video" && kind !== "doc") return void res.status(400).json({ error: "invalid_kind" });
-  let parsed: URL;
-  try {
-    parsed = new URL(url);
-  } catch {
-    return void res.status(400).json({ error: "invalid_url" });
-  }
-  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
-    return void res.status(400).json({ error: "invalid_url" });
-  }
+  if (!isStorableLinkUrl(url)) return void res.status(400).json({ error: "invalid_url" });
   const existing = ctx.repo.guidance ?? [];
   if (existing.length >= MAX_GUIDANCE_ITEMS) return void res.status(400).json({ error: "too_many_items" });
 
@@ -990,8 +1014,23 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
     repos.some((repo) => installs.some((i) => i.id === repo.installationId)) ||
     (!!task.userId && task.userId === user.id);
   if (!owns) return void res.status(403).json({ error: "forbidden" });
-  const { kind, url, note } = req.body || {};
+  const { kind, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
+  // `url` is optional — a `kind: "text"` message from the composer carries only
+  // a note. When one IS present it gets stored, echoed back to the agent page,
+  // and rendered there as a link, so it has to clear the same bar as a guidance
+  // URL. See isStorableLinkUrl: this is an XSS/storage check, not an SSRF one.
+  //
+  // Trim first so the value we validate is the value we store, matching the
+  // guidance route. Whitespace-only collapses to "absent" (the field is
+  // optional), but a NON-string url deliberately stays as-is so it still fails
+  // the check below — silently treating it as absent would 200 the request and
+  // drop the link, leaving the client believing it saved one.
+  const rawUrl = req.body?.url;
+  const url = typeof rawUrl === "string" ? rawUrl.trim() || undefined : rawUrl;
+  if (url !== undefined && url !== null && !isStorableLinkUrl(url)) {
+    return void res.status(400).json({ error: "invalid_url" });
+  }
   const att = { id: uuid(), kind, url, note, createdAt: Date.now() };
   // Non-text kinds (videos, docs, images, PDFs) genuinely reshape the brief
   // and warrant a fresh criteria synthesis. Plain text messages from the

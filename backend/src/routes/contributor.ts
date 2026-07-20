@@ -129,7 +129,13 @@ export function contributorBountyView(b: Bounty, githubId: number) {
     deadlineAt: b.deadlineAt ?? null,
     prNumber: b.prNumber ?? null,
     submittedAt: b.submittedAt ?? null,
-    supportingLinks: b.supportingLinks ?? [],
+    // The assignee's submitted work evidence — an unlisted demo, a preview
+    // deploy, a design doc. Gated like the wallet fields above, and for a
+    // sharper reason than they are: involvesContributor() keeps every REJECTED
+    // applicant subscribed to this bounty, so ungated they would each keep
+    // receiving whoever won it delivering it. Empty array rather than null when
+    // gated — the contributor app calls .length/.map on this unconditionally.
+    supportingLinks: isAssignee ? (b.supportingLinks ?? []) : [],
     payoutRequestedAt: b.payoutRequestedAt ?? null,
     rejection: b.rejection ?? null,
     cancelReason: b.cancelReason ?? null,

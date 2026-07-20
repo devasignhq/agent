@@ -135,6 +135,38 @@ test("wallet fields surface only for the assignee", () => {
   assert.equal(asOther.assigneeMemo, null);
 });
 
+// Supporting links are the assignee's submitted work evidence — an unlisted
+// demo, a preview deploy, a design doc. involvesContributor() keeps every
+// rejected applicant subscribed to the bounty, so without a gate they keep
+// receiving whoever won it delivering it.
+test("submitted work links surface only for the assignee", () => {
+  const assigned = mkBounty({
+    status: "IN_REVIEW",
+    assigneeGithubId: DEV.githubId,
+    assigneeGithubLogin: DEV.githubLogin,
+    prNumber: 42,
+    submittedAt: Date.now(),
+    supportingLinks: [{ type: "Demo", url: "https://preview.example.com/unlisted", addedAt: 1 }],
+    applications: [
+      { githubId: DEV.githubId, githubLogin: DEV.githubLogin, appliedAt: 1, status: "accepted" },
+      { githubId: OTHER.githubId, githubLogin: OTHER.githubLogin, appliedAt: 2, status: "rejected" },
+    ],
+  });
+  const asAssignee = contributorBountyView(assigned, DEV.githubId);
+  assert.deepEqual(
+    asAssignee.supportingLinks.map((l) => l.url),
+    ["https://preview.example.com/unlisted"],
+    "the assignee still gets their own links (the submit modal prefills from them)"
+  );
+
+  const asOther = contributorBountyView(assigned, OTHER.githubId);
+  assert.deepEqual(asOther.supportingLinks, [], "a losing applicant must not receive them");
+  assert.ok(
+    !JSON.stringify(asOther).includes("preview.example.com"),
+    "the URL must not survive anywhere in the payload"
+  );
+});
+
 test("summary: active/applied/completed and escrow/earned sums", () => {
   const mine = (patch: Partial<Bounty>) =>
     mkBounty({

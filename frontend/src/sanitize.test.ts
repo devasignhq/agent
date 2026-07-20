@@ -10,6 +10,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   safeUrl,
+  sourceLink,
   escapeHtml,
   SANITIZE_ALLOWED_TAGS,
   SANITIZE_ALLOWED_ATTR,
@@ -62,6 +63,48 @@ test("safeUrl rejects empty / whitespace / nullish input", () => {
 
 test("safeUrl rejects garbage that isn't a URL under either candidate", () => {
   assert.equal(safeUrl("not a url with spaces"), "");
+});
+
+// ── sourceLink (the agent page's "sources analyzed" render model) ────────────
+
+// The decisive case: a source URL stored before the backend validated them can
+// be any string, and the agent page puts it in an href. An unsafe scheme must
+// produce no href — but must still be shown, so the maintainer can see what is
+// on the task rather than have it silently vanish.
+test("sourceLink refuses to link an unsafe URL but still displays it", () => {
+  for (const bad of ["javascript:alert(1)", "data:text/html,<script>alert(1)</script>", "file:///etc/passwd"]) {
+    const { href, shown } = sourceLink(bad);
+    assert.equal(href, "", `${bad} must not become an href`);
+    assert.ok(shown.length > 0, `${bad} must still be displayed`);
+  }
+});
+
+test("sourceLink links a real http(s) URL", () => {
+  const { href, shown } = sourceLink("https://www.loom.com/share/deadbeef");
+  assert.equal(href, "https://www.loom.com/share/deadbeef");
+  assert.equal(shown, "https://www.loom.com/share/deadbeef");
+});
+
+test("sourceLink truncates only the display string, never the href", () => {
+  const long = "https://example.com/" + "a".repeat(80);
+  const { href, shown } = sourceLink(long);
+  assert.equal(href, long, "the href must stay whole and navigable");
+  assert.equal(shown.length, 39, "38 chars + the ellipsis");
+  assert.ok(shown.endsWith("…"));
+});
+
+test("sourceLink leaves a URL at the length limit unabbreviated", () => {
+  const exact = "https://example.com/" + "a".repeat(20); // exactly 40 chars
+  assert.equal(exact.length, 40);
+  assert.equal(sourceLink(exact).shown, exact);
+});
+
+test("sourceLink handles a missing url (text attachments carry none)", () => {
+  for (const empty of ["", null, undefined]) {
+    const { href, shown } = sourceLink(empty);
+    assert.equal(href, "");
+    assert.equal(shown, "");
+  }
 });
 
 // ── escapeHtml ───────────────────────────────────────────────────────────────
