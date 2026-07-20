@@ -7,7 +7,8 @@
 //     node --import tsx/esm --test src/statsig.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeMetadata, track, toStatsigUser } from "./statsig.js";
+import { checkGate, normalizeMetadata, track, toStatsigUser } from "./statsig.js";
+import { isStatsigConfigured } from "./config.js";
 import type { User } from "./types.js";
 
 const user: User = {
@@ -57,6 +58,35 @@ test("track() is a no-op and never throws when the client is uninitialized", () 
   assert.doesNotThrow(() => track("u-123", "account deletion requested"));
   assert.doesNotThrow(() => track(user, "pr opened", { pr_number: 482, is_private: true }));
   assert.equal(track(user, "noop"), undefined);
+});
+
+// ── checkGate(): unconfigured must NOT mean "feature off" ────────────────────
+// The whole point of the three-state decision. If this regressed to track()'s
+// plain `if (!client) return false`, every gated feature would silently stop
+// running in local dev and in this very test suite — the job tests would then
+// assert against work that never happens and still go green.
+//
+// The test script blanks STATSIG_SECRET_KEY so this is deterministic regardless
+// of the developer's shell. The two CONFIGURED branches (gate off -> false, SDK
+// throw -> false) need a live client and are not reachable here; they are
+// covered by the manual staging check, not by a module-cache-busting harness.
+test("the suite really is running unconfigured", () => {
+  assert.equal(isStatsigConfigured(), false, "npm test must blank STATSIG_SECRET_KEY");
+});
+
+test("checkGate() returns the caller's fallback when Statsig is unconfigured", () => {
+  assert.equal(checkGate(user, "bounty_criteria_drafting", true), true);
+  assert.equal(checkGate("u-123", "bounty_criteria_drafting", true), true);
+  assert.equal(checkGate(user, "some_other_gate", false), false);
+});
+
+test("checkGate() defaults to fallback=false when the caller omits it", () => {
+  assert.equal(checkGate(user, "bounty_criteria_drafting"), false);
+});
+
+test("checkGate() never throws", () => {
+  assert.doesNotThrow(() => checkGate(user, ""));
+  assert.doesNotThrow(() => checkGate("", "gate"));
 });
 
 // ── toStatsigUser(): User-vs-string mapping ──────────────────────────────────

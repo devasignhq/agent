@@ -4,6 +4,7 @@ import { flushPending } from "./db.js";
 import { runLinearIngestJob, runMaintainerFeedbackJob, runReviewJob } from "./review/pipeline.js";
 import { buildRepoIndex } from "./review/indexer.js";
 import { runGuidanceIngestJob } from "./review/guidance.js";
+import { runBountyCriteriaJob } from "./bounties/criteria-job.js";
 
 // Run one job to completion. A job mutates the store (a finished review writes
 // its prReviews/reviewLogs rows and charges the monthly count) but there is no
@@ -35,6 +36,10 @@ async function runJob(job: Job): Promise<void> {
     case "guidance_ingest":
       console.log(`[worker] guidance_ingest ${job.payload.repoId}/${job.payload.itemId}`);
       await runGuidanceIngestJob(job.payload);
+      return;
+    case "bounty_criteria":
+      console.log(`[worker] bounty_criteria ${job.payload.bountyId}`);
+      await runBountyCriteriaJob(job.payload.bountyId);
       return;
   }
 }

@@ -458,6 +458,8 @@ export type SubmissionRejection = { reason: string; byLogin: string; at: number 
 // (the frontend synthesizes a coarse timeline from timestamps as a fallback).
 export type BountyEventKind =
   | "created"
+  | "criteria_drafted"
+  | "criteria_edited"
   | "funding_submitted"
   | "funded"
   | "applied"
@@ -515,7 +517,19 @@ export type Bounty = {
   externalKey?: string | null; // Linear issue id, when source === "linear"
   title: string;
   description: string;
+  // The acceptance contract. ORDER IS LOAD-BEARING: the review pipeline seeds
+  // criteria from this list with positional `bounty-1..N` ids, and
+  // partitionBountyCriteria sorts on them — so reordering after funding would
+  // silently reshuffle verdicts against a paid contract. Frozen at funding
+  // (see acceptanceLocked in bounties/service.ts).
   acceptance: string[];
+  // AI-drafted acceptance criteria (both optional; rows written before the
+  // drafting job existed load unchanged and read as "ready").
+  // Generation state for the fund page: without it `acceptance: []` is
+  // ambiguous between "not drafted yet", "drafted nothing" and "drafting
+  // failed" — three different screens.
+  acceptanceState?: "generating" | "ready" | "errored";
+  acceptanceEndGoal?: string | null; // one-sentence "what success looks like"
   sponsorUserId?: string | null; // the DevAsign user who triggered it (may be unset for a pure-comment sponsor)
   sponsorAddress?: string | null; // Freighter G… = on-chain creator; set when funding lands
   taskId: string; // EXACTLY 25 chars; the on-chain escrow key (deterministic from id)

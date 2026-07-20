@@ -26,8 +26,10 @@ import { ensurePRReview } from "../github/webhooks.js";
 import { pushNotification } from "../notifications.js";
 import { updateStatusComment } from "../bounties/botcomment.js";
 import { postAndRecordConfirmComment } from "../bounties/webhooks.js";
+import { validateAcceptance } from "../bounties/acceptance.js";
 import {
   acceptAndStartClock,
+  acceptanceLocked,
   applyToBounty,
   approveApplication,
   buildFundingTx,
@@ -37,6 +39,7 @@ import {
   deleteBounty,
   getBounty,
   markInReview,
+  patchBounty,
   recordBountyEvent,
   refundBounty,
   rejectApplication,
@@ -224,6 +227,41 @@ bounties.post("/bounties", (req, res) => {
   } catch (err) {
     res.status(400).json({ error: "invalid_bounty", message: (err as Error).message });
   }
+});
+
+// --- acceptance criteria (sponsor session only; frozen at funding) ---
+
+// A named sub-resource rather than a generic PATCH /bounties/:id: no such route
+// exists today, and adding one would invite future callers to patch fields that
+// must never be client-writable (amountStroops, status, taskId).
+//
+// Auth here is SESSION + sponsor, deliberately stricter than the funding routes
+// below, which accept the signed link token alone. The two are not comparable:
+// funding costs the actor their own USDC, while editing is free and rewrites
+// what a contributor is paid for — and that link sits in a PUBLIC GitHub
+// comment. Requiring a session costs nothing either, since the funding page
+// already loads the bounty through the session-authed GET above.
+bounties.patch("/bounties/:id/acceptance", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(String(req.params.id));
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(b, user.id)) return void res.status(403).json({ error: "forbidden" });
+  if (acceptanceLocked(b)) return void res.status(409).json({ error: "already_funded" });
+
+  const parsed = validateAcceptance(req.body?.acceptance);
+  if (!parsed.ok) {
+    return void res.status(400).json({ error: parsed.error, index: parsed.index });
+  }
+  // "ready" is what the drafting job's compare-and-set reads: once the sponsor
+  // has saved, an in-flight draft must stand down rather than overwrite them.
+  patchBounty(b.id, { acceptance: parsed.acceptance, acceptanceState: "ready" });
+  recordBountyEvent(b.id, "criteria_edited", {
+    actor: user.githubLogin || null,
+    detail: `${parsed.acceptance.length} criteria`,
+  });
+  const bounty = getBounty(b.id)!;
+  res.json({ bounty: withSponsorLinks(bounty) });
 });
 
 // --- funding (token-scoped; sponsor need not have a session) ---

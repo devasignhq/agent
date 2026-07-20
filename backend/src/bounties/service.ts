@@ -25,6 +25,9 @@ import {
 } from "../stellar/escrow.js";
 import { parseInvokeContractCall, parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
 import { pushNotification } from "../notifications.js";
+import { enqueueBountyCriteria } from "../queue.js";
+import { checkGate, GATES } from "../statsig.js";
+import { bountyActor } from "./owner.js";
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
@@ -65,7 +68,9 @@ function nextSeq(): number {
   return max + 1;
 }
 
-function patchBounty(id: string, patch: Partial<Bounty>): Bounty | null {
+// Exported: the criteria drafting job (bounties/criteria-job.ts) writes the
+// acceptance fields through here so it picks up the updatedAt bump too.
+export function patchBounty(id: string, patch: Partial<Bounty>): Bounty | null {
   return db.update("bounties", (b) => b.id === id, { ...patch, updatedAt: Date.now() });
 }
 
@@ -103,6 +108,36 @@ export function recordBountyEvent(
 }
 
 export type LifecycleResult = { ok: boolean; reason: string; hash?: string; bounty?: Bounty };
+
+/**
+ * True once this bounty's money is committed — the acceptance criteria freeze
+ * here. Before this point the sponsor may still reword the contract; after it,
+ * the list is what every delivered PR gets judged against.
+ *
+ * Deliberately checks the escrow LEDGER ROW as well as escrowTxHash. A bounty
+ * stays PENDING_FUNDING until the keeper confirms, so status alone is far too
+ * late; and recordFunding writes the txn row BEFORE it patches the hash, so a
+ * partial flush can leave either one alone. recoverOrphanedFunding exists for
+ * exactly that failure, and it keys off the row.
+ *
+ * Mirrors — but deliberately does NOT share — unfundedPendingBounties'
+ * predicate below. Adding `|| b.escrowTxHash` there would NARROW orphan
+ * recovery (a bounty with a hash but no row would stop being a candidate), and
+ * duplicating one db.find is a far better trade than perturbing money-recovery
+ * logic.
+ *
+ * Known gap: an escrow live on-chain with neither hash nor row (a post-restart
+ * orphan) stays editable until the keeper adopts it, ~a minute. Closing that
+ * would cost a chain read on every edit.
+ */
+export function acceptanceLocked(b: Bounty): boolean {
+  if (b.status !== "PENDING_FUNDING") return true;
+  if (b.escrowTxHash) return true;
+  return !!db.find(
+    "escrowTransactions",
+    (t) => t.idempotencyKey === `escrow:${b.taskId}` && t.status !== "failed"
+  );
+}
 
 // ── creation + funding ───────────────────────────────────────────────────────
 
@@ -177,7 +212,22 @@ export function createBounty(input: CreateBountyInput): Bounty {
     createdAt: now,
     updatedAt: now,
   };
-  return db.insert("bounties", bounty);
+  const created = db.insert("bounties", bounty);
+
+  // Draft the acceptance criteria unless the caller already supplied a list.
+  // Enqueued HERE rather than at the three call sites so the "generating" flag
+  // and the job can never disagree — this is the only writer of `acceptance`.
+  //
+  // Gated so the rollout can be stopped without a redeploy. The gate is on
+  // GENERATION, which is enough: the review pipeline's bounty-seed path only
+  // fires when acceptance is non-empty, so an off gate leaves PR verdicts
+  // exactly as they are today with no pipeline change at all. Defaults ON when
+  // Statsig is unconfigured, so local dev and the test suite still draft.
+  if (!input.acceptance?.length && checkGate(bountyActor(created), GATES.bountyCriteriaDrafting, true)) {
+    patchBounty(created.id, { acceptanceState: "generating" });
+    enqueueBountyCriteria(created.id);
+  }
+  return getBounty(created.id) ?? created;
 }
 
 /** Build the unsigned `create_escrow` XDR the sponsor signs with Freighter. */
