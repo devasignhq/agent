@@ -88,3 +88,16 @@ test("overLongRows reports exactly the rows the backend would reject", () => {
   const rows = ["fine", "x".repeat(MAX_CRITERION_CHARS), "y".repeat(MAX_CRITERION_CHARS + 1)];
   assert.deepEqual(overLongRows(rows), [2], "the boundary length is allowed, one over is not");
 });
+
+test("overLongRows measures the COLLAPSED row, exactly as the backend does", () => {
+  // Over the limit as typed, under it once whitespace collapses — which is what
+  // the server stores. Measuring the raw row here flagged pasted text (tabs,
+  // double spaces) as unsavable when it would have saved fine.
+  const padded = `${"x".repeat(MAX_CRITERION_CHARS - 4)}${"  ".repeat(10)}end`;
+  assert.ok(padded.trim().length > MAX_CRITERION_CHARS, "the raw row really is over the limit");
+  assert.deepEqual(overLongRows([padded]), [], "collapsed it fits, so the UI must not warn");
+  assert.ok(
+    normalizeForSave([padded])[0].length <= MAX_CRITERION_CHARS,
+    "and what we'd actually send does fit — the two must never disagree"
+  );
+});

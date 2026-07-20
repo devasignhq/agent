@@ -42,6 +42,17 @@ export function moveRow(rows: string[], index: number, direction: -1 | 1): strin
 }
 
 /**
+ * One criterion, normalized exactly as the backend's validateAcceptance does:
+ * ALL consecutive whitespace collapsed, not merely trimmed.
+ *
+ * Shared by normalizeForSave and overLongRows on purpose. They previously
+ * carried separate rules and drifted: the length warning measured the raw
+ * trimmed row while the save collapsed it first, so pasted text with tabs or
+ * double spaces was flagged as too long and then saved fine.
+ */
+const collapse = (text: string) => text.replace(/\s+/g, " ").trim();
+
+/**
  * What actually gets sent. Mirrors the backend's validateAcceptance
  * normalization so the sponsor sees the same list the server will store —
  * blank rows the editor allows while typing are dropped here, not rejected.
@@ -50,7 +61,7 @@ export function normalizeForSave(rows: string[]): string[] {
   const out: string[] = [];
   const seen = new Set<string>();
   for (const row of rows) {
-    const text = row.replace(/\s+/g, " ").trim();
+    const text = collapse(row);
     if (!text) continue;
     const key = text.toLowerCase();
     if (seen.has(key)) continue;
@@ -68,5 +79,7 @@ export function isDirty(rows: string[], saved: string[]): boolean {
 
 /** Rows the backend would reject outright, so the UI can flag them inline. */
 export function overLongRows(rows: string[]): number[] {
-  return rows.map((r, i) => (r.trim().length > MAX_CRITERION_CHARS ? i : -1)).filter((i) => i !== -1);
+  return rows
+    .map((r, i) => (collapse(r).length > MAX_CRITERION_CHARS ? i : -1))
+    .filter((i) => i !== -1);
 }
