@@ -183,6 +183,19 @@ export async function completeWithMeta(opts: {
 // without an API key. Returns JSON shaped like the live model would produce.
 function mockComplete({ system, messages }: { system?: string; messages: LLMMessage[] }): string {
   const last = messages[messages.length - 1]?.content || "";
+
+  // MUST stay ahead of the criteria-synthesis branch below: the judge's user
+  // message quotes the drafted list, so it contains the literal phrase
+  // "acceptance criteria" and would otherwise be answered with criteria.
+  // Returns a clean verdict per criterion, echoing the `[n]` indices out of the
+  // prompt so scoreCriteria merges them (hardcoded indices would zero-match).
+  if (system?.includes("bounty criteria evaluation")) {
+    const indices = [...last.matchAll(/^\[(\d+)\]/gm)].map((m) => Number(m[1]));
+    return JSON.stringify({
+      results: indices.map((index) => ({ index, flags: [], note: "mock verdict: sound" })),
+    });
+  }
+
   if (system?.includes("criteria synthesis") || last.includes("acceptance criteria")) {
     return JSON.stringify({
       endGoal:
