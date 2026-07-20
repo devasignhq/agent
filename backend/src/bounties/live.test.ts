@@ -11,7 +11,7 @@ import {
   addClient,
   closeAllStreams,
 } from "../notifications-stream.js";
-import type { Bounty, BountyApplication, EscrowTransaction } from "../types.js";
+import type { Bounty, BountyApplication, EscrowTransaction, Installation } from "../types.js";
 import { contributorAudience, startBountyLiveSignals } from "./live.js";
 
 // Records frames; `types` is the sequence of frame types this socket received.
@@ -74,6 +74,7 @@ beforeEach(() => {
   closeAllStreams();
   db.remove("bounties", () => true);
   db.remove("escrowTransactions", () => true);
+  db.remove("installations", () => true);
   stop = startBountyLiveSignals();
 });
 afterEach(() => {
@@ -117,6 +118,114 @@ test("a bounty change reaches every watching contributor exactly once", async ()
   assert.deepEqual(assignee.types, ["bounties-changed"]);
   assert.deepEqual(applicant.types, ["bounties-changed"]);
   assert.deepEqual(stranger.types, [], "an unrelated contributor hears nothing");
+});
+
+// ── sponsor audience ────────────────────────────────────────────────────────
+
+function mkInstall(installationId: number, over: Partial<Installation> = {}): Installation {
+  seq++;
+  return db.insert("installations", {
+    id: `i-${seq}`,
+    userId: `owner-${seq}`,
+    installationId,
+    accountId: 1,
+    accountLogin: "acme",
+    createdAt: 1,
+    ...over,
+  } as Installation);
+}
+
+test("the sponsor is reached by sponsorUserId when the bounty carries one", async () => {
+  const sponsor = fakeRes();
+  addClient("sponsor-1", sponsor);
+  const b = mkBounty({ sponsorUserId: "sponsor-1", installationId: 0 });
+  await settle();
+  sponsor.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "PAID" });
+  await settle();
+  assert.deepEqual(sponsor.types, ["bounties-changed"]);
+});
+
+test("a comment-created bounty (no sponsorUserId) still reaches every install member", async () => {
+  // This is the case that makes the installation lookup mandatory: bounties
+  // created from a GitHub issue comment never get a sponsorUserId.
+  const owner = fakeRes();
+  const colleague = fakeRes();
+  addClient("u-owner", owner);
+  addClient("u-colleague", colleague);
+  mkInstall(9090, { userId: "u-owner", userIds: ["u-owner", "u-colleague"] });
+  const b = mkBounty({ sponsorUserId: null, installationId: 9090 });
+  await settle();
+  owner.writes.length = 0;
+  colleague.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "IN_REVIEW" });
+  await settle();
+  assert.deepEqual(owner.types, ["bounties-changed"]);
+  assert.deepEqual(colleague.types, ["bounties-changed"], "an org install has several sponsors");
+});
+
+test("a legacy install row with no userIds falls back to its single userId", async () => {
+  const owner = fakeRes();
+  addClient("u-legacy", owner);
+  mkInstall(7070, { userId: "u-legacy", userIds: undefined });
+  const b = mkBounty({ sponsorUserId: null, installationId: 7070 });
+  await settle();
+  owner.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "PAID" });
+  await settle();
+  assert.deepEqual(owner.types, ["bounties-changed"]);
+});
+
+test("the install join uses the GITHUB numeric id, not the row id", async () => {
+  // Bounty.installationId joins Installation.installationId (numeric), while
+  // Repository.installationId joins Installation.id (uuid). Copying the repo
+  // join here would resolve the wrong install — or none — and silently deliver
+  // to nobody. Pin the distinction.
+  const wrong = fakeRes();
+  addClient("u-wrong", wrong);
+  const install = mkInstall(5050, { userId: "u-wrong" });
+  // Point the bounty at the ROW id's numeric-looking twin: a bounty whose
+  // installationId matches nothing must reach no sponsor at all.
+  const b = mkBounty({ sponsorUserId: null, installationId: 4040 });
+  await settle();
+  wrong.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "PAID" });
+  await settle();
+  assert.deepEqual(wrong.types, [], "no install matches 4040, so no sponsor frame");
+  assert.equal(install.installationId, 5050);
+});
+
+test("a Linear bounty (installationId 0) resolves via sponsorUserId only", async () => {
+  const sponsor = fakeRes();
+  addClient("u-linear", sponsor);
+  mkInstall(0, { userId: "u-should-not-match" }); // a 0 must not join this
+  const b = mkBounty({ sponsorUserId: "u-linear", installationId: 0 });
+  await settle();
+  sponsor.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "CANCELLED" });
+  await settle();
+  assert.deepEqual(sponsor.types, ["bounties-changed"]);
+});
+
+test("someone who is both sponsor and applicant is written to once", async () => {
+  const both = fakeRes();
+  addClient("u-both", both, { githubId: 321 });
+  const b = mkBounty({
+    sponsorUserId: "u-both",
+    installationId: 0,
+    applications: [app(321, "pending")],
+  });
+  await settle();
+  both.writes.length = 0;
+
+  db.update("bounties", (x) => x.id === b.id, { status: "IN_REVIEW" });
+  await settle();
+  assert.deepEqual(both.types, ["bounties-changed"], "named by both identities, one frame");
 });
 
 // ── silence on invisible writes ─────────────────────────────────────────────

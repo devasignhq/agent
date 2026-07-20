@@ -14,12 +14,13 @@
 //      so one logical transition (which patches the row for its state AND again
 //      for its activity-event) sends one frame, not two or three.
 //
-// Audience is contributors only for now: the assignee and the applicants still
-// in the running. Sponsors are deliberately NOT signalled yet — the sponsor app
-// refreshes on ANY frame it receives, so pushing to it before it can route by
-// type would just buy it a pointless /api/notifications refetch. It joins when
-// that app gets the same live bus.
+// Two audiences, resolved by different identities because the domain names them
+// differently: contributors by githubId (an application carries no userId) and
+// sponsors by userId (they are DevAsign accounts, and an org install can have
+// several members). Both are resolved in the coalesced flush, never in the
+// synchronous listener — the sponsor lookup scans `installations`.
 import { db, onRowChange } from "../db.js";
+import { installMembers } from "../github/installations.js";
 import { hasClients, notifyAudience } from "../notifications-stream.js";
 import type { Bounty, EscrowTransaction } from "../types.js";
 
@@ -73,6 +74,30 @@ export function contributorAudience(b: Bounty): number[] {
   return [...ids];
 }
 
+// Who on the sponsor side is watching. Mirrors the `isSponsor` access rule
+// (routes/bounties.ts) rather than inventing a second one, and returns userIds
+// because sponsors are DevAsign accounts rather than bare GitHub identities.
+//
+// Two traps here. First, `sponsorUserId` is null for every bounty created from a
+// GitHub issue comment, so it can't be the only source — the installation is.
+// Second, `Bounty.installationId` is GitHub's NUMERIC id, joining
+// `Installation.installationId`; `Repository.installationId` is a uuid joining
+// `Installation.id`. Copying the repo-side join here would silently resolve the
+// wrong installation, or none. Linear bounties carry 0 and fall through.
+//
+// A sponsor "audience" is legitimately several people: an org install can have
+// many members, which is what installMembers() returns (falling back to
+// [userId] for rows written before `userIds` existed).
+export function sponsorAudience(b: Bounty): string[] {
+  const ids = new Set<string>();
+  if (b.sponsorUserId) ids.add(b.sponsorUserId);
+  if (b.installationId) {
+    const install = db.find("installations", (i) => i.installationId === b.installationId);
+    if (install) for (const id of installMembers(install)) ids.add(id);
+  }
+  return [...ids];
+}
+
 // ── coalescing ───────────────────────────────────────────────────────────────
 // One logical transition writes the bounty row more than once (the state patch,
 // then recordBountyEvent's own patch). Collect and flush once per turn.
@@ -99,8 +124,16 @@ function flush(): void {
     // final state (an applicant approved mid-burst should get this frame).
     const b = db.find("bounties", (x) => x.id === id);
     if (!b) continue;
+    // Both sides in ONE frame per connection: notifyAudience dedupes, so a
+    // person who is somehow both (sponsor of one bounty, applicant on it) is
+    // written to once. Note the sponsor lookup scans `installations`, which is
+    // why all of this lives in the coalesced flush and never in the synchronous
+    // listener — db.ts is explicit that listeners run inside the write.
     const githubIds = contributorAudience(b);
-    if (githubIds.length > 0) notifyAudience({ githubIds }, "bounties-changed");
+    const userIds = sponsorAudience(b);
+    if (githubIds.length > 0 || userIds.length > 0) {
+      notifyAudience({ githubIds, userIds }, "bounties-changed");
+    }
   }
   for (const id of ledgers) {
     const b = db.find("bounties", (x) => x.id === id);

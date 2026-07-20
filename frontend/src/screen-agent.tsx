@@ -7,6 +7,12 @@ import { Icon } from "./icons";
 import { api } from "./api";
 import { pushRecent } from "./recent-reviews";
 import { useAuth } from "./auth-context";
+import { useLiveTopic } from "./live-context";
+
+// Backstop cadence for the review queue. The stream is the primary path; this
+// only has to catch a wedged connection, so it matches the notification
+// stream's own fallback rather than the 3s/6s poll it replaced.
+const FALLBACK_REFRESH_MS = 60_000;
 
 const PR_REVIEWS = [
 {
@@ -1467,38 +1473,45 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   // visible again, so the queue is never more than one request behind what
   // the server knows about.
   //
-  // We hold liveReviews in a ref so the polling effect doesn't re-create on
-  // every refresh (which would churn the setTimeout chain and the
-  // visibilitychange listener). The ref always reads the latest value when
-  // the timer fires.
-  const liveReviewsRef = React.useRef(liveReviews);
-  React.useEffect(() => { liveReviewsRef.current = liveReviews; }, [liveReviews]);
+  // The queue is push-driven: a PR joining the queue and a review reaching its
+  // terminal verdict both notify the install owner, which is this user, so the
+  // "reviews" topic covers exactly the two moments the queue must reflect.
+  useLiveTopic("reviews", () => void refreshList());
+
+  // …with a slow fallback behind it. This used to be a 3s/6s adaptive poll that
+  // ran for the entire life of the page — ~18 requests a minute on a completely
+  // idle queue, since each tick fetches reviews AND repositories. It is kept
+  // only as a backstop for a wedged or blocked stream: reviews are the primary
+  // workflow here, so a missed frame must not freeze the queue indefinitely.
   React.useEffect(() => {
     let cancelled = false;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    const tick = async () => {
+    const tick = () => {
       if (cancelled) return;
-      if (document.visibilityState === "visible") {
-        await refreshList();
-      }
-      if (cancelled) return;
-      const anyLive = liveReviewsRef.current.some(
-        (r) => r.status === "queued" || r.status === "reviewing"
-      );
-      timer = setTimeout(tick, anyLive ? 3000 : 6000);
+      if (document.visibilityState === "visible") void refreshList();
     };
-    // Kick off immediately so the first paint already reflects live data.
+    // Paint immediately on mount; the stream drives everything after that.
     tick();
+    const timer = setInterval(tick, FALLBACK_REFRESH_MS);
     const onVisible = () => {
       if (document.visibilityState === "visible") refreshList();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      clearInterval(timer);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [refreshList]);
+
+  // Relative labels ("2m ago") used to re-render as a side effect of the poll
+  // replacing the array every few seconds. With the poll gone they would freeze,
+  // so drive them off a clock instead — same visible granularity, no network.
+  // Feeds mappedReviews' deps below, which is where RELATIVE() is actually read.
+  const [nowTick, setNowTick] = React.useState(0);
+  React.useEffect(() => {
+    const t = setInterval(() => setNowTick((n) => n + 1), 60_000);
+    return () => clearInterval(t);
+  }, []);
 
   // Is the selected review still in flight? Read from the queue's live list
   // (kept fresh by the queue poll), so it flips to false the moment the review
@@ -1575,7 +1588,10 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       met,
       total: r.criteria.length,
     };
-  }), [liveReviews, repoById]);
+    // nowTick is a dependency purely so the RELATIVE() labels above re-evaluate
+    // on the clock. It replaces the identity churn the old 3-6s poll produced as
+    // a side effect — same effect at 60s instead, and without a request.
+  }), [liveReviews, repoById, nowTick]);
 
   // All connected repos, each with its PR count in the queue. Sourced from
   // /api/repositories so repos with zero open PRs still appear in the filter.

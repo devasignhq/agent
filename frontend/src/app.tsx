@@ -13,8 +13,8 @@ import { WorkflowPage } from "./screen-workflow";
 import { BountiesPage } from "./screen-bounties";
 import { SettingsPage } from "./screens-rest";
 import { useAuth } from "./auth-context";
-import { api, apiBase, oauthStartUrl } from "./api";
-import { startNotificationsStream } from "./notifications-stream";
+import { api, oauthStartUrl } from "./api";
+import { LiveProvider, useLiveTopic } from "./live-context";
 import { registerPopup, closePopup } from "./popup-registry";
 import { useRecentReviews } from "./recent-reviews";
 
@@ -130,31 +130,18 @@ function useNotifications(enabled) {
       }
     }
   }, [enabled]);
+  useLiveTopic("notifications", () => void refresh());
   React.useEffect(() => {
     if (!enabled) {
       setItems([]);
       setUnreadCount(0);
       return;
     }
-    // Paint immediately on mount/sign-in, then let the live stream drive refreshes.
+    // Paint immediately on mount/sign-in; LiveProvider drives every refresh after
+    // that. The connection, the fallback poll and the tab-visible refetch all
+    // moved there — one stream per tab, shared with the review queue and the
+    // bounties screen instead of one per consumer.
     void refresh();
-    const stream = startNotificationsStream({
-      openSource: () =>
-        new EventSource(`${apiBase}/api/notifications/stream`, { withCredentials: true }),
-      refresh: () => void refresh(),
-      scheduleFallback: (fn, ms) => setInterval(fn, ms),
-      clearFallback: (h) => clearInterval(h),
-    });
-    // Also refetch when the tab regains focus (cheap, and catches anything missed
-    // while the stream was backgrounded).
-    const onVis = () => {
-      if (document.visibilityState === "visible") void refresh();
-    };
-    document.addEventListener("visibilitychange", onVis);
-    return () => {
-      stream.stop();
-      document.removeEventListener("visibilitychange", onVis);
-    };
   }, [enabled, refresh]);
   const markAllRead = React.useCallback(async () => {
     // Optimistic: clear the badge + flip each row, then confirm server-side.
@@ -811,9 +798,16 @@ const App = () => {
       .catch((err) => console.warn("[statsig] updateUser failed:", err));
   }, [auth.status, auth.user?.id, client]);
 
+  // LiveProvider wraps AppContent rather than living inside it: AppContent
+  // early-returns for loading / auth / unavailable / onboarding, so mounting the
+  // provider in there would tear down and re-open the SSE connection on every
+  // stage flip — including onboarding→app, the moment a user finishes setup.
+  // Out here it survives all of them, and it gates itself on auth internally.
   return (
     <StatsigProvider client={client} loadingComponent={<div>Loading...</div>}>
-      <AppContent />
+      <LiveProvider>
+        <AppContent />
+      </LiveProvider>
     </StatsigProvider>
   );
 };
