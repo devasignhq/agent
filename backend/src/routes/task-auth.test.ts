@@ -187,6 +187,48 @@ test("POST /tasks/:id/attachments: owner adds to a review-less Linear task (task
   assert.equal(attCount(linearTaskId), 2);
 });
 
+// A stored attachment URL is echoed back to the agent page and rendered as an
+// <a href> (screen-agent.tsx renders `s.url` for every summarised video), so a
+// non-http(s) scheme stored here lands in an href. These are the schemes that
+// execute when clicked; the handler must reject them before the row is written.
+test("POST /tasks/:id/attachments: rejects a url that cannot safely become an href", () => {
+  const { ownerId, ghTaskId } = seed();
+  const rejected = [
+    "javascript:alert(document.cookie)",
+    "data:text/html,<script>alert(1)</script>",
+    "file:///etc/passwd",
+    "http://localhost/admin",
+    "http://169.254.169.254/latest/meta-data/", // cloud metadata, decidable offline
+    "not a url",
+  ];
+  for (const url of rejected) {
+    const res = fakeRes();
+    // kind "loom" is the branch that skips detectVideoProvider entirely, so it
+    // is the one that would otherwise store an arbitrary URL unexamined.
+    addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "loom", url }), res);
+    assert.equal(res.statusCode, 400, `expected 400 for ${url}`);
+    assert.equal(res.body.error, "invalid_url", `expected invalid_url for ${url}`);
+  }
+  assert.equal(attCount(ghTaskId), 1, "no rejected url may be persisted");
+});
+
+// The validation is opt-in on presence: a text message from the composer sends
+// no url at all and must still go through.
+test("POST /tasks/:id/attachments: a real link and a url-less text note still pass", () => {
+  const { ownerId, ghTaskId } = seed();
+  const okRes = fakeRes();
+  addTaskAttachmentHandler(
+    authedReq(ownerId, { id: ghTaskId }, { kind: "loom", url: "https://www.loom.com/share/deadbeef" }),
+    okRes
+  );
+  assert.equal(okRes.statusCode, 200);
+
+  const textRes = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), textRes);
+  assert.equal(textRes.statusCode, 200);
+  assert.equal(attCount(ghTaskId), 3);
+});
+
 // --- DELETE /tasks/:taskId/attachments/:attachmentId ---
 
 test("DELETE /tasks/:taskId/attachments/:id: 401 signed-out, attachment kept", () => {
