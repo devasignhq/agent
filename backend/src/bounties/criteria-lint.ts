@@ -11,12 +11,15 @@
 // them — a nagging linter must not stand between a sponsor and funding.
 import { MAX_CRITERION_CHARS } from "./acceptance.js";
 
-export type CriteriaLint =
-  | "count_out_of_range"
-  | "conjoined"
-  | "vague_word"
-  | "empty_end_goal"
-  | "too_long";
+// NOTE: "criterion joins two requirements with `and`" deliberately is NOT here.
+// It was, and the first live eval run showed it is not lexically detectable:
+// the heuristic fired on conditional clauses ("when X and Y have happened, Z")
+// and on noun phrases ("Buffer and ArrayBuffer views"), and a comma-before-and
+// rule fares no better because lists use ", and" too. Telling those apart needs
+// the semantics, so it moved to the LLM judge as a `conjoined` flag
+// (criteria-eval.ts). A noisy advisory is worse than no advisory — it trains
+// you to ignore the output.
+export type CriteriaLint = "count_out_of_range" | "vague_word" | "empty_end_goal" | "too_long";
 
 export type CriteriaLintFinding = { lint: CriteriaLint; index?: number; detail: string };
 
@@ -42,22 +45,6 @@ const VAGUE_WORDS = [
   "where appropriate",
   "make sure it works",
 ];
-
-// A criterion joining two independent requirements with "and". Both sides must
-// be substantial before we flag it — "duplicate deliveries and retries are
-// ignored" is one idea, while two 25+ char clauses is almost always two.
-const CONJUNCTION_MIN_SIDE = 25;
-
-function isConjoined(text: string): boolean {
-  const parts = text.split(/\s+and\s+/i);
-  if (parts.length < 2) return false;
-  for (let i = 0; i < parts.length - 1; i++) {
-    if (parts[i].trim().length >= CONJUNCTION_MIN_SIDE && parts[i + 1].trim().length >= CONJUNCTION_MIN_SIDE) {
-      return true;
-    }
-  }
-  return false;
-}
 
 /** Structural problems with a drafted list. Empty array = nothing to flag. */
 export function lintCriteria(criteria: string[], endGoal: string): CriteriaLintFinding[] {
@@ -86,9 +73,6 @@ export function lintCriteria(criteria: string[], endGoal: string): CriteriaLintF
   criteria.forEach((text, index) => {
     if (text.length > MAX_CRITERION_CHARS) {
       findings.push({ lint: "too_long", index, detail: `${text.length} chars` });
-    }
-    if (isConjoined(text)) {
-      findings.push({ lint: "conjoined", index, detail: "joins two requirements with 'and'" });
     }
     const lower = text.toLowerCase();
     for (const word of VAGUE_WORDS) {

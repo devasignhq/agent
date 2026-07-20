@@ -48,25 +48,18 @@ test(`flags a list longer than ${SOFT_MAX_CRITERIA}`, () => {
   assert.deepEqual(kinds(atCap), [], "exactly at the cap is fine");
 });
 
-test("flags two substantial requirements joined by 'and', with the criterion index", () => {
-  const findings = lintCriteria(
-    [
-      ...CLEAN,
-      "The endpoint returns 409 once the escrow is funded and the bot comment is rewritten with the locked list.",
-    ],
-    GOAL
-  );
-  const conjoined = findings.find((f) => f.lint === "conjoined");
-  assert.ok(conjoined, "expected a conjoined finding");
-  assert.equal(conjoined.index, 3);
-});
-
-test("does not flag 'and' joining one idea", () => {
-  assert.deepEqual(
-    kinds([...CLEAN, "Retries and replays are capped."]),
-    [],
-    "both sides must be substantial before this is two requirements"
-  );
+// Conjoined requirements are NOT linted here — see the note on CriteriaLint.
+// The first live eval run showed a lexical rule flags conditional clauses and
+// noun phrases far more often than real conjunctions, so the check moved to the
+// LLM judge. These pin that the noisy cases stay quiet.
+test("does not flag 'and' — conditional clauses and noun phrases are one requirement", () => {
+  for (const text of [
+    "When res.send() is called with a raw ArrayBuffer and no content type has been set, the type is binary.",
+    "The existing handling of Buffer and ArrayBuffer views in res.send() remains unchanged.",
+    "The endpoint returns 409 once the escrow is funded and the bot comment is rewritten with the locked list.",
+  ]) {
+    assert.deepEqual(kinds([...CLEAN, text]), [], `must not lint: ${text.slice(0, 40)}…`);
+  }
 });
 
 test("flags each unjudgeable word the prompt bans", () => {

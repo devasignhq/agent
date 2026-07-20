@@ -18,14 +18,21 @@ export type CriterionFlag =
   | "not_pr_verifiable"
   /** Names a solution instead of an outcome, forbidding a better implementation. */
   | "dictates_implementation"
-  /** Derived from a repo_context file summary rather than from the issue. */
-  | "invented_from_context";
+  /** Derived from background context or model knowledge rather than the issue. */
+  | "invented_from_context"
+  /**
+   * Two independent requirements in one criterion. Lives here rather than in
+   * criteria-lint.ts: the first live eval showed a lexical rule cannot separate
+   * a real conjunction from a conditional clause or a noun phrase.
+   */
+  | "conjoined";
 
 export const CRITERION_FLAGS: CriterionFlag[] = [
   "out_of_scope",
   "not_pr_verifiable",
   "dictates_implementation",
   "invented_from_context",
+  "conjoined",
 ];
 
 export type JudgeVerdict = { index: number; flags: CriterionFlag[]; note: string };
@@ -61,13 +68,20 @@ export const JUDGE_SYSTEM_PROMPT =
   "- `not_pr_verifiable`: the criterion cannot be settled by reading a pull request. It needs the application " +
   "running, a screenshot, a staging deploy, a benchmark, a design review, or a conversation.\n" +
   "- `dictates_implementation`: the criterion names a specific solution, file or data structure instead of " +
-  "stating the outcome, so it forbids a better implementation.\n" +
-  "- `invented_from_context`: the criterion was derived from the background repository files rather than from " +
-  "the issue itself. Background files are descriptive only; a requirement that exists solely because a file " +
-  "exists is invented.\n" +
+  "stating the outcome, so it forbids a better implementation. IMPORTANT: if the ISSUE ITSELF specifies that " +
+  "mechanism, restating it is faithful, not prescriptive — do NOT flag it. Only flag a mechanism the criterion " +
+  "introduces on its own.\n" +
+  "- `invented_from_context`: the criterion requires something the issue never asks for, drawn from the " +
+  "background repository files or from your own knowledge of this project. Background files are descriptive " +
+  "only; a requirement that exists solely because some code exists is invented.\n" +
+  "- `conjoined`: the criterion states TWO independent requirements that could be met separately, so a reviewer " +
+  "could not answer met/not-met with one verdict. Judge the meaning, not the word \"and\": a conditional clause " +
+  "(\"when X and Y hold, Z happens\"), a list of fields, and a compound noun phrase (\"Buffer and ArrayBuffer " +
+  "views\") are each ONE requirement and must not be flagged.\n" +
   "Return an EMPTY `flags` array for a sound criterion — most criteria in a good list should have none. Be " +
   "strict but do not invent problems: a criterion that is merely terse, or that restates the issue plainly, is " +
-  "sound. Judge only what is written; never rewrite the criterion. Never use emoji.";
+  "sound. When a flag is genuinely borderline, leave it off. Judge only what is written; never rewrite the " +
+  "criterion. Never use emoji.";
 
 /** The share of flagged criteria above which a run is considered a regression. */
 export const FLAG_RATE_THRESHOLD = 0.15;

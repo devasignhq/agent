@@ -1652,6 +1652,9 @@ const BOUNTY_CRITERIA_GUARDRAILS =
   "- State outcomes, not implementations. \"Duplicate webhook deliveries are ignored\" is right; \"add a Set to " +
   "webhooks.ts\" is wrong, because it dictates a solution and forbids a better one.\n" +
   "- Each criterion is ONE independently checkable claim. Never join two requirements with \"and\".\n" +
+  "- Every criterion must trace back to something the ticket actually says. You may recognise this project and " +
+  "know APIs it has; that knowledge is NOT a source of requirements. If the ticket does not ask for it, it does " +
+  "not go in the list, however obviously related it seems.\n" +
   "- Write plainly, in the present tense, addressed to a reviewer deciding met or not met. Avoid \"properly\", " +
   "\"correctly\", \"robustly\", \"gracefully\", \"as needed\", and any other word that cannot be judged.\n" +
   "- Include a criterion about tests ONLY when the issue asks for them, or the repository's own conventions (visible " +
