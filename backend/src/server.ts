@@ -32,10 +32,12 @@ import { closeAllStreams } from "./notifications-stream.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { startWorker } from "./worker.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
+import { startBountyLiveSignals } from "./bounties/live.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
+import { requestContext } from "./request-context.js";
 
 // Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
 // fund/cancel/approve links in bounties/links.ts. A secret that is public (either
@@ -140,6 +142,13 @@ app.use(securityHeaders);
 app.use(morgan("dev"));
 app.use(cors({ origin: allowedWebOrigins(), credentials: true }));
 app.use(cookieParser());
+
+// Ambient per-request scope carrying the acting browser tab, so a write deep in
+// the call graph can skip pushing a live-refresh frame back to the tab that
+// caused it (which already refetches on its own). Mounted before every route so
+// the scope covers the whole handler chain; no-ops for callers that send no tab
+// header. See request-context.ts.
+app.use(requestContext);
 
 // Broad per-IP flood shield, applied after CORS so handled preflights don't burn
 // budget and before the webhook receivers below so they're covered too. This is
@@ -274,6 +283,10 @@ const server = app.listen(port, () => {
 
 startWorker();
 startBountyKeeper();
+// Translate bounty/escrow row writes into live-refresh signals for the
+// contributor app. Subscribes to the db change emitter; a no-op while no
+// client holds an open stream. See bounties/live.ts.
+startBountyLiveSignals();
 backfillRepoIndex();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside

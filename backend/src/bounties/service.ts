@@ -511,11 +511,19 @@ export function markInReview(bountyId: string, prNumber: number): LifecycleResul
   // A webhook-inferred PR link counts as the submission moment too — the
   // contributor app's stage machine and timeline key off submittedAt.
   const isNewLink = b.status !== "IN_REVIEW" || b.prNumber !== prNumber;
-  patchBounty(bountyId, {
-    status: "IN_REVIEW",
-    prNumber,
-    ...(b.submittedAt ? {} : { submittedAt: Date.now() }),
-  });
+  // Skip the write entirely when it would change nothing. GitHub re-delivers
+  // `synchronize` on EVERY push to the PR, and patchBounty bumps updatedAt +
+  // version unconditionally — so an unguarded patch turns a 20-commit branch
+  // into 20 identical row writes. That was merely wasteful before; now that a
+  // write drives a live-refresh frame, it would be 20 pushes to every watching
+  // client for no semantic change.
+  if (isNewLink || !b.submittedAt) {
+    patchBounty(bountyId, {
+      status: "IN_REVIEW",
+      prNumber,
+      ...(b.submittedAt ? {} : { submittedAt: Date.now() }),
+    });
+  }
   if (isNewLink) {
     recordBountyEvent(bountyId, "pr_opened", {
       actor: b.assigneeGithubLogin ?? null,
@@ -947,6 +955,25 @@ export async function applyTxnOutcome(
         actor: "system",
         detail: b.cancelReason ?? null,
       });
+      // A contributor who had this bounty assigned just lost it — to the delivery
+      // deadline elapsing, or to the sponsor cancelling. Both arrive here, and
+      // both were previously silent: their dashboard simply stopped showing the
+      // work with no explanation. Word it from the reason so it isn't a mystery.
+      if (b.assigneeGithubId != null) {
+        const dev = db.find("users", (u) => u.githubId === b.assigneeGithubId);
+        if (dev) {
+          const expired = b.cancelReason === "expired";
+          pushNotification(
+            dev.id,
+            "bounty",
+            expired
+              ? `${b.code} expired — the delivery window closed`
+              : `${b.code} was cancelled`,
+            `${b.repo}#${b.issueNumber} — ${b.title}`,
+            { link: "/dashboard" }
+          );
+        }
+      }
     }
     return;
   }

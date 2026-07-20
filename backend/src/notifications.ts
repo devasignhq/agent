@@ -82,7 +82,9 @@ export function markAllRead(userId: string): number {
     db.update("notifications", (n) => n.id === row.id, { readAt: now });
   }
   // Let other open tabs of the same user clear their badge without waiting on
-  // the fallback poll. Only signal when something actually flipped.
-  if (unread.length > 0) notifyUser(userId);
+  // the fallback poll. Only signal when something actually flipped. A distinct
+  // frame type because nothing but read-state moved here — a client that refetched
+  // its bounties on this would be doing it on every click of "Mark all read".
+  if (unread.length > 0) notifyUser(userId, "notifications-read");
   return unread.length;
 }

@@ -1,10 +1,14 @@
 // Shared bounty data: one GET /api/contributor/bounties drives the dashboard,
 // the bounties page, the wallet stats, and the sidebar's recent list, so pages
-// never fetch the same list twice. reload() after any mutation.
+// never fetch the same list twice. reload() after any mutation — and, via the
+// "bounties" live topic, whenever the server says something moved on its own
+// (a maintainer approving work, a payout confirming), so pages stay current
+// without the user reloading.
 import React from "react";
 import { api } from "./api";
 import type { ContributorBounty, ContributorSummary } from "./api";
 import { useAuth } from "./auth-context";
+import { useLiveTopic } from "./live-context";
 
 type BountiesState = {
   bounties: ContributorBounty[];
@@ -48,6 +52,11 @@ export function BountiesProvider({ children }: { children: React.ReactNode }) {
       setLoading(false);
     }
   }, [auth.status]);
+
+  // Server-driven refresh. Note reload() deliberately doesn't touch `loading` —
+  // only the mount effect below does — so a live refetch swaps the data in
+  // place without flashing the pages' full-screen "loading…" state.
+  useLiveTopic("bounties", () => void reload());
 
   React.useEffect(() => {
     if (auth.status === "signed_in") {

@@ -25,6 +25,7 @@ import {
   unreadCountForUser,
 } from "../notifications.js";
 import { addClient, removeClient } from "../notifications-stream.js";
+import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 
@@ -1426,7 +1427,14 @@ api.get("/notifications/stream", (req, res) => {
   // Establish the stream and tell the browser how long to wait before
   // reconnecting if it drops (EventSource handles the reconnect itself).
   res.write("retry: 5000\n\n");
-  addClient(user.id, res);
+  // githubId indexes this stream for bounty fan-out (applications carry a
+  // githubId, not a userId). The tab id arrives as a query param because
+  // EventSource can't set headers — it lets a write caused by THIS tab skip
+  // pushing back to it. Both are optional; a stream without them still works.
+  addClient(user.id, res, {
+    githubId: user.githubId,
+    tabId: sanitizeTabId(req.query.tab),
+  });
   req.on("close", () => removeClient(user.id, res));
 });
 

@@ -1342,6 +1342,63 @@ export async function shutdownDb(): Promise<void> {
   }
 }
 
+// ── row-change notification ──────────────────────────────────────────────────
+// A deliberately domain-free "this row was just written" signal. It exists so a
+// feature can react to a mutation without every write site having to remember to
+// tell it — the live-push fan-out (bounties/live.ts) is the first consumer, and
+// db.ts knows nothing about what any listener does with the row.
+//
+// Emitted from insert() and update() specifically, NOT from stageUpsert() where
+// they converge: stageUpsert early-returns in ephemeral mode (no pool), so
+// hooking there would silently stop emitting in dev and in every test that runs
+// without Postgres. Boot and reconcileAll() stage rows directly and never call
+// insert/update, so loading a snapshot cannot fan out thousands of signals.
+//
+// remove() deliberately does not emit: the only caller is account deletion
+// (account.ts), and nothing live-facing is driven by a row disappearing.
+//
+// Listeners run SYNCHRONOUSLY inside the write, so they must be cheap — do the
+// resolution work behind a coalescing window, not here.
+export type RowChange = {
+  collection: keyof DB;
+  kind: "insert" | "update";
+  row: unknown;
+  // The row as it was BEFORE an update, or null on an insert. Handing this over
+  // costs nothing — update() is about to discard the old object anyway — and it
+  // lets a listener tell a meaningful change from a no-op rewrite without
+  // re-reading or snapshotting anything. Several hot paths rewrite fields no
+  // user can see (bot comment ids, single-flight guards, transaction hash
+  // rebroadcasts), and without a `prev` every one of them looks identical to a
+  // real state transition.
+  prev: unknown | null;
+};
+export type RowChangeListener = (change: RowChange) => void;
+
+const changeListeners = new Set<RowChangeListener>();
+
+/** Subscribe to row writes. Returns an unsubscribe. */
+export function onRowChange(fn: RowChangeListener): () => void {
+  changeListeners.add(fn);
+  return () => {
+    changeListeners.delete(fn);
+  };
+}
+
+function emitRowChange(change: RowChange): void {
+  // Hot path: the keeper writes on a 12s loop and usually nobody is subscribed.
+  if (changeListeners.size === 0) return;
+  // Copy — a listener may unsubscribe itself while being notified.
+  for (const fn of [...changeListeners]) {
+    try {
+      fn(change);
+    } catch (err) {
+      // A listener must NEVER be able to fail a write. The row is already in
+      // memory and staged for persistence by the time we get here; swallow.
+      console.error(`[db] change listener threw for "${String(change.collection)}":`, err);
+    }
+  }
+}
+
 export const db = {
   // Read primitive — return the live array; callers must not mutate without flushing
   table<K extends keyof DB>(name: K): DB[K] {
@@ -1353,6 +1410,7 @@ export const db = {
     (row as { version?: number }).version = bumpedVersion(row);
     (state[name] as DB[K][number][]).push(row);
     stageUpsert(name, row);
+    emitRowChange({ collection: name, kind: "insert", row, prev: null });
     return row;
   },
 
@@ -1366,8 +1424,10 @@ export const db = {
     if (idx === -1) return null;
     // Bump from the pre-update version so a later/concurrent writer with a stale
     // base can't win the upsert and roll this change back.
-    list[idx] = { ...list[idx], ...patch, version: bumpedVersion(list[idx]) } as DB[K][number];
+    const prev = list[idx];
+    list[idx] = { ...prev, ...patch, version: bumpedVersion(prev) } as DB[K][number];
     stageUpsert(name, list[idx]);
+    emitRowChange({ collection: name, kind: "update", row: list[idx], prev });
     return list[idx];
   },
 

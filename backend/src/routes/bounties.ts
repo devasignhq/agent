@@ -301,18 +301,27 @@ bounties.post("/bounties/:id/applications/:githubId/:action", (req, res) => {
         ? rejectApplication(b.id, githubId, user.githubLogin)
         : { ok: false, reason: "bad_action" };
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
-  // Tell the applicant they were picked — the contributor app's "awarded" alert.
-  if (action === "approve") {
-    const applicant = db.find("users", (u) => u.githubId === githubId);
-    if (applicant) {
-      pushNotification(
-        applicant.id,
-        "bounty",
-        `You were picked for ${b.code}`,
-        `${b.repo}#${b.issueNumber} — ${b.title}. Accept to start the clock.`,
-        { link: "/dashboard" }
-      );
-    }
+  // Tell the applicant either way. Being picked is the contributor app's
+  // "awarded" alert; being turned down matters just as much, because otherwise a
+  // rejected application sits in their dashboard looking live indefinitely
+  // (nothing ever mass-rejects the losing applicants when someone else accepts).
+  const applicant = db.find("users", (u) => u.githubId === githubId);
+  if (applicant && action === "approve") {
+    pushNotification(
+      applicant.id,
+      "bounty",
+      `You were picked for ${b.code}`,
+      `${b.repo}#${b.issueNumber} — ${b.title}. Accept to start the clock.`,
+      { link: "/dashboard" }
+    );
+  } else if (applicant && action === "reject") {
+    pushNotification(
+      applicant.id,
+      "bounty",
+      `Your application for ${b.code} wasn't accepted`,
+      `${b.repo}#${b.issueNumber} — ${b.title}`,
+      { link: "/bounties" }
+    );
   }
   res.json({ ok: true, bounty: r.bounty });
 });

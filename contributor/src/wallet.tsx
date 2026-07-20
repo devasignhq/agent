@@ -9,6 +9,7 @@ import { api } from "./api";
 import type { PayoutTransaction } from "./api";
 import { useAuth } from "./auth-context";
 import { useBounties } from "./data-context";
+import { useLiveTopic } from "./live-context";
 import { Icon } from "./icons";
 import { cmoney, cmoney2, fmtDate, isStellarAddr, isValidMemo } from "./model.ts";
 
@@ -211,6 +212,9 @@ export function WalletPage() {
   React.useEffect(() => {
     if (auth.status === "signed_in") void loadTxns();
   }, [auth.status, loadTxns]);
+  // Keep the ledger current when a payout confirms on-chain while the page is
+  // open. Scoped to this component, so no transaction fetches happen off /wallet.
+  useLiveTopic("wallet", () => void loadTxns());
 
   const removeWallet = async () => {
     try {

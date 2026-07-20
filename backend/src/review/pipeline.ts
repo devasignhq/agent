@@ -1007,6 +1007,26 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       `PR #${review.prNumber} — Review failed`,
       `${repo.owner}/${repo.name} — ${errMsg.slice(0, 140)}`
     );
+    // Bounty PR: tell the CONTRIBUTOR too. notifyForReview only ever reaches the
+    // install owner, and the success path's contributor notification lives inside
+    // the try above — so before this, an errored run left the assignee with no
+    // signal at all and a review that appeared to be running forever.
+    if (review.bountyId) {
+      const bounty = db.find("bounties", (b) => b.id === review.bountyId);
+      const assignee =
+        bounty?.assigneeGithubId != null
+          ? db.find("users", (u) => u.githubId === bounty.assigneeGithubId)
+          : null;
+      if (bounty && assignee) {
+        pushNotification(
+          assignee.id,
+          "bounty",
+          `${bounty.code} review couldn't be completed`,
+          `${bounty.repo}#${review.prNumber} — we'll retry on your next push`,
+          { link: "/dashboard", reviewId: review.id }
+        );
+      }
+    }
     // Analytics: the run errored. Mirrors "review completed" so a failure shows
     // up in the same funnel rather than vanishing.
     if (reviewUser) {
