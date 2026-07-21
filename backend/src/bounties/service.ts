@@ -1303,9 +1303,10 @@ export async function resubmitAdminTxn(
     } else {
       return { ok: false, reason: "not_resubmittable" };
     }
-  } catch {
+  } catch (err) {
     // Rebuild/simulate failed (RPC down, or the escrow already settled → contract
     // revert). Leave the row pending; the keeper's age-out is the final backstop.
+    console.warn(`[bounty] resubmitAdminTxn for ${b.code} (task ${b.taskId}) threw:`, err);
     return { ok: false, reason: "chain_error" };
   }
   if (send.status === "error") return { ok: false, reason: "send_error", hash: send.hash };
