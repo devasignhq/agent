@@ -12,7 +12,9 @@ export function downloadTextFile(
   // Excel on Windows decodes a .csv in the system ANSI codepage unless a UTF-8
   // BOM leads the file, which mangles the "·" the transaction notes carry. Added
   // here rather than in the serialiser so its output stays clean text.
-  const blob = new Blob(bom ? ["﻿", text] : [text], { type: mime });
+  // Written as an escape, not a literal: a BOM is an invisible character that an
+  // editor, linter or git filter can silently strip.
+  const blob = new Blob(bom ? ["\ufeff", text] : [text], { type: mime });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
