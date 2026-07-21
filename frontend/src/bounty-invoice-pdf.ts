@@ -39,15 +39,19 @@ const S = LETTER_W / DESIGN_W;
 // them base64-encoded, so neither the request nor the encode should repeat.
 let fontCache: Promise<{ regular: string; bold: string }> | null = null;
 
-function toBase64(buf: ArrayBuffer): string {
-  const bytes = new Uint8Array(buf);
-  let binary = "";
-  // Chunked: String.fromCharCode.apply blows the call stack on a 150KB spread.
-  const CHUNK = 0x8000;
-  for (let i = 0; i < bytes.length; i += CHUNK) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + CHUNK));
-  }
-  return btoa(binary);
+// Encodes via the platform rather than by hand, so there's no chunking to get
+// wrong and no argument-count ceiling to stay under. readAsDataURL yields
+// "data:<type>;base64,<payload>" — jsPDF wants only the payload.
+//
+// This makes the module browser-only: FileReader is a DOM API and is absent in
+// Node, so the page is the only place the PDF can be produced or checked.
+function toBase64(buf: ArrayBuffer): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve((reader.result as string).split(",")[1]);
+    reader.onerror = () => reject(reader.error);
+    reader.readAsDataURL(new Blob([buf]));
+  });
 }
 
 async function loadFonts() {
@@ -57,7 +61,7 @@ async function loadFonts() {
         ["/fonts/GeistMono-Regular.ttf", "/fonts/GeistMono-Bold.ttf"].map(async (url) => {
           const res = await fetch(url);
           if (!res.ok) throw new Error(`Couldn't load invoice font (${res.status})`);
-          return toBase64(await res.arrayBuffer());
+          return await toBase64(await res.arrayBuffer());
         }),
       );
       return { regular, bold };
