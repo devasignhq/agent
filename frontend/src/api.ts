@@ -383,6 +383,12 @@ export type EscrowTransaction = {
   note?: string;
   createdAt: number;
   confirmedAt?: number | null;
+  // Payout destination snapshot: the exact wallet this payout was sent to, as
+  // recorded when it was signed. The backend has always returned these (the
+  // route serialises whole rows); they're declared here because the payout
+  // invoice bills to them.
+  destAddress?: string | null;
+  destMemo?: string | null;
 };
 
 export type BountySummary = { total: number; active: number; inEscrow: number; paidOut: number };
