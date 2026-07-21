@@ -719,29 +719,44 @@ test("declined request can be re-requested while still in time", async () => {
   assert.equal(getBounty(b.id)!.extension!.status, "pending");
 });
 
-// ── submission stops the delivery clock ──────────────────────────────────────
+// ── the delivery window is absolute ──────────────────────────────────────────
 
-test("a submitted bounty is never swept — the review stage owns the clock", async () => {
+test("a submitted bounty IS swept — submission does not stop the clock", async () => {
   const { b, chain, calls } = await delegated();
   markInReview(b.id, 55); // IN_REVIEW + submittedAt
   db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
 
-  // The sweep skips it…
+  // The sweep takes it…
+  assert.ok(expiredBounties().map((x) => x.id).includes(b.id));
+  // …and the refund goes through even though the work was delivered. Known gap:
+  // a sponsor who sits on the review gets refunded. Revisit with dispute resolution.
+  const r = await refundBounty(b.id, "expired", chain);
+  assert.equal(r.ok, true);
+  assert.equal(calls.adminRefund, 1);
+  assert.equal(getBounty(b.id)!.cancelReason, "expired");
+});
+
+test("a submitted bounty with a pending extension is still held from the sweep", async () => {
+  const { b, chain, calls } = await delegated();
+  // Request BEFORE submitting (the gate is pre-submission), then submit: the hold
+  // has to survive the transition, or widening the predicate would have quietly
+  // broken the one protection a submitted contributor can still be under.
+  requestExtension(b.id, DEV, 3, "sick");
+  markInReview(b.id, 55);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
+
   assert.ok(!expiredBounties().map((x) => x.id).includes(b.id));
-  // …and a direct expiry refund refuses (webhook race guard), with no chain call.
   const r = await refundBounty(b.id, "expired", chain);
   assert.equal(r.ok, false);
-  assert.equal(r.reason, "submitted");
+  assert.equal(r.reason, "extension_pending");
   assert.equal(calls.adminRefund, 0);
-  // No pendingOp left behind — the guard sits before acquire().
-  assert.equal(getBounty(b.id)!.pendingOp ?? null, null);
 });
 
 test("an IN_REVIEW bounty still refunds on the rejection path", async () => {
   const { b, chain, calls } = await delegated();
   markInReview(b.id, 55);
   // reject-submission deliberately keeps the bounty IN_REVIEW, so accept-rejection
-  // must still be able to refund from there — the guard above is expiry-scoped.
+  // must still be able to refund from there.
   const r = await refundBounty(b.id, "rejected", chain);
   assert.equal(r.ok, true);
   assert.equal(calls.adminRefund, 1);
@@ -795,7 +810,7 @@ test("approve re-arms the deadline warning", async () => {
   assert.equal(getBounty(b.id)!.deadlineWarnedAt, null, "re-armed against the new deadline");
 });
 
-test("bountiesNearingDeadline excludes submitted, held, warned and out-of-window bounties", async () => {
+test("bountiesNearingDeadline covers submitted work, excludes held/warned/out-of-window", async () => {
   const now = Date.now();
   const near = () => ({ deadlineAt: now + 12 * 60 * 60 * 1000 }); // 12h out
 
@@ -803,10 +818,12 @@ test("bountiesNearingDeadline excludes submitted, held, warned and out-of-window
   db.update("bounties", (x) => x.id === a.b.id, near());
   assert.ok(bountiesNearingDeadline(now).map((x) => x.id).includes(a.b.id), "12h out → warn");
 
+  // Submitted work is swept on expiry, so it must be warned too — this is the
+  // contributor with the most to lose and no way to request more time.
   const submitted = await delegated();
   db.update("bounties", (x) => x.id === submitted.b.id, near());
   markInReview(submitted.b.id, 7);
-  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(submitted.b.id));
+  assert.ok(bountiesNearingDeadline(now).map((x) => x.id).includes(submitted.b.id));
 
   const held = await delegated();
   db.update("bounties", (x) => x.id === held.b.id, near());

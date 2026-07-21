@@ -279,15 +279,19 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
 
   // In review (incl. ready-for-payout).
   if (st.key === "review" || st.key === "ready") {
+    // The delivery window keeps running through review — if it closes before the
+    // sponsor releases, the escrow returns to them. This stage used to show no
+    // clock at all, hiding the one risk the contributor can't act on directly.
+    const dueMeta = b.deadlineAt ? <> · {timeLeft(b.deadlineAt)}</> : null;
     if (payoutRequested) {
       return card("In review", "Payout requested — the sponsor has been notified. On approval (or merge), the escrow releases to your wallet.",
         <button className="btn ghost" disabled><Icon name="check" size={12} /> Payout requested</button>,
-        <><Icon name="shield" size={11} /> pays directly to your USDC wallet</>);
+        <><Icon name="shield" size={11} /> pays directly to your USDC wallet{dueMeta}</>);
     }
     if (ready || st.key === "ready") {
       return card("All criteria met", "This submission is ready. Request payout and the escrow releases on approval.",
         <button className="btn primary" disabled={busy} onClick={() => void requestPayout()}><Icon name="coins" size={13} /> {busy ? "Requesting…" : `Request payout · ${cmoney(b.amountUsdc)}`}</button>,
-        <><Icon name="shield" size={11} /> pays to your saved address</>);
+        <><Icon name="shield" size={11} /> pays to your saved address{dueMeta}</>);
     }
     return (
       <>
@@ -298,7 +302,7 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
             {prUrl && <a className="btn ghost" href={prUrl} target="_blank" rel="noopener noreferrer"><Icon name="external" size={12} /> View PR</a>}
             <button className="btn ghost" onClick={() => { setLinksOnly(true); setSubmitOpen(true); }}><Icon name="plus" size={12} /> Add / update links</button>
           </>,
-          <><Icon name="shield" size={11} /> pays directly to your USDC wallet</>)}
+          <><Icon name="shield" size={11} /> pays directly to your USDC wallet{dueMeta}</>)}
         {submitOpen && <SubmitModal b={b} linksOnly={linksOnly} onClose={() => setSubmitOpen(false)} onDone={() => void reload()} />}
       </>
     );

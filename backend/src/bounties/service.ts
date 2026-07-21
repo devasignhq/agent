@@ -627,7 +627,12 @@ export function requestExtension(
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   if (b.assigneeGithubId !== contributor.githubId) return { ok: false, reason: "not_assignee" };
-  // Pre-submission only: once work is submitted the review flow owns the clock.
+  // Pre-submission only. NOTE this is a known gap, not a guarantee: the delivery
+  // window is absolute (see expiredBounties), so a contributor whose PR is sitting
+  // unreviewed can be refunded out and has no way to buy time. Widening this would
+  // combine with the keeper's 3-day auto-approval to turn sponsor silence into a
+  // 7-day extension rather than a refund, which is the opposite of the intended
+  // behaviour. Revisit together with dispute resolution.
   if (b.status !== "DELEGATED" || b.submittedAt) {
     return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
   }
@@ -860,11 +865,9 @@ export async function refundBounty(
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status === "CANCELLED") return { ok: true, reason: "already_cancelled" };
   if (b.status === "PAID") return { ok: false, reason: "already_paid" };
-  // Only refundable states: funded-and-open (delete), delegated (expiry), or
-  // in-review (the "rejected" path only — reject-submission deliberately KEEPS
-  // the bounty IN_REVIEW, so accept-rejection refunds from there. Do not narrow
-  // this list to fix expiry; the expired-scoped guard below does that instead,
-  // or a rejected contributor would have no way to close the bounty).
+  // Only refundable states: funded-and-open (delete), or delegated / in-review
+  // (expiry, and the "rejected" path — reject-submission deliberately KEEPS the
+  // bounty IN_REVIEW, so accept-rejection has to refund from there too).
   const refundable = ["OPEN", "DELEGATED", "IN_REVIEW"];
   if (!refundable.includes(b.status)) return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
   // A pending extension request holds the expiry refund until the sponsor
@@ -873,14 +876,6 @@ export async function refundBounty(
   // to "expired" so sponsor cancel/delete paths are unaffected.
   if (reason === "expired" && b.extension?.status === "pending") {
     return { ok: false, reason: "extension_pending" };
-  }
-  // Submission stops the delivery clock — the review stage owns the timeline from
-  // there. Belt-and-braces with the expiredBounties predicate: closes the race
-  // where a PR webhook flips the bounty IN_REVIEW between the sweep's snapshot
-  // and this call. Scoped to "expired" so the rejection path below still refunds
-  // from IN_REVIEW. Placed BEFORE acquire() so a rejected call leaves no pendingOp.
-  if (reason === "expired" && (b.status === "IN_REVIEW" || b.submittedAt)) {
-    return { ok: false, reason: "submitted" };
   }
   const key = `refund:${b.taskId}`;
   const existing = findTxnByKey(key);
@@ -1080,21 +1075,25 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
 /**
  * Bounties whose delivery clock has elapsed and should be refunded to the sponsor.
  *
- * DELEGATED only — submission STOPS the clock. Once the contributor has opened a
- * PR the review stage owns the timeline: a sponsor who sat on it would otherwise
- * run the window out, recover the escrow AND keep the work, and the contributor
- * cannot even ask for more time (requestExtension is pre-submission only). The
- * sponsor's route out of review is reject-submission → the contributor reworks or
- * accepts the verdict (refund, reason "rejected"). `!b.submittedAt` is
- * belt-and-braces: markInReview writes both in one patch and nothing reverts
- * IN_REVIEW → DELEGATED today, so it only guards a future path that might.
+ * The delivery window is ABSOLUTE: submission does not stop the clock. If the work
+ * has not been accepted and paid by the deadline, the escrow goes back to the
+ * sponsor whether or not a PR was opened — hence DELEGATED *and* IN_REVIEW.
+ *
+ * Known gap, accepted deliberately: a sponsor who sits on a review runs the window
+ * out and gets refunded while keeping the work, and the contributor cannot buy time
+ * (requestExtension is pre-submission only). The alternative — exempting IN_REVIEW —
+ * was tried and is worse: a silent sponsor then freezes the escrow forever with no
+ * escape hatch at all. Fixing this properly needs dispute resolution / a review SLA
+ * (the DISPUTED status is typed but unwired); until that exists, expiry wins.
+ *
+ * The remaining clauses are what keep a legitimately-settling bounty safe: an op in
+ * flight, a pending extension request, or an existing on-chain release.
  */
 export function expiredBounties(now = Date.now()): Bounty[] {
   return db.filter(
     "bounties",
     (b) =>
-      b.status === "DELEGATED" &&
-      !b.submittedAt &&
+      (b.status === "DELEGATED" || b.status === "IN_REVIEW") &&
       !b.pendingOp &&
       // A pending extension request holds the refund until the sponsor responds.
       b.extension?.status !== "pending" &&
@@ -1130,19 +1129,21 @@ export const DEADLINE_WARNING_MS = DAY_MS; // one-shot bell 24h before the windo
 
 /**
  * Assigned bounties in the final 24h of the delivery window that haven't been
- * warned yet. DELEGATED only, deliberately mirroring expiredBounties: after
- * submission a bounty is never refunded on expiry, so warning one would be both
- * false and un-actionable (requestExtension is pre-submission only). A pending
- * extension is skipped too — the clock is already held, the contributor is
- * demonstrably aware of it, and an approval re-arms the stamp so they still get a
- * fresh warning against the new deadline.
+ * warned yet. Mirrors expiredBounties on status deliberately — anything the sweep
+ * can refund should get a heads-up first, INCLUDING submitted work: a contributor
+ * whose PR is waiting on the sponsor is the one with the most to lose and the
+ * least recourse, so silence there is the worst outcome. The caller varies the
+ * wording on submittedAt, since "submit your PR" is nonsense to someone who has.
+ *
+ * A pending extension is skipped — the refund really is held then, so a warning
+ * would be false, and an approval re-arms the stamp so they still get a fresh one
+ * against the new deadline.
  */
 export function bountiesNearingDeadline(now = Date.now()): Bounty[] {
   return db.filter(
     "bounties",
     (b) =>
-      b.status === "DELEGATED" &&
-      !b.submittedAt &&
+      (b.status === "DELEGATED" || b.status === "IN_REVIEW") &&
       !b.pendingOp &&
       b.extension?.status !== "pending" &&
       b.deadlineWarnedAt == null && // == null: undefined on rows written before the field existed
@@ -1228,15 +1229,17 @@ export async function applyTxnOutcome(
         const dev = assigneeUser(b);
         if (dev) {
           const expired = b.cancelReason === "expired";
-          pushNotification(
-            dev.id,
-            "bounty",
-            expired
-              ? `${b.code} expired — the delivery window closed`
-              : `${b.code} was cancelled`,
-            `${b.repo}#${b.issueNumber} — ${b.title}`,
-            { link: "/dashboard" }
-          );
+          // Say so explicitly when they DID deliver: "the delivery window closed"
+          // alone reads as though they never submitted, which is a bad thing to
+          // tell someone who shipped and lost the bounty to review latency.
+          const title = expired
+            ? b.submittedAt
+              ? `${b.code} expired — the window closed while your work was in review`
+              : `${b.code} expired — the delivery window closed`
+            : `${b.code} was cancelled`;
+          pushNotification(dev.id, "bounty", title, `${b.repo}#${b.issueNumber} — ${b.title}`, {
+            link: "/dashboard",
+          });
         }
       }
     }

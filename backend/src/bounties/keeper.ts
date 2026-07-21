@@ -302,6 +302,11 @@ async function sweepDeadlines(deps: KeeperDeps): Promise<void> {
  * what makes this one-shot rather than one-per-12s-tick — and unlike the
  * lastResubmit / lastOrphanCheck throttles it lives on the ROW, so a keeper
  * restart doesn't re-fire it.
+ *
+ * Fires for submitted work too, because the window is absolute — but the ask is
+ * different. Someone who hasn't submitted can still act on their own; someone
+ * waiting on a review can only chase the sponsor, since requestExtension is
+ * pre-submission only.
  */
 async function warnApproachingDeadlines(deps: KeeperDeps): Promise<void> {
   const now = deps.now();
@@ -314,13 +319,12 @@ async function warnApproachingDeadlines(deps: KeeperDeps): Promise<void> {
       const dev = assigneeUser(b);
       if (!dev) continue;
       const hours = Math.max(1, Math.round((b.deadlineAt! - now) / (60 * 60 * 1000)));
-      pushNotification(
-        dev.id,
-        "bounty",
-        `${b.code} is due in ${hours}h`,
-        `${b.repo}#${b.issueNumber} — submit your PR or request an extension before the window closes`,
-        { link: "/dashboard" }
-      );
+      const ask = b.submittedAt
+        ? "your submission is still awaiting review — nudge the sponsor, or the escrow returns to them when the window closes"
+        : "submit your PR or request an extension before the window closes";
+      pushNotification(dev.id, "bounty", `${b.code} is due in ${hours}h`, `${b.repo}#${b.issueNumber} — ${ask}`, {
+        link: "/dashboard",
+      });
     } catch (err) {
       console.warn(`[bounty-keeper] deadline warning for ${b.code} threw:`, err);
     }

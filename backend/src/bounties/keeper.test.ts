@@ -374,18 +374,21 @@ test("a dropped admin refund still ages out to failed once past the max age", as
   assert.equal(getBounty(b.id)!.pendingOp, null); // guard cleared → retryable
 });
 
-// ── submission stops the delivery clock ──────────────────────────────────────
+// ── the delivery window is absolute ──────────────────────────────────────────
 
-test("a submitted bounty is not swept even past its deadline", async () => {
+test("a submitted bounty past its deadline is swept, then confirms → CANCELLED", async () => {
   const b = mkBounty();
   await fundOpenDelegate(b.id);
   markInReview(b.id, 7); // IN_REVIEW + submittedAt
   db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
 
   await runTick(keeperDeps({}));
+  assert.ok(txnByKey(`refund:${b.taskId}`), "submission does not stop the clock");
 
-  assert.equal(txnByKey(`refund:${b.taskId}`), null, "no refund submitted");
-  assert.equal(getBounty(b.id)!.status, "IN_REVIEW", "still awaiting review, escrow intact");
+  await runTick(keeperDeps({ H_REF: { status: "success", ledger: 11 } }));
+  const done = getBounty(b.id)!;
+  assert.equal(done.status, "CANCELLED");
+  assert.equal(done.cancelReason, "expired");
 });
 
 // ── stale extension auto-approval ────────────────────────────────────────────
@@ -497,15 +500,32 @@ test("a warned bounty is warned again after its extension is approved", async ()
   assert.equal(bells(devId, /due in/i).length, 2, "fresh warning against the new deadline");
 });
 
-test("an expired-but-submitted bounty is touched by neither the sweep nor the warning", async () => {
+test("a submitted contributor is warned, with review-flavoured copy", async () => {
   const devId = seedDevUser();
   const b = mkBounty();
   await fundOpenDelegate(b.id);
   markInReview(b.id, 7);
-  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
 
   await runTick(keeperDeps({}));
 
-  assert.equal(txnByKey(`refund:${b.taskId}`), null);
-  assert.equal(bells(devId).length, 0, "no misleading 'due in' bell for work already delivered");
+  const bell = bells(devId, /due in/i);
+  assert.equal(bell.length, 1, "submitted work is warned too — it can still be swept");
+  // "submit your PR" is nonsense to someone who already has; theirs points at the
+  // only lever they actually have, which is chasing the sponsor.
+  assert.match(bell[0].meta, /awaiting review/i);
+  assert.doesNotMatch(bell[0].meta, /submit your PR/i);
+});
+
+test("an unsubmitted contributor keeps the original warning copy", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
+
+  await runTick(keeperDeps({}));
+
+  const bell = bells(devId, /due in/i);
+  assert.equal(bell.length, 1);
+  assert.match(bell[0].meta, /submit your PR or request an extension/i);
 });

@@ -553,6 +553,20 @@ export const Workspace = ({
 
   const deadlineText = b.deadlineAt ? timeLeft(b.deadlineAt) : `${b.deliveryDays}-day window`;
 
+  // The window keeps running through review — if it closes before the sponsor
+  // releases, the escrow goes back to them (see expiredBounties on the backend).
+  // The submitted footers used to render no clock at all, which hid precisely the
+  // risk the contributor can least do anything about.
+  const overdue = !!b.deadlineAt && b.deadlineAt < Date.now();
+  const deadlineNote = b.deadlineAt ? (
+    <span style={overdue ? { color: "var(--danger)" } : undefined}>
+      <Icon name="clock" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
+      {overdue
+        ? "Past due — the escrow can return to the sponsor at any time."
+        : `${deadlineText} — the escrow returns to the sponsor if it isn't released in time.`}
+    </span>
+  ) : null;
+
   return (
     <div className={`c-ws ${expanded ? "" : "collapsed"}`}>
       <div className="c-ws-head toggle" onClick={onToggle}>
@@ -728,7 +742,7 @@ export const Workspace = ({
         ) : payoutRequested ? (
           <div className="c-payout-ready" style={{ margin: 0, borderTop: "1px solid var(--line)" }}>
             <span className="ic"><Icon name="check" size={18} /></span>
-            <div><div className="t">Payout requested</div><div className="d">The sponsor has been notified. On approval (or merge), {cmoney(b.amountUsdc)} releases to your wallet on Stellar.</div></div>
+            <div><div className="t">Payout requested</div><div className="d">The sponsor has been notified. On approval (or merge), {cmoney(b.amountUsdc)} releases to your wallet on Stellar. {deadlineNote}</div></div>
           </div>
         ) : allMet ? (
           <>
@@ -737,7 +751,7 @@ export const Workspace = ({
               <div><div className="t">All criteria met — ready for payout</div><div className="d">Request payout to notify the sponsor. Escrow releases on approval.</div></div>
             </div>
             <div className="c-ws-foot">
-              <div className="grow hint"><Icon name="shield" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Pays directly to your USDC wallet on file · Stellar</div>
+              <div className="grow hint"><Icon name="shield" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />Pays directly to your USDC wallet on file · Stellar {deadlineNote}</div>
               {prUrl && <a className="btn ghost" href={prUrl} target="_blank" rel="noopener noreferrer"><Icon name="external" size={12} /> View PR</a>}
               <button className="btn primary" disabled={busy} onClick={() => void requestPayout()}>
                 <Icon name="coins" size={13} /> {busy ? "Requesting…" : `Request payout · ${cmoney(b.amountUsdc)}`}
@@ -746,12 +760,12 @@ export const Workspace = ({
           </>
         ) : !reviewed ? (
           <div className="c-ws-foot">
-            <div className="grow hint"><Icon name="check" size={11} color="var(--success)" style={{ verticalAlign: -1, marginRight: 4 }} />Submitted. You can add more links or update your PR while it's in review.</div>
+            <div className="grow hint"><Icon name="check" size={11} color="var(--success)" style={{ verticalAlign: -1, marginRight: 4 }} />Submitted. You can add more links or update your PR while it's in review. {deadlineNote}</div>
             <button className="btn ghost" onClick={() => { setLinksOnly(true); setSubmitOpen(true); }}><Icon name="plus" size={12} /> Add / update links</button>
           </div>
         ) : (
           <div className="c-ws-foot">
-            <div className="grow hint"><Icon name="target" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{total - met} criteria outstanding. Push to {b.repo}#{b.prNumber} and DevAsign re-checks automatically.</div>
+            <div className="grow hint"><Icon name="target" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{total - met} criteria outstanding. Push to {b.repo}#{b.prNumber} and DevAsign re-checks automatically. {deadlineNote}</div>
             {prUrl && <a className="btn primary" href={prUrl} target="_blank" rel="noopener noreferrer"><Icon name="external" size={12} /> Open the PR</a>}
           </div>
         )}
