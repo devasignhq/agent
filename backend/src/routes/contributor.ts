@@ -235,6 +235,32 @@ contributor.get("/contributor/bounties", contributorBountiesHandler);
 // bountyId, bounties are never deleted, and the assignee's numeric id is written
 // in the same patch as the payout address every payout path requires — so this
 // returning null means the data is malformed, not old. Fail closed and say so.
+const UNRESOLVED_WARN_MS = 60 * 60 * 1000;
+const lastUnresolvedWarn = new Map<string, number>();
+
+// Throttled because the caller runs this inside a db.filter on every ledger
+// fetch: unthrottled, a single malformed row would log once per contributor per
+// request forever. A WINDOW rather than a warn-once-ever set, though — the
+// condition is supposed to be unreachable, so if it ever starts happening the
+// recurrence is the signal that something is actively wrong. Reporting it a
+// single time and then going quiet reads exactly like it healed itself.
+function warnUnresolvable(t: EscrowTransaction): void {
+  const now = Date.now();
+  const last = lastUnresolvedWarn.get(t.id);
+  if (last != null && now - last < UNRESOLVED_WARN_MS) return;
+  // Rows that stopped being unresolvable (repaired, or deleted) stop refreshing
+  // their stamp, so aging them out bounds the map — mirrors the keeper's
+  // throttle prune. Runs only when we are about to warn, which should be never.
+  for (const [id, at] of lastUnresolvedWarn) {
+    if (now - at >= UNRESOLVED_WARN_MS) lastUnresolvedWarn.delete(id);
+  }
+  lastUnresolvedWarn.set(t.id, now);
+  console.warn(
+    `[ledger] payout txn ${t.id} (bounty ${t.bountyId ?? "none"}) has no resolvable ` +
+      `counterparty id — withheld from every ledger`
+  );
+}
+
 export function payoutCounterpartyId(
   t: EscrowTransaction,
   bountyById: Map<string, Bounty>
@@ -242,10 +268,7 @@ export function payoutCounterpartyId(
   if (t.githubId != null) return t.githubId;
   const b = t.bountyId ? bountyById.get(t.bountyId) : undefined;
   if (b?.assigneeGithubId != null) return b.assigneeGithubId;
-  console.warn(
-    `[ledger] payout txn ${t.id} (bounty ${t.bountyId ?? "none"}) has no resolvable ` +
-      `counterparty id — withheld from every ledger`
-  );
+  warnUnresolvable(t);
   return null;
 }
 

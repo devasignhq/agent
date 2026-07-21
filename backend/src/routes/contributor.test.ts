@@ -484,3 +484,21 @@ test("ledger: a payout that resolves to nobody is served to nobody", () => {
   assert.equal(ledgerFor(DEV.id).body.transactions.length, 0);
   assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
 });
+
+test("ledger: an unresolvable payout warns once per row, not once per fetch", () => {
+  // The check runs inside a db.filter, so an unthrottled warning would fire for
+  // every contributor on every request for as long as the row exists.
+  const warnings: string[] = [];
+  const realWarn = console.warn;
+  console.warn = (m: string) => void warnings.push(m);
+  try {
+    mkPayout("ghost-bounty-throttle", { githubLogin: DEV.githubLogin });
+    ledgerFor(DEV.id);
+    ledgerFor(DEV.id);
+    ledgerFor(OTHER.id);
+  } finally {
+    console.warn = realWarn;
+  }
+  assert.equal(warnings.length, 1, "three fetches, one warning");
+  assert.match(warnings[0], /no resolvable counterparty id/);
+});
