@@ -7,21 +7,19 @@
 // around chain.adminRefund(). This walks the same path (getAccount → build →
 // simulate) and prints the error, plus the state that usually explains it.
 //
-// Deliberately talks to Postgres with a single SELECT rather than importing
-// db.ts: booting the store in a second process would start its heartbeat and
-// coherence timers against the production database. One query, no writes.
+// Reads go through the `db` helper, like seed.ts — the store is the one place
+// that owns SQL. Safe against production: this script performs NO mutations, so
+// shutdownDb's flush is a no-op, and the coherence poller initDb starts only ever
+// SELECTs (it reconciles Postgres → memory, never writes back).
 //
 // Run with the SAME env as the service (STELLAR_* + DATABASE_URL).
-import pg from "pg";
 import { config, isStellarConfigured } from "../src/config.js";
+import { db, initDb, shutdownDb } from "../src/db.js";
 import { adminAddress, server } from "../src/stellar/client.js";
 import { buildEscrowInvoke } from "../src/stellar/build.js";
 import { getEscrow } from "../src/stellar/escrow.js";
 import { addressScVal, taskIdScVal } from "../src/stellar/scval.js";
 import { isValidTaskId } from "../src/bounties/taskid.js";
-import type { Bounty, EscrowTransaction } from "../src/types.js";
-
-const { Pool } = pg;
 
 function detail(err: unknown): string {
   if (err instanceof Error) {
@@ -29,17 +27,6 @@ function detail(err: unknown): string {
     return cause ? `${err.message}\n    cause: ${String(cause)}` : err.message;
   }
   return String(err);
-}
-
-// Mirrors db.ts: Neon appends params node-postgres rejects.
-function sanitizeUrl(url: string): string {
-  try {
-    const u = new URL(url);
-    for (const p of ["sslmode", "channel_binding", "uselibpqcompat"]) u.searchParams.delete(p);
-    return u.toString();
-  } catch {
-    return url;
-  }
 }
 
 async function main() {
@@ -53,6 +40,12 @@ async function main() {
     console.error("Stellar is not configured here — the keeper would be idle in this env.");
     process.exit(1);
   }
+  if (!config.databaseUrl) {
+    // Without it initDb falls back to an empty in-memory store, so every lookup
+    // would falsely report "no such bounty". Require the real database.
+    console.error("DATABASE_URL is not set — point it at the same database as the service.");
+    process.exit(1);
+  }
 
   console.log("── config ──────────────────────────────────────────────");
   console.log(`network      ${config.stellar.network}`);
@@ -60,23 +53,11 @@ async function main() {
   console.log(`contractId   ${config.stellar.contractId}`);
   console.log(`admin        ${adminAddress()}`);
 
-  if (!config.databaseUrl) {
-    console.error("\nDATABASE_URL is not set — cannot look up the bounty.");
-    process.exit(1);
-  }
-  const pool = new Pool({
-    connectionString: sanitizeUrl(config.databaseUrl),
-    ssl: { rejectUnauthorized: true },
-    max: 1,
-  });
-  const { rows } = await pool.query<{ data: Bounty }>(
-    `select data from "bounties" where data->>'code' = $1`,
-    [code]
-  );
-  const b = rows[0]?.data;
+  await initDb();
+  const b = db.find("bounties", (x) => x.code === code);
   if (!b) {
     console.error(`\nNo bounty with code ${code} in this database.`);
-    await pool.end();
+    await shutdownDb();
     process.exit(1);
   }
 
@@ -92,20 +73,16 @@ async function main() {
   console.log(`deadlineAt   ${b.deadlineAt ? new Date(b.deadlineAt).toISOString() : "(none)"}`);
   console.log(`extension    ${b.extension ? `${b.extension.status} (+${b.extension.days}d)` : "(none)"}`);
 
-  const txns = await pool.query<{ data: EscrowTransaction }>(
-    `select data from "escrowTransactions" where data->>'bountyId' = $1`,
-    [b.id]
-  );
-  console.log(`\n── escrowTransactions (${txns.rows.length}) ─────────────────────────`);
-  if (!txns.rows.length) {
+  const txns = db.filter("escrowTransactions", (t) => t.bountyId === b.id);
+  console.log(`\n── escrowTransactions (${txns.length}) ─────────────────────────`);
+  if (!txns.length) {
     console.log("(none — a refund that throws before insertTxn leaves NO row, which is");
     console.log(" why this failure is invisible outside the logs)");
   }
-  for (const { data: t } of txns.rows) {
+  for (const t of txns) {
     console.log(`${t.kind.padEnd(7)} ${t.status.padEnd(8)} ${t.idempotencyKey}`);
     console.log(`        hash=${t.hash ?? "-"} error=${t.error ?? "-"}`);
   }
-  await pool.end();
 
   console.log("\n── admin account ───────────────────────────────────────");
   try {
@@ -166,6 +143,8 @@ async function main() {
     console.log("    • 'Error(Contract, #N)'              → contract rejected it: wrong admin, already settled, or bad status");
     console.log("    • 'task_id must be exactly 25 chars' → the bounty row's taskId is corrupt");
   }
+
+  await shutdownDb();
 }
 
 main().catch((err) => {
