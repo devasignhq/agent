@@ -1490,6 +1490,57 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   line-height: 1.55;
 }
 
+/* Invoice preview modal. Wider than the create-bounty modal because it holds a
+   full page at its own aspect ratio, and capped to the viewport so a long page
+   scrolls inside the modal instead of pushing the Download button off screen. */
+.inv-modal {
+  width: min(720px, 100%);
+  display: flex;
+  flex-direction: column;
+  /* Capped so the Download button is always on screen — the page inside is
+     taller than most viewports. The /var(--zoom) is the usual compensation for
+     body{zoom} inflating vh; the 64px is the scrim's vertical padding. */
+  max-height: calc(100vh / var(--zoom) - 64px);
+}
+.inv-modal-head {
+  padding: 22px 24px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.inv-paper-wrap {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 24px;
+  background: var(--bg);
+}
+/* The page is a light document sitting in a dark app, so it gets a drop shadow
+   to read as paper rather than as a blown-out panel. */
+.inv-page {
+  display: block;
+  width: 100%;
+  height: auto;
+  font-family: var(--mono);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+}
+.inv-modal-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--line);
+}
+.inv-error {
+  margin-right: auto;
+  color: var(--danger);
+  font-size: 12px;
+}
+@media (max-width: 760px) {
+  .inv-modal { width: 100%; }
+  .inv-modal-head, .inv-modal-foot { padding-left: 16px; padding-right: 16px; }
+  .inv-paper-wrap { padding: 12px; }
+}
+
 /* Source tabs */
 .cb-source-tabs {
   display: flex;

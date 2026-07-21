@@ -43,7 +43,8 @@ db.insert("installations", {
 });
 // One awaiting-funding bounty on the seeded installation so the Bounties page
 // (list, drawer, in-app Fund/Cancel links) renders with real data.
-const { createBounty, recordFunding, applyTxnOutcome } = await import("../src/bounties/service.js");
+const { createBounty, recordFunding, applyTxnOutcome, patchBounty, recordSponsorRelease } =
+  await import("../src/bounties/service.js");
 createBounty({
   source: "github",
   installationId: 1,
@@ -76,6 +77,46 @@ const escrowTxn = db.find(
   (t) => t.idempotencyKey === `escrow:${openBounty.taskId}`
 )!;
 applyTxnOutcome(escrowTxn.id, { status: "success", ledger: 1 });
+// …and one PAID bounty carrying a CONFIRMED PAYOUT. Without this the
+// transaction history only ever holds an `escrow` row, and payouts are the only
+// kind that can be invoiced (see TxnRow in screen-bounties.tsx) — so the invoice
+// preview/download would be unreachable locally. Content mirrors the invoice
+// design so the seeded document matches the mock.
+const paidBounty = createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 8842,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/8842",
+  title: "Add anti-fingerprinting capabilities to avoid bot detection",
+  description: "Already paid out — exercises the invoice preview and PDF download.",
+  amountUsdc: 450,
+  deliveryDays: 7,
+  sponsorUserId: "ephemeral-user-1",
+});
+recordFunding(paidBounty.id, "G".padEnd(56, "A"), { hash: "H_EPHEMERAL_PAID", status: "pending" });
+await applyTxnOutcome(
+  db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${paidBounty.taskId}`)!.id,
+  { status: "success", ledger: 2 }
+);
+// Stands in for apply → approve → accept: the payout (and so the invoice) only
+// reads the assignee snapshot, so seeding it directly beats driving four routes.
+patchBounty(paidBounty.id, {
+  status: "IN_REVIEW",
+  assigneeGithubId: 424242,
+  assigneeGithubLogin: "ephemeral-contributor",
+  assigneeAddress: "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4TPPZAKQGZ3S4EFVXJT",
+  prNumber: 12,
+});
+recordSponsorRelease(paidBounty.id, {
+  status: "success",
+  hash: "3ad9f0c1e2b4a5768899aabbccddeeff00112233445566778899aabbccddeeff",
+});
+await applyTxnOutcome(
+  db.find("escrowTransactions", (t) => t.idempotencyKey === `release:${paidBounty.taskId}`)!.id,
+  { status: "success", ledger: 3 }
+);
+
 // A contributor identity (GitHub id, NO installation) for the apply flow — also
 // exercises the app's onboarding bypass on bounty deep links.
 db.insert("users", {

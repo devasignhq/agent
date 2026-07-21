@@ -18,6 +18,8 @@ import { Icon } from "./icons";
 import { freighterAddress, freighterSign, money, shortHash, stellarTxUrl } from "./bounty-shared";
 import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
+import { buildInvoice } from "./bounty-invoice";
+import { InvoicePreviewModal } from "./bounty-invoice-modal";
 import {
   api,
   ApiError,
@@ -108,6 +110,7 @@ export const BountiesPage = ({
   const [balanceHidden, setBalanceHidden] = React.useState(false);
   const [selectedId, setSelectedId] = React.useState<string | null>(null);
   const [creating, setCreating] = React.useState(false);
+  const [invoiceTxn, setInvoiceTxn] = React.useState<EscrowTransaction | null>(null);
 
   const load = React.useCallback(async () => {
     setLoading(true);
@@ -181,6 +184,11 @@ export const BountiesPage = ({
   const txShown = txns.slice(txStart, txStart + TX_PAGE_SIZE);
 
   const selected = selectedId != null ? bounties.find((b) => b.id === selectedId) || null : null;
+
+  // Transactions and bounties are fetched separately, so an invoice joins them
+  // here by id. A payout whose bounty isn't in the list still renders — the
+  // invoice degrades to what the transaction alone carries.
+  const bountyById = React.useMemo(() => new Map(bounties.map((b) => [b.id, b])), [bounties]);
 
   const openCount = bounties.filter((b) => b.status === "OPEN").length;
   const inReviewCount = bounties.filter((b) => b.status === "IN_REVIEW").length;
@@ -310,7 +318,9 @@ export const BountiesPage = ({
                 {txShown.length === 0 ? (
                   <div className="bnty-empty mono mute">No transactions yet.</div>
                 ) : (
-                  txShown.map((t) => <TxnRow key={t.id} t={t} hidden={balanceHidden} />)
+                  txShown.map((t) => (
+                    <TxnRow key={t.id} t={t} hidden={balanceHidden} onInvoice={() => setInvoiceTxn(t)} />
+                  ))
                 )}
               </div>
               <div className="bounty-pager">
@@ -326,6 +336,15 @@ export const BountiesPage = ({
 
       {selected && <BountyDrawer bounty={selected} onClose={() => setSelectedId(null)} onChanged={applyBounty} />}
       {creating && <CreateBountyModal onClose={() => setCreating(false)} />}
+      {invoiceTxn && (
+        <InvoicePreviewModal
+          data={buildInvoice({
+            txn: invoiceTxn,
+            bounty: invoiceTxn.bountyId ? bountyById.get(invoiceTxn.bountyId) : null,
+          })}
+          onClose={() => setInvoiceTxn(null)}
+        />
+      )}
       {isCancelling && (
         <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
       )}
@@ -382,7 +401,15 @@ const TXN_PILL: Record<EscrowTransaction["status"], { label: string; cls: string
   failed: { label: "FAILED", cls: "danger" },
 };
 
-const TxnRow = ({ t, hidden }: { t: EscrowTransaction; hidden?: boolean }) => {
+const TxnRow = ({
+  t,
+  hidden,
+  onInvoice,
+}: {
+  t: EscrowTransaction;
+  hidden?: boolean;
+  onInvoice?: () => void;
+}) => {
   const usdc = stroopsToUsdc(t.amountStroops);
   const note = t.note || `${t.kind}${t.githubLogin ? ` · @${t.githubLogin}` : ""}`;
   const pill = TXN_PILL[t.status];
@@ -406,7 +433,21 @@ const TxnRow = ({ t, hidden }: { t: EscrowTransaction; hidden?: boolean }) => {
       </span>
       <span className={`pill ${pill.cls}`}><i className="dot" />{pill.label}</span>
       <span>
-        <button className="btn ghost sm"><Icon name="download" size={11} /> PDF</button>
+        {/* Only a payout settles money to a contributor, so only a payout has a
+            payee to bill. Escrow funding and refunds move money to or from the
+            sponsor's own wallet and get no invoice.
+
+            And only once it's CONFIRMED: a pending payout hasn't settled and a
+            failed one never will, so invoicing either would document a transfer
+            that didn't happen. This also guarantees `confirmedAt` is set, which
+            is the date the invoice is issued under. */}
+        {t.kind === "payout" && t.status === "confirmed" && onInvoice ? (
+          <button className="btn ghost sm" onClick={onInvoice}>
+            <Icon name="download" size={11} /> PDF
+          </button>
+        ) : (
+          <span className="mute">—</span>
+        )}
       </span>
     </div>
   );
