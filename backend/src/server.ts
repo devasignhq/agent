@@ -15,9 +15,11 @@ import {
   isSessionSecretShort,
   isSlackEnvConfigured,
   isStatsigConfigured,
+  isStellarConfigured,
   sessionSecretLength,
   sessionSecretProblem,
 } from "./config.js";
+import { adminAddress } from "./stellar/client.js";
 import { initStatsig, shutdownStatsig } from "./statsig.js";
 import { startOAuth, finishOAuth, signOut } from "./github/oauth.js";
 import { enforceSameOrigin } from "./csrf.js";
@@ -266,6 +268,19 @@ const server = app.listen(port, () => {
   console.log(`  · Slack:      ${isSlackEnvConfigured() ? `env fallback → ${config.integrations.slackBotChannel}` : "per-user only"}`);
   console.log(`  · Discord:    ${isDiscordEnvConfigured() ? `env fallback → ${config.integrations.discordBotChannelId}` : "per-user only"}`);
   console.log(`  · Statsig:    ${isStatsigConfigured() ? `live (${config.statsig.environment})` : "disabled (no key)"}`);
+  // Network, contract and the admin PUBLIC key (never the secret) — the same
+  // "which environment am I actually talking to" guard as describeDb's boot
+  // label. admin_release/admin_refund authorise against the admin address the
+  // contract stored at init, so a key that doesn't match it fails EVERY
+  // settlement at simulation time. That is invisible unless the address the
+  // service is using is written down somewhere comparable.
+  console.log(
+    `  · Escrow:     ${
+      isStellarConfigured()
+        ? `${config.stellar.network} · contract ${config.stellar.contractId} · admin ${adminAddress()}`
+        : "disabled (Stellar not configured)"
+    }`
+  );
   console.log(`  · Web origin: ${config.webOrigin}`);
   // Spell out which webhook event types the receiver handles. If a comment
   // posted on GitHub never shows up in stdout (or in the review log), the
