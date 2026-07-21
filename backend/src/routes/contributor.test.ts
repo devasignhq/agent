@@ -205,6 +205,70 @@ test("events: rival applicants' application events are filtered; lifecycle event
   assert.deepEqual(kinds, ["created:maya", "funded:system", `applied:${DEV.githubLogin}`]);
 });
 
+// The activity-log filter keys on subjectGithubId, not the login: applying
+// again after a GitHub rename rewrites the application row (applyToBounty
+// replaces it wholesale), and GitHub hands abandoned usernames to new accounts.
+const evKinds = (b: Bounty, githubId: number) =>
+  contributorBountyView(b, githubId).events.map((e: any) => e.kind);
+
+test("events: re-applying under a new login keeps the earlier application history", () => {
+  // Applied as "devon-old", was rejected, renamed, applied again. The row now
+  // carries the new login; the first two events still carry the old one.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "devon-new", appliedAt: 3, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "applied", actor: "devon-old", subject: "devon-old", subjectGithubId: DEV.githubId },
+      { at: 2, kind: "application_rejected", actor: "maya", subject: "devon-old", subjectGithubId: DEV.githubId },
+      { at: 3, kind: "applied", actor: "devon-new", subject: "devon-new", subjectGithubId: DEV.githubId },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["applied", "application_rejected", "applied"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), [], "still nothing for a rival");
+});
+
+test("events: a recycled login sees neither applicant's application events", () => {
+  // Legacy events (no subjectGithubId) whose login matches TWO applications —
+  // the previous holder of the name and whoever claimed it. Ambiguous, so it
+  // resolves to nobody rather than to both.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "shared", appliedAt: 1, status: "rejected" },
+      { githubId: OTHER.githubId, githubLogin: "shared", appliedAt: 2, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "funded", actor: "system" },
+      { at: 2, kind: "applied", actor: "shared", subject: "shared" },
+      { at: 3, kind: "application_rejected", actor: "maya", subject: "shared" },
+      { at: 4, kind: "applied", actor: "shared", subject: "shared" },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["funded"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), ["funded"]);
+});
+
+test("events: a stamped subject disambiguates a shared login exactly", () => {
+  // Same collision, but the events know who they are: each side sees only its
+  // own, and the withholding above is confined to pre-stamp events.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "shared", appliedAt: 1, status: "rejected" },
+      { githubId: OTHER.githubId, githubLogin: "shared", appliedAt: 2, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "applied", actor: "shared", subject: "shared", subjectGithubId: DEV.githubId },
+      { at: 2, kind: "application_rejected", actor: "maya", subject: "shared", subjectGithubId: DEV.githubId },
+      { at: 3, kind: "applied", actor: "shared", subject: "shared", subjectGithubId: OTHER.githubId },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["applied", "application_rejected"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), ["applied"]);
+});
+
 test("derived timestamps: awardedAt from events, paid/funded fall back to ledger confirms", () => {
   const bounty = mkBounty({
     status: "PAID",
@@ -287,9 +351,17 @@ test("transactions: only my payouts, with dest snapshot and bounty join", () => 
     idempotencyKey: `release:${b.taskId}-2`, signer: "admin", status: "confirmed",
     hash: "PAYHASH2", amountStroops: "5000000000", dir: "out", createdAt: 5,
   } as any);
-  // Someone else's payout and my escrow-kind row must both be excluded.
+  // Someone else's payout and my escrow-kind row must both be excluded. The
+  // other payout hangs off a bounty assigned to OTHER — a payout to OTHER on a
+  // bounty delegated to DEV is not a state the lifecycle can produce.
+  const otherBounty = mkBounty({
+    status: "PAID",
+    assigneeGithubId: OTHER.githubId,
+    assigneeGithubLogin: OTHER.githubLogin,
+  });
   db.insert("escrowTransactions", {
-    id: uuid(), bountyId: b.id, githubLogin: OTHER.githubLogin, kind: "payout",
+    id: uuid(), bountyId: otherBounty.id, githubId: OTHER.githubId,
+    githubLogin: OTHER.githubLogin, kind: "payout",
     idempotencyKey: "release:other", signer: "admin", status: "confirmed",
     amountStroops: "1", dir: "out", createdAt: 1,
   } as any);
@@ -311,4 +383,122 @@ test("transactions: only my payouts, with dest snapshot and bounty join", () => 
   assert.equal(legacy.dest.address, "GFALLBACK");
   assert.equal(legacy.dest.memo, "fallback-memo");
   assert.ok(res.body.explorerBase.startsWith("https://stellar.expert/explorer/"));
+});
+
+// ── ledger identity ──────────────────────────────────────────────────────────
+// The ledger keys on the stable numeric githubId, never the login: logins are
+// rewritten on sign-in after a GitHub rename, and GitHub recycles abandoned
+// logins to new accounts. Both directions are money-visible, so both are pinned.
+
+// A payout row against a bounty delegated to DEV, in either vintage: `stamped`
+// carries the githubId written at send time, `legacy` predates that field and
+// must resolve through the bounty.
+function mkPaidBountyFor(who: typeof DEV, assigneeLogin = who.githubLogin) {
+  return mkBounty({
+    status: "PAID",
+    assigneeGithubId: who.githubId,
+    assigneeGithubLogin: assigneeLogin,
+  });
+}
+function mkPayout(bountyId: string, patch: Record<string, unknown> = {}) {
+  return db.insert("escrowTransactions", {
+    id: uuid(), bountyId, kind: "payout", idempotencyKey: `release:${uuid()}`,
+    signer: "admin", status: "confirmed", hash: "PAYHASH",
+    amountStroops: "5000000000", dir: "out", createdAt: 10, confirmedAt: 11,
+    ...patch,
+  } as any);
+}
+function ledgerFor(userId: string) {
+  const res = fakeRes();
+  contributorTransactionsHandler(reqFor(userId), res);
+  return res;
+}
+
+test("ledger: a renamed contributor keeps their payout history", () => {
+  // The row froze the old login at send time; the user row has since been
+  // rewritten by the OAuth callback. Matching on login would return nothing.
+  const b = mkPaidBountyFor(DEV, "devon-old");
+  mkPayout(b.id, { githubLogin: "devon-old" });
+  db.update("users", (u) => u.id === DEV.id, { githubLogin: "devon-new" } as any);
+
+  const res = ledgerFor(DEV.id);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.transactions.length, 1, "rename must not erase the ledger");
+  assert.equal(res.body.transactions[0].hash, "PAYHASH");
+});
+
+test("ledger: a recycled login is served none of the previous holder's payouts", () => {
+  // DEV renames away; a brand-new account claims the freed login. It shares
+  // nothing with DEV but the string, and must see nothing.
+  const b = mkPaidBountyFor(DEV);
+  mkPayout(b.id, {
+    githubId: DEV.githubId, githubLogin: DEV.githubLogin,
+    destAddress: "GSECRETWALLET", destMemo: "secret-memo",
+  });
+  db.update("users", (u) => u.id === DEV.id, { githubLogin: "devon-renamed" } as any);
+  const RECYCLER = { id: uuid(), githubId: 999, githubLogin: DEV.githubLogin };
+  mkUser(RECYCLER);
+
+  const stranger = ledgerFor(RECYCLER.id);
+  assert.equal(stranger.statusCode, 200);
+  assert.equal(stranger.body.transactions.length, 0);
+  assert.ok(
+    !JSON.stringify(stranger.body).includes("GSECRETWALLET"),
+    "the previous holder's wallet address must not leak to a recycled login"
+  );
+  // ...and the rename did not cost DEV the row.
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+});
+
+test("ledger: unstamped rows resolve through the bounty, never the row's login", () => {
+  // Deliberately mismatched login on the row: if it were consulted at all this
+  // would land in the wrong ledger (or no ledger).
+  const b = mkPaidBountyFor(DEV);
+  mkPayout(b.id, { githubLogin: "somebody-else" });
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
+});
+
+test("ledger: the stamped counterparty wins over the bounty's current assignee", () => {
+  // The row records who was actually paid; a later reassignment must not hand
+  // the payment history to the new assignee.
+  const b = mkPaidBountyFor(OTHER);
+  mkPayout(b.id, { githubId: DEV.githubId, githubLogin: DEV.githubLogin });
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
+});
+
+test("ledger: a payout that resolves to nobody is served to nobody", () => {
+  // Fail closed. Neither a stamp nor a resolvable bounty, and a login that
+  // would have matched DEV under the old filter — this is the shape a recycled
+  // login exploits, so it must reach no one rather than fall back to the login.
+  mkPayout("ghost-bounty-id", { githubLogin: DEV.githubLogin });
+  db.insert("escrowTransactions", {
+    id: uuid(), bountyId: null, githubLogin: DEV.githubLogin, kind: "payout",
+    idempotencyKey: "release:orphan", signer: "admin", status: "confirmed",
+    amountStroops: "1", dir: "out", createdAt: 9,
+  } as any);
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 0);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
+});
+
+test("ledger: an unresolvable payout warns once per row, not once per fetch", () => {
+  // The check runs inside a db.filter, so an unthrottled warning would fire for
+  // every contributor on every request for as long as the row exists.
+  const warnings: string[] = [];
+  const realWarn = console.warn;
+  console.warn = (m: string) => void warnings.push(m);
+  try {
+    mkPayout("ghost-bounty-throttle", { githubLogin: DEV.githubLogin });
+    ledgerFor(DEV.id);
+    ledgerFor(DEV.id);
+    ledgerFor(OTHER.id);
+  } finally {
+    console.warn = realWarn;
+  }
+  assert.equal(warnings.length, 1, "three fetches, one warning");
+  assert.match(warnings[0], /no resolvable counterparty id/);
 });

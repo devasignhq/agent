@@ -489,6 +489,14 @@ export type BountyEvent = {
   // applicant's login on application_approved (actor = the sponsor). Drives
   // the contributor view's privacy filter: application events are only shown
   // to the contributor they concern.
+  //
+  // `subjectGithubId` is what that filter actually keys on; `subject` is the
+  // display string. A login is not an identity — re-applying after a GitHub
+  // rename rewrites the application row and orphans a contributor's own older
+  // events, and a recycled login makes two applicants indistinguishable. Absent
+  // on events written before this field existed; see eventsForContributor for
+  // how those resolve.
+  subjectGithubId?: number | null;
   subject?: string | null;
   // Short human-readable context (rejection reason, "3 of 5 criteria met", …).
   detail?: string | null;
@@ -581,7 +589,14 @@ export type EscrowTxnStatus = "pending" | "confirmed" | "failed";
 export type EscrowTransaction = {
   id: string;
   bountyId?: string | null;
-  githubLogin?: string | null; // the counterparty (contributor) when relevant
+  // The counterparty (contributor) when relevant. `githubId` is the identity —
+  // it is stable across a GitHub rename, and GitHub recycles abandoned logins,
+  // so matching a ledger row to a person by login both loses history and can
+  // serve one person's payouts to whoever claims their old name. Stamped from
+  // Bounty.assigneeGithubId at send time. `githubLogin` is DISPLAY/AUDIT ONLY —
+  // it records what they were called when the money moved. Never join on it.
+  githubId?: number | null;
+  githubLogin?: string | null;
   kind: EscrowTxnKind;
   idempotencyKey: string;
   signer: "sponsor" | "admin"; // who authorized it (client Freighter vs. backend admin key)

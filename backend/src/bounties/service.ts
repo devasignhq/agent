@@ -92,7 +92,13 @@ const EVENT_CAP = 100;
 export function recordBountyEvent(
   bountyId: string,
   kind: BountyEvent["kind"],
-  opts: { actor?: string | null; subject?: string | null; detail?: string | null; at?: number } = {}
+  opts: {
+    actor?: string | null;
+    subject?: string | null;
+    subjectGithubId?: number | null;
+    detail?: string | null;
+    at?: number;
+  } = {}
 ): void {
   const b = getBounty(bountyId);
   if (!b) return;
@@ -101,6 +107,7 @@ export function recordBountyEvent(
     kind,
     actor: opts.actor ?? null,
     subject: opts.subject ?? null,
+    subjectGithubId: opts.subjectGithubId ?? null,
     detail: opts.detail ?? null,
   };
   const events = [...(b.events ?? []), event].slice(-EVENT_CAP);
@@ -408,6 +415,7 @@ export function applyToBounty(
   recordBountyEvent(bountyId, "applied", {
     actor: applicant.githubLogin,
     subject: applicant.githubLogin,
+    subjectGithubId: applicant.githubId,
   });
   const bounty = getBounty(bountyId);
   return { ok: true, reason: "applied", bounty: bounty ?? undefined };
@@ -441,6 +449,7 @@ export function approveApplication(
   recordBountyEvent(bountyId, "application_approved", {
     actor: actorLogin ?? null,
     subject: applicant?.githubLogin ?? null,
+    subjectGithubId: githubId,
     detail: applicant ? `@${applicant.githubLogin} picked` : null,
   });
   const bounty = getBounty(bountyId);
@@ -462,6 +471,7 @@ export function rejectApplication(
   recordBountyEvent(bountyId, "application_rejected", {
     actor: actorLogin ?? null,
     subject: applicant?.githubLogin ?? null,
+    subjectGithubId: githubId,
     detail: applicant ? `@${applicant.githubLogin}'s application` : null,
   });
   const bounty = getBounty(bountyId);
@@ -489,6 +499,7 @@ export function withdrawApplication(
   recordBountyEvent(bountyId, "application_withdrawn", {
     actor: contributor.githubLogin,
     subject: contributor.githubLogin,
+    subjectGithubId: contributor.githubId,
   });
   const bounty = getBounty(bountyId);
   return { ok: true, reason: "withdrawn", bounty: bounty ?? undefined };
@@ -629,6 +640,7 @@ export async function releaseByMerge(
   }
   insertTxn({
     bountyId,
+    githubId: b.assigneeGithubId ?? null,
     githubLogin: b.assigneeGithubLogin ?? null,
     kind: "payout",
     idempotencyKey: key,
@@ -686,6 +698,7 @@ export function recordSponsorRelease(bountyId: string, send: SendResult): Lifecy
   const failed = send.status === "error";
   insertTxn({
     bountyId,
+    githubId: b.assigneeGithubId ?? null,
     githubLogin: b.assigneeGithubLogin ?? null,
     kind: "payout",
     idempotencyKey: key,
