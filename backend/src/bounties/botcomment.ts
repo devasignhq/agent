@@ -60,6 +60,9 @@ function renderAcceptance(bounty: Bounty): string[] {
 export function renderStatusBody(bounty: Bounty): string {
   const amt = `$${bounty.amountUsdc} USDC`;
   const dev = bounty.assigneeGithubLogin ? `@${bounty.assigneeGithubLogin}` : "the contributor";
+  // The delivery window is absolute — it keeps running through review — so both
+  // assigned states state the due date rather than only the pre-submission one.
+  const due = bounty.deadlineAt ? ` Delivery due by ${new Date(bounty.deadlineAt).toUTCString()}.` : "";
   switch (bounty.status) {
     case "OPEN":
       return [
@@ -70,20 +73,16 @@ export function renderStatusBody(bounty: Bounty): string {
         ``,
         `<sub>Applying takes a minute — sign in with GitHub and introduce yourself. The sponsor approves one applicant to delegate the work; once their PR merges within the ${bounty.deliveryDays}-day window, the escrow pays out automatically.</sub>`,
       ].join("\n");
-    case "DELEGATED": {
-      const due = bounty.deadlineAt ? ` Delivery due by ${new Date(bounty.deadlineAt).toUTCString()}.` : "";
+    case "DELEGATED":
       return `🤖 **DevAsign Bounty** — 👤 delegated to ${dev}.${due} Merge their PR to release the ${amt}, or it refunds when the window elapses.`;
-    }
     case "IN_REVIEW":
-      return `🤖 **DevAsign Bounty** — 🔍 in review${bounty.prNumber ? ` (PR #${bounty.prNumber})` : ""} from ${dev}. Merging releases the ${amt} automatically.`;
+      return `🤖 **DevAsign Bounty** — 🔍 in review${bounty.prNumber ? ` (PR #${bounty.prNumber})` : ""} from ${dev}.${due} Merging releases the ${amt} automatically — if the window elapses first it refunds to the sponsor.`;
     case "PAID":
       return `🤖 **DevAsign Bounty** — 💰 paid. **${amt}** released to ${dev}.${bounty.payoutTxHash ? ` (tx \`${bounty.payoutTxHash}\`)` : ""}`;
     case "CANCELLED":
       return bounty.cancelReason === "expired"
         ? `🤖 **DevAsign Bounty** — ⌛ expired. The delivery window elapsed; **${amt}** was refunded to the sponsor.`
         : `🤖 **DevAsign Bounty** — ✖ cancelled. **${amt}** was refunded to the sponsor.`;
-    case "DISPUTED":
-      return `🤖 **DevAsign Bounty** — ⚠️ disputed; under review by DevAsign.`;
     default:
       return renderConfirmBody(bounty);
   }

@@ -32,6 +32,7 @@ import {
   acceptanceLocked,
   applyToBounty,
   approveApplication,
+  assigneeUser,
   buildFundingTx,
   buildSponsorReleaseTx,
   cancelBounty,
@@ -43,6 +44,8 @@ import {
   recordBountyEvent,
   refundBounty,
   rejectApplication,
+  requestExtension,
+  respondToExtension,
   submitFunding,
   submitSponsorRelease,
   withdrawApplication,
@@ -128,7 +131,7 @@ export function listBountiesHandler(req: Request, res: Response) {
   const list = db
     .filter("bounties", (b) => ids.has(b.installationId) || b.sponsorUserId === user.id)
     .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ bounties: list.map(withSponsorLinks), summary: summarize(list) });
+  res.json({ bounties: list.map(withSponsorLinks), summary: summarize(list), explorerBase: explorerBase() });
 }
 bounties.get("/bounties", listBountiesHandler);
 
@@ -142,7 +145,7 @@ bounties.get("/bounties/transactions", (req, res) => {
   const txns = db
     .filter("escrowTransactions", (t) => !!t.bountyId && bountyIds.has(t.bountyId))
     .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ transactions: txns });
+  res.json({ transactions: txns, explorerBase: explorerBase() });
 });
 
 // Unauthenticated public read for the contributor app's discovery page — a
@@ -173,12 +176,13 @@ export function getBountyHandler(req: Request, res: Response) {
   // bounty must never leave the sponsor) and the applicant list (non-sponsors
   // see only their OWN applications, which is what the apply page needs to
   // render an "already applied" state).
-  if (sponsor) return void res.json({ bounty: withSponsorLinks(b) });
+  if (sponsor) return void res.json({ bounty: withSponsorLinks(b), explorerBase: explorerBase() });
   res.json({
     bounty: {
       ...b,
       applications: b.applications.filter((a) => a.githubId === user.githubId),
     },
+    explorerBase: explorerBase(),
   });
 }
 bounties.get("/bounties/:id", getBountyHandler);
@@ -461,12 +465,6 @@ function contributorFacing(b: Bounty, githubId: number | null) {
   return { ...b, applications: b.applications.filter((a) => a.githubId === githubId) };
 }
 
-// The DevAsign user row for a bounty's assignee, for notifications.
-function assigneeUser(b: Bounty) {
-  if (b.assigneeGithubId == null) return null;
-  return db.find("users", (u) => u.githubId === b.assigneeGithubId);
-}
-
 // Explicit "submit work": the assignee pastes their PR URL (+ optional
 // supporting links). Verifies the PR on GitHub — it must exist in the bounty's
 // repo and be authored by the assignee (same identity rule as the webhook path,
@@ -581,9 +579,86 @@ bounties.post("/bounties/:id/request-payout", (req, res) => {
   res.json({ ok: true, bounty: contributorFacing(updated ?? b, user.githubId) });
 });
 
+// The contributor asks for more delivery time (with a required reason). Purely
+// a DB write — the contract has no expiry — but consequential: while the request
+// is pending, the keeper's deadline sweep holds the expiry refund.
+bounties.post("/bounties/:id/request-extension", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (user.githubId == null || b.assigneeGithubId !== user.githubId) {
+    return void res.status(403).json({ error: "not_assignee" });
+  }
+  const days = Number(req.body?.days);
+  const reason = String(req.body?.reason || "");
+  const r = requestExtension(
+    b.id,
+    { githubId: user.githubId, githubLogin: user.githubLogin },
+    days,
+    reason
+  );
+  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  // Every sponsor of the installation gets a bell (org installs have several).
+  if (r.bounty) {
+    const nb = r.bounty;
+    for (const sponsorId of sponsorAudience(nb)) {
+      pushNotification(
+        sponsorId,
+        "bounty",
+        `@${user.githubLogin} requested a ${days}-day extension on ${nb.code}`,
+        `${nb.repo}#${nb.issueNumber} — ${nb.extension?.reason?.slice(0, 140) ?? ""}`,
+        { link: "/bounty" }
+      );
+    }
+  }
+  res.json({ ok: true, bounty: r.bounty ? contributorFacing(r.bounty, user.githubId) : undefined });
+});
+
+// The sponsor approves or declines the pending extension request. Approving
+// moves deadlineAt; declining lets the keeper refund on its next tick if the
+// bounty is already past due.
+bounties.post("/bounties/:id/extension/:action", (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(b, user.id)) return void res.status(403).json({ error: "forbidden" });
+  const action = req.params.action;
+  if (action !== "approve" && action !== "decline") {
+    return void res.status(400).json({ error: "bad_action" });
+  }
+  const r = respondToExtension(b.id, action, user.githubLogin);
+  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
+  const dev = assigneeUser(b);
+  const ext = r.bounty?.extension;
+  if (dev && ext) {
+    if (action === "approve") {
+      pushNotification(
+        dev.id,
+        "bounty",
+        `Your extension on ${b.code} was approved`,
+        `${b.repo}#${b.issueNumber} — +${ext.days} day${ext.days === 1 ? "" : "s"}, new deadline ${
+          r.bounty?.deadlineAt ? new Date(r.bounty.deadlineAt).toUTCString() : ""
+        }`,
+        { link: "/dashboard" }
+      );
+    } else {
+      pushNotification(
+        dev.id,
+        "bounty",
+        `Your extension request on ${b.code} was declined`,
+        `${b.repo}#${b.issueNumber} — the current deadline stands`,
+        { link: "/dashboard" }
+      );
+    }
+  }
+  res.json({ ok: true, bounty: r.bounty });
+});
+
 // The sponsor rejects the submitted work, with a required reason. The bounty
 // STAYS IN_REVIEW — rejection is a flag on the review stage, so the contributor
-// can rework and resubmit, accept the verdict (refund), or dispute (future).
+// can rework and resubmit, or accept the verdict (refund).
 bounties.post("/bounties/:id/reject-submission", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;

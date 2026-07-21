@@ -433,14 +433,17 @@ export type BountyStatus =
   | "DELEGATED" // an approved contributor accepted (gave a payout address); delivery clock running
   | "IN_REVIEW" // the contributor opened a PR referencing the issue
   | "PAID" // escrow released to the contributor
-  | "CANCELLED" // refunded to the sponsor (deleted while undelegated, or deadline expired), or resolved
-  | "DISPUTED"; // escalated to the admin arbiter (resolve_dispute)
+  | "CANCELLED"; // refunded to the sponsor (deleted while undelegated, or deadline expired)
 
 // Mirrors the contract's on-chain TaskStatus (Open → Completed | Disputed;
 // Open → Cancelled). Null until the escrow is funded on-chain.
+// "Disputed" is kept for fidelity with the contract enum — the contract really
+// can hold an escrow there via dispute_task — but the app never models disputes
+// and no code path writes it: adoptOnchainEscrow reads only `creator` and
+// hardcodes "Open", and every other write is a literal from a tx confirmation.
 export type OnchainStatus = "Open" | "Completed" | "Cancelled" | "Disputed";
 
-export type BountyCancelReason = "deleted" | "expired" | "disputed" | "rejected";
+export type BountyCancelReason = "deleted" | "expired" | "rejected";
 
 // A supporting link the contributor attached to their submission (demo video,
 // design doc, screen recording, …) — free-form type label + URL, sanitized by
@@ -449,8 +452,24 @@ export type SupportingLink = { type: string; url: string; addedAt: number };
 
 // A sponsor's rejection of the submitted work. The bounty STAYS IN_REVIEW —
 // rejection is a flag on the review stage, not a status: the contributor can
-// rework and resubmit, accept the verdict (→ refund), or dispute (future).
+// rework and resubmit, or accept the verdict (→ refund).
 export type SubmissionRejection = { reason: string; byLogin: string; at: number };
+
+// The contributor's request for more delivery time. A single subdocument, not a
+// list: the invariants are "at most one pending at a time" and "at most one
+// approved ever", so one field makes both checks trivial (including inside the
+// keeper's expiredBounties predicate, which must stay cheap). A declined request
+// is overwritten by the next one — the history lives in the events log. While
+// status is "pending" the deadline sweeper HOLDS the expiry refund.
+export type BountyExtension = {
+  days: number; // integer, 1..EXTENSION_MAX_DAYS
+  reason: string; // required; trimmed and capped at EXTENSION_REASON_MAX
+  requestedBy: string; // assignee githubLogin at request time
+  requestedAt: number;
+  status: "pending" | "approved" | "declined";
+  respondedBy?: string | null; // sponsor githubLogin
+  respondedAt?: number | null;
+};
 
 // One entry in a bounty's append-only activity log — every lifecycle moment
 // the contributor app's timeline renders. Written by recordBountyEvent()
@@ -471,6 +490,9 @@ export type BountyEventKind =
   | "submitted"
   | "review_completed"
   | "payout_requested"
+  | "extension_requested"
+  | "extension_approved"
+  | "extension_declined"
   | "submission_rejected"
   | "rejection_accepted"
   | "payout_submitted"
@@ -554,6 +576,11 @@ export type Bounty = {
   assigneeMemo?: string | null; // the payout memo snapshotted alongside assigneeAddress (may be unset on old rows)
   acceptedAt?: number | null;
   deadlineAt?: number | null; // acceptedAt + deliveryDays; the keeper refunds past this
+  // One-shot stamp for the keeper's 24h-out warning bell, so a 12s tick can't
+  // re-notify. CLEARED whenever deadlineAt moves (respondToExtension approve) so
+  // an extended bounty gets a fresh warning against its new deadline. Absent on
+  // every row written before this existed — read it with `== null`.
+  deadlineWarnedAt?: number | null;
   prNumber?: number | null; // the delivering PR
   // Contributor-app submission surface (all optional; old rows load unchanged):
   // when the contributor explicitly submitted via the app (vs. webhook-inferred),
@@ -563,6 +590,9 @@ export type Bounty = {
   supportingLinks?: SupportingLink[];
   payoutRequestedAt?: number | null;
   rejection?: SubmissionRejection | null;
+  // The (single) timeline-extension request; see BountyExtension. Absent on
+  // rows written before the feature existed.
+  extension?: BountyExtension | null;
   // Append-only activity log (see BountyEvent). Capped at EVENT_CAP entries in
   // recordBountyEvent; absent on rows written before the log existed.
   events?: BountyEvent[];
@@ -579,7 +609,7 @@ export type Bounty = {
   updatedAt: number;
 };
 
-export type EscrowTxnKind = "escrow" | "payout" | "refund" | "dispute" | "resolve";
+export type EscrowTxnKind = "escrow" | "payout" | "refund";
 export type EscrowTxnStatus = "pending" | "confirmed" | "failed";
 
 // One row per on-chain escrow operation. Doubles as the frontend transaction

@@ -60,6 +60,31 @@ export function parsePrUrl(raw: string): { repo: string; prNumber: number } | nu
   return { repo: `${m[1]}/${m[2]}`, prNumber };
 }
 
+// ── timeline extension ───────────────────────────────────────────────────────
+
+// Quick-pick chips in the request modal; Custom allows any integer up to the max.
+export const EXTENSION_PRESETS = [1, 2, 3] as const;
+export const EXTENSION_MAX_DAYS = 7;
+// Mirrors EXTENSION_AUTO_APPROVE_MS in backend/src/bounties/service.ts: past this
+// much sponsor silence the keeper approves the request on the contributor's
+// behalf. Surfaced in copy so "waiting on the sponsor" has a stated bound.
+export const EXTENSION_AUTO_APPROVE_HOURS = 24;
+
+export const isValidExtensionDays = (n: number): boolean =>
+  Number.isInteger(n) && n >= 1 && n <= EXTENSION_MAX_DAYS;
+
+// What the extension CTA should show for this bounty. Only meaningful in the
+// "progress" stage (accepted, nothing submitted): once approved, the button is
+// gone for good — one extension per bounty, ever.
+export type ExtensionState = "can_request" | "pending" | "approved" | "unavailable";
+
+export function extensionState(b: ContributorBounty): ExtensionState {
+  if (bountyStage(b) !== "progress") return "unavailable";
+  if (b.extension?.status === "pending") return "pending";
+  if (b.extension?.status === "approved") return "approved";
+  return "can_request"; // absent or declined — may (re)request
+}
+
 // ── bounty stage machine ─────────────────────────────────────────────────────
 // The screen-level state a bounty is in FOR THIS CONTRIBUTOR — richer than the
 // backend status because it folds in their application, the submission, and a
@@ -206,6 +231,28 @@ const EVENT_DISPLAY: Record<
   submitted: (e) => ({ at: e.at, icon: "git", action: "You submitted the work", detail: e.detail }),
   review_completed: (e) => ({ at: e.at, icon: "spark", cls: "cool", action: "DevAsign review", detail: e.detail }),
   payout_requested: (e) => ({ at: e.at, icon: "coins", cls: "cool", action: "You requested payout", detail: "The sponsor has been notified." }),
+  extension_requested: (e) => ({
+    at: e.at, icon: "clock", cls: "warn", action: "You requested a timeline extension",
+    detail: e.detail,
+  }),
+  extension_approved: (e) => ({
+    at: e.at, icon: "check", cls: "cool",
+    // actor "system" = the keeper approved it after the sponsor left the request
+    // unanswered past the auto-approve window; "@system approved…" would read as
+    // a phantom user.
+    action:
+      e.actor === "system"
+        ? "Extension auto-approved (no sponsor response)"
+        : e.actor
+          ? `@${e.actor} approved your extension`
+          : "Extension approved",
+    detail: e.detail,
+  }),
+  extension_declined: (e) => ({
+    at: e.at, icon: "x", cls: "danger",
+    action: e.actor ? `@${e.actor} declined your extension request` : "Extension declined",
+    detail: "The current deadline stands.",
+  }),
   submission_rejected: (e) => ({
     at: e.at, icon: "warn", cls: "danger",
     action: e.actor ? `${e.actor} rejected the submission` : "Submission rejected",

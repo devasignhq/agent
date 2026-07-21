@@ -122,8 +122,8 @@ export const TRANSACTION_HEADERS = [
 // `Bounty ID` because without it a row with a generic note can't be reconciled.
 //
 // Left out: `signer` (internal — which key signed; `kind` already implies it),
-// `destMemo` (near-always null), an explorer URL (stellarTxUrl hardcodes
-// testnet, and baking that into a file that outlives the session is worse than
+// `destMemo` (near-always null), an explorer URL (network-dependent, and baking
+// one network's URL into a file that outlives the session is worse than
 // omitting it), and the undeclared fields the route serialises along with the
 // row (githubId, idempotencyKey, sourceAccount, ledger, error) — not part of the
 // typed contract, and `error` could carry an internal chain message into a

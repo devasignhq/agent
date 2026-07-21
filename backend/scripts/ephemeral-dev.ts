@@ -12,7 +12,7 @@ process.env.ANTHROPIC_API_KEY = "";
 process.env.GEMINI_API_KEY = "";
 process.env.STATSIG_SECRET_KEY = "";
 process.env.WEB_ORIGIN = "http://localhost:3001";
-process.env.PORT = "8787";
+process.env.PORT ||= "8787"; // ||= so a caller can run a second instance elsewhere
 // Dummy Stellar config so isStellarConfigured() passes and the bounty surfaces
 // (create/list/links) are exercisable — nothing here reaches a chain until a
 // funding tx is actually built, which will just error against the fake ids.
@@ -126,6 +126,77 @@ db.insert("users", {
   email: "contributor@example.com",
   plan: "free",
   createdAt: Date.now(),
+});
+
+// …and one DELEGATED (unsubmitted) bounty assigned to that contributor so the
+// in-progress surfaces — submit CTA, timeline-extension request/approve — are
+// exercisable from both apps without driving apply → approve → accept.
+const delegatedBounty = createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 3,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/3",
+  title: "Delegated demo bounty (ephemeral)",
+  description: "In progress — exercises the submission + extension CTAs.",
+  amountUsdc: 300,
+  deliveryDays: 5,
+  sponsorUserId: "ephemeral-user-1",
+});
+recordFunding(delegatedBounty.id, "G".padEnd(56, "A"), { hash: "H_EPHEMERAL_DELEGATED", status: "pending" });
+await applyTxnOutcome(
+  db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${delegatedBounty.taskId}`)!.id,
+  { status: "success", ledger: 4 }
+);
+patchBounty(delegatedBounty.id, {
+  status: "DELEGATED",
+  applications: [{ githubId: 424242, githubLogin: "ephemeral-contributor", appliedAt: Date.now(), status: "accepted" }],
+  assigneeGithubId: 424242,
+  assigneeGithubLogin: "ephemeral-contributor",
+  assigneeAddress: "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4TPPZAKQGZ3S4EFVXJT",
+  acceptedAt: Date.now(),
+  // 12h out: inside the keeper's 24h warning window, so the first tick fires the
+  // "due in Xh" bell — the extension CTA is still exercisable (and this is exactly
+  // when a contributor would reach for it).
+  deadlineAt: Date.now() + 12 * 60 * 60 * 1000,
+});
+
+// …and one IN_REVIEW bounty. The /submit route verifies the PR against real
+// GitHub, which ephemeral mode can't do, so the review stage was unreachable here
+// and its surfaces went unexercised — which is how it shipped showing no delivery
+// deadline at all. Seeded past-due on purpose: the window is absolute (it keeps
+// running through review), so this is the state where the keeper sweeps a bounty
+// whose work was actually delivered.
+const reviewBounty = createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 4,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/4",
+  title: "In-review demo bounty (ephemeral)",
+  description: "Submitted and awaiting the sponsor — exercises the review-stage deadline surfaces.",
+  amountUsdc: 150,
+  deliveryDays: 3,
+  sponsorUserId: "ephemeral-user-1",
+});
+recordFunding(reviewBounty.id, "G".padEnd(56, "A"), { hash: "H_EPHEMERAL_REVIEW", status: "pending" });
+await applyTxnOutcome(
+  db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${reviewBounty.taskId}`)!.id,
+  { status: "success", ledger: 5 }
+);
+patchBounty(reviewBounty.id, {
+  status: "IN_REVIEW",
+  applications: [{ githubId: 424242, githubLogin: "ephemeral-contributor", appliedAt: Date.now(), status: "accepted" }],
+  assigneeGithubId: 424242,
+  assigneeGithubLogin: "ephemeral-contributor",
+  assigneeAddress: "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4TPPZAKQGZ3S4EFVXJT",
+  acceptedAt: Date.now() - 3 * 24 * 60 * 60 * 1000,
+  submittedAt: Date.now() - 60 * 60 * 1000,
+  prNumber: 21,
+  // 6h out rather than past-due: a past-due one is swept within a tick and the
+  // review-stage surfaces vanish, so this keeps the stage inspectable and fires
+  // the warning bell's review-flavoured copy on the first tick.
+  deadlineAt: Date.now() + 6 * 60 * 60 * 1000,
 });
 
 // Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the

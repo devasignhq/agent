@@ -3,20 +3,19 @@
 //   Center — bounty detail: issue + escrow links, acceptance criteria,
 //            DevAsign review (once submitted)
 //   Right  — contextual call-to-action per bounty state + the timeline
-// Ported from the design's c-bounty.jsx, wired to the real API. Dispute
-// branches render only behind FLAGS.disputes (preview shell, Phase E).
+// Ported from the design's c-bounty.jsx, wired to the real API.
 import React from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "./api";
 import type { ContributorBounty } from "./api";
 import { useBounties } from "./data-context";
 import { Icon } from "./icons";
-import { FLAGS } from "./flags";
-import { SubmitModal, linkIcon, useBountyReview } from "./dashboard";
+import { ExtensionModal, SubmitModal, linkIcon, useBountyReview } from "./dashboard";
 import {
   allCriteriaMet,
   bountyStage,
   cmoney,
+  extensionState,
   fmtDate,
   mergedCriteria,
   reviewHeadline,
@@ -220,9 +219,10 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
   const review = useBountyReview(b);
   const [submitOpen, setSubmitOpen] = React.useState(false);
   const [linksOnly, setLinksOnly] = React.useState(false);
+  const [extOpen, setExtOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
-  React.useEffect(() => { setSubmitOpen(false); setBusy(false); }, [b.id]);
+  React.useEffect(() => { setSubmitOpen(false); setExtOpen(false); setBusy(false); }, [b.id]);
 
   const prUrl = b.prNumber ? `https://github.com/${b.repo}/pull/${b.prNumber}` : null;
   const payoutRequested = !!b.payoutRequestedAt;
@@ -251,27 +251,45 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
 
   // In progress — no submission yet.
   if (st.key === "progress") {
+    const extState = extensionState(b);
+    const pastDue = !!b.deadlineAt && b.deadlineAt < Date.now();
     return (
       <>
         {card("Ready to submit?", "Link your pull request and any supporting material — a demo video, a recording, notes. DevAsign reviews it against the criteria.",
-          <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>,
-          <><Icon name="clock" size={11} /> {b.acceptedAt ? `accepted ${fmtDate(b.acceptedAt)}` : "accepted"}{b.deadlineAt ? ` · ${timeLeft(b.deadlineAt)}` : ""}</>)}
+          <>
+            <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>
+            {extState === "can_request" && (
+              <button className="btn ghost" onClick={() => setExtOpen(true)}><Icon name="clock" size={12} /> Request extension</button>
+            )}
+            {extState === "pending" && (
+              <button className="btn ghost" disabled><Icon name="clock" size={12} /> Extension requested</button>
+            )}
+          </>,
+          <><Icon name="clock" size={11} /> {b.acceptedAt ? `accepted ${fmtDate(b.acceptedAt)}` : "accepted"}
+            {b.deadlineAt ? ` · ${timeLeft(b.deadlineAt)}` : ""}
+            {extState === "pending" ? ` · ${b.extension!.days}-day extension pending${pastDue ? " — refund on hold" : ""}` : ""}
+            {extState === "approved" ? ` · extended +${b.extension!.days}d` : ""}</>)}
         {submitOpen && <SubmitModal b={b} linksOnly={linksOnly} onClose={() => setSubmitOpen(false)} onDone={() => void reload()} />}
+        {extOpen && <ExtensionModal b={b} onClose={() => setExtOpen(false)} onDone={() => void reload()} />}
       </>
     );
   }
 
   // In review (incl. ready-for-payout).
   if (st.key === "review" || st.key === "ready") {
+    // The delivery window keeps running through review — if it closes before the
+    // sponsor releases, the escrow returns to them. This stage used to show no
+    // clock at all, hiding the one risk the contributor can't act on directly.
+    const dueMeta = b.deadlineAt ? <> · {timeLeft(b.deadlineAt)}</> : null;
     if (payoutRequested) {
       return card("In review", "Payout requested — the sponsor has been notified. On approval (or merge), the escrow releases to your wallet.",
         <button className="btn ghost" disabled><Icon name="check" size={12} /> Payout requested</button>,
-        <><Icon name="shield" size={11} /> pays directly to your USDC wallet</>);
+        <><Icon name="shield" size={11} /> pays directly to your USDC wallet{dueMeta}</>);
     }
     if (ready || st.key === "ready") {
       return card("All criteria met", "This submission is ready. Request payout and the escrow releases on approval.",
         <button className="btn primary" disabled={busy} onClick={() => void requestPayout()}><Icon name="coins" size={13} /> {busy ? "Requesting…" : `Request payout · ${cmoney(b.amountUsdc)}`}</button>,
-        <><Icon name="shield" size={11} /> pays to your saved address</>);
+        <><Icon name="shield" size={11} /> pays to your saved address{dueMeta}</>);
     }
     return (
       <>
@@ -282,7 +300,7 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
             {prUrl && <a className="btn ghost" href={prUrl} target="_blank" rel="noopener noreferrer"><Icon name="external" size={12} /> View PR</a>}
             <button className="btn ghost" onClick={() => { setLinksOnly(true); setSubmitOpen(true); }}><Icon name="plus" size={12} /> Add / update links</button>
           </>,
-          <><Icon name="shield" size={11} /> pays directly to your USDC wallet</>)}
+          <><Icon name="shield" size={11} /> pays directly to your USDC wallet{dueMeta}</>)}
         {submitOpen && <SubmitModal b={b} linksOnly={linksOnly} onClose={() => setSubmitOpen(false)} onDone={() => void reload()} />}
       </>
     );
@@ -296,12 +314,9 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
           <span className="ic"><Icon name="x" size={16} /></span>
           <div><div className="t">{b.rejection!.byLogin} rejected this · {fmtDate(b.rejection!.at)}</div><div className="d">{b.rejection!.reason}</div></div>
         </div>
-        {card("Contest or close",
-          FLAGS.disputes
-            ? "Disagree with the verdict? Open a dispute and a neutral reviewer decides. Otherwise accept it to close the bounty."
-            : "You can rework and resubmit your PR, or accept the verdict to close the bounty. Disputes are coming soon.",
+        {card("Rework or close",
+          "You can rework and resubmit your PR, or accept the verdict to close the bounty.",
           <>
-            {FLAGS.disputes && <button className="btn primary" onClick={() => navigate("/disputes")}><Icon name="scale" size={13} /> Dispute the rejection</button>}
             <button className="btn ghost" disabled={busy} onClick={() => void acceptVerdict()}><Icon name="check" size={12} /> Accept verdict</button>
           </>)}
       </>

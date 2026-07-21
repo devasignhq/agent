@@ -3,7 +3,10 @@
 // DURABLE source of truth across restarts — the in-memory queue isn't. Each tick:
 //   1. confirm submitted txns → advance the bounty state machine (+ edit the bot
 //      comment); age out a tx that never lands so it's retryable.
-//   2. sweep delivery deadlines → refund the sponsor (admin-signed).
+//   2. auto-approve extension requests the sponsor left unanswered past
+//      EXTENSION_AUTO_APPROVE_MS, so a silent sponsor can't hold the escrow.
+//   3. sweep delivery deadlines → refund the sponsor (admin-signed).
+//   4. warn the contributor 24h before their window closes (one-shot, in-app).
 // All state advances go through the service's idempotent, guarded transitions, so
 // a tick is safe to run repeatedly and concurrently-guarded against itself.
 import { flushPending } from "../db.js";
@@ -12,16 +15,24 @@ import { confirmTransaction, type ConfirmResult } from "../stellar/submit.js";
 import {
   adoptOnchainEscrow,
   applyTxnOutcome,
+  assigneeUser,
+  bountiesNearingDeadline,
   defaultChain,
+  EXTENSION_AUTO_APPROVE_HOURS,
   expiredBounties,
   getBounty,
+  patchBounty,
   pendingTxns,
   refundBounty,
+  respondToExtension,
   resubmitAdminTxn,
+  staleExtensionRequests,
   unfundedPendingBounties,
   type EscrowChain,
 } from "./service.js";
 import { updateStatusComment } from "./botcomment.js";
+import { sponsorAudience } from "./live.js";
+import { pushNotification } from "../notifications.js";
 
 const DEFAULT_TICK_MS = 12_000;
 // Give up waiting for a tx to be included after this long (timebounds expired /
@@ -84,7 +95,16 @@ export async function runTick(deps: KeeperDeps = realDeps): Promise<void> {
   try {
     await confirmPending(deps);
     await recoverOrphanedFunding(deps);
+    // MUST precede sweepDeadlines: auto-approval is what releases the refund
+    // hold, and doing it first means a bounty whose new deadline lands in the
+    // future is never even considered for refund this tick — no wasted chain
+    // call, no misleading "delivery window elapsed" log line.
+    await autoApproveStaleExtensions(deps);
     await sweepDeadlines(deps);
+    // Last: purely advisory, and it must read the deadline AFTER any auto-approval
+    // moved it. Its predicate (deadlineAt > now) is disjoint from the sweep's
+    // (deadlineAt < now), so the two never contend over the same bounty.
+    await warnApproachingDeadlines(deps);
     await flushPending();
   } catch (err) {
     console.warn("[bounty-keeper] tick error:", err);
@@ -215,12 +235,103 @@ async function recoverOrphanedFunding(deps: KeeperDeps): Promise<void> {
   }
 }
 
+/**
+ * A pending extension request HOLDS the expiry refund (expiredBounties + the
+ * refundBounty guard), so a sponsor who never answers holds it forever. Past
+ * EXTENSION_AUTO_APPROVE_MS, silence counts as consent: approve on the
+ * contributor's behalf — through respondToExtension, so the deadline math, the
+ * activity event and the at-most-one-approved invariant stay in ONE place.
+ *
+ * Runs BEFORE sweepDeadlines so a bounty whose new deadline lands in the future
+ * is never even considered for refund this tick.
+ */
+async function autoApproveStaleExtensions(deps: KeeperDeps): Promise<void> {
+  for (const b of staleExtensionRequests(deps.now())) {
+    try {
+      const r = respondToExtension(b.id, "approve", "system", { at: deps.now() });
+      if (!r.ok) {
+        // Benign and self-healing: a release landed mid-tick (pendingOp), or
+        // another instance won the race. Retried on the next tick.
+        console.warn(`[bounty-keeper] auto-approve extension on ${b.code}: ${r.reason}`);
+        continue;
+      }
+      const nb = r.bounty ?? b;
+      const days = nb.extension?.days ?? 0;
+      const plural = days === 1 ? "" : "s";
+      const due = nb.deadlineAt ? new Date(nb.deadlineAt).toUTCString() : "";
+      // Derived, never spelled out: the window has changed once already and the
+      // copy silently went stale everywhere it was written by hand.
+      const window = `${EXTENSION_AUTO_APPROVE_HOURS}h`;
+      console.log(`[bounty-keeper] ${b.code}: extension unanswered for ${window} → auto-approved`);
+      // Both parties: the contributor because their deadline moved, the sponsor
+      // because it moved WITHOUT them and their escrow is committed for longer.
+      const dev = assigneeUser(nb);
+      if (dev) {
+        pushNotification(
+          dev.id,
+          "bounty",
+          `Your extension on ${b.code} was auto-approved`,
+          `${b.repo}#${b.issueNumber} — +${days} day${plural} after ${window} without a sponsor response. New deadline ${due}`,
+          { link: "/dashboard" }
+        );
+      }
+      for (const sponsorId of sponsorAudience(nb)) {
+        pushNotification(
+          sponsorId,
+          "bounty",
+          `Extension on ${b.code} auto-approved after ${window}`,
+          `${b.repo}#${b.issueNumber} — @${nb.assigneeGithubLogin ?? "the contributor"} now has until ${due}`,
+          { link: "/bounties" }
+        );
+      }
+      await syncComment(b.id);
+    } catch (err) {
+      console.warn(`[bounty-keeper] auto-approve extension on ${b.code} threw:`, err);
+    }
+  }
+}
+
 async function sweepDeadlines(deps: KeeperDeps): Promise<void> {
   for (const b of expiredBounties(deps.now())) {
     console.log(`[bounty-keeper] ${b.code} delivery window elapsed → refunding sponsor`);
     const r = await refundBounty(b.id, "expired", deps.chain);
     if (!r.ok) console.warn(`[bounty-keeper] refund for ${b.code}: ${r.reason}`);
     // The comment flips to "expired" once the refund tx confirms on a later tick.
+  }
+}
+
+/**
+ * One in-app bell 24h before the delivery window closes, so an expiry refund is
+ * never the first the contributor hears of it. The `deadlineWarnedAt` stamp is
+ * what makes this one-shot rather than one-per-12s-tick — and unlike the
+ * lastResubmit / lastOrphanCheck throttles it lives on the ROW, so a keeper
+ * restart doesn't re-fire it.
+ *
+ * Fires for submitted work too, because the window is absolute — but the ask is
+ * different. Someone who hasn't submitted can still act on their own; someone
+ * waiting on a review can only chase the sponsor, since requestExtension is
+ * pre-submission only.
+ */
+async function warnApproachingDeadlines(deps: KeeperDeps): Promise<void> {
+  const now = deps.now();
+  for (const b of bountiesNearingDeadline(now)) {
+    try {
+      // Stamp FIRST and unconditionally: an unclaimed GitHub identity has no user
+      // row to notify, and re-scanning it every 12s until expiry is pure waste.
+      // For an advisory bell, idempotency beats delivery.
+      patchBounty(b.id, { deadlineWarnedAt: now });
+      const dev = assigneeUser(b);
+      if (!dev) continue;
+      const hours = Math.max(1, Math.round((b.deadlineAt! - now) / (60 * 60 * 1000)));
+      const ask = b.submittedAt
+        ? "your submission is still awaiting review — nudge the sponsor, or the escrow returns to them when the window closes"
+        : "submit your PR or request an extension before the window closes";
+      pushNotification(dev.id, "bounty", `${b.code} is due in ${hours}h`, `${b.repo}#${b.issueNumber} — ${ask}`, {
+        link: "/dashboard",
+      });
+    } catch (err) {
+      console.warn(`[bounty-keeper] deadline warning for ${b.code} threw:`, err);
+    }
   }
 }
 

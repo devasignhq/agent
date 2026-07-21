@@ -316,8 +316,7 @@ export type BountyStatus =
   | "DELEGATED"
   | "IN_REVIEW"
   | "PAID"
-  | "CANCELLED"
-  | "DISPUTED";
+  | "CANCELLED";
 
 export type BountyApplication = {
   githubId: number;
@@ -325,6 +324,18 @@ export type BountyApplication = {
   note?: string;
   appliedAt: number;
   status: "pending" | "approved" | "accepted" | "rejected";
+};
+
+// The contributor's timeline-extension request (backend types.ts). While
+// status is "pending" the backend holds the deadline-expiry refund.
+export type BountyExtension = {
+  days: number;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  status: "pending" | "approved" | "declined";
+  respondedBy?: string | null;
+  respondedAt?: number | null;
 };
 
 export type Bounty = {
@@ -358,6 +369,7 @@ export type Bounty = {
   acceptedAt?: number | null;
   deadlineAt?: number | null;
   prNumber?: number | null;
+  extension?: BountyExtension | null;
   escrowTxHash?: string | null;
   payoutTxHash?: string | null;
   refundTxHash?: string | null;
@@ -374,7 +386,7 @@ export type EscrowTransaction = {
   id: string;
   bountyId?: string | null;
   githubLogin?: string | null;
-  kind: "escrow" | "payout" | "refund" | "dispute" | "resolve";
+  kind: "escrow" | "payout" | "refund";
   signer: "sponsor" | "admin";
   status: "pending" | "confirmed" | "failed";
   hash?: string | null;
@@ -536,10 +548,11 @@ export const api = {
   // bounties. Funding + in-app "Approve payment" are two-step: fetch an UNSIGNED
   // transaction (xdr), sign it with the sponsor's Freighter wallet client-side,
   // then post the signed envelope back to the matching *-submit endpoint.
-  bounties: () => request<{ bounties: Bounty[]; summary: BountySummary }>("/api/bounties"),
-  bounty: (id: string) => request<{ bounty: Bounty }>(`/api/bounties/${id}`),
+  bounties: () =>
+    request<{ bounties: Bounty[]; summary: BountySummary; explorerBase?: string }>("/api/bounties"),
+  bounty: (id: string) => request<{ bounty: Bounty; explorerBase?: string }>(`/api/bounties/${id}`),
   bountyTransactions: () =>
-    request<{ transactions: EscrowTransaction[] }>("/api/bounties/transactions"),
+    request<{ transactions: EscrowTransaction[]; explorerBase?: string }>("/api/bounties/transactions"),
   createBounty: (input: {
     repo: string;
     issueNumber: number;
@@ -596,6 +609,18 @@ export const api = {
     }),
   rejectApplication: (id: string, githubId: number) =>
     request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/applications/${githubId}/reject`, {
+      method: "POST",
+      body: "{}",
+    }),
+  // Timeline extension: approve moves the deadline; decline releases the
+  // refund hold (the keeper refunds on its next tick if past due).
+  approveExtension: (id: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/extension/approve`, {
+      method: "POST",
+      body: "{}",
+    }),
+  declineExtension: (id: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/extension/decline`, {
       method: "POST",
       body: "{}",
     }),

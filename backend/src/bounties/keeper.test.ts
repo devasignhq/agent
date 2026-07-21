@@ -13,10 +13,14 @@ import {
   applyToBounty,
   approveApplication,
   acceptAndStartClock,
+  markInReview,
   releaseByMerge,
   refundBounty,
+  requestExtension,
+  respondToExtension,
   getBounty,
   applyTxnOutcome,
+  EXTENSION_AUTO_APPROVE_MS,
   type EscrowChain,
 } from "./service.js";
 import { runTick, type KeeperDeps } from "./keeper.js";
@@ -85,10 +89,36 @@ async function fundOpenDelegate(id: string) {
   await acceptAndStartClock(id, { githubId: 5, githubLogin: "dev" }, ADDR(), "", chain);
 }
 
+const DEV = { githubId: 5, githubLogin: "dev" };
+const DAY = 24 * 60 * 60 * 1000;
+
+// The contributor's DevAsign account — the keeper's bells resolve the assignee
+// through it, so without this row a notification has nowhere to land.
+function seedDevUser(): string {
+  const id = "u_dev";
+  db.insert("users", {
+    id,
+    githubId: DEV.githubId,
+    githubLogin: DEV.githubLogin,
+    email: "dev@example.com",
+    plan: "free",
+    createdAt: Date.now(),
+  });
+  return id;
+}
+
+function bells(userId: string, pattern?: RegExp) {
+  return db.filter(
+    "notifications",
+    (n) => n.userId === userId && (!pattern || pattern.test(n.title))
+  );
+}
+
 beforeEach(() => {
   db.remove("bounties", () => true);
   db.remove("escrowTransactions", () => true);
   db.remove("users", () => true);
+  db.remove("notifications", () => true);
 });
 
 test("keeper confirms a pending payout → PAID", async () => {
@@ -342,4 +372,175 @@ test("a dropped admin refund still ages out to failed once past the max age", as
   assert.equal(resubmits, 0, "age-out wins over resubmit past the max age");
   assert.equal(txnByKey(`refund:${b.taskId}`)!.status, "failed");
   assert.equal(getBounty(b.id)!.pendingOp, null); // guard cleared → retryable
+});
+
+// ── the delivery window is absolute ──────────────────────────────────────────
+
+test("a submitted bounty past its deadline is swept, then confirms → CANCELLED", async () => {
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  markInReview(b.id, 7); // IN_REVIEW + submittedAt
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
+
+  await runTick(keeperDeps({}));
+  assert.ok(txnByKey(`refund:${b.taskId}`), "submission does not stop the clock");
+
+  await runTick(keeperDeps({ H_REF: { status: "success", ledger: 11 } }));
+  const done = getBounty(b.id)!;
+  assert.equal(done.status, "CANCELLED");
+  assert.equal(done.cancelReason, "expired");
+});
+
+// ── stale extension auto-approval ────────────────────────────────────────────
+
+test("an unanswered extension auto-approves and the deadline moves", async () => {
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  // Deadline derived from the window, not a literal: the tick clock lands just
+  // past the window, so the bounty is genuinely overdue by then and this exercises
+  // the real case — a request that outlived its own deadline. A literal silently
+  // stops doing that whenever the window changes (as it did at 3 days → 24h).
+  const EXT_DAYS = 3;
+  const oldDeadline = Date.now() + EXTENSION_AUTO_APPROVE_MS / 2;
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: oldDeadline });
+  requestExtension(b.id, DEV, EXT_DAYS, "sick");
+
+  const at = Date.now() + EXTENSION_AUTO_APPROVE_MS + 1000;
+  assert.ok(oldDeadline < at, "fixture guard: the bounty must be overdue at tick time");
+  await runTick(keeperDeps({}, () => at));
+
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.extension!.status, "approved");
+  assert.equal(after.extension!.respondedBy, "system");
+  assert.equal(after.deadlineAt, oldDeadline + EXT_DAYS * DAY, "old-deadline anchored");
+  const ev = after.events!.at(-1)!;
+  assert.equal(ev.kind, "extension_approved");
+  assert.equal(ev.actor, "system");
+  // Overdue but never refunded: expiredBounties excludes a pending extension, so
+  // the hold protects it until it is resolved. NOTE this does NOT prove the tick
+  // ordering — the pending guard holds whichever order the two steps run in. The
+  // ordering is only observable once the hold is released, which is what the
+  // long-outage test below actually pins (swap the two steps in runTick and that
+  // one goes red, this one does not).
+  assert.equal(txnByKey(`refund:${b.taskId}`), null, "the pending hold survives its own deadline");
+});
+
+test("after a long outage, auto-approval releases the hold and the sweep refunds same-tick", async () => {
+  // The documented edge case: if even the EXTENDED deadline is already past
+  // (keeper down for days), approval is still correct — anchoring on the old
+  // deadline means the contributor already consumed that time — and the refund
+  // then proceeds immediately rather than the escrow staying frozen forever.
+  //
+  // This is ALSO the only test that pins the runTick ordering. Auto-approval must
+  // run before the sweep: it is what releases the hold, and "same-tick" below is
+  // the observable difference. Swap the two steps in runTick and this goes red
+  // (the refund slips to the next tick) — no other test catches that.
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  const oldDeadline = Date.now() - 1000;
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: oldDeadline });
+  requestExtension(b.id, DEV, 1, "sick");
+
+  await runTick(keeperDeps({}, () => Date.now() + 30 * DAY));
+
+  const after = getBounty(b.id)!;
+  assert.equal(after.extension!.status, "approved", "the request still resolves");
+  assert.equal(after.deadlineAt, oldDeadline + 1 * DAY, "old-deadline anchored, still in the past");
+  assert.ok(txnByKey(`refund:${b.taskId}`), "hold released → the sweep refunds, no permanent freeze");
+});
+
+test("a fresh extension request is left alone and still holds the refund", async () => {
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
+  requestExtension(b.id, DEV, 3, "sick");
+
+  await runTick(keeperDeps({}));
+
+  assert.equal(getBounty(b.id)!.extension!.status, "pending", "not yet stale");
+  assert.equal(txnByKey(`refund:${b.taskId}`), null, "the hold still holds");
+});
+
+test("auto-approval notifies both the contributor and the sponsor", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, {
+    // Comfortably past the tick clock, so the sweep never fires and the only
+    // bells in play are the auto-approval's.
+    deadlineAt: Date.now() + EXTENSION_AUTO_APPROVE_MS + 7 * DAY,
+    sponsorUserId: "u_sponsor",
+  });
+  requestExtension(b.id, DEV, 2, "sick");
+
+  await runTick(keeperDeps({}, () => Date.now() + EXTENSION_AUTO_APPROVE_MS + 1000));
+
+  assert.equal(bells(devId, /auto-approved/i).length, 1, "contributor told their deadline moved");
+  assert.equal(bells("u_sponsor", /auto-approved/i).length, 1, "sponsor told it moved without them");
+});
+
+// ── 24h deadline warning ─────────────────────────────────────────────────────
+
+test("the 24h warning fires once and only once", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
+
+  await runTick(keeperDeps({}));
+  assert.equal(bells(devId, /due in/i).length, 1, "warned on the first tick");
+  assert.ok(getBounty(b.id)!.deadlineWarnedAt, "stamped");
+
+  await runTick(keeperDeps({}));
+  assert.equal(bells(devId, /due in/i).length, 1, "the stamp makes it one-shot, not one-per-tick");
+});
+
+test("a warned bounty is warned again after its extension is approved", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
+
+  await runTick(keeperDeps({}));
+  assert.equal(bells(devId, /due in/i).length, 1);
+
+  // +1 day lands the new deadline ~36h out; advance the clock so it is inside
+  // the 24h window again. The approve re-armed deadlineWarnedAt.
+  requestExtension(b.id, DEV, 1, "one more day");
+  respondToExtension(b.id, "approve", "sponsor");
+  assert.equal(getBounty(b.id)!.deadlineWarnedAt, null, "re-armed");
+
+  await runTick(keeperDeps({}, () => Date.now() + 24 * 60 * 60 * 1000));
+  assert.equal(bells(devId, /due in/i).length, 2, "fresh warning against the new deadline");
+});
+
+test("a submitted contributor is warned, with review-flavoured copy", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  markInReview(b.id, 7);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
+
+  await runTick(keeperDeps({}));
+
+  const bell = bells(devId, /due in/i);
+  assert.equal(bell.length, 1, "submitted work is warned too — it can still be swept");
+  // "submit your PR" is nonsense to someone who already has; theirs points at the
+  // only lever they actually have, which is chasing the sponsor.
+  assert.match(bell[0].meta, /awaiting review/i);
+  assert.doesNotMatch(bell[0].meta, /submit your PR/i);
+});
+
+test("an unsubmitted contributor keeps the original warning copy", async () => {
+  const devId = seedDevUser();
+  const b = mkBounty();
+  await fundOpenDelegate(b.id);
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() + 12 * 60 * 60 * 1000 });
+
+  await runTick(keeperDeps({}));
+
+  const bell = bells(devId, /due in/i);
+  assert.equal(bell.length, 1);
+  assert.match(bell[0].meta, /submit your PR or request an extension/i);
 });
