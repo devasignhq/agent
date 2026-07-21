@@ -18,6 +18,7 @@ import {
   acceptAndStartClock,
   markInReview,
   releaseByMerge,
+  recordSponsorRelease,
   refundBounty,
   resubmitAdminTxn,
   deleteBounty,
@@ -148,6 +149,31 @@ test("happy path: fund → open → delegate → merge-release → paid", async 
   assert.equal(paid.status, "PAID");
   assert.equal(paid.onchainStatus, "Completed");
   assert.equal(paid.pendingOp, null);
+});
+
+// The contributor's payout ledger matches rows to a person by this numeric id
+// (routes/contributor.ts). A login can be renamed away or recycled to a new
+// account, so if either writer stops stamping it, the read path silently falls
+// back to bounty resolution and nothing else would catch the regression.
+test("both release paths stamp the assignee's numeric githubId on the payout row", async () => {
+  for (const [label, release] of [
+    ["admin/merge", (id: string, chain: EscrowChain) => releaseByMerge(id, chain)],
+    ["sponsor/in-app", async (id: string) =>
+      recordSponsorRelease(id, { hash: "H_SPONSOR", status: "pending" })],
+  ] as const) {
+    db.remove("bounties", () => true);
+    db.remove("escrowTransactions", () => true);
+    const { chain } = fakeChain();
+    const b = mkBounty();
+    fundAndConfirm(b.id);
+    await delegate(b.id, chain);
+    await release(b.id, chain);
+
+    const payout = txnByKey(`release:${getBounty(b.id)!.taskId}`)!;
+    assert.equal(payout.kind, "payout", label);
+    assert.equal(payout.githubId, 999, `${label}: stamped with the assignee's githubId`);
+    assert.equal(payout.githubId, getBounty(b.id)!.assigneeGithubId, label);
+  }
 });
 
 test("no double-pay: merge fired twice + already-paid", async () => {

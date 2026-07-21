@@ -629,6 +629,7 @@ export async function releaseByMerge(
   }
   insertTxn({
     bountyId,
+    githubId: b.assigneeGithubId ?? null,
     githubLogin: b.assigneeGithubLogin ?? null,
     kind: "payout",
     idempotencyKey: key,
@@ -686,6 +687,7 @@ export function recordSponsorRelease(bountyId: string, send: SendResult): Lifecy
   const failed = send.status === "error";
   insertTxn({
     bountyId,
+    githubId: b.assigneeGithubId ?? null,
     githubLogin: b.assigneeGithubLogin ?? null,
     kind: "payout",
     idempotencyKey: key,

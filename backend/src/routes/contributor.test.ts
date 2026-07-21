@@ -287,9 +287,17 @@ test("transactions: only my payouts, with dest snapshot and bounty join", () => 
     idempotencyKey: `release:${b.taskId}-2`, signer: "admin", status: "confirmed",
     hash: "PAYHASH2", amountStroops: "5000000000", dir: "out", createdAt: 5,
   } as any);
-  // Someone else's payout and my escrow-kind row must both be excluded.
+  // Someone else's payout and my escrow-kind row must both be excluded. The
+  // other payout hangs off a bounty assigned to OTHER — a payout to OTHER on a
+  // bounty delegated to DEV is not a state the lifecycle can produce.
+  const otherBounty = mkBounty({
+    status: "PAID",
+    assigneeGithubId: OTHER.githubId,
+    assigneeGithubLogin: OTHER.githubLogin,
+  });
   db.insert("escrowTransactions", {
-    id: uuid(), bountyId: b.id, githubLogin: OTHER.githubLogin, kind: "payout",
+    id: uuid(), bountyId: otherBounty.id, githubId: OTHER.githubId,
+    githubLogin: OTHER.githubLogin, kind: "payout",
     idempotencyKey: "release:other", signer: "admin", status: "confirmed",
     amountStroops: "1", dir: "out", createdAt: 1,
   } as any);
@@ -311,4 +319,104 @@ test("transactions: only my payouts, with dest snapshot and bounty join", () => 
   assert.equal(legacy.dest.address, "GFALLBACK");
   assert.equal(legacy.dest.memo, "fallback-memo");
   assert.ok(res.body.explorerBase.startsWith("https://stellar.expert/explorer/"));
+});
+
+// ── ledger identity ──────────────────────────────────────────────────────────
+// The ledger keys on the stable numeric githubId, never the login: logins are
+// rewritten on sign-in after a GitHub rename, and GitHub recycles abandoned
+// logins to new accounts. Both directions are money-visible, so both are pinned.
+
+// A payout row against a bounty delegated to DEV, in either vintage: `stamped`
+// carries the githubId written at send time, `legacy` predates that field and
+// must resolve through the bounty.
+function mkPaidBountyFor(who: typeof DEV, assigneeLogin = who.githubLogin) {
+  return mkBounty({
+    status: "PAID",
+    assigneeGithubId: who.githubId,
+    assigneeGithubLogin: assigneeLogin,
+  });
+}
+function mkPayout(bountyId: string, patch: Record<string, unknown> = {}) {
+  return db.insert("escrowTransactions", {
+    id: uuid(), bountyId, kind: "payout", idempotencyKey: `release:${uuid()}`,
+    signer: "admin", status: "confirmed", hash: "PAYHASH",
+    amountStroops: "5000000000", dir: "out", createdAt: 10, confirmedAt: 11,
+    ...patch,
+  } as any);
+}
+function ledgerFor(userId: string) {
+  const res = fakeRes();
+  contributorTransactionsHandler(reqFor(userId), res);
+  return res;
+}
+
+test("ledger: a renamed contributor keeps their payout history", () => {
+  // The row froze the old login at send time; the user row has since been
+  // rewritten by the OAuth callback. Matching on login would return nothing.
+  const b = mkPaidBountyFor(DEV, "devon-old");
+  mkPayout(b.id, { githubLogin: "devon-old" });
+  db.update("users", (u) => u.id === DEV.id, { githubLogin: "devon-new" } as any);
+
+  const res = ledgerFor(DEV.id);
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.transactions.length, 1, "rename must not erase the ledger");
+  assert.equal(res.body.transactions[0].hash, "PAYHASH");
+});
+
+test("ledger: a recycled login is served none of the previous holder's payouts", () => {
+  // DEV renames away; a brand-new account claims the freed login. It shares
+  // nothing with DEV but the string, and must see nothing.
+  const b = mkPaidBountyFor(DEV);
+  mkPayout(b.id, {
+    githubId: DEV.githubId, githubLogin: DEV.githubLogin,
+    destAddress: "GSECRETWALLET", destMemo: "secret-memo",
+  });
+  db.update("users", (u) => u.id === DEV.id, { githubLogin: "devon-renamed" } as any);
+  const RECYCLER = { id: uuid(), githubId: 999, githubLogin: DEV.githubLogin };
+  mkUser(RECYCLER);
+
+  const stranger = ledgerFor(RECYCLER.id);
+  assert.equal(stranger.statusCode, 200);
+  assert.equal(stranger.body.transactions.length, 0);
+  assert.ok(
+    !JSON.stringify(stranger.body).includes("GSECRETWALLET"),
+    "the previous holder's wallet address must not leak to a recycled login"
+  );
+  // ...and the rename did not cost DEV the row.
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+});
+
+test("ledger: unstamped rows resolve through the bounty, never the row's login", () => {
+  // Deliberately mismatched login on the row: if it were consulted at all this
+  // would land in the wrong ledger (or no ledger).
+  const b = mkPaidBountyFor(DEV);
+  mkPayout(b.id, { githubLogin: "somebody-else" });
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
+});
+
+test("ledger: the stamped counterparty wins over the bounty's current assignee", () => {
+  // The row records who was actually paid; a later reassignment must not hand
+  // the payment history to the new assignee.
+  const b = mkPaidBountyFor(OTHER);
+  mkPayout(b.id, { githubId: DEV.githubId, githubLogin: DEV.githubLogin });
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 1);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
+});
+
+test("ledger: a payout that resolves to nobody is served to nobody", () => {
+  // Fail closed. Neither a stamp nor a resolvable bounty, and a login that
+  // would have matched DEV under the old filter — this is the shape a recycled
+  // login exploits, so it must reach no one rather than fall back to the login.
+  mkPayout("ghost-bounty-id", { githubLogin: DEV.githubLogin });
+  db.insert("escrowTransactions", {
+    id: uuid(), bountyId: null, githubLogin: DEV.githubLogin, kind: "payout",
+    idempotencyKey: "release:orphan", signer: "admin", status: "confirmed",
+    amountStroops: "1", dir: "out", createdAt: 9,
+  } as any);
+
+  assert.equal(ledgerFor(DEV.id).body.transactions.length, 0);
+  assert.equal(ledgerFor(OTHER.id).body.transactions.length, 0);
 });

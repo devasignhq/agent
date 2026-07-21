@@ -206,19 +206,47 @@ export function contributorBountiesHandler(req: Request, res: Response) {
 }
 contributor.get("/contributor/bounties", contributorBountiesHandler);
 
+// Who a payout row belongs to, as a stable numeric GitHub id — never a login.
+// `githubLogin` on the row is a snapshot frozen at send time while the user's
+// login is rewritten on every sign-in after a rename (see oauth.ts), so matching
+// the two loses a renamed contributor's entire history; worse, GitHub recycles
+// abandoned logins, so whoever claims a departed contributor's name would be
+// served their payouts — amounts, hashes, and destination wallet.
+//
+// Rows written before `githubId` existed resolve through the bounty, exactly as
+// bounties/live.ts does when picking the audience for this same ledger (keep the
+// two in sync). Unresolvable rows belong to NOBODY: every payout carries a
+// bountyId, bounties are never deleted, and the assignee's numeric id is written
+// in the same patch as the payout address every payout path requires — so this
+// returning null means the data is malformed, not old. Fail closed and say so.
+export function payoutCounterpartyId(
+  t: EscrowTransaction,
+  bountyById: Map<string, Bounty>
+): number | null {
+  if (t.githubId != null) return t.githubId;
+  const b = t.bountyId ? bountyById.get(t.bountyId) : undefined;
+  if (b?.assigneeGithubId != null) return b.assigneeGithubId;
+  console.warn(
+    `[ledger] payout txn ${t.id} (bounty ${t.bountyId ?? "none"}) has no resolvable ` +
+      `counterparty id — withheld from every ledger`
+  );
+  return null;
+}
+
 // The contributor's payout ledger: every escrow release addressed to them, with
 // the dest wallet snapshotted at send time (falling back to the bounty's
 // assignee snapshot for rows written before destAddress existed).
 export function contributorTransactionsHandler(req: Request, res: Response) {
   const user = requireGithubUser(req, res);
   if (!user) return;
+  const githubId = user.githubId!;
+  const bountyById = new Map(db.table("bounties").map((b) => [b.id, b]));
   const rows = db
     .filter(
       "escrowTransactions",
-      (t) => t.kind === "payout" && !!t.githubLogin && t.githubLogin === user.githubLogin
+      (t) => t.kind === "payout" && payoutCounterpartyId(t, bountyById) === githubId
     )
     .sort((a, b) => b.createdAt - a.createdAt);
-  const bountyById = new Map(db.table("bounties").map((b) => [b.id, b]));
   const transactions = rows.map((t: EscrowTransaction) => {
     const b = t.bountyId ? bountyById.get(t.bountyId) : undefined;
     return {

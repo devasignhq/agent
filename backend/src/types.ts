@@ -581,7 +581,14 @@ export type EscrowTxnStatus = "pending" | "confirmed" | "failed";
 export type EscrowTransaction = {
   id: string;
   bountyId?: string | null;
-  githubLogin?: string | null; // the counterparty (contributor) when relevant
+  // The counterparty (contributor) when relevant. `githubId` is the identity —
+  // it is stable across a GitHub rename, and GitHub recycles abandoned logins,
+  // so matching a ledger row to a person by login both loses history and can
+  // serve one person's payouts to whoever claims their old name. Stamped from
+  // Bounty.assigneeGithubId at send time. `githubLogin` is DISPLAY/AUDIT ONLY —
+  // it records what they were called when the money moved. Never join on it.
+  githubId?: number | null;
+  githubLogin?: string | null;
   kind: EscrowTxnKind;
   idempotencyKey: string;
   signer: "sponsor" | "admin"; // who authorized it (client Freighter vs. backend admin key)
