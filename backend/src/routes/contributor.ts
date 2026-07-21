@@ -7,7 +7,7 @@
 import { Router } from "express";
 import type { Request, Response } from "express";
 import { db } from "../db.js";
-import type { Bounty, EscrowTransaction, User } from "../types.js";
+import type { Bounty, BountyEvent, EscrowTransaction, User } from "../types.js";
 import { config } from "../config.js";
 import { getSessionUser } from "../github/oauth.js";
 import { stroopsToUsdcNumber } from "../stellar/amount.js";
@@ -43,14 +43,31 @@ const APPLICATION_EVENT_KINDS = new Set([
   "application_withdrawn",
 ]);
 
+// Which contributor an application event concerns, as a numeric id — the same
+// reason payoutCounterpartyId() exists below: a login is a display string, not
+// an identity. Events written before subjectGithubId existed carry only a
+// login, resolved here through the bounty's own applications, which carry both.
+//
+// A login matching two applications — one applicant renamed, someone else took
+// the freed username, both applied here — resolves to NOBODY rather than to
+// both. Withholding costs the legitimate holder some of their own timeline;
+// the alternative shows each of them the other's application outcomes, which is
+// the exact thing this filter exists to prevent. Fail closed.
+function eventSubjectId(e: BountyEvent, b: Bounty): number | null {
+  if (e.subjectGithubId != null) return e.subjectGithubId;
+  const who = e.subject ?? e.actor;
+  if (!who) return null;
+  const named = b.applications.filter((a) => a.githubLogin === who);
+  return named.length === 1 ? named[0].githubId : null;
+}
+
 // The caller's view of the activity log: every lifecycle event, EXCEPT other
 // contributors' application events — rival applicants stay invisible, matching
 // the applications-array filtering below.
-function eventsForContributor(b: Bounty, myLogin: string | null) {
+function eventsForContributor(b: Bounty, githubId: number) {
   return (b.events ?? []).filter((e) => {
     if (!APPLICATION_EVENT_KINDS.has(e.kind)) return true;
-    const who = e.subject ?? e.actor;
-    return !!myLogin && who === myLogin;
+    return eventSubjectId(e, b) === githubId;
   });
 }
 
@@ -87,8 +104,7 @@ function sponsorLoginFor(b: Bounty): string | null {
 export function contributorBountyView(b: Bounty, githubId: number) {
   const mine = b.applications.find((a) => a.githubId === githubId) ?? null;
   const isAssignee = b.assigneeGithubId === githubId;
-  const myLogin = mine?.githubLogin ?? (isAssignee ? (b.assigneeGithubLogin ?? null) : null);
-  const events = eventsForContributor(b, myLogin);
+  const events = eventsForContributor(b, githubId);
   // Compact AI-review projection so the list screens can render PR titles,
   // the review line, and ready-for-payout pills without N+1 review fetches.
   const reviewRow = findBountyReview(b);

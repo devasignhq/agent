@@ -489,6 +489,14 @@ export type BountyEvent = {
   // applicant's login on application_approved (actor = the sponsor). Drives
   // the contributor view's privacy filter: application events are only shown
   // to the contributor they concern.
+  //
+  // `subjectGithubId` is what that filter actually keys on; `subject` is the
+  // display string. A login is not an identity — re-applying after a GitHub
+  // rename rewrites the application row and orphans a contributor's own older
+  // events, and a recycled login makes two applicants indistinguishable. Absent
+  // on events written before this field existed; see eventsForContributor for
+  // how those resolve.
+  subjectGithubId?: number | null;
   subject?: string | null;
   // Short human-readable context (rejection reason, "3 of 5 criteria met", …).
   detail?: string | null;

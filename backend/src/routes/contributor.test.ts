@@ -205,6 +205,70 @@ test("events: rival applicants' application events are filtered; lifecycle event
   assert.deepEqual(kinds, ["created:maya", "funded:system", `applied:${DEV.githubLogin}`]);
 });
 
+// The activity-log filter keys on subjectGithubId, not the login: applying
+// again after a GitHub rename rewrites the application row (applyToBounty
+// replaces it wholesale), and GitHub hands abandoned usernames to new accounts.
+const evKinds = (b: Bounty, githubId: number) =>
+  contributorBountyView(b, githubId).events.map((e: any) => e.kind);
+
+test("events: re-applying under a new login keeps the earlier application history", () => {
+  // Applied as "devon-old", was rejected, renamed, applied again. The row now
+  // carries the new login; the first two events still carry the old one.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "devon-new", appliedAt: 3, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "applied", actor: "devon-old", subject: "devon-old", subjectGithubId: DEV.githubId },
+      { at: 2, kind: "application_rejected", actor: "maya", subject: "devon-old", subjectGithubId: DEV.githubId },
+      { at: 3, kind: "applied", actor: "devon-new", subject: "devon-new", subjectGithubId: DEV.githubId },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["applied", "application_rejected", "applied"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), [], "still nothing for a rival");
+});
+
+test("events: a recycled login sees neither applicant's application events", () => {
+  // Legacy events (no subjectGithubId) whose login matches TWO applications —
+  // the previous holder of the name and whoever claimed it. Ambiguous, so it
+  // resolves to nobody rather than to both.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "shared", appliedAt: 1, status: "rejected" },
+      { githubId: OTHER.githubId, githubLogin: "shared", appliedAt: 2, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "funded", actor: "system" },
+      { at: 2, kind: "applied", actor: "shared", subject: "shared" },
+      { at: 3, kind: "application_rejected", actor: "maya", subject: "shared" },
+      { at: 4, kind: "applied", actor: "shared", subject: "shared" },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["funded"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), ["funded"]);
+});
+
+test("events: a stamped subject disambiguates a shared login exactly", () => {
+  // Same collision, but the events know who they are: each side sees only its
+  // own, and the withholding above is confined to pre-stamp events.
+  const bounty = mkBounty({
+    applications: [
+      { githubId: DEV.githubId, githubLogin: "shared", appliedAt: 1, status: "rejected" },
+      { githubId: OTHER.githubId, githubLogin: "shared", appliedAt: 2, status: "pending" },
+    ],
+    events: [
+      { at: 1, kind: "applied", actor: "shared", subject: "shared", subjectGithubId: DEV.githubId },
+      { at: 2, kind: "application_rejected", actor: "maya", subject: "shared", subjectGithubId: DEV.githubId },
+      { at: 3, kind: "applied", actor: "shared", subject: "shared", subjectGithubId: OTHER.githubId },
+    ],
+  } as any);
+
+  assert.deepEqual(evKinds(bounty, DEV.githubId), ["applied", "application_rejected"]);
+  assert.deepEqual(evKinds(bounty, OTHER.githubId), ["applied"]);
+});
+
 test("derived timestamps: awardedAt from events, paid/funded fall back to ledger confirms", () => {
   const bounty = mkBounty({
     status: "PAID",
