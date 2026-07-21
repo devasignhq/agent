@@ -69,6 +69,12 @@ export function getBounty(id: string): Bounty | null {
   return db.find("bounties", (b) => b.id === id);
 }
 
+/** The DevAsign user row for a bounty's assignee, for notifications. */
+export function assigneeUser(b: Bounty) {
+  if (b.assigneeGithubId == null) return null;
+  return db.find("users", (u) => u.githubId === b.assigneeGithubId);
+}
+
 function nextSeq(): number {
   let max = 0;
   for (const b of db.table("bounties")) if (b.seq > max) max = b.seq;
@@ -652,10 +658,18 @@ export function requestExtension(
   return { ok: true, reason: "requested", bounty: bounty ?? undefined };
 }
 
+/**
+ * Approve or decline a pending extension request. `respondedBy` is the sponsor's
+ * githubLogin, or "system" when the keeper auto-approves one the sponsor left
+ * unanswered — the deadline math, the event and the at-most-one-approved
+ * invariant must stay in ONE place, so the keeper calls through here rather than
+ * duplicating them. `opts.at` lets the keeper pass its injected clock.
+ */
 export function respondToExtension(
   bountyId: string,
   action: "approve" | "decline",
-  sponsorLogin: string
+  respondedBy: string,
+  opts: { at?: number } = {}
 ): LifecycleResult {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
@@ -667,7 +681,7 @@ export function respondToExtension(
   }
   if (b.pendingOp) return { ok: false, reason: "in_flight" };
 
-  const now = Date.now();
+  const now = opts.at ?? Date.now();
   if (action === "approve") {
     // Anchor on the OLD deadline, not `now`: the keeper held the refund while
     // the request was pending, so the contributor already consumed any
@@ -676,10 +690,12 @@ export function respondToExtension(
     const newDeadline = (b.deadlineAt ?? now) + ext.days * DAY_MS;
     patchBounty(bountyId, {
       deadlineAt: newDeadline,
-      extension: { ...ext, status: "approved", respondedBy: sponsorLogin, respondedAt: now },
+      // The clock moved — re-arm the keeper's 24h warning against the NEW deadline.
+      deadlineWarnedAt: null,
+      extension: { ...ext, status: "approved", respondedBy, respondedAt: now },
     });
     recordBountyEvent(bountyId, "extension_approved", {
-      actor: sponsorLogin,
+      actor: respondedBy,
       subject: b.assigneeGithubLogin ?? ext.requestedBy,
       subjectGithubId: b.assigneeGithubId ?? null,
       detail: `+${ext.days} day${ext.days === 1 ? "" : "s"} — due ${new Date(newDeadline).toISOString().slice(0, 10)}`,
@@ -687,10 +703,10 @@ export function respondToExtension(
     });
   } else {
     patchBounty(bountyId, {
-      extension: { ...ext, status: "declined", respondedBy: sponsorLogin, respondedAt: now },
+      extension: { ...ext, status: "declined", respondedBy, respondedAt: now },
     });
     recordBountyEvent(bountyId, "extension_declined", {
-      actor: sponsorLogin,
+      actor: respondedBy,
       subject: b.assigneeGithubLogin ?? ext.requestedBy,
       subjectGithubId: b.assigneeGithubId ?? null,
       at: now,
@@ -844,7 +860,11 @@ export async function refundBounty(
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status === "CANCELLED") return { ok: true, reason: "already_cancelled" };
   if (b.status === "PAID") return { ok: false, reason: "already_paid" };
-  // Only refundable states: funded-and-open (delete) or delegated/in-review (expiry).
+  // Only refundable states: funded-and-open (delete), delegated (expiry), or
+  // in-review (the "rejected" path only — reject-submission deliberately KEEPS
+  // the bounty IN_REVIEW, so accept-rejection refunds from there. Do not narrow
+  // this list to fix expiry; the expired-scoped guard below does that instead,
+  // or a rejected contributor would have no way to close the bounty).
   const refundable = ["OPEN", "DELEGATED", "IN_REVIEW"];
   if (!refundable.includes(b.status)) return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
   // A pending extension request holds the expiry refund until the sponsor
@@ -853,6 +873,14 @@ export async function refundBounty(
   // to "expired" so sponsor cancel/delete paths are unaffected.
   if (reason === "expired" && b.extension?.status === "pending") {
     return { ok: false, reason: "extension_pending" };
+  }
+  // Submission stops the delivery clock — the review stage owns the timeline from
+  // there. Belt-and-braces with the expiredBounties predicate: closes the race
+  // where a PR webhook flips the bounty IN_REVIEW between the sweep's snapshot
+  // and this call. Scoped to "expired" so the rejection path below still refunds
+  // from IN_REVIEW. Placed BEFORE acquire() so a rejected call leaves no pendingOp.
+  if (reason === "expired" && (b.status === "IN_REVIEW" || b.submittedAt)) {
+    return { ok: false, reason: "submitted" };
   }
   const key = `refund:${b.taskId}`;
   const existing = findTxnByKey(key);
@@ -1049,12 +1077,24 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
   return { ok: true, reason: "recovered", bounty: bounty ?? undefined };
 }
 
-/** Bounties whose delivery clock has elapsed and should be refunded to the sponsor. */
+/**
+ * Bounties whose delivery clock has elapsed and should be refunded to the sponsor.
+ *
+ * DELEGATED only — submission STOPS the clock. Once the contributor has opened a
+ * PR the review stage owns the timeline: a sponsor who sat on it would otherwise
+ * run the window out, recover the escrow AND keep the work, and the contributor
+ * cannot even ask for more time (requestExtension is pre-submission only). The
+ * sponsor's route out of review is reject-submission → the contributor reworks or
+ * accepts the verdict (refund, reason "rejected"). `!b.submittedAt` is
+ * belt-and-braces: markInReview writes both in one patch and nothing reverts
+ * IN_REVIEW → DELEGATED today, so it only guards a future path that might.
+ */
 export function expiredBounties(now = Date.now()): Bounty[] {
   return db.filter(
     "bounties",
     (b) =>
-      (b.status === "DELEGATED" || b.status === "IN_REVIEW") &&
+      b.status === "DELEGATED" &&
+      !b.submittedAt &&
       !b.pendingOp &&
       // A pending extension request holds the refund until the sponsor responds.
       b.extension?.status !== "pending" &&
@@ -1062,6 +1102,54 @@ export function expiredBounties(now = Date.now()): Bounty[] {
       b.deadlineAt < now &&
       // never refund a bounty already released on-chain
       !db.find("escrowTransactions", (t) => t.idempotencyKey === `release:${b.taskId}` && t.status !== "failed")
+  );
+}
+
+// Silence past this counts as consent. A pending request HOLDS the expiry refund
+// (expiredBounties + the refundBounty guard), so a sponsor who simply never
+// answers would freeze the contributor's deadline — and their own escrow — forever.
+export const EXTENSION_AUTO_APPROVE_MS = 3 * DAY_MS;
+
+/** Pending extension requests the sponsor has left unanswered past the auto-approve window. */
+export function staleExtensionRequests(now = Date.now()): Bounty[] {
+  return db.filter(
+    "bounties",
+    (b) =>
+      b.extension?.status === "pending" &&
+      // The same statuses respondToExtension accepts — a contributor may have
+      // submitted since requesting, and that request must still resolve so the
+      // sponsor's pending card stops showing forever.
+      (b.status === "DELEGATED" || b.status === "IN_REVIEW") &&
+      !b.pendingOp &&
+      typeof b.extension.requestedAt === "number" &&
+      now - b.extension.requestedAt >= EXTENSION_AUTO_APPROVE_MS
+  );
+}
+
+export const DEADLINE_WARNING_MS = DAY_MS; // one-shot bell 24h before the window closes
+
+/**
+ * Assigned bounties in the final 24h of the delivery window that haven't been
+ * warned yet. DELEGATED only, deliberately mirroring expiredBounties: after
+ * submission a bounty is never refunded on expiry, so warning one would be both
+ * false and un-actionable (requestExtension is pre-submission only). A pending
+ * extension is skipped too — the clock is already held, the contributor is
+ * demonstrably aware of it, and an approval re-arms the stamp so they still get a
+ * fresh warning against the new deadline.
+ */
+export function bountiesNearingDeadline(now = Date.now()): Bounty[] {
+  return db.filter(
+    "bounties",
+    (b) =>
+      b.status === "DELEGATED" &&
+      !b.submittedAt &&
+      !b.pendingOp &&
+      b.extension?.status !== "pending" &&
+      b.deadlineWarnedAt == null && // == null: undefined on rows written before the field existed
+      b.assigneeGithubId != null &&
+      typeof b.deadlineAt === "number" &&
+      b.deadlineAt > now && // already-expired belongs to the sweep, not here
+      b.deadlineAt - now <= DEADLINE_WARNING_MS
   );
 }
 
@@ -1115,7 +1203,7 @@ export async function applyTxnOutcome(
       });
       // Tell the contributor the money moved — the contributor app's wallet page.
       if (b.assigneeGithubId != null) {
-        const dev = db.find("users", (u) => u.githubId === b.assigneeGithubId);
+        const dev = assigneeUser(b);
         if (dev) {
           pushNotification(
             dev.id,
@@ -1137,7 +1225,7 @@ export async function applyTxnOutcome(
       // both were previously silent: their dashboard simply stopped showing the
       // work with no explanation. Word it from the reason so it isn't a mystery.
       if (b.assigneeGithubId != null) {
-        const dev = db.find("users", (u) => u.githubId === b.assigneeGithubId);
+        const dev = assigneeUser(b);
         if (dev) {
           const expired = b.cancelReason === "expired";
           pushNotification(

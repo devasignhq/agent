@@ -12,7 +12,7 @@ process.env.ANTHROPIC_API_KEY = "";
 process.env.GEMINI_API_KEY = "";
 process.env.STATSIG_SECRET_KEY = "";
 process.env.WEB_ORIGIN = "http://localhost:3001";
-process.env.PORT = "8787";
+process.env.PORT ||= "8787"; // ||= so a caller can run a second instance elsewhere
 // Dummy Stellar config so isStellarConfigured() passes and the bounty surfaces
 // (create/list/links) are exercisable — nothing here reaches a chain until a
 // funding tx is actually built, which will just error against the fake ids.
@@ -155,7 +155,10 @@ patchBounty(delegatedBounty.id, {
   assigneeGithubLogin: "ephemeral-contributor",
   assigneeAddress: "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4TPPZAKQGZ3S4EFVXJT",
   acceptedAt: Date.now(),
-  deadlineAt: Date.now() + 2 * 24 * 60 * 60 * 1000,
+  // 12h out: inside the keeper's 24h warning window, so the first tick fires the
+  // "due in Xh" bell — the extension CTA is still exercisable (and this is exactly
+  // when a contributor would reach for it).
+  deadlineAt: Date.now() + 12 * 60 * 60 * 1000,
 });
 
 // Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the

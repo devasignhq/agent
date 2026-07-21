@@ -233,7 +233,14 @@ const EVENT_DISPLAY: Record<
   }),
   extension_approved: (e) => ({
     at: e.at, icon: "check", cls: "cool",
-    action: e.actor ? `@${e.actor} approved your extension` : "Extension approved",
+    // actor "system" = the keeper approved it after the sponsor left the request
+    // unanswered for 3 days; "@system approved…" would read as a phantom user.
+    action:
+      e.actor === "system"
+        ? "Extension auto-approved (no sponsor response)"
+        : e.actor
+          ? `@${e.actor} approved your extension`
+          : "Extension approved",
     detail: e.detail,
   }),
   extension_declined: (e) => ({

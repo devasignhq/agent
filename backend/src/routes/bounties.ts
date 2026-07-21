@@ -32,6 +32,7 @@ import {
   acceptanceLocked,
   applyToBounty,
   approveApplication,
+  assigneeUser,
   buildFundingTx,
   buildSponsorReleaseTx,
   cancelBounty,
@@ -462,12 +463,6 @@ bounties.delete("/bounties/:id", async (req, res) => {
 // getBountyHandler's non-sponsor branch) and no sponsor links.
 function contributorFacing(b: Bounty, githubId: number | null) {
   return { ...b, applications: b.applications.filter((a) => a.githubId === githubId) };
-}
-
-// The DevAsign user row for a bounty's assignee, for notifications.
-function assigneeUser(b: Bounty) {
-  if (b.assigneeGithubId == null) return null;
-  return db.find("users", (u) => u.githubId === b.assigneeGithubId);
 }
 
 // Explicit "submit work": the assignee pastes their PR URL (+ optional

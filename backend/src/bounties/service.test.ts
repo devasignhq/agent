@@ -25,6 +25,9 @@ import {
   getBounty,
   applyTxnOutcome,
   expiredBounties,
+  staleExtensionRequests,
+  bountiesNearingDeadline,
+  EXTENSION_AUTO_APPROVE_MS,
   requestExtension,
   respondToExtension,
   withdrawApplication,
@@ -714,6 +717,113 @@ test("declined request can be re-requested while still in time", async () => {
   assert.equal(again.ok, true);
   assert.equal(getBounty(b.id)!.extension!.days, 1);
   assert.equal(getBounty(b.id)!.extension!.status, "pending");
+});
+
+// ── submission stops the delivery clock ──────────────────────────────────────
+
+test("a submitted bounty is never swept — the review stage owns the clock", async () => {
+  const { b, chain, calls } = await delegated();
+  markInReview(b.id, 55); // IN_REVIEW + submittedAt
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: Date.now() - 1000 });
+
+  // The sweep skips it…
+  assert.ok(!expiredBounties().map((x) => x.id).includes(b.id));
+  // …and a direct expiry refund refuses (webhook race guard), with no chain call.
+  const r = await refundBounty(b.id, "expired", chain);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "submitted");
+  assert.equal(calls.adminRefund, 0);
+  // No pendingOp left behind — the guard sits before acquire().
+  assert.equal(getBounty(b.id)!.pendingOp ?? null, null);
+});
+
+test("an IN_REVIEW bounty still refunds on the rejection path", async () => {
+  const { b, chain, calls } = await delegated();
+  markInReview(b.id, 55);
+  // reject-submission deliberately keeps the bounty IN_REVIEW, so accept-rejection
+  // must still be able to refund from there — the guard above is expiry-scoped.
+  const r = await refundBounty(b.id, "rejected", chain);
+  assert.equal(r.ok, true);
+  assert.equal(calls.adminRefund, 1);
+  assert.equal(getBounty(b.id)!.cancelReason, "rejected");
+});
+
+// ── stale extension auto-approval ────────────────────────────────────────────
+
+test("staleExtensionRequests selects only requests past the auto-approve window", async () => {
+  const { b } = await delegated();
+  requestExtension(b.id, DEV, 3, "sick");
+  // Fresh request → not yet stale.
+  assert.ok(!staleExtensionRequests().map((x) => x.id).includes(b.id));
+
+  const aged = getBounty(b.id)!.extension!;
+  db.update("bounties", (x) => x.id === b.id, {
+    extension: { ...aged, requestedAt: Date.now() - EXTENSION_AUTO_APPROVE_MS - 1000 },
+  });
+  assert.ok(staleExtensionRequests().map((x) => x.id).includes(b.id));
+
+  // An op in flight defers it — respondToExtension would refuse anyway.
+  db.update("bounties", (x) => x.id === b.id, { pendingOp: "releasing" });
+  assert.ok(!staleExtensionRequests().map((x) => x.id).includes(b.id));
+});
+
+test("respondToExtension accepts an injected clock and a system actor", async () => {
+  const { b } = await delegated();
+  const oldDeadline = Date.now() + 5 * DAY;
+  db.update("bounties", (x) => x.id === b.id, { deadlineAt: oldDeadline });
+  requestExtension(b.id, DEV, 2, "blocked on review");
+
+  const r = respondToExtension(b.id, "approve", "system", { at: 5_000 });
+  assert.equal(r.ok, true);
+  const after = getBounty(b.id)!;
+  assert.equal(after.extension!.respondedBy, "system");
+  assert.equal(after.extension!.respondedAt, 5_000);
+  assert.equal(after.deadlineAt, oldDeadline + 2 * DAY, "still old-deadline anchored");
+  const ev = after.events!.at(-1)!;
+  assert.equal(ev.kind, "extension_approved");
+  assert.equal(ev.actor, "system");
+  assert.equal(ev.at, 5_000);
+});
+
+// ── 24h deadline warning ─────────────────────────────────────────────────────
+
+test("approve re-arms the deadline warning", async () => {
+  const { b } = await delegated();
+  db.update("bounties", (x) => x.id === b.id, { deadlineWarnedAt: 123 });
+  requestExtension(b.id, DEV, 2, "need time");
+  respondToExtension(b.id, "approve", "sponsor");
+  assert.equal(getBounty(b.id)!.deadlineWarnedAt, null, "re-armed against the new deadline");
+});
+
+test("bountiesNearingDeadline excludes submitted, held, warned and out-of-window bounties", async () => {
+  const now = Date.now();
+  const near = () => ({ deadlineAt: now + 12 * 60 * 60 * 1000 }); // 12h out
+
+  const a = await delegated();
+  db.update("bounties", (x) => x.id === a.b.id, near());
+  assert.ok(bountiesNearingDeadline(now).map((x) => x.id).includes(a.b.id), "12h out → warn");
+
+  const submitted = await delegated();
+  db.update("bounties", (x) => x.id === submitted.b.id, near());
+  markInReview(submitted.b.id, 7);
+  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(submitted.b.id));
+
+  const held = await delegated();
+  db.update("bounties", (x) => x.id === held.b.id, near());
+  requestExtension(held.b.id, DEV, 2, "pending ask");
+  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(held.b.id));
+
+  const warned = await delegated();
+  db.update("bounties", (x) => x.id === warned.b.id, { ...near(), deadlineWarnedAt: now - 60_000 });
+  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(warned.b.id));
+
+  const far = await delegated();
+  db.update("bounties", (x) => x.id === far.b.id, { deadlineAt: now + 48 * 60 * 60 * 1000 });
+  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(far.b.id));
+
+  const past = await delegated();
+  db.update("bounties", (x) => x.id === past.b.id, { deadlineAt: now - 1000 });
+  assert.ok(!bountiesNearingDeadline(now).map((x) => x.id).includes(past.b.id), "already expired → the sweep's, not ours");
 });
 
 test("respondToExtension with nothing pending fails", async () => {

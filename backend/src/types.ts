@@ -573,6 +573,11 @@ export type Bounty = {
   assigneeMemo?: string | null; // the payout memo snapshotted alongside assigneeAddress (may be unset on old rows)
   acceptedAt?: number | null;
   deadlineAt?: number | null; // acceptedAt + deliveryDays; the keeper refunds past this
+  // One-shot stamp for the keeper's 24h-out warning bell, so a 12s tick can't
+  // re-notify. CLEARED whenever deadlineAt moves (respondToExtension approve) so
+  // an extended bounty gets a fresh warning against its new deadline. Absent on
+  // every row written before this existed — read it with `== null`.
+  deadlineWarnedAt?: number | null;
   prNumber?: number | null; // the delivering PR
   // Contributor-app submission surface (all optional; old rows load unchanged):
   // when the contributor explicitly submitted via the app (vs. webhook-inferred),

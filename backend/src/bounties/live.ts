@@ -29,7 +29,15 @@ import type { Bounty, EscrowTransaction } from "../types.js";
 //   updatedAt/version — stamped by every patch, so they can never be the signal
 //   botCommentId      — the id of the bot's GitHub comment
 //   pendingOp         — the single-flight guard; drives sponsor button state only
-const INVISIBLE_BOUNTY_FIELDS = new Set(["updatedAt", "version", "botCommentId", "pendingOp"]);
+//   deadlineWarnedAt  — the keeper's one-shot 24h-warning stamp; no projection
+//                       exposes it, and the bell it accompanies pushes its own signal
+const INVISIBLE_BOUNTY_FIELDS = new Set([
+  "updatedAt",
+  "version",
+  "botCommentId",
+  "pendingOp",
+  "deadlineWarnedAt",
+]);
 
 // Escrow-transaction fields the contributor's payout ledger actually renders.
 // `hash` counts: a keeper rebroadcast rewrites it, which changes the explorer
