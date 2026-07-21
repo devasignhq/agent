@@ -128,6 +128,36 @@ db.insert("users", {
   createdAt: Date.now(),
 });
 
+// …and one DELEGATED (unsubmitted) bounty assigned to that contributor so the
+// in-progress surfaces — submit CTA, timeline-extension request/approve — are
+// exercisable from both apps without driving apply → approve → accept.
+const delegatedBounty = createBounty({
+  source: "github",
+  installationId: 1,
+  repo: "ephemeral-tester/demo",
+  issueNumber: 3,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/3",
+  title: "Delegated demo bounty (ephemeral)",
+  description: "In progress — exercises the submission + extension CTAs.",
+  amountUsdc: 300,
+  deliveryDays: 5,
+  sponsorUserId: "ephemeral-user-1",
+});
+recordFunding(delegatedBounty.id, "G".padEnd(56, "A"), { hash: "H_EPHEMERAL_DELEGATED", status: "pending" });
+await applyTxnOutcome(
+  db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${delegatedBounty.taskId}`)!.id,
+  { status: "success", ledger: 4 }
+);
+patchBounty(delegatedBounty.id, {
+  status: "DELEGATED",
+  applications: [{ githubId: 424242, githubLogin: "ephemeral-contributor", appliedAt: Date.now(), status: "accepted" }],
+  assigneeGithubId: 424242,
+  assigneeGithubLogin: "ephemeral-contributor",
+  assigneeAddress: "GAIH3ULLFQ4DGSECF2AR555KZ4KNDGEKN4AFI4TPPZAKQGZ3S4EFVXJT",
+  acceptedAt: Date.now(),
+  deadlineAt: Date.now() + 2 * 24 * 60 * 60 * 1000,
+});
+
 // Session cookies are now signed JWTs (HS256 over SESSION_SECRET), so mint the
 // cookie through the same helper the server verifies — a hand-rolled value won't
 // pass getSessionUser anymore. Print it ready to paste into a curl Cookie header.

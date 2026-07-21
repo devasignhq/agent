@@ -12,11 +12,12 @@ import type { ContributorBounty } from "./api";
 import { useBounties } from "./data-context";
 import { Icon } from "./icons";
 import { FLAGS } from "./flags";
-import { SubmitModal, linkIcon, useBountyReview } from "./dashboard";
+import { ExtensionModal, SubmitModal, linkIcon, useBountyReview } from "./dashboard";
 import {
   allCriteriaMet,
   bountyStage,
   cmoney,
+  extensionState,
   fmtDate,
   mergedCriteria,
   reviewHeadline,
@@ -220,9 +221,10 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
   const review = useBountyReview(b);
   const [submitOpen, setSubmitOpen] = React.useState(false);
   const [linksOnly, setLinksOnly] = React.useState(false);
+  const [extOpen, setExtOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
 
-  React.useEffect(() => { setSubmitOpen(false); setBusy(false); }, [b.id]);
+  React.useEffect(() => { setSubmitOpen(false); setExtOpen(false); setBusy(false); }, [b.id]);
 
   const prUrl = b.prNumber ? `https://github.com/${b.repo}/pull/${b.prNumber}` : null;
   const payoutRequested = !!b.payoutRequestedAt;
@@ -251,12 +253,26 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
 
   // In progress — no submission yet.
   if (st.key === "progress") {
+    const extState = extensionState(b);
+    const pastDue = !!b.deadlineAt && b.deadlineAt < Date.now();
     return (
       <>
         {card("Ready to submit?", "Link your pull request and any supporting material — a demo video, a recording, notes. DevAsign reviews it against the criteria.",
-          <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>,
-          <><Icon name="clock" size={11} /> {b.acceptedAt ? `accepted ${fmtDate(b.acceptedAt)}` : "accepted"}{b.deadlineAt ? ` · ${timeLeft(b.deadlineAt)}` : ""}</>)}
+          <>
+            <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>
+            {extState === "can_request" && (
+              <button className="btn ghost" onClick={() => setExtOpen(true)}><Icon name="clock" size={12} /> Request extension</button>
+            )}
+            {extState === "pending" && (
+              <button className="btn ghost" disabled><Icon name="clock" size={12} /> Extension requested</button>
+            )}
+          </>,
+          <><Icon name="clock" size={11} /> {b.acceptedAt ? `accepted ${fmtDate(b.acceptedAt)}` : "accepted"}
+            {b.deadlineAt ? ` · ${timeLeft(b.deadlineAt)}` : ""}
+            {extState === "pending" ? ` · ${b.extension!.days}-day extension pending${pastDue ? " — refund on hold" : ""}` : ""}
+            {extState === "approved" ? ` · extended +${b.extension!.days}d` : ""}</>)}
         {submitOpen && <SubmitModal b={b} linksOnly={linksOnly} onClose={() => setSubmitOpen(false)} onDone={() => void reload()} />}
+        {extOpen && <ExtensionModal b={b} onClose={() => setExtOpen(false)} onDone={() => void reload()} />}
       </>
     );
   }

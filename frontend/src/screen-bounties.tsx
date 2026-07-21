@@ -490,6 +490,17 @@ function activityFor(b: Bounty): Array<{ time: string; text: React.ReactNode }> 
   if (b.escrowTxHash) out.push({ time: fmtDay(b.createdAt), text: `escrowed $${b.amountUsdc} USDC on Stellar` });
   if (b.acceptedAt) out.push({ time: fmtDay(b.acceptedAt), text: `bounty assigned to @${b.assigneeGithubLogin || "developer"}` });
   if (b.prNumber) out.push({ time: fmtDay(b.updatedAt), text: <>PR #{b.prNumber} opened</> });
+  if (b.extension) {
+    out.push({ time: fmtDay(b.extension.requestedAt), text: `@${b.extension.requestedBy} requested a ${b.extension.days}-day extension` });
+    if (b.extension.respondedAt) {
+      out.push({
+        time: fmtDay(b.extension.respondedAt),
+        text: b.extension.status === "approved"
+          ? `extension approved (+${b.extension.days} day${b.extension.days === 1 ? "" : "s"})`
+          : "extension declined",
+      });
+    }
+  }
   if (b.payoutTxHash) out.push({ time: fmtDay(b.updatedAt), text: `payout released to @${b.assigneeGithubLogin || "developer"}` });
   if (b.refundTxHash) out.push({ time: fmtDay(b.updatedAt), text: "escrow refunded to sponsor" });
   return out.reverse(); // newest first
@@ -499,7 +510,8 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
   const [tab, setTab] = React.useState<"details" | "submissions" | "applications">("details");
   const apps = bounty.applications || [];
   const newApps = apps.filter((a) => a.status === "pending").length;
-  const subCount = bounty.prNumber ? 1 : 0;
+  const pendingExt = bounty.extension?.status === "pending";
+  const subCount = (bounty.prNumber ? 1 : 0) + (pendingExt ? 1 : 0);
 
   React.useEffect(() => {
     const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
@@ -524,7 +536,8 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
           <TabBtn active={tab === "details"} onClick={() => setTab("details")}>Details</TabBtn>
           <TabBtn active={tab === "submissions"} onClick={() => setTab("submissions")}>
             Submissions
-            {tab !== "submissions" && subCount > 0 && <span className="tab-count">{subCount}</span>}
+            {tab !== "submissions" && pendingExt && <span className="tab-count new">1 new</span>}
+            {tab !== "submissions" && !pendingExt && subCount > 0 && <span className="tab-count">{subCount}</span>}
           </TabBtn>
           <TabBtn active={tab === "applications"} onClick={() => setTab("applications")}>
             Applications
@@ -534,7 +547,7 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
 
         <div className="drawer-body">
           {tab === "details" && <DetailsTab b={bounty} />}
-          {tab === "submissions" && <SubmissionsTab b={bounty} />}
+          {tab === "submissions" && <SubmissionsTab b={bounty} onChanged={onChanged} />}
           {tab === "applications" && <ApplicationsTab b={bounty} onChanged={onChanged} />}
         </div>
 
@@ -583,7 +596,7 @@ const DetailsTab = ({ b }: { b: Bounty }) => {
         </div>
         <div className="kv">
           <div className="kv-k">Delivery</div>
-          <div className="kv-v">{b.deliveryDays} day{b.deliveryDays === 1 ? "" : "s"}{b.deadlineAt ? ` · due ${fmtDay(b.deadlineAt)}` : ""}</div>
+          <div className="kv-v">{b.deliveryDays} day{b.deliveryDays === 1 ? "" : "s"}{b.extension?.status === "approved" ? ` (+${b.extension.days} extended)` : ""}{b.deadlineAt ? ` · due ${fmtDay(b.deadlineAt)}` : ""}</div>
         </div>
         <div className="kv">
           <div className="kv-k">Applications</div>
@@ -638,8 +651,88 @@ const DetailsTab = ({ b }: { b: Bounty }) => {
   );
 };
 
-const SubmissionsTab = ({ b }: { b: Bounty }) => {
-  if (!b.prNumber) {
+// The pending timeline-extension request card: reason, requested window, and
+// the approve/decline two-step confirm (same pattern as ApplicationsTab).
+// While the request is pending the backend holds the expiry refund — so a
+// past-due bounty sits in limbo until the sponsor acts, and the card says so.
+const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => void }) => {
+  const ext = b.extension!;
+  const [confirming, setConfirming] = React.useState<null | "approve" | "decline">(null);
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const pastDue = !!b.deadlineAt && b.deadlineAt < Date.now();
+  const newDeadline = b.deadlineAt ? b.deadlineAt + ext.days * 86_400_000 : null;
+
+  const act = async (kind: "approve" | "decline") => {
+    setBusy(true);
+    setErr(null);
+    try {
+      const res = kind === "approve" ? await api.approveExtension(b.id) : await api.declineExtension(b.id);
+      onChanged(res.bounty);
+    } catch (e: any) {
+      setErr(e?.message || "Action failed.");
+    } finally {
+      setBusy(false);
+      setConfirming(null);
+    }
+  };
+
+  return (
+    <div className="app-card new" style={{ marginBottom: 14 }}>
+      <div className="app-card-row">
+        <div style={{ minWidth: 0 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+            <span className="mono" style={{ fontWeight: 600 }}>@{ext.requestedBy}</span>
+            <span className="tab-count new">EXTENSION</span>
+          </div>
+          <div className="mono mute" style={{ fontSize: 11, marginTop: 4 }}>
+            asks for {ext.days} more day{ext.days === 1 ? "" : "s"} · requested {fmtDay(ext.requestedAt)}
+            {b.deadlineAt ? ` · current deadline ${fmtDay(b.deadlineAt)}` : ""}
+          </div>
+        </div>
+        {confirming ? null : (
+          <div className="flex gap-2">
+            <button className="btn sm" disabled={busy} onClick={() => setConfirming("decline")}>Decline</button>
+            <button className="btn sm primary" disabled={busy} onClick={() => setConfirming("approve")}>Approve</button>
+          </div>
+        )}
+      </div>
+      <div className="sub-card-note" style={{ marginTop: 8 }}>“{ext.reason}”</div>
+      {pastDue && (
+        <div className="mono" style={{ fontSize: 11, marginTop: 8, color: "var(--warn, #d6a354)" }}>
+          <Icon name="warn" size={11} /> Past due — the automatic refund is on hold until you respond.
+        </div>
+      )}
+      {err && <div className="mono" style={{ fontSize: 11, color: "var(--danger)", marginTop: 8 }}>{err}</div>}
+      {confirming && (
+        <div className={`app-confirm ${confirming === "decline" ? "reject" : "delegate"}`}>
+          {confirming === "decline" && <span className="app-confirm-icon"><Icon name="warn" size={15} /></span>}
+          <div className="app-confirm-msg">
+            {confirming === "approve"
+              ? `Approve a ${ext.days}-day extension?${newDeadline ? ` The deadline moves to ${fmtDay(newDeadline)}.` : ""}`
+              : `Decline this request? The current deadline stands${pastDue ? " and the escrow refunds to you shortly" : ""}.`}
+          </div>
+          <div className="app-confirm-actions">
+            <button className="btn sm ghost" disabled={busy} onClick={() => setConfirming(null)}>Cancel</button>
+            {confirming === "decline" ? (
+              <button className="btn sm app-confirm-go reject" disabled={busy} onClick={() => act("decline")}>
+                <Icon name="x" size={11} /> {busy ? "Declining…" : "Confirm decline"}
+              </button>
+            ) : (
+              <button className="btn sm app-confirm-go delegate" disabled={busy} onClick={() => act("approve")}>
+                <Icon name="check" size={11} /> {busy ? "Approving…" : "Confirm approve"}
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const SubmissionsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => void }) => {
+  const pendingExt = b.extension?.status === "pending";
+  if (!b.prNumber && !pendingExt && b.extension?.status !== "approved") {
     return (
       <div className="drawer-empty">
         <div className="drawer-empty-art"><Icon name="git" size={22} color="var(--fg-mute)" /></div>
@@ -650,27 +743,42 @@ const SubmissionsTab = ({ b }: { b: Bounty }) => {
   }
   return (
     <>
-      <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
-        Merging this PR on GitHub auto-releases the escrow to @{b.assigneeGithubLogin || "the contributor"} on Stellar.
-      </div>
-      <div className="sub-cards">
-        <div className="sub-card ready">
-          <div className="sub-card-head">
-            <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
-              <span className="mono" style={{ fontWeight: 600 }}>@{b.assigneeGithubLogin || "contributor"}</span>
-              <span className="mono mute" style={{ fontSize: 11 }}>
-                <Icon name="git" size={10} /> {b.repo}#{b.prNumber}
-              </span>
+      {pendingExt && <ExtensionCard b={b} onChanged={onChanged} />}
+      {b.extension?.status === "approved" && (
+        <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
+          <Icon name="check" size={11} /> Deadline extended by {b.extension.days} day{b.extension.days === 1 ? "" : "s"}
+          {b.extension.respondedAt ? ` on ${fmtDay(b.extension.respondedAt)}` : ""}{b.deadlineAt ? ` — now due ${fmtDay(b.deadlineAt)}` : ""}.
+        </div>
+      )}
+      {b.prNumber ? (
+        <>
+          <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
+            Merging this PR on GitHub auto-releases the escrow to @{b.assigneeGithubLogin || "the contributor"} on Stellar.
+          </div>
+          <div className="sub-cards">
+            <div className="sub-card ready">
+              <div className="sub-card-head">
+                <div style={{ display: "flex", flexDirection: "column", gap: 2, minWidth: 0 }}>
+                  <span className="mono" style={{ fontWeight: 600 }}>@{b.assigneeGithubLogin || "contributor"}</span>
+                  <span className="mono mute" style={{ fontSize: 11 }}>
+                    <Icon name="git" size={10} /> {b.repo}#{b.prNumber}
+                  </span>
+                </div>
+              </div>
+              <div className="sub-card-note">
+                Status: {ST_LABEL[b.status]}. When you merge the PR, the escrowed {money(b.amountUsdc)} USDC is released automatically — no extra action needed.
+              </div>
+              <div className="sub-card-actions">
+                <a className="btn sm" href={prUrl(b.repo, b.prNumber)} target="_blank" rel="noreferrer"><Icon name="github" size={11} /> View PR <Icon name="external" size={10} /></a>
+              </div>
             </div>
           </div>
-          <div className="sub-card-note">
-            Status: {ST_LABEL[b.status]}. When you merge the PR, the escrowed {money(b.amountUsdc)} USDC is released automatically — no extra action needed.
-          </div>
-          <div className="sub-card-actions">
-            <a className="btn sm" href={prUrl(b.repo, b.prNumber)} target="_blank" rel="noreferrer"><Icon name="github" size={11} /> View PR <Icon name="external" size={10} /></a>
-          </div>
+        </>
+      ) : (
+        <div className="mono mute" style={{ fontSize: 11 }}>
+          No pull request yet — when the contributor opens one against this bounty it appears here.
         </div>
-      </div>
+      )}
     </>
   );
 };

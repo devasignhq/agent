@@ -327,6 +327,18 @@ export type BountyApplication = {
   status: "pending" | "approved" | "accepted" | "rejected";
 };
 
+// The contributor's timeline-extension request (backend types.ts). While
+// status is "pending" the backend holds the deadline-expiry refund.
+export type BountyExtension = {
+  days: number;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  status: "pending" | "approved" | "declined";
+  respondedBy?: string | null;
+  respondedAt?: number | null;
+};
+
 export type Bounty = {
   id: string;
   seq: number;
@@ -358,6 +370,7 @@ export type Bounty = {
   acceptedAt?: number | null;
   deadlineAt?: number | null;
   prNumber?: number | null;
+  extension?: BountyExtension | null;
   escrowTxHash?: string | null;
   payoutTxHash?: string | null;
   refundTxHash?: string | null;
@@ -597,6 +610,18 @@ export const api = {
     }),
   rejectApplication: (id: string, githubId: number) =>
     request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/applications/${githubId}/reject`, {
+      method: "POST",
+      body: "{}",
+    }),
+  // Timeline extension: approve moves the deadline; decline releases the
+  // refund hold (the keeper refunds on its next tick if past due).
+  approveExtension: (id: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/extension/approve`, {
+      method: "POST",
+      body: "{}",
+    }),
+  declineExtension: (id: string) =>
+    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/extension/decline`, {
       method: "POST",
       body: "{}",
     }),

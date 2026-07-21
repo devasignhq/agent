@@ -6,6 +6,8 @@ import {
   acceptanceRate,
   bountyStage,
   deleteConfirmOk,
+  extensionState,
+  isValidExtensionDays,
   groupBounties,
   isStellarAddr,
   isValidMemo,
@@ -29,7 +31,7 @@ function b(patch: Partial<ContributorBounty>): ContributorBounty {
     applicantCount: 1, myApplication: null, isAssignee: false,
     assigneeGithubLogin: null, assigneeAddress: null, assigneeMemo: null,
     acceptedAt: null, deadlineAt: null, prNumber: null, submittedAt: null,
-    supportingLinks: [], payoutRequestedAt: null, rejection: null,
+    supportingLinks: [], payoutRequestedAt: null, rejection: null, extension: null,
     cancelReason: null, escrowTxHash: null, payoutTxHash: null,
     escrowContract: null, sponsorLogin: null, events: [],
     fundedAt: null, awardedAt: null, paidAt: null, refundedAt: null, review: null,
@@ -236,4 +238,45 @@ test("deleteConfirmOk: both factors must match", () => {
   // missing login keeps the gate shut even with blank inputs
   assert.equal(deleteConfirmOk(undefined, "", ""), false);
   assert.equal(deleteConfirmOk("", "", "delete my account"), false);
+});
+
+// ── timeline extension ───────────────────────────────────────────────────────
+
+test("isValidExtensionDays: integer 1..7 only", () => {
+  assert.equal(isValidExtensionDays(1), true);
+  assert.equal(isValidExtensionDays(3), true);
+  assert.equal(isValidExtensionDays(7), true);
+  assert.equal(isValidExtensionDays(0), false);
+  assert.equal(isValidExtensionDays(8), false);
+  assert.equal(isValidExtensionDays(2.5), false);
+  assert.equal(isValidExtensionDays(NaN), false);
+});
+
+test("extensionState: keyed off stage and the extension subdocument", () => {
+  const ext = (status: "pending" | "approved" | "declined") => ({
+    days: 2, reason: "r", requestedBy: "dev", requestedAt: 1, status,
+  });
+  const progress = { status: "DELEGATED" as const, isAssignee: true, acceptedAt: 1 };
+
+  assert.equal(extensionState(b({ ...progress })), "can_request");
+  assert.equal(extensionState(b({ ...progress, extension: ext("declined") })), "can_request");
+  assert.equal(extensionState(b({ ...progress, extension: ext("pending") })), "pending");
+  assert.equal(extensionState(b({ ...progress, extension: ext("approved") })), "approved");
+  // Outside the in-progress window it's never offered.
+  assert.equal(extensionState(b({ status: "OPEN" })), "unavailable");
+  assert.equal(extensionState(b({ ...progress, submittedAt: 5, prNumber: 9 })), "unavailable");
+  assert.equal(extensionState(b({ status: "CANCELLED", isAssignee: true })), "unavailable");
+});
+
+test("timelineFromEvents renders the three extension kinds", () => {
+  const events: BountyEvent[] = [
+    { at: 1, kind: "extension_requested", actor: "dev", detail: "3 days — sick" },
+    { at: 2, kind: "extension_declined", actor: "sponsor" },
+    { at: 3, kind: "extension_approved", actor: "sponsor", detail: "+2 days — due 2026-07-30" },
+  ];
+  const entries = timelineFromEvents(b({ status: "DELEGATED", isAssignee: true, acceptedAt: 1, events }));
+  const actions = entries.map((e) => e.action);
+  assert.ok(actions.includes("You requested a timeline extension"));
+  assert.ok(actions.includes("@sponsor declined your extension request"));
+  assert.ok(actions.includes("@sponsor approved your extension"));
 });

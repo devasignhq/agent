@@ -11,7 +11,14 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config, isStellarConfigured } from "../config.js";
-import type { Bounty, BountyApplication, BountyCancelReason, BountyEvent, EscrowTransaction } from "../types.js";
+import type {
+  Bounty,
+  BountyApplication,
+  BountyCancelReason,
+  BountyEvent,
+  BountyExtension,
+  EscrowTransaction,
+} from "../types.js";
 import { taskIdForBounty } from "./taskid.js";
 import { assertBountyAmount, stroopsToUsdcNumber, usdcToStroops } from "../stellar/amount.js";
 import { assertValidAddress } from "../stellar/scval.js";
@@ -595,6 +602,104 @@ export function markInReview(bountyId: string, prNumber: number): LifecycleResul
   return { ok: true, reason: "in_review", bounty: bounty ?? undefined };
 }
 
+// ── timeline extension ───────────────────────────────────────────────────────
+// The contributor asks for more delivery time; the sponsor approves or declines.
+// Purely an app-DB affair — the contract has no expiry, so no chain call and no
+// pendingOp. A pending request HOLDS the keeper's expiry refund (see
+// expiredBounties + the refundBounty guard); at most one extension is ever
+// approved per bounty.
+
+export const EXTENSION_MAX_DAYS = 7;
+export const EXTENSION_REASON_MAX = 500;
+
+export function requestExtension(
+  bountyId: string,
+  contributor: { githubId: number; githubLogin: string },
+  days: number,
+  reason: string
+): LifecycleResult {
+  const b = getBounty(bountyId);
+  if (!b) return { ok: false, reason: "not_found" };
+  if (b.assigneeGithubId !== contributor.githubId) return { ok: false, reason: "not_assignee" };
+  // Pre-submission only: once work is submitted the review flow owns the clock.
+  if (b.status !== "DELEGATED" || b.submittedAt) {
+    return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
+  }
+  if (b.pendingOp) return { ok: false, reason: "in_flight" };
+  if (!Number.isInteger(days) || days < 1 || days > EXTENSION_MAX_DAYS) {
+    return { ok: false, reason: "invalid_days" };
+  }
+  const trimmed = reason.trim().slice(0, EXTENSION_REASON_MAX);
+  if (!trimmed) return { ok: false, reason: "missing_reason" };
+  if (b.extension?.status === "pending") return { ok: false, reason: "already_pending" };
+  if (b.extension?.status === "approved") return { ok: false, reason: "already_extended" };
+
+  const ext: BountyExtension = {
+    days,
+    reason: trimmed,
+    requestedBy: contributor.githubLogin,
+    requestedAt: Date.now(),
+    status: "pending",
+  };
+  patchBounty(bountyId, { extension: ext });
+  recordBountyEvent(bountyId, "extension_requested", {
+    actor: contributor.githubLogin,
+    subject: contributor.githubLogin,
+    subjectGithubId: contributor.githubId,
+    detail: `${days} day${days === 1 ? "" : "s"} — ${trimmed.slice(0, 140)}`,
+  });
+  const bounty = getBounty(bountyId);
+  return { ok: true, reason: "requested", bounty: bounty ?? undefined };
+}
+
+export function respondToExtension(
+  bountyId: string,
+  action: "approve" | "decline",
+  sponsorLogin: string
+): LifecycleResult {
+  const b = getBounty(bountyId);
+  if (!b) return { ok: false, reason: "not_found" };
+  const ext = b.extension;
+  if (ext?.status !== "pending") return { ok: false, reason: "no_pending_extension" };
+  // The contributor may have submitted since requesting — approving then is fine.
+  if (b.status !== "DELEGATED" && b.status !== "IN_REVIEW") {
+    return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
+  }
+  if (b.pendingOp) return { ok: false, reason: "in_flight" };
+
+  const now = Date.now();
+  if (action === "approve") {
+    // Anchor on the OLD deadline, not `now`: the keeper held the refund while
+    // the request was pending, so the contributor already consumed any
+    // post-expiry time — this grants exactly `days` of total slack no matter
+    // how long the sponsor took to respond.
+    const newDeadline = (b.deadlineAt ?? now) + ext.days * DAY_MS;
+    patchBounty(bountyId, {
+      deadlineAt: newDeadline,
+      extension: { ...ext, status: "approved", respondedBy: sponsorLogin, respondedAt: now },
+    });
+    recordBountyEvent(bountyId, "extension_approved", {
+      actor: sponsorLogin,
+      subject: b.assigneeGithubLogin ?? ext.requestedBy,
+      subjectGithubId: b.assigneeGithubId ?? null,
+      detail: `+${ext.days} day${ext.days === 1 ? "" : "s"} — due ${new Date(newDeadline).toISOString().slice(0, 10)}`,
+      at: now,
+    });
+  } else {
+    patchBounty(bountyId, {
+      extension: { ...ext, status: "declined", respondedBy: sponsorLogin, respondedAt: now },
+    });
+    recordBountyEvent(bountyId, "extension_declined", {
+      actor: sponsorLogin,
+      subject: b.assigneeGithubLogin ?? ext.requestedBy,
+      subjectGithubId: b.assigneeGithubId ?? null,
+      at: now,
+    });
+  }
+  const bounty = getBounty(bountyId);
+  return { ok: true, reason: action === "approve" ? "approved" : "declined", bounty: bounty ?? undefined };
+}
+
 // ── payout + refund (guarded, idempotent, single-flight) ─────────────────────
 
 // Set pendingOp iff clear; returns false if another op is already in flight.
@@ -742,6 +847,13 @@ export async function refundBounty(
   // Only refundable states: funded-and-open (delete) or delegated/in-review (expiry).
   const refundable = ["OPEN", "DELEGATED", "IN_REVIEW"];
   if (!refundable.includes(b.status)) return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
+  // A pending extension request holds the expiry refund until the sponsor
+  // responds (belt-and-braces with the expiredBounties predicate — closes the
+  // race where a request lands between the sweep's read and this call). Scoped
+  // to "expired" so sponsor cancel/delete paths are unaffected.
+  if (reason === "expired" && b.extension?.status === "pending") {
+    return { ok: false, reason: "extension_pending" };
+  }
   const key = `refund:${b.taskId}`;
   const existing = findTxnByKey(key);
   if (existing && existing.status !== "failed") {
@@ -944,6 +1056,8 @@ export function expiredBounties(now = Date.now()): Bounty[] {
     (b) =>
       (b.status === "DELEGATED" || b.status === "IN_REVIEW") &&
       !b.pendingOp &&
+      // A pending extension request holds the refund until the sponsor responds.
+      b.extension?.status !== "pending" &&
       typeof b.deadlineAt === "number" &&
       b.deadlineAt < now &&
       // never refund a bounty already released on-chain

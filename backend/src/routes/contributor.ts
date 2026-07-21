@@ -35,12 +35,18 @@ function involvesContributor(b: Bounty, githubId: number): boolean {
   );
 }
 
-// Which activity-log kinds concern a specific applicant (filtered per caller).
-const APPLICATION_EVENT_KINDS = new Set([
+// Which activity-log kinds concern a specific contributor (filtered per
+// caller): application outcomes, and the assignee's extension requests — the
+// extension reason is assignee-authored and possibly personal, and rival
+// applicants stay subscribed to the bounty (involvesContributor above).
+const SUBJECT_GATED_EVENT_KINDS = new Set([
   "applied",
   "application_approved",
   "application_rejected",
   "application_withdrawn",
+  "extension_requested",
+  "extension_approved",
+  "extension_declined",
 ]);
 
 // Which contributor an application event concerns, as a numeric id — the same
@@ -66,7 +72,7 @@ function eventSubjectId(e: BountyEvent, b: Bounty): number | null {
 // the applications-array filtering below.
 function eventsForContributor(b: Bounty, githubId: number) {
   return (b.events ?? []).filter((e) => {
-    if (!APPLICATION_EVENT_KINDS.has(e.kind)) return true;
+    if (!SUBJECT_GATED_EVENT_KINDS.has(e.kind)) return true;
     return eventSubjectId(e, b) === githubId;
   });
 }
@@ -154,6 +160,9 @@ export function contributorBountyView(b: Bounty, githubId: number) {
     supportingLinks: isAssignee ? (b.supportingLinks ?? []) : [],
     payoutRequestedAt: b.payoutRequestedAt ?? null,
     rejection: b.rejection ?? null,
+    // Gated like supportingLinks: the request (and its reason) is the
+    // assignee's business, not the rival applicants'.
+    extension: isAssignee ? (b.extension ?? null) : null,
     cancelReason: b.cancelReason ?? null,
     escrowTxHash: b.escrowTxHash ?? null,
     payoutTxHash: b.payoutTxHash ?? null,

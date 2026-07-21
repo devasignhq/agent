@@ -452,6 +452,22 @@ export type SupportingLink = { type: string; url: string; addedAt: number };
 // rework and resubmit, accept the verdict (→ refund), or dispute (future).
 export type SubmissionRejection = { reason: string; byLogin: string; at: number };
 
+// The contributor's request for more delivery time. A single subdocument, not a
+// list: the invariants are "at most one pending at a time" and "at most one
+// approved ever", so one field makes both checks trivial (including inside the
+// keeper's expiredBounties predicate, which must stay cheap). A declined request
+// is overwritten by the next one — the history lives in the events log. While
+// status is "pending" the deadline sweeper HOLDS the expiry refund.
+export type BountyExtension = {
+  days: number; // integer, 1..EXTENSION_MAX_DAYS
+  reason: string; // required; trimmed and capped at EXTENSION_REASON_MAX
+  requestedBy: string; // assignee githubLogin at request time
+  requestedAt: number;
+  status: "pending" | "approved" | "declined";
+  respondedBy?: string | null; // sponsor githubLogin
+  respondedAt?: number | null;
+};
+
 // One entry in a bounty's append-only activity log — every lifecycle moment
 // the contributor app's timeline renders. Written by recordBountyEvent()
 // (bounties/service.ts) at each transition; absent entirely on legacy rows
@@ -471,6 +487,9 @@ export type BountyEventKind =
   | "submitted"
   | "review_completed"
   | "payout_requested"
+  | "extension_requested"
+  | "extension_approved"
+  | "extension_declined"
   | "submission_rejected"
   | "rejection_accepted"
   | "payout_submitted"
@@ -563,6 +582,9 @@ export type Bounty = {
   supportingLinks?: SupportingLink[];
   payoutRequestedAt?: number | null;
   rejection?: SubmissionRejection | null;
+  // The (single) timeline-extension request; see BountyExtension. Absent on
+  // rows written before the feature existed.
+  extension?: BountyExtension | null;
   // Append-only activity log (see BountyEvent). Capped at EVENT_CAP entries in
   // recordBountyEvent; absent on rows written before the log existed.
   events?: BountyEvent[];

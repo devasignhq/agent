@@ -15,9 +15,13 @@ import {
   allCriteriaMet,
   bountyStage,
   cmoney,
+  EXTENSION_MAX_DAYS,
+  EXTENSION_PRESETS,
+  extensionState,
   fmtDate,
   groupBounties,
   isStellarAddr,
+  isValidExtensionDays,
   isValidMemo,
   mergedCriteria,
   parsePrUrl,
@@ -328,6 +332,130 @@ export const SubmitModal = ({
   );
 };
 
+// ═══ REQUEST-EXTENSION MODAL — more delivery time, sponsor must approve ══════
+export const ExtensionModal = ({
+  b,
+  onClose,
+  onDone,
+}: {
+  b: ContributorBounty;
+  onClose: () => void;
+  onDone: () => void;
+}) => {
+  const [preset, setPreset] = React.useState<number | "custom">(EXTENSION_PRESETS[0]);
+  const [customVal, setCustomVal] = React.useState("");
+  const [reason, setReason] = React.useState("");
+  const [confirming, setConfirming] = React.useState(false);
+  const [busy, setBusy] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") (confirming ? setConfirming(false) : onClose()); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose, confirming]);
+
+  const days = preset === "custom" ? Number(customVal) : preset;
+  const daysOk = isValidExtensionDays(days);
+  const ready = daysOk && !!reason.trim();
+
+  const submit = async () => {
+    setBusy(true);
+    setError(null);
+    try {
+      await api.requestExtension(b.id, days, reason.trim());
+      onDone();
+      onClose();
+    } catch (err: any) {
+      const code = (err?.body as any)?.error || "request_failed";
+      setError(
+        code === "already_pending" ? "You already have a pending extension request on this bounty." :
+        code === "already_extended" ? "This bounty's timeline was already extended once — that's the limit." :
+        code === "invalid_days" ? `Choose between 1 and ${EXTENSION_MAX_DAYS} days.` :
+        code === "missing_reason" ? "Tell the sponsor why you need more time." :
+        code.startsWith("bad_status") ? "Extensions can only be requested before you submit your work." :
+        "Couldn't send the request — try again."
+      );
+      setConfirming(false);
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal c-submit" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose}><Icon name="x" size={13} /></button>
+        <div className="c-accept-head">
+          <div className="c-accept-eyebrow"><Icon name="clock" size={11} style={{ verticalAlign: -1, marginRight: 5 }} />more time on the clock</div>
+          <h2 className="c-accept-title">Request extension</h2>
+          <div className="c-accept-sub">
+            Ask the sponsor for extra delivery time on <span className="mono" style={{ color: "var(--fg-dim)" }}>{b.repo}#{b.issueNumber}</span>.
+            {b.deadlineAt ? <> Current deadline: {fmtDate(b.deadlineAt)} · {timeLeft(b.deadlineAt)}.</> : null} Your deadline only moves if they approve.
+          </div>
+        </div>
+
+        <div className="c-accept-body">
+          <label className="label">How many extra days? <span style={{ color: "var(--danger)" }}>*</span></label>
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+            {EXTENSION_PRESETS.map((d) => (
+              <button key={d} className={`btn ${preset === d ? "primary" : "ghost"}`} onClick={() => setPreset(d)}>
+                {d} day{d === 1 ? "" : "s"}
+              </button>
+            ))}
+            <button className={`btn ${preset === "custom" ? "primary" : "ghost"}`} onClick={() => setPreset("custom")}>Custom</button>
+            {preset === "custom" && (
+              <input
+                className="input mono" type="number" min={1} max={EXTENSION_MAX_DAYS} placeholder="days" autoFocus
+                value={customVal} onChange={(e) => setCustomVal(e.target.value)}
+                style={{ width: 90, height: 34, fontSize: 12 }}
+              />
+            )}
+          </div>
+          {preset === "custom" && customVal && !daysOk && (
+            <div className="mono" style={{ color: "var(--danger)", fontSize: 11, marginTop: 6 }}>
+              Whole days only, 1 to {EXTENSION_MAX_DAYS}.
+            </div>
+          )}
+
+          <label className="label" style={{ marginTop: 18 }}>Why do you need more time? <span style={{ color: "var(--danger)" }}>*</span></label>
+          <textarea
+            className="input" rows={3} maxLength={500}
+            placeholder="e.g. The upstream API change landed late — the integration tests need another pass."
+            value={reason} onChange={(e) => setReason(e.target.value)}
+            style={{ height: "auto", minHeight: 84, padding: "10px 12px", fontSize: 12, lineHeight: 1.5, resize: "vertical", fontFamily: "inherit" }}
+          />
+          <div className="c-submit-help">The sponsor sees your reason and approves or declines. While the request is pending, your bounty won't be refunded — even past the current deadline.</div>
+          {error && <div className="mono" style={{ color: "var(--danger)", fontSize: 11, marginTop: 10 }}>{error}</div>}
+        </div>
+
+        <div className="c-accept-foot" style={{ flexDirection: "column", alignItems: "stretch", gap: 10 }}>
+          {confirming ? (
+            <>
+              <div className="c-submit-confirm">
+                <Icon name="clock" size={13} style={{ verticalAlign: -2, marginRight: 6, color: "var(--accent)" }} />
+                Ask the sponsor for {days} more day{days === 1 ? "" : "s"}? Your deadline only moves if they approve — keep working meanwhile.
+              </div>
+              <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+                <button className="btn ghost" onClick={() => setConfirming(false)}>Not yet</button>
+                <button className="btn primary" disabled={busy} onClick={() => void submit()}>
+                  <Icon name="send" size={13} /> {busy ? "Sending…" : "Yes, send request"}
+                </button>
+              </div>
+            </>
+          ) : (
+            <div style={{ display: "flex", gap: 8, justifyContent: "space-between" }}>
+              <button className="btn ghost" onClick={onClose}>Cancel</button>
+              <button className="btn primary" disabled={!ready} onClick={() => setConfirming(true)}>
+                <Icon name="clock" size={13} /> Request {daysOk ? `${days}-day ` : ""}extension
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // ═══ ACTIVE BOUNTY WORKSPACE ═════════════════════════════════════════════════
 const WS_STAGES = [
   { k: "applied", l: "Applied" }, { k: "accepted", l: "Accepted" },
@@ -364,8 +492,10 @@ export const Workspace = ({
   const { reload } = useBounties();
   const [submitOpen, setSubmitOpen] = React.useState(false);
   const [linksOnly, setLinksOnly] = React.useState(false);
+  const [extOpen, setExtOpen] = React.useState(false);
   const [busy, setBusy] = React.useState(false);
   const review = useBountyReview(b);
+  const extState = extensionState(b);
 
   const submitted = !!b.prNumber || !!b.submittedAt;
   const reviewed = !!review && review.counts.pending < review.counts.total;
@@ -559,10 +689,24 @@ export const Workspace = ({
             <div><div className="t">Verdict accepted — bounty closed</div><div className="d">The {cmoney(b.amountUsdc)} escrow was returned to the sponsor. Nothing further is owed on either side.</div></div>
           </div>
         ) : !submitted ? (
-          <div className="c-ws-foot">
-            <div className="grow hint"><Icon name="clock" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{b.acceptedAt ? `Accepted ${fmtDate(b.acceptedAt)} · ${deadlineText}.` : deadlineText + "."} Submit whenever you're ready.</div>
-            <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>
-          </div>
+          <>
+            {extState === "pending" && (
+              <div className="c-payout-ready" style={{ margin: 0, borderTop: "1px solid var(--line)" }}>
+                <span className="ic"><Icon name="clock" size={18} /></span>
+                <div>
+                  <div className="t">Extension requested — {b.extension!.days} day{b.extension!.days === 1 ? "" : "s"}</div>
+                  <div className="d">The sponsor has been notified. Your deadline holds until they respond{b.deadlineAt && b.deadlineAt < Date.now() ? " — no refund while it's pending" : ""}.</div>
+                </div>
+              </div>
+            )}
+            <div className="c-ws-foot">
+              <div className="grow hint"><Icon name="clock" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />{b.acceptedAt ? `Accepted ${fmtDate(b.acceptedAt)} · ${deadlineText}.` : deadlineText + "."} Submit whenever you're ready.</div>
+              {extState === "can_request" && (
+                <button className="btn ghost" onClick={() => setExtOpen(true)}><Icon name="clock" size={12} /> Request extension</button>
+              )}
+              <button className="btn primary" onClick={() => { setLinksOnly(false); setSubmitOpen(true); }}><Icon name="pr" size={13} /> Make a submission</button>
+            </div>
+          </>
         ) : rejected ? (
           <>
             <div className="c-reject-banner">
@@ -615,6 +759,9 @@ export const Workspace = ({
 
       {submitOpen && (
         <SubmitModal b={b} linksOnly={linksOnly} onClose={() => setSubmitOpen(false)} onDone={() => void reload()} />
+      )}
+      {extOpen && (
+        <ExtensionModal b={b} onClose={() => setExtOpen(false)} onDone={() => void reload()} />
       )}
     </div>
   );

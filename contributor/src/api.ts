@@ -119,7 +119,8 @@ export type BountyEventKind =
   | "created" | "funding_submitted" | "funded" | "applied"
   | "application_approved" | "application_rejected" | "application_withdrawn"
   | "accepted" | "pr_opened" | "submitted" | "review_completed"
-  | "payout_requested" | "submission_rejected" | "rejection_accepted"
+  | "payout_requested" | "extension_requested" | "extension_approved" | "extension_declined"
+  | "submission_rejected" | "rejection_accepted"
   | "payout_submitted" | "paid" | "refund_submitted" | "refunded" | "cancelled";
 
 export type BountyEvent = {
@@ -128,6 +129,19 @@ export type BountyEvent = {
   actor?: string | null;
   subject?: string | null;
   detail?: string | null;
+};
+
+// The (single) timeline-extension request on a bounty (backend types.ts
+// BountyExtension). Only the assignee ever receives it — the projection nulls
+// it for everyone else.
+export type BountyExtension = {
+  days: number;
+  reason: string;
+  requestedBy: string;
+  requestedAt: number;
+  status: "pending" | "approved" | "declined";
+  respondedBy?: string | null;
+  respondedAt?: number | null;
 };
 
 // Compact AI-review projection carried on every contributor bounty row.
@@ -184,6 +198,7 @@ export type ContributorBounty = {
   supportingLinks: SupportingLink[];
   payoutRequestedAt: number | null;
   rejection: SubmissionRejection | null;
+  extension: BountyExtension | null;
   cancelReason: string | null;
   escrowTxHash: string | null;
   payoutTxHash: string | null;
@@ -305,6 +320,11 @@ export const api = {
   requestPayout: (id: string) =>
     request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/request-payout`, {
       method: "POST",
+    }),
+  requestExtension: (id: string, days: number, reason: string) =>
+    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/request-extension`, {
+      method: "POST",
+      body: JSON.stringify({ days, reason }),
     }),
   acceptRejection: (id: string) =>
     request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/accept-rejection`, {
