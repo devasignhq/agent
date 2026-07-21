@@ -435,8 +435,13 @@ const TxnRow = ({
       <span>
         {/* Only a payout settles money to a contributor, so only a payout has a
             payee to bill. Escrow funding and refunds move money to or from the
-            sponsor's own wallet and get no invoice. */}
-        {t.kind === "payout" && onInvoice ? (
+            sponsor's own wallet and get no invoice.
+
+            And only once it's CONFIRMED: a pending payout hasn't settled and a
+            failed one never will, so invoicing either would document a transfer
+            that didn't happen. This also guarantees `confirmedAt` is set, which
+            is the date the invoice is issued under. */}
+        {t.kind === "payout" && t.status === "confirmed" && onInvoice ? (
           <button className="btn ghost sm" onClick={onInvoice}>
             <Icon name="download" size={11} /> PDF
           </button>
