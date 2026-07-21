@@ -761,6 +761,8 @@ export async function releaseByMerge(
   try {
     send = await chain.adminRelease(b.taskId, b.assigneeAddress, b.assigneeMemo ?? "");
   } catch (err) {
+    // Same blind spot as refundBounty's throw path — see the note there.
+    console.warn(`[bounty] admin_release for ${b.code} (task ${b.taskId}) threw:`, err);
     releaseGuard(bountyId);
     return { ok: false, reason: "chain_error", hash: undefined };
   }
@@ -886,7 +888,12 @@ export async function refundBounty(
   let send: SendResult;
   try {
     send = await chain.adminRefund(b.taskId);
-  } catch {
+  } catch (err) {
+    // Log it: a build/simulate throw is almost always DETERMINISTIC (missing
+    // admin account, contract revert, corrupt taskId), so the keeper retries it
+    // every tick forever. Without the message the log reads `chain_error` on
+    // loop with nothing to act on.
+    console.warn(`[bounty] admin_refund for ${b.code} (task ${b.taskId}) threw:`, err);
     releaseGuard(bountyId);
     return { ok: false, reason: "chain_error" };
   }
@@ -1296,9 +1303,10 @@ export async function resubmitAdminTxn(
     } else {
       return { ok: false, reason: "not_resubmittable" };
     }
-  } catch {
+  } catch (err) {
     // Rebuild/simulate failed (RPC down, or the escrow already settled → contract
     // revert). Leave the row pending; the keeper's age-out is the final backstop.
+    console.warn(`[bounty] resubmitAdminTxn for ${b.code} (task ${b.taskId}) threw:`, err);
     return { ok: false, reason: "chain_error" };
   }
   if (send.status === "error") return { ok: false, reason: "send_error", hash: send.hash };
