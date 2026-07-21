@@ -56,6 +56,13 @@ const day = (ts?: number | null) => (ts ? new Date(ts).toISOString().slice(0, 10
 // Mirrors TXN_PILL (screen-bounties.tsx:398) so the CSV and the screen use the
 // same words. A support conversation stalls when the file says "confirmed" and
 // the dashboard says "COMPLETED".
+//
+// The lookup falls back to the raw wire value rather than trusting this map to
+// be exhaustive. It is exhaustive against the type, but the type is a hand-kept
+// mirror of what the backend sends, so a status added there and not here would
+// otherwise export an empty Status cell — silently dropping the one field that
+// says whether the money moved. Exporting an unrecognised "reversed" is a far
+// better failure than exporting "".
 const STATUS_LABEL: Record<EscrowTransaction["status"], string> = {
   confirmed: "COMPLETED",
   pending: "PENDING",
@@ -129,7 +136,7 @@ export const transactionRows = (txns: EscrowTransaction[]): string[][] => [
     day(t.confirmedAt),
     text(t.kind),
     text(t.dir),
-    STATUS_LABEL[t.status],
+    text(STATUS_LABEL[t.status] ?? t.status),
     amountUsdc(t),
     text(t.amountStroops),
     text(note(t)),

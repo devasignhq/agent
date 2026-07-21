@@ -164,6 +164,14 @@ test("status uses the dashboard's vocabulary, not the wire value", () => {
   assert.equal(row({ status: "failed" })[STATUS], "FAILED");
 });
 
+test("an unrecognised status falls back to the wire value, not an empty cell", () => {
+  // The label map is exhaustive against the type, but the type is a hand-kept
+  // mirror of the backend. If a status is added there and not here, the Status
+  // column must still say something — it's the field that reports whether the
+  // money actually moved.
+  assert.equal(row({ status: "reversed" as never })[STATUS], "reversed");
+});
+
 test("the note falls back exactly as the table's row does", () => {
   assert.equal(row({ note: "Bounty DA-8842 payout" })[NOTE], "Bounty DA-8842 payout");
   assert.equal(row({ note: undefined })[NOTE], "payout · @lenny_malcolm");
