@@ -3,15 +3,13 @@
 //   Center — bounty detail: issue + escrow links, acceptance criteria,
 //            DevAsign review (once submitted)
 //   Right  — contextual call-to-action per bounty state + the timeline
-// Ported from the design's c-bounty.jsx, wired to the real API. Dispute
-// branches render only behind FLAGS.disputes (preview shell, Phase E).
+// Ported from the design's c-bounty.jsx, wired to the real API.
 import React from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "./api";
 import type { ContributorBounty } from "./api";
 import { useBounties } from "./data-context";
 import { Icon } from "./icons";
-import { FLAGS } from "./flags";
 import { ExtensionModal, SubmitModal, linkIcon, useBountyReview } from "./dashboard";
 import {
   allCriteriaMet,
@@ -316,12 +314,9 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
           <span className="ic"><Icon name="x" size={16} /></span>
           <div><div className="t">{b.rejection!.byLogin} rejected this · {fmtDate(b.rejection!.at)}</div><div className="d">{b.rejection!.reason}</div></div>
         </div>
-        {card("Contest or close",
-          FLAGS.disputes
-            ? "Disagree with the verdict? Open a dispute and a neutral reviewer decides. Otherwise accept it to close the bounty."
-            : "You can rework and resubmit your PR, or accept the verdict to close the bounty. Disputes are coming soon.",
+        {card("Rework or close",
+          "You can rework and resubmit your PR, or accept the verdict to close the bounty.",
           <>
-            {FLAGS.disputes && <button className="btn primary" onClick={() => navigate("/disputes")}><Icon name="scale" size={13} /> Dispute the rejection</button>}
             <button className="btn ghost" disabled={busy} onClick={() => void acceptVerdict()}><Icon name="check" size={12} /> Accept verdict</button>
           </>)}
       </>

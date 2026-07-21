@@ -393,29 +393,37 @@ test("a submitted bounty past its deadline is swept, then confirms → CANCELLED
 
 // ── stale extension auto-approval ────────────────────────────────────────────
 
-test("a 3-day-silent extension auto-approves and the deadline moves", async () => {
+test("an unanswered extension auto-approves and the deadline moves", async () => {
   const b = mkBounty();
   await fundOpenDelegate(b.id);
-  // Due in 2 days. By the time the sponsor's silence runs out (3 days from now)
-  // the bounty is a day past due — only the pending hold has kept it alive, and
-  // only the auto-approval saves it from the sweep in this very tick.
-  const oldDeadline = Date.now() + 2 * DAY;
+  // Deadline derived from the window, not a literal: the tick clock lands just
+  // past the window, so the bounty is genuinely overdue by then and this exercises
+  // the real case — a request that outlived its own deadline. A literal silently
+  // stops doing that whenever the window changes (as it did at 3 days → 24h).
+  const EXT_DAYS = 3;
+  const oldDeadline = Date.now() + EXTENSION_AUTO_APPROVE_MS / 2;
   db.update("bounties", (x) => x.id === b.id, { deadlineAt: oldDeadline });
-  requestExtension(b.id, DEV, 3, "sick");
+  requestExtension(b.id, DEV, EXT_DAYS, "sick");
 
   const at = Date.now() + EXTENSION_AUTO_APPROVE_MS + 1000;
+  assert.ok(oldDeadline < at, "fixture guard: the bounty must be overdue at tick time");
   await runTick(keeperDeps({}, () => at));
+
 
   const after = getBounty(b.id)!;
   assert.equal(after.extension!.status, "approved");
   assert.equal(after.extension!.respondedBy, "system");
-  assert.equal(after.deadlineAt, oldDeadline + 3 * DAY, "old-deadline anchored");
+  assert.equal(after.deadlineAt, oldDeadline + EXT_DAYS * DAY, "old-deadline anchored");
   const ev = after.events!.at(-1)!;
   assert.equal(ev.kind, "extension_approved");
   assert.equal(ev.actor, "system");
-  // The ordering assertion: auto-approve ran BEFORE the sweep in the same tick,
-  // so the now-future deadline was never a refund candidate.
-  assert.equal(txnByKey(`refund:${b.taskId}`), null, "no refund — approval beat the sweep");
+  // Overdue but never refunded: expiredBounties excludes a pending extension, so
+  // the hold protects it until it is resolved. NOTE this does NOT prove the tick
+  // ordering — the pending guard holds whichever order the two steps run in. The
+  // ordering is only observable once the hold is released, which is what the
+  // long-outage test below actually pins (swap the two steps in runTick and that
+  // one goes red, this one does not).
+  assert.equal(txnByKey(`refund:${b.taskId}`), null, "the pending hold survives its own deadline");
 });
 
 test("after a long outage, auto-approval releases the hold and the sweep refunds same-tick", async () => {
@@ -423,6 +431,11 @@ test("after a long outage, auto-approval releases the hold and the sweep refunds
   // (keeper down for days), approval is still correct — anchoring on the old
   // deadline means the contributor already consumed that time — and the refund
   // then proceeds immediately rather than the escrow staying frozen forever.
+  //
+  // This is ALSO the only test that pins the runTick ordering. Auto-approval must
+  // run before the sweep: it is what releases the hold, and "same-tick" below is
+  // the observable difference. Swap the two steps in runTick and this goes red
+  // (the refund slips to the next tick) — no other test catches that.
   const b = mkBounty();
   await fundOpenDelegate(b.id);
   const oldDeadline = Date.now() - 1000;
@@ -454,7 +467,9 @@ test("auto-approval notifies both the contributor and the sponsor", async () => 
   const b = mkBounty();
   await fundOpenDelegate(b.id);
   db.update("bounties", (x) => x.id === b.id, {
-    deadlineAt: Date.now() + 2 * DAY, // +2d extension clears the tick's clock → no refund noise
+    // Comfortably past the tick clock, so the sweep never fires and the only
+    // bells in play are the auto-approval's.
+    deadlineAt: Date.now() + EXTENSION_AUTO_APPROVE_MS + 7 * DAY,
     sponsorUserId: "u_sponsor",
   });
   requestExtension(b.id, DEV, 2, "sick");

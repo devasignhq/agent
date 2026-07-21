@@ -11,7 +11,6 @@ import { useAuth } from "./auth-context";
 import { BountiesProvider, useBounties } from "./data-context";
 import { LiveProvider, useLiveTopic } from "./live-context";
 import { Icon } from "./icons";
-import { FLAGS } from "./flags";
 import { Discovery } from "./discovery";
 import { AuthGate } from "./auth-gate";
 import { Dashboard } from "./dashboard";
@@ -161,12 +160,6 @@ const Sidebar = ({ route, go }: { route: string; go: (key: string) => void }) =>
             <span className="sb-label">{n.name}</span>
           </div>
         ))}
-        {FLAGS.disputes && (
-          <div className={`sb-item ${route === "disputes" ? "active" : ""}`} onClick={() => go("disputes")}>
-            <span className="icon"><Icon name="scale" size={15} /></span>
-            <span className="sb-label">Disputes</span>
-          </div>
-        )}
       </div>
 
       {recent.length > 0 && (
@@ -280,7 +273,7 @@ const TopBar = ({ route, isMobile }: { route: string; isMobile: boolean }) => {
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
   const labels: Record<string, string> = {
-    dashboard: "Dashboard", bounties: "Bounties", wallet: "Wallet", disputes: "Disputes",
+    dashboard: "Dashboard", bounties: "Bounties", wallet: "Wallet",
     settings: "Settings",
   };
   return (
@@ -416,11 +409,6 @@ function Shell({ route, children }: { route: string; children: React.ReactNode }
   );
 }
 
-// Lazy so the flag-off build never even loads the dispute code path.
-const DisputePage = React.lazy(() =>
-  import("./dispute").then((m) => ({ default: m.DisputePage }))
-);
-
 function DiscoveryRoute() {
   const { id } = useParams();
   return <Discovery bountyId={id!} />;
@@ -440,15 +428,6 @@ export default function App() {
           <Route path="/wallet" element={<Shell route="wallet"><WalletPage /></Shell>} />
           <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
           <Route path="/settings/:section" element={<Shell route="settings"><SettingsPage /></Shell>} />
-          {FLAGS.disputes && (
-            <Route path="/disputes" element={
-              <Shell route="disputes">
-                <React.Suspense fallback={<LoadingScreen />}>
-                  <DisputePage />
-                </React.Suspense>
-              </Shell>
-            } />
-          )}
           <Route path="*" element={<Navigate to="/dashboard" replace />} />
         </Routes>
         <Analytics />

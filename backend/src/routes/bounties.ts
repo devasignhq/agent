@@ -658,7 +658,7 @@ bounties.post("/bounties/:id/extension/:action", (req, res) => {
 
 // The sponsor rejects the submitted work, with a required reason. The bounty
 // STAYS IN_REVIEW — rejection is a flag on the review stage, so the contributor
-// can rework and resubmit, accept the verdict (refund), or dispute (future).
+// can rework and resubmit, or accept the verdict (refund).
 bounties.post("/bounties/:id/reject-submission", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;

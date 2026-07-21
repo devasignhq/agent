@@ -65,6 +65,10 @@ export function parsePrUrl(raw: string): { repo: string; prNumber: number } | nu
 // Quick-pick chips in the request modal; Custom allows any integer up to the max.
 export const EXTENSION_PRESETS = [1, 2, 3] as const;
 export const EXTENSION_MAX_DAYS = 7;
+// Mirrors EXTENSION_AUTO_APPROVE_MS in backend/src/bounties/service.ts: past this
+// much sponsor silence the keeper approves the request on the contributor's
+// behalf. Surfaced in copy so "waiting on the sponsor" has a stated bound.
+export const EXTENSION_AUTO_APPROVE_HOURS = 24;
 
 export const isValidExtensionDays = (n: number): boolean =>
   Number.isInteger(n) && n >= 1 && n <= EXTENSION_MAX_DAYS;
@@ -234,7 +238,8 @@ const EVENT_DISPLAY: Record<
   extension_approved: (e) => ({
     at: e.at, icon: "check", cls: "cool",
     // actor "system" = the keeper approved it after the sponsor left the request
-    // unanswered for 3 days; "@system approved…" would read as a phantom user.
+    // unanswered past the auto-approve window; "@system approved…" would read as
+    // a phantom user.
     action:
       e.actor === "system"
         ? "Extension auto-approved (no sponsor response)"

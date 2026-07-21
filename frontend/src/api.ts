@@ -316,8 +316,7 @@ export type BountyStatus =
   | "DELEGATED"
   | "IN_REVIEW"
   | "PAID"
-  | "CANCELLED"
-  | "DISPUTED";
+  | "CANCELLED";
 
 export type BountyApplication = {
   githubId: number;
@@ -387,7 +386,7 @@ export type EscrowTransaction = {
   id: string;
   bountyId?: string | null;
   githubLogin?: string | null;
-  kind: "escrow" | "payout" | "refund" | "dispute" | "resolve";
+  kind: "escrow" | "payout" | "refund";
   signer: "sponsor" | "admin";
   status: "pending" | "confirmed" | "failed";
   hash?: string | null;

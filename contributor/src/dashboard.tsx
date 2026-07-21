@@ -9,12 +9,12 @@ import type { BountyReview, ContributorBounty, SupportingLink } from "./api";
 import { useAuth } from "./auth-context";
 import { useBounties } from "./data-context";
 import { Icon, ChainLogo } from "./icons";
-import { FLAGS } from "./flags";
 import {
   acceptanceRate,
   allCriteriaMet,
   bountyStage,
   cmoney,
+  EXTENSION_AUTO_APPROVE_HOURS,
   EXTENSION_MAX_DAYS,
   EXTENSION_PRESETS,
   extensionState,
@@ -390,7 +390,7 @@ export const ExtensionModal = ({
           <h2 className="c-accept-title">Request extension</h2>
           <div className="c-accept-sub">
             Ask the sponsor for extra delivery time on <span className="mono" style={{ color: "var(--fg-dim)" }}>{b.repo}#{b.issueNumber}</span>.
-            {b.deadlineAt ? <> Current deadline: {fmtDate(b.deadlineAt)} · {timeLeft(b.deadlineAt)}.</> : null} Your deadline only moves if they approve.
+            {b.deadlineAt ? <> Current deadline: {fmtDate(b.deadlineAt)} · {timeLeft(b.deadlineAt)}.</> : null} If they don't respond within {EXTENSION_AUTO_APPROVE_HOURS}h it's approved automatically.
           </div>
         </div>
 
@@ -433,7 +433,7 @@ export const ExtensionModal = ({
             <>
               <div className="c-submit-confirm">
                 <Icon name="clock" size={13} style={{ verticalAlign: -2, marginRight: 6, color: "var(--accent)" }} />
-                Ask the sponsor for {days} more day{days === 1 ? "" : "s"}? Your deadline only moves if they approve — keep working meanwhile.
+                Ask the sponsor for {days} more day{days === 1 ? "" : "s"}? They have {EXTENSION_AUTO_APPROVE_HOURS}h to respond — after that it's approved automatically. Keep working meanwhile.
               </div>
               <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
                 <button className="btn ghost" onClick={() => setConfirming(false)}>Not yet</button>
@@ -482,12 +482,10 @@ export const Workspace = ({
   b,
   expanded,
   onToggle,
-  onGoDispute,
 }: {
   b: ContributorBounty;
   expanded: boolean;
   onToggle: () => void;
-  onGoDispute?: () => void;
 }) => {
   const { reload } = useBounties();
   const [submitOpen, setSubmitOpen] = React.useState(false);
@@ -709,7 +707,7 @@ export const Workspace = ({
                 <span className="ic"><Icon name="clock" size={18} /></span>
                 <div>
                   <div className="t">Extension requested — {b.extension!.days} day{b.extension!.days === 1 ? "" : "s"}</div>
-                  <div className="d">The sponsor has been notified. Your deadline holds until they respond{b.deadlineAt && b.deadlineAt < Date.now() ? " — no refund while it's pending" : ""}.</div>
+                  <div className="d">The sponsor has been notified and has {EXTENSION_AUTO_APPROVE_HOURS}h to respond — after that it's approved automatically. Your deadline holds meanwhile{b.deadlineAt && b.deadlineAt < Date.now() ? ", and no refund can happen while it's pending" : ""}.</div>
                 </div>
               </div>
             )}
@@ -729,14 +727,9 @@ export const Workspace = ({
             </div>
             <div className="c-ws-foot">
               <div className="grow hint"><Icon name="scale" size={11} style={{ verticalAlign: -1, marginRight: 4 }} />
-                {FLAGS.disputes
-                  ? "Disagree? Open a dispute and a neutral reviewer decides. Otherwise accept the verdict to close it out."
-                  : "You can rework and resubmit your PR, or accept the verdict to close it out. Disputes are coming soon."}
+                You can rework and resubmit your PR, or accept the verdict to close it out.
               </div>
               <button className="btn ghost" disabled={busy} onClick={() => void acceptVerdict()}><Icon name="check" size={12} /> Accept verdict</button>
-              {FLAGS.disputes && onGoDispute && (
-                <button className="btn primary" onClick={onGoDispute}><Icon name="scale" size={13} /> Dispute the rejection</button>
-              )}
             </div>
           </>
         ) : payoutRequested ? (

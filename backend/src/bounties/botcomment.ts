@@ -83,8 +83,6 @@ export function renderStatusBody(bounty: Bounty): string {
       return bounty.cancelReason === "expired"
         ? `🤖 **DevAsign Bounty** — ⌛ expired. The delivery window elapsed; **${amt}** was refunded to the sponsor.`
         : `🤖 **DevAsign Bounty** — ✖ cancelled. **${amt}** was refunded to the sponsor.`;
-    case "DISPUTED":
-      return `🤖 **DevAsign Bounty** — ⚠️ disputed; under review by DevAsign.`;
     default:
       return renderConfirmBody(bounty);
   }

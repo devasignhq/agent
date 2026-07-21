@@ -41,7 +41,6 @@ const ST_LABEL: Record<BountyStatus, string> = {
   IN_REVIEW: "IN REVIEW",
   PAID: "PAID",
   CANCELLED: "CANCELLED",
-  DISPUTED: "DISPUTED",
 };
 const ST_CLS: Record<BountyStatus, string> = {
   PENDING_FUNDING: "warn",
@@ -50,7 +49,6 @@ const ST_CLS: Record<BountyStatus, string> = {
   IN_REVIEW: "warn",
   PAID: "cyan",
   CANCELLED: "nit",
-  DISPUTED: "danger",
 };
 const ST_DOT: Record<BountyStatus, string> = {
   PENDING_FUNDING: "var(--warn)",
@@ -59,14 +57,12 @@ const ST_DOT: Record<BountyStatus, string> = {
   IN_REVIEW: "var(--warn)",
   PAID: "var(--cyan)",
   CANCELLED: "var(--fg-faint)",
-  DISPUTED: "var(--danger)",
 };
 
 const TABS: Array<{ key: string; label: string; match: (b: Bounty) => boolean }> = [
   { key: "all",       label: "all",       match: () => true },
   { key: "open",      label: "open",      match: (b) => b.status === "OPEN" },
   { key: "in_review", label: "in review", match: (b) => b.status === "IN_REVIEW" },
-  { key: "disputed",  label: "disputed",  match: (b) => b.status === "DISPUTED" },
   { key: "paid",      label: "paid",      match: (b) => b.status === "PAID" },
 ];
 
@@ -651,10 +647,15 @@ const DetailsTab = ({ b }: { b: Bounty }) => {
   );
 };
 
+// Mirrors EXTENSION_AUTO_APPROVE_MS in backend/src/bounties/service.ts.
+const EXTENSION_AUTO_APPROVE_HOURS = 24;
+
 // The pending timeline-extension request card: reason, requested window, and
 // the approve/decline two-step confirm (same pattern as ApplicationsTab).
 // While the request is pending the backend holds the expiry refund — so a
 // past-due bounty sits in limbo until the sponsor acts, and the card says so.
+// It also says that NOT acting is a decision: past the auto-approve window the
+// keeper approves on the sponsor's behalf, so silence must not look free.
 const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => void }) => {
   const ext = b.extension!;
   const [confirming, setConfirming] = React.useState<null | "approve" | "decline">(null);
@@ -698,6 +699,9 @@ const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => 
         )}
       </div>
       <div className="sub-card-note" style={{ marginTop: 8 }}>“{ext.reason}”</div>
+      <div className="mono" style={{ fontSize: 11, marginTop: 8, color: "var(--fg-mute)" }}>
+        <Icon name="clock" size={11} /> No response within {EXTENSION_AUTO_APPROVE_HOURS}h approves this automatically.
+      </div>
       {pastDue && (
         <div className="mono" style={{ fontSize: 11, marginTop: 8, color: "var(--warn, #d6a354)" }}>
           <Icon name="warn" size={11} /> Past due — the automatic refund is on hold until you respond.

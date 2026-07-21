@@ -630,9 +630,9 @@ export function requestExtension(
   // Pre-submission only. NOTE this is a known gap, not a guarantee: the delivery
   // window is absolute (see expiredBounties), so a contributor whose PR is sitting
   // unreviewed can be refunded out and has no way to buy time. Widening this would
-  // combine with the keeper's 3-day auto-approval to turn sponsor silence into a
-  // 7-day extension rather than a refund, which is the opposite of the intended
-  // behaviour. Revisit together with dispute resolution.
+  // combine with the keeper's 24h auto-approval to turn a single day of sponsor
+  // silence into a 7-day extension rather than a refund, which is the opposite of
+  // the intended behaviour. Revisit when a review SLA exists.
   if (b.status !== "DELEGATED" || b.submittedAt) {
     return { ok: false, reason: `bad_status_${b.status.toLowerCase()}` };
   }
@@ -1083,8 +1083,9 @@ export function adoptOnchainEscrow(bountyId: string, escrow: unknown): Lifecycle
  * out and gets refunded while keeping the work, and the contributor cannot buy time
  * (requestExtension is pre-submission only). The alternative — exempting IN_REVIEW —
  * was tried and is worse: a silent sponsor then freezes the escrow forever with no
- * escape hatch at all. Fixing this properly needs dispute resolution / a review SLA
- * (the DISPUTED status is typed but unwired); until that exists, expiry wins.
+ * escape hatch at all. Fixing this properly needs a review SLA — some bound on how
+ * long a sponsor may sit on a submission — which does not exist yet. Until it does,
+ * expiry wins.
  *
  * The remaining clauses are what keep a legitimately-settling bounty safe: an op in
  * flight, a pending extension request, or an existing on-chain release.
@@ -1107,7 +1108,11 @@ export function expiredBounties(now = Date.now()): Bounty[] {
 // Silence past this counts as consent. A pending request HOLDS the expiry refund
 // (expiredBounties + the refundBounty guard), so a sponsor who simply never
 // answers would freeze the contributor's deadline — and their own escrow — forever.
-export const EXTENSION_AUTO_APPROVE_MS = 3 * DAY_MS;
+// Every user-facing string that quotes this window derives its number from here.
+export const EXTENSION_AUTO_APPROVE_MS = DAY_MS;
+
+/** The auto-approve window in whole hours, for copy that has to name it. */
+export const EXTENSION_AUTO_APPROVE_HOURS = Math.round(EXTENSION_AUTO_APPROVE_MS / (60 * 60 * 1000));
 
 /** Pending extension requests the sponsor has left unanswered past the auto-approve window. */
 export function staleExtensionRequests(now = Date.now()): Bounty[] {

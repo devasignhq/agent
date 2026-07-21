@@ -3,8 +3,8 @@
 // DURABLE source of truth across restarts — the in-memory queue isn't. Each tick:
 //   1. confirm submitted txns → advance the bounty state machine (+ edit the bot
 //      comment); age out a tx that never lands so it's retryable.
-//   2. auto-approve extension requests the sponsor left unanswered for 3 days,
-//      so a silent sponsor can't hold the escrow indefinitely.
+//   2. auto-approve extension requests the sponsor left unanswered past
+//      EXTENSION_AUTO_APPROVE_MS, so a silent sponsor can't hold the escrow.
 //   3. sweep delivery deadlines → refund the sponsor (admin-signed).
 //   4. warn the contributor 24h before their window closes (one-shot, in-app).
 // All state advances go through the service's idempotent, guarded transitions, so
@@ -18,6 +18,7 @@ import {
   assigneeUser,
   bountiesNearingDeadline,
   defaultChain,
+  EXTENSION_AUTO_APPROVE_HOURS,
   expiredBounties,
   getBounty,
   patchBounty,
@@ -258,7 +259,10 @@ async function autoApproveStaleExtensions(deps: KeeperDeps): Promise<void> {
       const days = nb.extension?.days ?? 0;
       const plural = days === 1 ? "" : "s";
       const due = nb.deadlineAt ? new Date(nb.deadlineAt).toUTCString() : "";
-      console.log(`[bounty-keeper] ${b.code}: extension unanswered for 3 days → auto-approved`);
+      // Derived, never spelled out: the window has changed once already and the
+      // copy silently went stale everywhere it was written by hand.
+      const window = `${EXTENSION_AUTO_APPROVE_HOURS}h`;
+      console.log(`[bounty-keeper] ${b.code}: extension unanswered for ${window} → auto-approved`);
       // Both parties: the contributor because their deadline moved, the sponsor
       // because it moved WITHOUT them and their escrow is committed for longer.
       const dev = assigneeUser(nb);
@@ -267,7 +271,7 @@ async function autoApproveStaleExtensions(deps: KeeperDeps): Promise<void> {
           dev.id,
           "bounty",
           `Your extension on ${b.code} was auto-approved`,
-          `${b.repo}#${b.issueNumber} — +${days} day${plural} after 3 days without a sponsor response. New deadline ${due}`,
+          `${b.repo}#${b.issueNumber} — +${days} day${plural} after ${window} without a sponsor response. New deadline ${due}`,
           { link: "/dashboard" }
         );
       }
@@ -275,7 +279,7 @@ async function autoApproveStaleExtensions(deps: KeeperDeps): Promise<void> {
         pushNotification(
           sponsorId,
           "bounty",
-          `Extension on ${b.code} auto-approved after 3 days`,
+          `Extension on ${b.code} auto-approved after ${window}`,
           `${b.repo}#${b.issueNumber} — @${nb.assigneeGithubLogin ?? "the contributor"} now has until ${due}`,
           { link: "/bounties" }
         );

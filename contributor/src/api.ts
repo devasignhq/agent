@@ -99,8 +99,7 @@ export type BountyStatus =
   | "DELEGATED"
   | "IN_REVIEW"
   | "PAID"
-  | "CANCELLED"
-  | "DISPUTED";
+  | "CANCELLED";
 
 export type BountyApplication = {
   githubId: number;
