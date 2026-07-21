@@ -536,10 +536,11 @@ export const api = {
   // bounties. Funding + in-app "Approve payment" are two-step: fetch an UNSIGNED
   // transaction (xdr), sign it with the sponsor's Freighter wallet client-side,
   // then post the signed envelope back to the matching *-submit endpoint.
-  bounties: () => request<{ bounties: Bounty[]; summary: BountySummary }>("/api/bounties"),
-  bounty: (id: string) => request<{ bounty: Bounty }>(`/api/bounties/${id}`),
+  bounties: () =>
+    request<{ bounties: Bounty[]; summary: BountySummary; explorerBase?: string }>("/api/bounties"),
+  bounty: (id: string) => request<{ bounty: Bounty; explorerBase?: string }>(`/api/bounties/${id}`),
   bountyTransactions: () =>
-    request<{ transactions: EscrowTransaction[] }>("/api/bounties/transactions"),
+    request<{ transactions: EscrowTransaction[]; explorerBase?: string }>("/api/bounties/transactions"),
   createBounty: (input: {
     repo: string;
     issueNumber: number;

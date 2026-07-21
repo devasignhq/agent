@@ -6,7 +6,15 @@ import { isConnected, requestAccess, signTransaction } from "@stellar/freighter-
 
 export const money = (n: number) => `$${n.toLocaleString("en-US")}`;
 export const shortHash = (h: string) => (h.length > 18 ? `${h.slice(0, 8)}…${h.slice(-6)}` : h);
-export const stellarTxUrl = (h: string) => `https://stellar.expert/explorer/testnet/tx/${h}`;
+
+// Explorer base comes from the backend (`explorerBase` on the bounty response
+// envelopes) so the network lives in exactly one place — backend config. The
+// default only covers the instant before the first API response lands.
+let explorerBase = "https://stellar.expert/explorer/public";
+export const setExplorerBase = (base: string) => {
+  if (base) explorerBase = base;
+};
+export const stellarTxUrl = (h: string) => `${explorerBase}/tx/${h}`;
 
 // ─── Freighter (browser wallet) bridge ────────────────────────────────────────
 // We talk to Freighter through its official `@stellar/freighter-api` package

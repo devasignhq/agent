@@ -128,7 +128,7 @@ export function listBountiesHandler(req: Request, res: Response) {
   const list = db
     .filter("bounties", (b) => ids.has(b.installationId) || b.sponsorUserId === user.id)
     .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ bounties: list.map(withSponsorLinks), summary: summarize(list) });
+  res.json({ bounties: list.map(withSponsorLinks), summary: summarize(list), explorerBase: explorerBase() });
 }
 bounties.get("/bounties", listBountiesHandler);
 
@@ -142,7 +142,7 @@ bounties.get("/bounties/transactions", (req, res) => {
   const txns = db
     .filter("escrowTransactions", (t) => !!t.bountyId && bountyIds.has(t.bountyId))
     .sort((a, b) => b.createdAt - a.createdAt);
-  res.json({ transactions: txns });
+  res.json({ transactions: txns, explorerBase: explorerBase() });
 });
 
 // Unauthenticated public read for the contributor app's discovery page — a
@@ -173,12 +173,13 @@ export function getBountyHandler(req: Request, res: Response) {
   // bounty must never leave the sponsor) and the applicant list (non-sponsors
   // see only their OWN applications, which is what the apply page needs to
   // render an "already applied" state).
-  if (sponsor) return void res.json({ bounty: withSponsorLinks(b) });
+  if (sponsor) return void res.json({ bounty: withSponsorLinks(b), explorerBase: explorerBase() });
   res.json({
     bounty: {
       ...b,
       applications: b.applications.filter((a) => a.githubId === user.githubId),
     },
+    explorerBase: explorerBase(),
   });
 }
 bounties.get("/bounties/:id", getBountyHandler);

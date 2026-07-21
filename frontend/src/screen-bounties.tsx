@@ -15,7 +15,7 @@
 import React from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { Icon } from "./icons";
-import { freighterAddress, freighterSign, money, shortHash, stellarTxUrl } from "./bounty-shared";
+import { freighterAddress, freighterSign, money, setExplorerBase, shortHash, stellarTxUrl } from "./bounty-shared";
 import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
 import { buildInvoice } from "./bounty-invoice";
@@ -119,6 +119,7 @@ export const BountiesPage = ({
     setError(null);
     try {
       const [b, t] = await Promise.all([api.bounties(), api.bountyTransactions()]);
+      setExplorerBase(b.explorerBase ?? "");
       setBounties(b.bounties);
       setSummary(b.summary);
       setTxns(t.transactions);
@@ -139,6 +140,7 @@ export const BountiesPage = ({
   const refresh = React.useCallback(async () => {
     try {
       const [b, t] = await Promise.all([api.bounties(), api.bountyTransactions()]);
+      setExplorerBase(b.explorerBase ?? "");
       setBounties(b.bounties);
       setSummary(b.summary);
       setTxns(t.transactions);

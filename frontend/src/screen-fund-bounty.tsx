@@ -19,7 +19,7 @@ import React from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Icon } from "./icons";
 import { api, ApiError, type Bounty } from "./api";
-import { freighterAddress, freighterSign, money, shortHash, stellarTxUrl } from "./bounty-shared";
+import { freighterAddress, freighterSign, money, setExplorerBase, shortHash, stellarTxUrl } from "./bounty-shared";
 import { runFund, type FundPhase } from "./bounty-fund";
 import {
   addRow,
@@ -134,6 +134,7 @@ export const FundBountyPage = () => {
       try {
         const r = await api.bounty(id);
         if (!alive) return;
+        setExplorerBase(r.explorerBase ?? "");
         setBounty(r.bounty);
         setRows(r.bounty.acceptance);
         setSaved(r.bounty.acceptance);
