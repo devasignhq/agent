@@ -20,6 +20,8 @@ import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
 import { buildInvoice } from "./bounty-invoice";
 import { InvoicePreviewModal } from "./bounty-invoice-modal";
+import { transactionsCsv, transactionsCsvFilename } from "./bounty-csv";
+import { downloadTextFile } from "./download";
 import {
   api,
   ApiError,
@@ -167,6 +169,24 @@ export const BountiesPage = ({
     setBounties((prev) => prev.map((x) => (x.id === b.id ? b : x)));
   }, []);
 
+  // Exports `txns` — the whole history — not `txShown`, which is only the ten
+  // rows currently paged into view.
+  //
+  // Synchronous on purpose. Unlike the invoice there's no dependency to lazy-load
+  // and no I/O, so there's nothing to await and nothing to report failing; an
+  // await before the anchor click would also cost us the user gesture that keeps
+  // Safari from blocking the download. The eye toggle is ignored: it hides
+  // balances from a passing glance, and a masked CSV would just be a wrong ledger.
+  const exportCsv = React.useCallback(() => {
+    if (txns.length === 0) return;
+    downloadTextFile(
+      transactionsCsvFilename(Date.now()),
+      "text/csv;charset=utf-8",
+      transactionsCsv(txns),
+      { bom: true }
+    );
+  }, [txns]);
+
   const matcher = TABS.find((t) => t.key === tab)!.match;
   const filtered = bounties.filter(matcher).filter((b) => {
     if (!query.trim()) return true;
@@ -302,7 +322,15 @@ export const BountiesPage = ({
                 <span className="bnty-panel-title">Transaction history</span>
                 <span className="bnty-panel-meta">
                   {txns.length} total
-                  <button className="btn ghost sm" style={{ marginLeft: 10 }}><Icon name="download" size={12} /> CSV</button>
+                  <button
+                    className="btn ghost sm"
+                    style={{ marginLeft: 10 }}
+                    onClick={exportCsv}
+                    disabled={txns.length === 0}
+                    title="Download all transactions as CSV"
+                  >
+                    <Icon name="download" size={12} /> CSV
+                  </button>
                 </span>
               </div>
               <div className="row-table txn-listwrap">
