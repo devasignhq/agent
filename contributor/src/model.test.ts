@@ -48,9 +48,10 @@ const myApp = (status: "pending" | "approved" | "accepted" | "rejected") =>
   ({ githubId: 1, githubLogin: "me", appliedAt: 0, status });
 
 test("stage derivation covers every design state", () => {
-  // Application lifecycle (not yet assignee).
+  // Application lifecycle (not yet assignee). A pending application — or a
+  // legacy "approved" one — reads as "applied" while the bounty is open.
   assert.equal(bountyStage(b({ myApplication: myApp("pending") })), "applied");
-  assert.equal(bountyStage(b({ myApplication: myApp("approved") })), "awarded");
+  assert.equal(bountyStage(b({ myApplication: myApp("approved") })), "applied");
   assert.equal(bountyStage(b({ myApplication: myApp("rejected") })), "closed");
   // Someone else won it.
   assert.equal(bountyStage(b({ status: "DELEGATED", myApplication: myApp("pending") })), "lost");
@@ -145,7 +146,7 @@ test("timelineFromEvents legacy fallback synthesizes from timestamps", () => {
 
 test("groupBounties routes stages into dashboard buckets", () => {
   const list = [
-    b({ id: "aw", myApplication: myApp("approved") }),
+    b({ id: "aw", myApplication: myApp("approved") }), // legacy approved → applied bucket now
     b({ id: "pr", isAssignee: true, status: "DELEGATED" }),
     b({ id: "rv", isAssignee: true, status: "IN_REVIEW" }),
     b({ id: "rj", isAssignee: true, status: "IN_REVIEW", rejection: { reason: "r", byLogin: "s", at: 1 } }),
@@ -154,9 +155,8 @@ test("groupBounties routes stages into dashboard buckets", () => {
     b({ id: "cl", status: "CANCELLED" }),
   ];
   const g = groupBounties(list);
-  assert.deepEqual(g.awarded.map((x) => x.id), ["aw"]);
   assert.deepEqual(g.active.map((x) => x.id), ["pr", "rv", "rj"]);
-  assert.deepEqual(g.applied.map((x) => x.id), ["ap"]);
+  assert.deepEqual(g.applied.map((x) => x.id), ["aw", "ap"]);
   assert.deepEqual(g.completed.map((x) => x.id), ["pd"]);
   assert.deepEqual(g.closed.map((x) => x.id), ["cl"]);
 });

@@ -744,7 +744,6 @@ const AppContent = () => {
             <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
             <Route path="/bounties/:id/fund" element={<FundBountyPage />} />
             <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
-            <Route path="/bounties/:id/apply" element={<BountiesPage isMobile={isMobile} isApplying />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/agent" replace />} />

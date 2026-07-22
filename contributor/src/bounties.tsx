@@ -32,7 +32,6 @@ const bpState = (b: ContributorBounty): DisplayState => {
   const map: Record<BountyStage, { label: string; cls: string }> = {
     applied: { label: "under review", cls: "" },
     shortlist: { label: "shortlisted", cls: "info" },
-    awarded: { label: "awarded to you", cls: "success" },
     progress: { label: "in progress", cls: "" },
     review: { label: "in review", cls: "info" },
     ready: { label: "ready for payout", cls: "success" },
@@ -51,7 +50,7 @@ const bpPill = (st: DisplayState) => (
 // Which list-filter category a stage belongs to.
 const categoryOf = (stage: BountyStage): "active" | "applied" | "completed" | "closed" =>
   stage === "progress" || stage === "review" || stage === "ready" || stage === "rejected" ? "active"
-  : stage === "applied" || stage === "awarded" ? "applied"
+  : stage === "applied" ? "applied"
   : stage === "paid" ? "completed"
   : "closed";
 
@@ -321,13 +320,6 @@ const BountyCTA = ({ b, st }: { b: ContributorBounty; st: DisplayState }) => {
           </>)}
       </>
     );
-  }
-
-  // Awarded — accept happens on the dashboard.
-  if (st.key === "awarded") {
-    return card("You were picked", "Accept the award and confirm your payout wallet — the delivery clock starts when you do.",
-      <button className="btn primary" onClick={() => navigate("/dashboard")}><Icon name="check" size={13} /> Accept on dashboard</button>,
-      <><Icon name="clock" size={11} /> {b.deliveryDays} days once accepted</>);
   }
 
   // Applied — the design's CTA is "Withdraw application".

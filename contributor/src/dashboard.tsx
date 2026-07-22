@@ -1,14 +1,14 @@
-// Contributor dashboard — stats, the awarded alert (accept → payout wallet),
-// the active-bounty workspace accordion (submit PR → review vs criteria →
-// request payout / handle rejection), and the applied / completed lists.
-// Ported from the design's c-dashboard.jsx, wired to the real API.
+// Contributor dashboard — stats, the active-bounty workspace accordion (submit
+// PR → review vs criteria → request payout / handle rejection), and the applied
+// / completed lists. Delegation is now one sponsor click, so there is no
+// award-accept step here. Ported from the design's c-dashboard.jsx.
 import React from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "./api";
 import type { BountyReview, ContributorBounty, SupportingLink } from "./api";
 import { useAuth } from "./auth-context";
 import { useBounties } from "./data-context";
-import { Icon, ChainLogo } from "./icons";
+import { Icon } from "./icons";
 import {
   acceptanceRate,
   allCriteriaMet,
@@ -20,179 +20,13 @@ import {
   extensionState,
   fmtDate,
   groupBounties,
-  isStellarAddr,
   isValidExtensionDays,
-  isValidMemo,
   mergedCriteria,
   parsePrUrl,
   reviewHeadline,
   timeAgo,
   timeLeft,
 } from "./model.ts";
-
-// ═══ ACCEPT AWARD → CONFIRM PAYOUT WALLET ════════════════════════════════════
-export const AcceptModal = ({
-  bounty,
-  onClose,
-}: {
-  bounty: ContributorBounty;
-  onClose: () => void;
-}) => {
-  const auth = useAuth();
-  const { reload } = useBounties();
-  const saved = auth.user?.stellarPayoutAddress
-    ? { addr: auth.user.stellarPayoutAddress, memo: auth.user.stellarPayoutMemo || "" }
-    : null;
-  const [step, setStep] = React.useState<"form" | "done">("form");
-  const [editing, setEditing] = React.useState(!saved);
-  const [addr, setAddr] = React.useState(saved ? saved.addr : "");
-  const [memo, setMemo] = React.useState(saved ? saved.memo : "");
-  const [busy, setBusy] = React.useState(false);
-  const [error, setError] = React.useState<string | null>(null);
-  const ok = isStellarAddr(addr);
-  const memoOk = isValidMemo(memo);
-  const canAccept = (saved && !editing ? true : ok && memoOk) && !busy;
-
-  const finalAddr = saved && !editing ? saved.addr : addr.trim();
-  const finalMemo = saved && !editing ? saved.memo : memo.trim();
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  const accept = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.acceptBounty(bounty.id, finalAddr, finalMemo);
-      void auth.reload();
-      void reload();
-      setStep("done");
-    } catch (err: any) {
-      const code = (err?.body as any)?.error || "accept_failed";
-      setError(
-        code === "no_trustline"
-          ? "That wallet can't receive USDC yet — add a USDC trustline in your wallet app, then try again."
-          : code === "invalid_address" ? "That Stellar address doesn't validate."
-          : code === "not_approved" ? "This award is no longer available."
-          : String(code).startsWith("not_open") ? "This bounty is no longer open."
-          : code === "stellar_unconfigured" ? "Payouts are momentarily unavailable — try again shortly."
-          : "Couldn't accept the bounty — try again."
-      );
-    } finally {
-      setBusy(false);
-    }
-  };
-
-  if (step === "done") {
-    return (
-      <div className="modal-scrim" onClick={onClose}>
-        <div className="modal c-accept" onClick={(e) => e.stopPropagation()}>
-          <div className="c-accept-done">
-            <div className="c-accept-done-mark"><Icon name="check" size={24} /></div>
-            <div className="c-accept-done-t">Bounty accepted</div>
-            <div className="c-accept-done-d">
-              <b>{bounty.repo}#{bounty.issueNumber}</b> is now in your active work. When it's approved,{" "}
-              <b>{cmoney(bounty.amountUsdc)} USDC</b> pays out straight to your wallet — directly to you.
-            </div>
-            <div className="c-addr-preview" style={{ textAlign: "left", maxWidth: 380, margin: "0 auto 20px" }}>
-              <span className="ic"><Icon name="coins" size={16} /></span>
-              <div className="body">
-                <div className="k">payout wallet · Stellar</div>
-                <div className="v">{finalAddr}</div>
-                <div className="v" style={{ color: "var(--fg-mute)", marginTop: 3 }}>{finalMemo ? "memo · " + finalMemo : "no memo"}</div>
-              </div>
-            </div>
-            <button className="btn primary" onClick={onClose} style={{ margin: "0 auto" }}>
-              <Icon name="briefcase" size={13} /> Start working
-            </button>
-          </div>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div className="modal c-accept" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose}><Icon name="x" size={13} /></button>
-        <div className="c-accept-head">
-          <div className="c-accept-eyebrow"><Icon name="trophy" size={11} style={{ verticalAlign: -1, marginRight: 5 }} />you've been awarded this bounty</div>
-          <h2 className="c-accept-title">Accept &amp; confirm your payout wallet</h2>
-          <div className="c-accept-sub">
-            {bounty.sponsorLogin ?? "The maintainer"} picked you for <span className="mono" style={{ color: "var(--fg-dim)" }}>{bounty.repo}#{bounty.issueNumber}</span>. Confirm the USDC wallet your payout lands in, and the clock starts.
-          </div>
-        </div>
-
-        <div className="c-accept-body">
-          <div className="c-accept-summary">
-            <div className="cell"><div className="k">reward</div><div className="v amt">{cmoney(bounty.amountUsdc)}</div></div>
-            <div className="cell"><div className="k">network</div><div className="v"><span className="chain-pip" style={{ background: "#7e54d6", display: "inline-block", marginRight: 6, verticalAlign: 1 }}></span>Stellar</div></div>
-            <div className="cell"><div className="k">delivery</div><div className="v">{bounty.deliveryDays} days once accepted</div></div>
-          </div>
-
-          <div className="c-accept-callout">
-            <Icon name="shield" size={14} />
-            <span>The <b>{cmoney(bounty.amountUsdc)}</b> pays out to your <b>own USDC wallet</b> — directly to you, never through a DevAsign-held wallet.</span>
-          </div>
-
-          <div className="c-apply-wallet">
-            <div className="c-apply-wallet-h">
-              <span><Icon name="coins" size={12} style={{ verticalAlign: -2, marginRight: 6 }} />USDC payout wallet · Stellar</span>
-              <span className="req">required</span>
-            </div>
-
-            {saved && !editing ? (
-              <>
-                <div className="c-apply-wallet-card">
-                  <div className="ic"><ChainLogo size={22} /></div>
-                  <div className="body">
-                    <div className="addr mono">{saved.addr.slice(0, 12)}…{saved.addr.slice(-6)}</div>
-                    <div className="memo mono">{saved.memo ? <>memo · {saved.memo}</> : "no memo"}</div>
-                  </div>
-                  <span className="pill ok"><i className="dot"></i> on file</span>
-                </div>
-                <div className="c-apply-wallet-ask">
-                  <span>Pay your <b>{cmoney(bounty.amountUsdc)}</b> into this wallet?</span>
-                  <button className="c-linkbtn" onClick={() => setEditing(true)}><Icon name="edit" size={11} /> Use a different wallet</button>
-                </div>
-              </>
-            ) : (
-              <div className="c-apply-wallet-edit">
-                <div className="c-apply-wallet-hint">Enter the Stellar wallet where the <b>{cmoney(bounty.amountUsdc)}</b> should land. It's saved as your default for future bounties too.</div>
-                <div className="c-addr-field">
-                  <input className="input mono" placeholder="G… (56 characters)" value={addr}
-                    onChange={(e) => setAddr(e.target.value)} style={{ height: 42, fontSize: 12, paddingRight: ok ? 96 : 12 }} />
-                  {ok && <span className="c-addr-valid"><Icon name="check" size={12} /> valid</span>}
-                </div>
-                {addr && !ok && <div className="mono" style={{ color: "var(--danger)", fontSize: 11, marginTop: 6 }}>Not a valid Stellar address — should start with G and be 56 characters.</div>}
-                <input className="input mono" placeholder="Memo (optional)" value={memo}
-                  onChange={(e) => setMemo(e.target.value)} style={{ height: 38, fontSize: 12, marginTop: 8 }} />
-                {!memoOk && <div className="mono" style={{ color: "var(--danger)", fontSize: 11, marginTop: 6 }}>Memo is limited to 28 bytes.</div>}
-                {saved && (
-                  <button className="c-linkbtn" style={{ marginTop: 10 }} onClick={() => { setEditing(false); setAddr(saved.addr); setMemo(saved.memo); }}>
-                    <Icon name="chevron-r" size={11} style={{ transform: "rotate(180deg)" }} /> Use my saved wallet
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
-
-          {error && <div className="mono" style={{ color: "var(--danger)", fontSize: 11, marginTop: 12 }}>{error}</div>}
-        </div>
-
-        <div className="c-accept-foot">
-          <span className="mono mute" style={{ fontSize: 11 }}>Escrow already funded · {cmoney(bounty.amountUsdc)} locked</span>
-          <button className="btn primary" disabled={!canAccept} onClick={() => void accept()}>
-            <Icon name="check" size={13} /> {busy ? "Accepting…" : "Accept & start"}
-          </button>
-        </div>
-      </div>
-    </div>
-  );
-};
 
 // ═══ SUBMIT-WORK MODAL — PR URL + supporting links ═══════════════════════════
 const LINK_TYPES = ["Demo video", "Screen recording", "Design / Figma", "Doc / write-up", "Other"];
@@ -854,25 +688,21 @@ const BountyDetails = ({ b, kind }: { b: ContributorBounty; kind: "applied" | "c
 const BountyCard = ({
   b,
   kind,
-  onAction,
   expanded,
   onToggle,
 }: {
   b: ContributorBounty;
-  kind: "applied" | "awarded" | "completed";
-  onAction?: (b: ContributorBounty) => void;
+  kind: "applied" | "completed";
   expanded?: boolean;
   onToggle?: () => void;
 }) => {
-  const expandable = kind === "applied" || kind === "completed";
   const content = (
     <>
       <div className="c-bcard-top">
         <span className="c-bcard-repo">{b.repo}#{b.issueNumber}</span>
         {kind === "applied" && <span className="pill"><i className="dot"></i> under review</span>}
-        {kind === "awarded" && <span className="pill ok"><i className="dot"></i> <span style={{ color: "var(--accent)" }}>awarded to you</span></span>}
         {kind === "completed" && <span className="pill success"><Icon name="check" size={9} /> paid</span>}
-        {expandable && <Chev open={!!expanded} />}
+        <Chev open={!!expanded} />
         <span className="c-bcard-amt">{b.amountUsdc.toLocaleString()}<span className="u">USDC</span></span>
       </div>
       <div className="c-bcard-title">{b.title}</div>
@@ -881,10 +711,6 @@ const BountyCard = ({
           <span className="c-bcard-meta"><Icon name="clock" size={11} /> applied {b.myApplication ? timeAgo(b.myApplication.appliedAt) : ""}</span>
           <span className="c-bcard-meta"><Icon name="user" size={11} /> {b.applicantCount} applicant{b.applicantCount === 1 ? "" : "s"}</span>
         </>}
-        {kind === "awarded" && <>
-          <span className="c-bcard-meta" style={{ color: "var(--accent)" }}><Icon name="clock" size={11} /> {b.awardedAt ? `awarded ${timeAgo(b.awardedAt)}` : "awarded — accept to start"}</span>
-          <button className="btn sm primary c-bcard-cta" onClick={(e) => { e.stopPropagation(); onAction && onAction(b); }}><Icon name="check" size={11} /> Accept</button>
-        </>}
         {kind === "completed" && <>
           <span className="c-bcard-meta"><Icon name="coins" size={11} /> {b.paidAt ? `paid ${fmtDate(b.paidAt)}` : "paid"}</span>
           <span className="c-bcard-meta" style={{ color: "var(--success)" }}><Icon name="check" size={11} /> to wallet</span>
@@ -892,11 +718,10 @@ const BountyCard = ({
       </div>
     </>
   );
-  if (!expandable) return <div className={`c-bcard ${kind}`}>{content}</div>;
   return (
     <div className={`c-bcard expandable ${kind} ${expanded ? "open" : ""}`}>
       <div className="c-bcard-inner" onClick={onToggle}>{content}</div>
-      {expanded && <BountyDetails b={b} kind={kind as "applied" | "completed"} />}
+      {expanded && <BountyDetails b={b} kind={kind} />}
     </div>
   );
 };
@@ -907,7 +732,6 @@ export function Dashboard() {
   const navigate = useNavigate();
   const { bounties, summary, loading } = useBounties();
   const groups = groupBounties(bounties);
-  const [acceptFor, setAcceptFor] = React.useState<ContributorBounty | null>(null);
   const [expandedActive, setExpandedActive] = React.useState<string | null>(null);
   const [expandedBounty, setExpandedBounty] = React.useState<string | null>(null);
 
@@ -939,7 +763,7 @@ export function Dashboard() {
           <div className="sub">
             {empty
               ? "Apply to a bounty from any DevAsign-funded GitHub issue and it shows up here."
-              : `${groups.active.length} in progress · ${groups.awarded.length} awarded · ${groups.applied.length} awaiting a decision`}
+              : `${groups.active.length} in progress · ${groups.applied.length} awaiting a decision`}
           </div>
         </div>
       </div>
@@ -954,15 +778,6 @@ export function Dashboard() {
 
       <div className="c-dash-grid">
         <div style={{ minWidth: 0, display: "flex", flexDirection: "column", gap: 22 }}>
-          {/* Alerts: awarded bounties needing an accept */}
-          {groups.awarded.length > 0 && (
-            <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-              {groups.awarded.map((b) => (
-                <BountyCard key={b.id} b={b} kind="awarded" onAction={setAcceptFor} />
-              ))}
-            </div>
-          )}
-
           {/* Active workspaces — accordion, top 3 (per design; the rest live on the Bounties page) */}
           {groups.active.length > 0 && (
             <div>
@@ -1020,8 +835,6 @@ export function Dashboard() {
           )}
         </div>
       </div>
-
-      {acceptFor && <AcceptModal bounty={acceptFor} onClose={() => setAcceptFor(null)} />}
     </div>
   );
 }

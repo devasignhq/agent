@@ -1,11 +1,12 @@
 // Bounties page — sponsor-facing dashboard. Wired to the backend bounty API
 // (frontend/src/api.ts): the header stats, bounty table, transaction history, and
 // the per-bounty drawer all render live data from `api.bounties()` +
-// `api.bountyTransactions()`. The Cancel and Apply routes (/bounties/:id/cancel,
-// /bounties/:id/apply — reached from the GitHub bot comment links) mount this
-// page with isCancelling/isApplying and overlay the matching modal. Funding is
-// NOT here: it needs the acceptance-criteria review step, so it has its own
-// page (screen-fund-bounty.tsx).
+// `api.bountyTransactions()`. The Cancel route (/bounties/:id/cancel — reached
+// from the GitHub bot comment link) mounts this page with isCancelling and
+// overlays the cancel modal. Contributors apply in the separate contributor
+// app, so there is no in-app apply modal here. Funding is NOT here either: it
+// needs the acceptance-criteria review step, so it has its own page
+// (screen-fund-bounty.tsx).
 //
 // Layout: a header (title + escrow balance + top-up/withdraw/create actions), a
 // 6-stat grid, filter tabs + search, and a two-column body — a bounties table on
@@ -16,7 +17,6 @@ import React from "react";
 import { useParams, useSearchParams, useNavigate } from "react-router-dom";
 import { Icon } from "./icons";
 import { freighterAddress, freighterSign, money, setExplorerBase, shortHash, stellarTxUrl } from "./bounty-shared";
-import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
 import { buildInvoice } from "./bounty-invoice";
 import { InvoicePreviewModal } from "./bounty-invoice-modal";
@@ -85,11 +85,9 @@ const fmtDate = (ts?: number | null) =>
 export const BountiesPage = ({
   isMobile,
   isCancelling,
-  isApplying,
 }: {
   isMobile?: boolean;
   isCancelling?: boolean;
-  isApplying?: boolean;
 }) => {
   const params = useParams();
   const [search] = useSearchParams();
@@ -373,9 +371,6 @@ export const BountiesPage = ({
       )}
       {isCancelling && (
         <CancelBountyModal id={params.id} token={search.get("token")} onClose={() => { navigate("/bounty"); void refresh(); }} />
-      )}
-      {isApplying && (
-        <ApplyBountyModal id={params.id} onClose={() => navigate("/bounty")} />
       )}
     </div>
   );
@@ -789,8 +784,10 @@ const SubmissionsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =>
 
 const APP_PILL: Record<BountyApplication["status"], { label: string; cls: string }> = {
   pending: { label: "PENDING", cls: "warn" },
+  // A delegate now accepts one application outright — "accepted" IS the
+  // delegated winner. "approved" only lingers on legacy rows.
   approved: { label: "DELEGATED", cls: "running" },
-  accepted: { label: "ACCEPTED", cls: "green" },
+  accepted: { label: "DELEGATED", cls: "green" },
   rejected: { label: "REJECTED", cls: "nit" },
 };
 
@@ -806,11 +803,22 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
     setErr(null);
     try {
       const res = kind === "delegate"
-        ? await api.approveApplication(b.id, githubId)
+        ? await api.approveApplication(b.id, githubId) // now delegates outright
         : await api.rejectApplication(b.id, githubId);
       onChanged(res.bounty);
     } catch (e: any) {
-      setErr(e?.message || "Action failed.");
+      const code = (e?.body as any)?.error || e?.message || "";
+      const who = apps.find((x) => x.githubId === githubId)?.githubLogin;
+      const whoLabel = who ? `@${who}` : "This contributor";
+      setErr(
+        code === "contributor_trustline_lapsed"
+          ? `${whoLabel}'s payout wallet can no longer receive USDC — ask them to restore their USDC trustline (or re-apply), then delegate again.`
+          : code === "no_contributor_wallet"
+            ? `${whoLabel} hasn't set a payout wallet — ask them to re-apply with one before you can delegate.`
+            : code === "no_such_application"
+              ? "That application is no longer available — refresh and try again."
+              : e?.message || "Action failed."
+      );
     } finally {
       setBusy(null);
       clearConfirm(githubId);
@@ -840,6 +848,9 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
         {apps.map((a) => {
           const pill = APP_PILL[a.status];
           const pending = a.status === "pending";
+          // Delegate/Reject stay available for a still-live application — a fresh
+          // "pending", or a legacy "approved" left over from the old handshake.
+          const actionable = pending || a.status === "approved";
           const isBusy = busy === a.githubId;
           return (
             <div key={a.githubId} className={`app-card ${pending ? "new" : ""}`}>
@@ -854,7 +865,7 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
                   </div>
                 </div>
                 <div className="flex gap-2">
-                  {!pending || !canAct ? (
+                  {!actionable || !canAct ? (
                     <span className={`pill ${pill.cls}`}><i className="dot" />{pill.label}</span>
                   ) : confirming[a.githubId] ? null : (
                     <>
@@ -864,7 +875,7 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
                   )}
                 </div>
               </div>
-              {confirming[a.githubId] && pending && canAct && (
+              {confirming[a.githubId] && actionable && canAct && (
                 <div className={`app-confirm ${confirming[a.githubId]}`}>
                   {confirming[a.githubId] === "reject" && (
                     <span className="app-confirm-icon"><Icon name="warn" size={15} /></span>
@@ -872,7 +883,7 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
                   <div className="app-confirm-msg">
                     {confirming[a.githubId] === "reject"
                       ? "Reject this application? This can't be undone."
-                      : `Delegate this bounty to @${a.githubLogin}? Every other application on this bounty will be automatically rejected.`}
+                      : `Delegate ${b.code} to @${a.githubLogin}? This assigns the work, starts the ${b.deliveryDays}-day delivery clock, and auto-rejects every other application. This can't be undone.`}
                   </div>
                   <div className="app-confirm-actions">
                     <button className="btn sm ghost" disabled={isBusy} onClick={() => clearConfirm(a.githubId)}>Cancel</button>
@@ -893,149 +904,6 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
         })}
       </div>
     </>
-  );
-};
-
-// ─── Apply modal (from /bounties/:id/apply — the bot comment's CTA) ───────────
-// Tokenless by design: the link lives in a public GitHub comment. Session auth,
-// the user's GitHub identity, and the backend's OPEN-status guard do the gating.
-const ApplyBountyModal = ({ id, onClose }: { id?: string; onClose: () => void }) => {
-  const auth = useAuth();
-  const [bounty, setBounty] = React.useState<Bounty | null>(null);
-  const [phase, setPhase] = React.useState<"loading" | "ready" | "working" | "done" | "error">("loading");
-  const [msg, setMsg] = React.useState<string | null>(null);
-  const [note, setNote] = React.useState("");
-
-  React.useEffect(() => {
-    const onKey = (e: KeyboardEvent) => { if (e.key === "Escape") onClose(); };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onClose]);
-
-  React.useEffect(() => {
-    let alive = true;
-    if (!id) { setPhase("error"); setMsg("This apply link is missing its bounty id."); return; }
-    (async () => {
-      try {
-        const r = await api.bounty(id);
-        if (!alive) return;
-        setBounty(r.bounty);
-        setPhase("ready");
-      } catch (e: any) {
-        if (!alive) return;
-        setPhase("error");
-        setMsg(e?.message || "Couldn't load this bounty.");
-      }
-    })();
-    return () => { alive = false; };
-  }, [id]);
-
-  // "Already applied" comes from the GET (a non-sponsor's read returns only
-  // their own applications) — the POST's repeat-apply response carries no bounty.
-  const myGithubId = auth.user?.githubId ?? null;
-  const alreadyApplied =
-    myGithubId != null &&
-    !!bounty?.applications?.some((a) => a.githubId === myGithubId && a.status !== "rejected");
-
-  // Friendly copy when the bounty can't take applications (the comment CTA is
-  // edited away on delegation, but stale tabs and shared links still land here).
-  const closedCopy =
-    !bounty || bounty.status === "OPEN"
-      ? null
-      : bounty.status === "PENDING_FUNDING"
-        ? "This bounty hasn't been funded yet — applications open once the sponsor escrows the funds."
-        : bounty.status === "DELEGATED" || bounty.status === "IN_REVIEW"
-          ? "This bounty has already been delegated to a contributor."
-          : bounty.status === "PAID"
-            ? "This bounty has been completed and paid out."
-            : "This bounty is closed.";
-
-  const apply = async () => {
-    if (!id) return;
-    setPhase("working");
-    setMsg(null);
-    try {
-      await api.applyToBounty(id, note.trim() || undefined);
-      setPhase("done");
-    } catch (e: any) {
-      setMsg(
-        e?.message === "no_github_identity"
-          ? "Your account has no GitHub identity — sign in with GitHub to apply."
-          : e?.message || "Couldn't submit your application."
-      );
-      setPhase("error");
-    }
-  };
-
-  const done = phase === "done" || alreadyApplied;
-  return (
-    <div className="modal-scrim" onClick={onClose}>
-      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
-        <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
-        <div className="cb-modal-head">
-          <div className="cb-eyebrow">Apply for bounty</div>
-          <h2 className="cb-modal-title">{bounty ? bounty.title : "Work this bounty"}</h2>
-          <div className="cb-modal-sub">
-            {bounty
-              ? <><span className="mono">{bounty.code}</span> · {bounty.repo}#{bounty.issueNumber}</>
-              : "Tell the sponsor you want to work this bounty."}
-          </div>
-        </div>
-
-        {bounty && (
-          <div className="tu-notice" style={{ marginBottom: 16 }}>
-            <Icon name="warn" size={15} />
-            <span>
-              <b>{money(bounty.amountUsdc)} USDC</b> {bounty.status === "PENDING_FUNDING" ? "is offered for this work" : "is escrowed for this work"}, with a{" "}
-              <b>{bounty.deliveryDays}-day</b> delivery window that starts when you accept the
-              delegation. If the sponsor approves your application, the escrow pays out to your
-              Stellar wallet when your PR merges.
-            </span>
-          </div>
-        )}
-
-        {done ? (
-          <div className="wd-success">
-            <div className="wd-success-icon"><Icon name="check" size={22} /></div>
-            <div className="wd-success-title">{phase === "done" ? "Application submitted" : "You've already applied"}</div>
-            <div className="wd-success-sub">
-              The sponsor reviews applications and delegates the work to one contributor.
-              You'll be able to accept and provide your payout wallet if you're approved.
-            </div>
-          </div>
-        ) : closedCopy ? (
-          <div className="mono" style={{ fontSize: 12, color: "var(--fg-mute)", padding: "4px 0 12px" }}>{closedCopy}</div>
-        ) : (
-          <>
-            {msg && (
-              <div className="mono" style={{ fontSize: 12, color: "var(--danger)", padding: "4px 0 12px" }}>{msg}</div>
-            )}
-            {bounty && bounty.description && (
-              <div style={{ fontSize: 13, color: "var(--fg-mute)", marginBottom: 14, whiteSpace: "pre-wrap" }}>{bounty.description}</div>
-            )}
-            {bounty && (
-              <textarea
-                className="input"
-                style={{ width: "100%", minHeight: 88, resize: "vertical", marginBottom: 4 }}
-                placeholder="Introduce yourself (optional): relevant experience, how you'd approach this…"
-                value={note}
-                onChange={(e) => setNote(e.target.value)}
-                disabled={phase === "working"}
-              />
-            )}
-          </>
-        )}
-
-        <div className="cb-modal-foot">
-          <button className="btn ghost" onClick={onClose}>{done ? "Done" : "Cancel"}</button>
-          {!done && !closedCopy && (
-            <button className="btn primary" disabled={phase === "loading" || phase === "working" || !bounty} onClick={apply}>
-              <Icon name="check" size={13} /> {phase === "working" ? "Applying…" : "Apply for this bounty"}
-            </button>
-          )}
-        </div>
-      </div>
-    </div>
   );
 };
 

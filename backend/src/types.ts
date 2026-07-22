@@ -524,15 +524,24 @@ export type BountyEvent = {
   detail?: string | null;
 };
 
-// A contributor's application to work a bounty. The sponsor must approve one
-// (status "approved") before that contributor can accept (status "accepted",
-// which delegates the bounty and starts the delivery clock).
+// A contributor's application to work a bounty. The contributor binds their
+// payout wallet at apply time; the sponsor's single "delegate" click then
+// accepts one application (status "accepted"), which delegates the bounty and
+// starts the delivery clock. ("approved" is a legacy substatus from the old
+// two-step handshake — retained so old rows load, never written by new code.)
 export type BountyApplication = {
   githubId: number;
   githubLogin: string;
   note?: string;
   appliedAt: number;
   status: "pending" | "approved" | "accepted" | "rejected";
+  // Payout wallet bound to this application at apply time (snapshotted onto the
+  // bounty as assigneeAddress when the sponsor delegates). Absent on legacy rows
+  // written before wallet-at-apply — delegateToApplicant falls back to the
+  // applicant's account wallet for those.
+  address?: string; // payout G…
+  memo?: string | null; // payout memo (MEMO_TEXT ≤28 bytes), normalized
+  trustline?: boolean; // cached USDC-trustline result at apply time (advisory)
 };
 
 export type Bounty = {
