@@ -1,32 +1,143 @@
 // Parse the bounty command a sponsor comments on a GitHub issue / Linear ticket:
-//   "bounty $100 2 days"   →  { amountUsdc: 100, deliveryDays: 2 }
-// The amount may omit the "$" and carry up to 7 decimals; the duration accepts
-// "2 days", "2 day", or "2d". Anything that doesn't match returns null (so a
-// comment like "I'll bounty this later" is ignored). Mirrors the exact-match
-// discipline of review/eligibility.ts:isReviewTriggerComment.
+//   "bounty $100 2 days"  →  { amountUsdc: 100, deliveryDays: 2 }
+//
+// Sponsors type this by hand, so the parser reads intent rather than insisting on
+// one exact form — it forgives the typos and spacings people actually use. All of
+// these resolve to { amountUsdc: 100, deliveryDays: 2 }:
+//   "bounty $100 2 days"        "Bounties 100 USDC 2 dys"     "bouny $ 100 in 2 days"
+//   "$100 bounty for 2 days"    "bounty 100 dollars 2d"       "bunty $100 2 days"
+//
+// The leniency is safe: only repo maintainers can trigger it
+// (webhooks.ts:MAINTAINER_ASSOCIATIONS), and the amount/window it reads are shown
+// back in the Fund/Cancel confirm comment (botcomment.ts:renderConfirmBody) before
+// a cent of USDC is escrowed — so a misread is one maintainer edit away, never a
+// lost payment.
+//
+// What it tolerates:
+//   • keyword — plural/stem and 1–2 letter slips ("bounties", "bouny", "bunty", "boutny")
+//   • amount  — "$100", "$ 100", "100 USDC", "USDC 100", "100 dollars", "$1,000"
+//   • window  — "2 days", "2 day", "2d", "2 dys", "2 weeks", "2 wks" (weeks count ×7)
+//   • filler  — connector words between the pieces ("in", "for", "within")
+// Word order is flexible; anything without a clear amount AND window returns null,
+// so casual mentions ("we should bounty this someday") stay ignored.
 
 export type BountyCommand = { amountUsdc: number; deliveryDays: number };
 
-// keyword · optional "$" · amount · duration (N days | N day | Nd)
-const BOUNTY_CMD = /\bbounty\b\s+\$?\s*(\d+(?:\.\d{1,7})?)\s+(\d+)\s*(?:days?|d)\b/i;
-
 const MAX_DELIVERY_DAYS = 365;
 
+// A number with optional thousands commas and up to USDC's 7 decimals.
+const NUM = String.raw`\d[\d,]*(?:\.\d{1,7})?`;
+
+// "<n> <word>" pairs (e.g. "2 days", "3d"); the word is classified as a time unit
+// afterwards. The lookbehind stops us latching onto the fractional tail of a
+// decimal — the "50" in "$12.50" must not read as a duration.
+const DURATION_SCAN = new RegExp(String.raw`(?<![\d.])(\d+)\s*([a-z]+)`, "gi");
+
+// Amount, most-specific anchor first; the bare-number fallback only runs when no
+// currency marker ($ / USDC / USD / dollars) is present in the leftover text.
+const AMOUNT_ANCHORED: RegExp[] = [
+  new RegExp(String.raw`\$\s*(${NUM})`, "i"), // $100, $ 100, $1,000
+  new RegExp(String.raw`(${NUM})\s*(?:usdc|usd|dollars?|bucks?)`, "i"), // 100 USDC, 100 dollars
+  new RegExp(String.raw`(?:usdc|usd)\s*(${NUM})`, "i"), // USDC 100
+];
+const AMOUNT_BARE = new RegExp(String.raw`(?<![\d.$#\-/])(${NUM})`, "i");
+
+// Standard Levenshtein edit distance. Only ever run on short tokens (a candidate
+// keyword or a unit word), so the DP is trivially cheap.
+function levenshtein(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (!m) return n;
+  if (!n) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const cur = [i];
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      cur[j] = Math.min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost);
+    }
+    prev = cur;
+  }
+  return prev[n];
+}
+
+// Does a word read as the "bounty" keyword? Accepts the plural/stem directly and
+// allows 1–2 letter slips, but requires a leading "b" so a near-word like
+// "county" (edit distance 1) doesn't trip it.
+function isBountyWord(token: string): boolean {
+  if (token.startsWith("bount")) return true; // bounty, bounties, bounti, bount…
+  return (
+    token.length >= 5 &&
+    token.length <= 8 &&
+    token[0] === "b" &&
+    levenshtein(token, "bounty") <= 2 // bouny, bunty, bonty, boutny…
+  );
+}
+
+// Days per unit for a (possibly abbreviated or misspelled) time-unit word, else null.
+function unitToDays(word: string): number | null {
+  if (word === "d" || word === "dy" || word === "dys") return 1;
+  if (word[0] === "d" && (levenshtein(word, "day") <= 1 || levenshtein(word, "days") <= 1)) return 1;
+  if (word === "w" || word === "wk" || word === "wks") return 7;
+  if (word[0] === "w" && (levenshtein(word, "week") <= 1 || levenshtein(word, "weeks") <= 1)) return 7;
+  return null;
+}
+
+function hasBountyKeyword(s: string): boolean {
+  for (const tok of s.match(/[a-z]+/g) ?? []) {
+    if (isBountyWord(tok)) return true;
+  }
+  return false;
+}
+
+// The first "<n> <unit>" whose unit reads as a day/week window, with the span it
+// occupies (so the caller can lift it out before reading the amount).
+function findDuration(s: string): { days: number; start: number; end: number } | null {
+  for (const m of s.matchAll(DURATION_SCAN)) {
+    const perUnit = unitToDays(m[2]);
+    if (perUnit == null) continue;
+    const n = Number(m[1]);
+    if (!Number.isInteger(n)) continue;
+    const start = m.index ?? 0;
+    return { days: n * perUnit, start, end: start + m[0].length };
+  }
+  return null;
+}
+
+function toAmount(raw: string): number {
+  return Number(raw.replace(/,/g, ""));
+}
+
+function findAmount(s: string): number | null {
+  for (const re of AMOUNT_ANCHORED) {
+    const m = s.match(re);
+    if (m) return toAmount(m[1]);
+  }
+  const bare = s.match(AMOUNT_BARE);
+  return bare ? toAmount(bare[1]) : null;
+}
+
 export function parseBountyCommand(body: string): BountyCommand | null {
-  const s = (body || "").trim();
-  if (!s) return null;
-  const m = s.match(BOUNTY_CMD);
-  if (!m) return null;
-  const amountUsdc = Number(m[1]);
-  const deliveryDays = Number(m[2]);
-  if (!Number.isFinite(amountUsdc) || amountUsdc <= 0) return null;
+  const s = (body || "").trim().toLowerCase();
+  if (!s || !hasBountyKeyword(s)) return null;
+
+  // The window is anchored by its unit word, so read it first and lift it out —
+  // then whatever number is left is unambiguously the amount. This is what lets
+  // "bounty 100 2 days" split into $100 / 2 days without guessing which is which.
+  const dur = findDuration(s);
+  if (!dur) return null;
+  const deliveryDays = dur.days;
   if (!Number.isInteger(deliveryDays) || deliveryDays <= 0 || deliveryDays > MAX_DELIVERY_DAYS) {
     return null;
   }
+
+  const amountUsdc = findAmount(s.slice(0, dur.start) + " " + s.slice(dur.end));
+  if (amountUsdc == null || !Number.isFinite(amountUsdc) || amountUsdc <= 0) return null;
+
   return { amountUsdc, deliveryDays };
 }
 
-/** Cheap pre-check so callers can skip work on comments with no keyword. */
+/** Cheap pre-check so callers can skip work on comments with no bounty keyword. */
 export function looksLikeBountyCommand(body: string): boolean {
-  return /\bbounty\b/i.test(body || "");
+  return hasBountyKeyword((body || "").toLowerCase());
 }
