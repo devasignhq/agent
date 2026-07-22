@@ -28,10 +28,9 @@ import { updateStatusComment } from "../bounties/botcomment.js";
 import { postAndRecordConfirmComment } from "../bounties/webhooks.js";
 import { validateAcceptance } from "../bounties/acceptance.js";
 import {
-  acceptAndStartClock,
   acceptanceLocked,
   applyToBounty,
-  approveApplication,
+  delegateToApplicant,
   assigneeUser,
   buildFundingTx,
   buildSponsorReleaseTx,
@@ -316,14 +315,21 @@ bounties.post("/bounties/:id/cancel", async (req, res) => {
 
 // --- applications + delegation ---
 
-bounties.post("/bounties/:id/apply", (req, res) => {
+bounties.post("/bounties/:id/apply", async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
+  if (!requireStellar(res)) return; // apply now probes the USDC trustline on-chain
   if (user.githubId == null) return void res.status(400).json({ error: "no_github_identity" });
-  const r = applyToBounty(req.params.id, {
+  const address = String(req.body?.address || "");
+  const memoCheck = validateMemo(req.body?.memo);
+  if (!memoCheck.ok) return void res.status(400).json({ error: "invalid_memo" });
+  const r = await applyToBounty(req.params.id, {
     githubId: user.githubId,
     githubLogin: user.githubLogin,
+    userId: user.id,
     note: typeof req.body?.note === "string" ? req.body.note : undefined,
+    address,
+    memo: memoCheck.memo,
   });
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
   // Tell the sponsor someone applied — until now this was completely silent, so
@@ -350,7 +356,10 @@ bounties.post("/bounties/:id/apply", (req, res) => {
   res.json({ ok: true, bounty: r.bounty });
 });
 
-bounties.post("/bounties/:id/applications/:githubId/:action", (req, res) => {
+// The sponsor's single delegate action: `approve` now delegates outright
+// (accepts one application, rejects the rest, starts the clock) — there is no
+// separate contributor accept step. `reject` turns a single application down.
+bounties.post("/bounties/:id/applications/:githubId/:action", async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
   const b = getBounty(req.params.id);
@@ -358,24 +367,27 @@ bounties.post("/bounties/:id/applications/:githubId/:action", (req, res) => {
   if (!isSponsor(b, user.id)) return void res.status(403).json({ error: "forbidden" });
   const githubId = Number(req.params.githubId);
   const action = req.params.action;
+  if (action === "approve" && !requireStellar(res)) return; // delegation re-probes the trustline
   const r =
     action === "approve"
-      ? approveApplication(b.id, githubId, user.githubLogin)
+      ? await delegateToApplicant(b.id, githubId, user.githubLogin)
       : action === "reject"
         ? rejectApplication(b.id, githubId, user.githubLogin)
         : { ok: false, reason: "bad_action" };
   if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
-  // Tell the applicant either way. Being picked is the contributor app's
-  // "awarded" alert; being turned down matters just as much, because otherwise a
-  // rejected application sits in their dashboard looking live indefinitely
-  // (nothing ever mass-rejects the losing applicants when someone else accepts).
+  if (action === "approve" && r.bounty) void updateStatusComment(r.bounty); // reflect "delegated" on the issue
+  // Tell the applicant either way. Approve now delegates outright — the delivery
+  // clock is already running — so the message says "start working", not
+  // "accept". A reject still matters so a turned-down application doesn't sit in
+  // their dashboard looking live. (The losers auto-rejected by a delegate are
+  // intentionally NOT pinged here, to avoid a notification burst.)
   const applicant = db.find("users", (u) => u.githubId === githubId);
   if (applicant && action === "approve") {
     pushNotification(
       applicant.id,
       "bounty",
-      `You were picked for ${b.code}`,
-      `${b.repo}#${b.issueNumber} — ${b.title}. Accept to start the clock.`,
+      `You're delegated ${b.code}`,
+      `${b.repo}#${b.issueNumber} — ${b.title}. The ${b.deliveryDays}-day delivery clock is running — start working.`,
       { link: "/dashboard" }
     );
   } else if (applicant && action === "reject") {
@@ -387,26 +399,6 @@ bounties.post("/bounties/:id/applications/:githubId/:action", (req, res) => {
       { link: "/bounties" }
     );
   }
-  res.json({ ok: true, bounty: r.bounty });
-});
-
-// The approved contributor accepts + provides their payout wallet → starts the clock.
-bounties.post("/bounties/:id/accept", async (req, res) => {
-  const user = requireUser(req, res);
-  if (!user) return;
-  if (!requireStellar(res)) return;
-  if (user.githubId == null) return void res.status(400).json({ error: "no_github_identity" });
-  const address = String(req.body?.address || "");
-  const memoCheck = validateMemo(req.body?.memo);
-  if (!memoCheck.ok) return void res.status(400).json({ error: "invalid_memo" });
-  const r = await acceptAndStartClock(
-    req.params.id,
-    { githubId: user.githubId, githubLogin: user.githubLogin, userId: user.id },
-    address,
-    memoCheck.memo
-  );
-  if (!r.ok) return void res.status(failStatus(r.reason)).json({ error: r.reason });
-  if (r.bounty) void updateStatusComment(r.bounty); // reflect "delegated" on the issue
   res.json({ ok: true, bounty: r.bounty });
 });
 

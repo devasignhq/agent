@@ -11,8 +11,7 @@ import {
   createBounty,
   recordFunding,
   applyToBounty,
-  approveApplication,
-  acceptAndStartClock,
+  delegateToApplicant,
   markInReview,
   releaseByMerge,
   refundBounty,
@@ -84,9 +83,8 @@ async function fundOpenDelegate(id: string) {
   const b = getBounty(id)!;
   recordFunding(id, ADDR(), { hash: "H_ESCROW", status: "pending" });
   applyTxnOutcome(txnByKey(`escrow:${b.taskId}`)!.id, { status: "success" });
-  applyToBounty(id, { githubId: 5, githubLogin: "dev" });
-  approveApplication(id, 5);
-  await acceptAndStartClock(id, { githubId: 5, githubLogin: "dev" }, ADDR(), "", chain);
+  await applyToBounty(id, { githubId: 5, githubLogin: "dev", address: ADDR() }, chain);
+  await delegateToApplicant(id, 5, "sponsor", chain);
 }
 
 const DEV = { githubId: 5, githubLogin: "dev" };

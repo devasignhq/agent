@@ -323,7 +323,12 @@ export type BountyApplication = {
   githubLogin: string;
   note?: string;
   appliedAt: number;
+  // "approved" is a legacy substatus (the old two-step handshake); the merged
+  // delegate goes pending → accepted. The wallet is bound at apply time.
   status: "pending" | "approved" | "accepted" | "rejected";
+  address?: string;
+  memo?: string | null;
+  trustline?: boolean;
 };
 
 // The contributor's timeline-extension request (backend types.ts). While
@@ -596,12 +601,9 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ token }),
     }),
-  // Applications + delegation.
-  applyToBounty: (id: string, note?: string) =>
-    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/apply`, {
-      method: "POST",
-      body: JSON.stringify({ note }),
-    }),
+  // Applications + delegation. `approveApplication` now delegates outright
+  // (accepts one application, rejects the rest, starts the delivery clock) —
+  // contributors apply (and bind their wallet) in the separate contributor app.
   approveApplication: (id: string, githubId: number) =>
     request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/applications/${githubId}/approve`, {
       method: "POST",
@@ -624,11 +626,6 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
-  acceptBounty: (id: string, address: string) =>
-    request<{ ok: true; bounty: Bounty }>(`/api/bounties/${id}/accept`, {
-      method: "POST",
-      body: JSON.stringify({ address }),
-    }),
   // In-app "Approve payment" (sponsor Freighter-signs the release).
   bountyApproveTx: (id: string) =>
     request<{ xdr: string }>(`/api/bounties/${id}/approve-tx`, { method: "POST", body: "{}" }),
@@ -638,9 +635,4 @@ export const api = {
       body: JSON.stringify({ signedXdr }),
     }),
   deleteBounty: (id: string) => request<{ ok: true }>(`/api/bounties/${id}`, { method: "DELETE" }),
-  setPayoutAddress: (address: string) =>
-    request<{ ok: true; address: string }>("/api/me/payout-address", {
-      method: "POST",
-      body: JSON.stringify({ address }),
-    }),
 };

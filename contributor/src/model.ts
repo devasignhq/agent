@@ -92,8 +92,7 @@ export function extensionState(b: ContributorBounty): ExtensionState {
 export type BountyStage =
   | "applied"    // my application is pending the sponsor's decision
   | "shortlist"  // (reserved) sponsor engaged but not decided — not modeled yet
-  | "awarded"    // sponsor approved me; I must accept (wallet) to start the clock
-  | "progress"   // accepted, clock running, nothing submitted yet
+  | "progress"   // delegated to me, clock running, nothing submitted yet
   | "review"     // PR submitted, awaiting review/approval
   | "ready"      // review complete, ALL criteria met — payout requestable
   | "rejected"   // submitted but the sponsor rejected the work (still reworkable)
@@ -114,9 +113,10 @@ export function bountyStage(b: ContributorBounty): BountyStage {
   // Not the assignee: my standing depends on my application.
   const app = b.myApplication;
   if (!app) return "closed";
-  if (app.status === "approved") return b.status === "OPEN" ? "awarded" : "lost";
-  if (app.status === "pending") return b.status === "OPEN" ? "applied" : "lost";
   if (app.status === "rejected") return "closed";
+  // pending (or a legacy "approved" that predates the merged delegate) → still
+  // in the running while the bounty is open; otherwise someone else got it.
+  if (app.status === "pending" || app.status === "approved") return b.status === "OPEN" ? "applied" : "lost";
   // accepted but not assignee — transitional server state; treat as progress.
   return "progress";
 }
@@ -124,7 +124,6 @@ export function bountyStage(b: ContributorBounty): BountyStage {
 export const STAGE_LABEL: Record<BountyStage, string> = {
   applied: "under review",
   shortlist: "shortlisted",
-  awarded: "awarded",
   progress: "in progress",
   review: "in review",
   ready: "ready for payout",
@@ -138,7 +137,6 @@ export const STAGE_LABEL: Record<BountyStage, string> = {
 export const STAGE_PILL: Record<BountyStage, string> = {
   applied: "info",
   shortlist: "info",
-  awarded: "ok",
   progress: "warn",
   review: "info",
   ready: "ok",
@@ -150,7 +148,6 @@ export const STAGE_PILL: Record<BountyStage, string> = {
 
 // Dashboard groupings.
 export type BountyGroups = {
-  awarded: ContributorBounty[];
   active: ContributorBounty[];   // progress / review / rejected — the workspace set
   applied: ContributorBounty[];
   completed: ContributorBounty[]; // paid
@@ -158,11 +155,10 @@ export type BountyGroups = {
 };
 
 export function groupBounties(list: ContributorBounty[]): BountyGroups {
-  const g: BountyGroups = { awarded: [], active: [], applied: [], completed: [], closed: [] };
+  const g: BountyGroups = { active: [], applied: [], completed: [], closed: [] };
   for (const b of list) {
     const stage = bountyStage(b);
-    if (stage === "awarded") g.awarded.push(b);
-    else if (stage === "progress" || stage === "review" || stage === "ready" || stage === "rejected") g.active.push(b);
+    if (stage === "progress" || stage === "review" || stage === "ready" || stage === "rejected") g.active.push(b);
     else if (stage === "applied") g.applied.push(b);
     else if (stage === "paid") g.completed.push(b);
     else g.closed.push(b);
@@ -213,10 +209,11 @@ const EVENT_DISPLAY: Record<
     detail: `${cmoney(b.amountUsdc)} USDC escrowed on Stellar. Criteria locked.`,
   }),
   applied: (e) => ({ at: e.at, icon: "send", action: "You applied" }),
+  // Legacy-only: the merged delegate no longer emits this (it records "accepted"
+  // directly). Kept so older bounties' timelines still render.
   application_approved: (e) => ({
     at: e.at, icon: "trophy", cls: "cool",
     action: e.actor ? `You were picked by @${e.actor}` : "You were picked",
-    detail: "Accept the award to start the delivery clock.",
   }),
   application_rejected: (e) => ({
     at: e.at, icon: "x", cls: "danger",

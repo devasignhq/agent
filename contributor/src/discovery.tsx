@@ -107,18 +107,19 @@ const ApplyModal = ({
     setBusy(true);
     setError(null);
     try {
-      const walletChanged = editing || !wallet;
-      if (walletChanged) {
-        await api.setPayoutWallet(addr.trim(), memo.trim());
-        void auth.reload(); // refresh the cached user so the saved wallet shows next time
-      }
-      await api.applyToBounty(bounty.id);
+      const finalAddr = (wallet && !editing ? wallet.addr : addr).trim();
+      const finalMemo = (wallet && !editing ? wallet.memo : memo).trim();
+      // The wallet is bound to the application; the backend also saves it as the
+      // account default, so refresh the cached user afterwards.
+      await api.applyToBounty(bounty.id, finalAddr, finalMemo);
+      void auth.reload();
       onApplied();
     } catch (err: any) {
       const code = (err?.body as any)?.error || err?.message || "apply_failed";
       setError(
         code === "invalid_address" ? "That Stellar address doesn't validate — double-check it." :
         code === "invalid_memo" ? "Memo is too long — 28 bytes max." :
+        code === "no_trustline" ? "That wallet can't receive USDC yet — add a USDC trustline in your wallet app, then apply." :
         String(code).startsWith("not_open") ? "This bounty is no longer open for applications." :
         code === "stellar_unconfigured" ? "Bounties are momentarily unavailable — try again shortly." :
         "Couldn't submit your application — try again."

@@ -14,8 +14,8 @@ import {
   cancelPending,
   cancelBounty,
   applyToBounty,
-  approveApplication,
-  acceptAndStartClock,
+  delegateToApplicant,
+  rejectApplication,
   markInReview,
   releaseByMerge,
   recordSponsorRelease,
@@ -92,11 +92,11 @@ function fundAndConfirm(bountyId: string) {
   applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
 }
 
-// Drive a bounty from OPEN to DELEGATED via apply → approve → accept.
-async function delegate(bountyId: string, chain: EscrowChain) {
-  applyToBounty(bountyId, { githubId: 999, githubLogin: "dev" });
-  approveApplication(bountyId, 999);
-  return acceptAndStartClock(bountyId, { githubId: 999, githubLogin: "dev" }, ADDR(), "", chain);
+// Drive a bounty from OPEN to DELEGATED: contributor applies (binding a wallet),
+// then the sponsor's single delegate accepts + starts the clock.
+async function delegate(bountyId: string, chain: EscrowChain, address = ADDR()) {
+  await applyToBounty(bountyId, { githubId: 999, githubLogin: "dev", address }, chain);
+  return delegateToApplicant(bountyId, 999, "sponsor", chain);
 }
 
 beforeEach(() => {
@@ -211,41 +211,202 @@ test("release requires a delegated bounty with a payout address", async () => {
   assert.equal(calls.adminRelease, 0);
 });
 
-test("accept refuses without an approved application, bad address, or no trustline", async () => {
+test("apply hard-gates a bad address and a missing trustline; nothing is written", async () => {
   const b = mkBounty();
   fundAndConfirm(b.id);
 
-  // Not approved yet.
-  applyToBounty(b.id, { githubId: 1, githubLogin: "dev" });
-  let r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), "", fakeChain().chain);
-  assert.equal(r.reason, "not_approved");
-
-  // Approved but malformed address.
-  approveApplication(b.id, 1);
-  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, "not-an-address", "", fakeChain().chain);
+  // Malformed address → refused, no application recorded.
+  let r = await applyToBounty(b.id, { githubId: 1, githubLogin: "dev", address: "not-an-address" }, fakeChain().chain);
   assert.equal(r.reason, "invalid_address");
+  assert.equal(getBounty(b.id)!.applications.length, 0);
 
-  // Approved, valid address, but no USDC trustline.
+  // Valid address but no USDC trustline → refused, still nothing recorded.
   const noTrust = fakeChain({ async hasUsdcTrustline() { return false; } });
-  r = await acceptAndStartClock(b.id, { githubId: 1, githubLogin: "dev" }, ADDR(), "", noTrust.chain);
+  r = await applyToBounty(b.id, { githubId: 1, githubLogin: "dev", address: ADDR() }, noTrust.chain);
   assert.equal(r.reason, "no_trustline");
-  assert.equal(getBounty(b.id)!.status, "OPEN"); // unchanged
+  assert.equal(getBounty(b.id)!.applications.length, 0);
 });
 
-test("accept snapshots the payout memo; the release stamps the dest wallet on the payout row", async () => {
+test("delegate aborts if the applicant's trustline lapsed after apply; bounty stays OPEN", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  // Apply succeeds (trustline present at apply time).
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "dev", address: ADDR() }, fakeChain().chain);
+  // …but by the time the sponsor delegates, the wallet can no longer receive USDC.
+  const lapsed = fakeChain({ async hasUsdcTrustline() { return false; } });
+  const r = await delegateToApplicant(b.id, 1, "sponsor", lapsed.chain);
+  assert.equal(r.reason, "contributor_trustline_lapsed");
+  const still = getBounty(b.id)!;
+  assert.equal(still.status, "OPEN"); // unchanged — no partial delegation
+  assert.equal(still.applications[0].status, "pending"); // applicant untouched
+});
+
+test("apply binds the wallet to the application and mirrors it onto the user row", async () => {
   const { chain } = fakeChain();
   const b = mkBounty();
   fundAndConfirm(b.id);
-  applyToBounty(b.id, { githubId: 7, githubLogin: "memodev" });
-  approveApplication(b.id, 7);
+  const uid = "user-alice";
+  db.insert("users", {
+    id: uid, githubId: 21, githubLogin: "alice", email: "a@x.io", plan: "free", createdAt: 1,
+  } as any);
   const addr = ADDR();
-  const r = await acceptAndStartClock(
+  const r = await applyToBounty(
     b.id,
-    { githubId: 7, githubLogin: "memodev" },
-    addr,
-    "memodev-exchange-01",
+    { githubId: 21, githubLogin: "alice", userId: uid, address: addr, memo: "tag-9" },
     chain
   );
+  assert.equal(r.reason, "applied");
+  const app = getBounty(b.id)!.applications[0];
+  assert.equal(app.address, addr);
+  assert.equal(app.memo, "tag-9");
+  assert.equal(app.trustline, true);
+  const user = db.find("users", (u) => u.id === uid)!;
+  assert.equal(user.stellarPayoutAddress, addr, "wallet saved as the account default");
+  assert.equal(user.stellarPayoutMemo, "tag-9");
+});
+
+test("re-applying while pending updates the wallet in place without a second 'applied' event", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 21, githubLogin: "alice", address: ADDR() }, chain);
+  const addr2 = ADDR();
+  const r = await applyToBounty(b.id, { githubId: 21, githubLogin: "alice", address: addr2 }, chain);
+  assert.equal(r.reason, "updated");
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.applications.length, 1, "no duplicate application");
+  assert.equal(bb.applications[0].address, addr2, "wallet swapped");
+  assert.equal(bb.events!.filter((e) => e.kind === "applied").length, 1, "no second applied event");
+});
+
+test("delegate accepts the chosen applicant and auto-rejects the rest", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "one", address: ADDR() }, chain);
+  await applyToBounty(b.id, { githubId: 2, githubLogin: "two", address: ADDR() }, chain);
+  await applyToBounty(b.id, { githubId: 3, githubLogin: "three", address: ADDR() }, chain);
+
+  const r = await delegateToApplicant(b.id, 2, "sponsor", chain);
+  assert.equal(r.reason, "delegated");
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.status, "DELEGATED");
+  assert.equal(bb.assigneeGithubId, 2);
+  const byId = (id: number) => bb.applications.find((a) => a.githubId === id)!;
+  assert.equal(byId(2).status, "accepted");
+  assert.equal(byId(1).status, "rejected");
+  assert.equal(byId(3).status, "rejected");
+  // The losers' rejections are logged (but not push-notified).
+  assert.equal(bb.events!.filter((e) => e.kind === "application_rejected").length, 2);
+});
+
+test("delegate falls back to the account wallet for a legacy application with no bound address", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  const addr = ADDR();
+  db.insert("users", {
+    id: "user-legacy", githubId: 55, githubLogin: "legacy", email: "l@x.io", plan: "free",
+    createdAt: 1, stellarPayoutAddress: addr, stellarPayoutMemo: "old-memo",
+  } as any);
+  // A pre-wallet-at-apply application: pending, no address bound to it.
+  db.update("bounties", (x) => x.id === b.id, {
+    applications: [{ githubId: 55, githubLogin: "legacy", appliedAt: 1, status: "pending" as const }],
+  });
+
+  const r = await delegateToApplicant(b.id, 55, "sponsor", chain);
+  assert.equal(r.reason, "delegated");
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.assigneeAddress, addr, "used the account wallet");
+  assert.equal(bb.assigneeMemo, "old-memo");
+});
+
+test("apply re-checks status after the async trustline probe (a concurrent close wins)", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  const uid = "user-racer";
+  db.insert("users", {
+    id: uid, githubId: 1, githubLogin: "dev", email: "d@x.io", plan: "free", createdAt: 1,
+  } as any);
+  // The bounty is cancelled while our trustline probe is in flight (the await is
+  // a yield point; another request runs, then we resume against a stale snapshot).
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      db.update("bounties", (x) => x.id === b.id, { status: "CANCELLED" });
+      return true;
+    },
+  });
+  const r = await applyToBounty(
+    b.id,
+    { githubId: 1, githubLogin: "dev", userId: uid, address: ADDR() },
+    racy.chain
+  );
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^not_open_/);
+  assert.equal(getBounty(b.id)!.applications.length, 0, "no application recorded on the closed bounty");
+  // The status guard runs BEFORE the account-default write, so a lost race must
+  // also leave the contributor's wallet untouched (regression guard for 42fcf3f).
+  assert.equal(db.find("users", (u) => u.id === uid)!.stellarPayoutAddress, undefined);
+});
+
+test("delegate re-checks status after the async trustline probe (a concurrent delegate wins)", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "one", address: ADDR() }, fakeChain().chain);
+  await applyToBounty(b.id, { githubId: 2, githubLogin: "two", address: ADDR() }, fakeChain().chain);
+  // Applicant 2 is delegated while our probe for applicant 1 is in flight.
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      db.update("bounties", (x) => x.id === b.id, {
+        status: "DELEGATED",
+        assigneeGithubId: 2,
+        applications: getBounty(b.id)!.applications.map((a) =>
+          a.githubId === 2 ? { ...a, status: "accepted" as const } : a
+        ),
+      });
+      return true;
+    },
+  });
+  const r = await delegateToApplicant(b.id, 1, "sponsor", racy.chain);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^not_open_/);
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.assigneeGithubId, 2, "the concurrent winner is not overwritten");
+  assert.equal(bb.applications.find((a) => a.githubId === 1)!.status, "pending", "applicant 1 untouched");
+});
+
+test("delegate aborts if the target withdrew during the async trustline probe", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "one", address: ADDR() }, fakeChain().chain);
+  await applyToBounty(b.id, { githubId: 2, githubLogin: "two", address: ADDR() }, fakeChain().chain);
+  // Applicant 1 withdraws while our delegate probe for them is in flight. Withdraw
+  // leaves the bounty OPEN, so only the fresh-target re-check catches it — the
+  // status guard alone would delegate to a vanished application.
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      withdrawApplication(b.id, { githubId: 1, githubLogin: "one" });
+      return true;
+    },
+  });
+  const r = await delegateToApplicant(b.id, 1, "sponsor", racy.chain);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "no_such_application");
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.status, "OPEN", "bounty not delegated to the withdrawn applicant");
+  assert.equal(bb.assigneeGithubId ?? null, null, "no assignee set");
+  // The abort happens before any write, so the other applicant is not auto-rejected.
+  assert.equal(bb.applications.find((a) => a.githubId === 2)!.status, "pending", "the other applicant is untouched");
+});
+
+test("delegate snapshots the apply-time payout memo; the release stamps the dest wallet on the payout row", async () => {
+  const { chain } = fakeChain();
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  const addr = ADDR();
+  // The memo is bound to the application at apply time.
+  await applyToBounty(b.id, { githubId: 7, githubLogin: "memodev", address: addr, memo: "memodev-exchange-01" }, chain);
+  const r = await delegateToApplicant(b.id, 7, "sponsor", chain);
   assert.equal(r.ok, true);
   const delegated = getBounty(b.id)!;
   assert.equal(delegated.assigneeMemo, "memodev-exchange-01");
@@ -276,29 +437,28 @@ test("activity log: the full lifecycle appends dated, attributed events", async 
   const { chain } = fakeChain();
   const b = mkBounty();
   fundAndConfirm(b.id);
-  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
-  approveApplication(b.id, 9, "maya");
-  await acceptAndStartClock(b.id, { githubId: 9, githubLogin: "devon" }, ADDR(), "", chain);
+  await applyToBounty(b.id, { githubId: 9, githubLogin: "devon", address: ADDR() }, chain);
+  await delegateToApplicant(b.id, 9, "maya", chain);
   markInReview(b.id, 41);
   await releaseByMerge(b.id, chain);
   applyTxnOutcome(txnByKey(`release:${b.taskId}`)!.id, { status: "success" });
 
   const events = getBounty(b.id)!.events!;
   const kinds = events.map((e) => e.kind);
+  // The merged delegate emits "accepted" directly — there is no separate
+  // "application_approved" step anymore.
   assert.deepEqual(kinds, [
     "created",
     "funding_submitted",
     "funded",
     "applied",
-    "application_approved",
     "accepted",
     "pr_opened",
     "payout_submitted",
     "paid",
   ]);
-  const approved = events.find((e) => e.kind === "application_approved")!;
-  assert.equal(approved.actor, "maya", "the approving sponsor is recorded");
-  assert.equal(approved.subject, "devon", "…and who was picked");
+  const accepted = events.find((e) => e.kind === "accepted")!;
+  assert.equal(accepted.actor, "devon", "the delegated contributor is recorded on accept");
   assert.equal(events.find((e) => e.kind === "applied")!.actor, "devon");
   assert.ok(events.every((e) => typeof e.at === "number" && e.at > 0));
   // markInReview backfilled the submission moment for the webhook path.
@@ -313,9 +473,8 @@ test("markInReview: a repeated PR link writes nothing (GitHub resends on every p
   const { chain } = fakeChain();
   const b = mkBounty();
   fundAndConfirm(b.id);
-  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
-  approveApplication(b.id, 9, "maya");
-  await acceptAndStartClock(b.id, { githubId: 9, githubLogin: "devon" }, ADDR(), "", chain);
+  await applyToBounty(b.id, { githubId: 9, githubLogin: "devon", address: ADDR() }, chain);
+  await delegateToApplicant(b.id, 9, "maya", chain);
 
   markInReview(b.id, 41);
   const afterFirst = getBounty(b.id)!;
@@ -362,10 +521,11 @@ test("activity log: expiry refund records refund_submitted(expired) then refunde
   );
 });
 
-test("withdrawApplication: pending only, own application, removes it + logs", () => {
+test("withdrawApplication: pending only, own application, removes it + logs", async () => {
+  const { chain } = fakeChain();
   const b = mkBounty();
   fundAndConfirm(b.id);
-  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
+  await applyToBounty(b.id, { githubId: 9, githubLogin: "devon", address: ADDR() }, chain);
 
   // Someone else can't withdraw it (no application of theirs).
   assert.equal(withdrawApplication(b.id, { githubId: 8, githubLogin: "rival" }).reason, "no_such_application");
@@ -375,10 +535,10 @@ test("withdrawApplication: pending only, own application, removes it + logs", ()
   assert.equal(getBounty(b.id)!.applications.length, 0);
   assert.ok(getBounty(b.id)!.events!.some((e) => e.kind === "application_withdrawn" && e.actor === "devon"));
 
-  // Approved applications can't be withdrawn.
-  applyToBounty(b.id, { githubId: 9, githubLogin: "devon" });
-  approveApplication(b.id, 9, "maya");
-  assert.equal(withdrawApplication(b.id, { githubId: 9, githubLogin: "devon" }).reason, "not_pending_approved");
+  // A non-pending application (here: rejected, bounty still open) can't be withdrawn.
+  await applyToBounty(b.id, { githubId: 9, githubLogin: "devon", address: ADDR() }, chain);
+  rejectApplication(b.id, 9, "maya");
+  assert.equal(withdrawApplication(b.id, { githubId: 9, githubLogin: "devon" }).reason, "not_pending_rejected");
 });
 
 test("delete: undelegated refunds once; delegated cannot be deleted", async () => {

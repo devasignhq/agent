@@ -402,25 +402,89 @@ export function cancelPending(bountyId: string): LifecycleResult {
 
 // ── applications + delegation ────────────────────────────────────────────────
 
-/** A contributor applies to work a bounty. Idempotent per github login. */
-export function applyToBounty(
+/**
+ * A contributor applies to work a bounty, binding their payout wallet to the
+ * application. The wallet must be a valid Stellar address that can ALREADY
+ * receive USDC (trustline). That hard gate lives here — the one moment the
+ * contributor is present to fix it — so the sponsor's later one-click delegate
+ * always lands on a payable wallet. Idempotent per github id: re-applying while
+ * still pending just updates the bound wallet (reason "updated"), so a
+ * contributor can swap wallets without withdrawing.
+ */
+export async function applyToBounty(
   bountyId: string,
-  applicant: { githubId: number; githubLogin: string; note?: string }
-): LifecycleResult {
+  applicant: {
+    githubId: number;
+    githubLogin: string;
+    userId?: string;
+    note?: string;
+    address: string;
+    memo?: string;
+  },
+  chain: EscrowChain = defaultChain
+): Promise<LifecycleResult> {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status !== "OPEN") return { ok: false, reason: `not_open_${b.status.toLowerCase()}` };
-  const apps = [...b.applications];
+  try {
+    assertValidAddress(applicant.address);
+  } catch {
+    return { ok: false, reason: "invalid_address" };
+  }
+  const trustline = await chain.hasUsdcTrustline(applicant.address);
+  if (!trustline) return { ok: false, reason: "no_trustline" };
+
+  // Re-verify status after the async trustline check: node is single-threaded but
+  // the await is a yield point, so a concurrent delegate/cancel could have closed
+  // the bounty since the snapshot above. Re-read and use the fresh row.
+  const b2 = getBounty(bountyId);
+  if (!b2 || b2.status !== "OPEN") {
+    return { ok: false, reason: `not_open_${b2?.status.toLowerCase() ?? "not_found"}` };
+  }
+
+  const memo = applicant.memo || null;
+  // Remember the wallet as the contributor's account default too (links
+  // githubLogin ↔ address even before delegation).
+  if (applicant.userId) {
+    db.update("users", (u) => u.id === applicant.userId, {
+      stellarPayoutAddress: applicant.address,
+      stellarPayoutMemo: applicant.memo || "",
+      stellarPayoutTrustline: true,
+    });
+  }
+
+  const apps = [...b2.applications];
   const idx = apps.findIndex((a) => a.githubId === applicant.githubId);
-  if (idx >= 0 && apps[idx].status !== "rejected") {
+  const existing = idx >= 0 ? apps[idx] : null;
+
+  // Still in the running → update the bound wallet/note in place. No second
+  // "applied" event or sponsor ping (see the notification gate in the route).
+  if (existing && existing.status === "pending") {
+    apps[idx] = {
+      ...existing,
+      note: applicant.note ?? existing.note,
+      address: applicant.address,
+      memo,
+      trustline: true,
+    };
+    patchBounty(bountyId, { applications: apps });
+    const bounty = getBounty(bountyId);
+    return { ok: true, reason: "updated", bounty: bounty ?? undefined };
+  }
+  // A still-live (legacy "approved") application can't be re-applied over.
+  if (existing && existing.status !== "rejected") {
     return { ok: true, reason: "already_applied" };
   }
+
   const app: BountyApplication = {
     githubId: applicant.githubId,
     githubLogin: applicant.githubLogin,
     note: applicant.note,
     appliedAt: Date.now(),
     status: "pending",
+    address: applicant.address,
+    memo,
+    trustline: true,
   };
   if (idx >= 0) apps[idx] = app;
   else apps.push(app);
@@ -435,38 +499,132 @@ export function applyToBounty(
 }
 
 /**
- * Sponsor approves an application; the contributor may then accept.
- * `actorLogin` (the approving sponsor) is recorded on the activity log — the
- * route layer knows it and previously discarded it.
+ * The shared delegation write: flip OPEN → DELEGATED, snapshot the assignee +
+ * their payout wallet, start the delivery clock, and mirror the wallet onto the
+ * user row. The caller must have already resolved+validated the address and
+ * built `apps` (winner "accepted", losers "rejected"). No chain WRITE — escrow
+ * was funded at OPEN — so this is a pure DB transition.
  */
-export function approveApplication(
+function finalizeDelegation(
+  b: Bounty,
+  contributor: { githubId: number; githubLogin: string; userId?: string },
+  apps: BountyApplication[],
+  address: string,
+  memo: string | null
+): void {
+  const now = Date.now();
+  patchBounty(b.id, {
+    status: "DELEGATED",
+    applications: apps,
+    assigneeGithubId: contributor.githubId,
+    assigneeGithubLogin: contributor.githubLogin,
+    assigneeAddress: address,
+    assigneeMemo: memo,
+    acceptedAt: now,
+    deadlineAt: now + b.deliveryDays * DAY_MS,
+  });
+  recordBountyEvent(b.id, "accepted", {
+    actor: contributor.githubLogin,
+    detail: `${b.deliveryDays}-day delivery clock started`,
+    at: now,
+  });
+  if (contributor.userId) {
+    db.update("users", (u) => u.id === contributor.userId, {
+      stellarPayoutAddress: address,
+      stellarPayoutMemo: memo ?? "",
+      stellarPayoutTrustline: true,
+    });
+  }
+}
+
+/**
+ * The sponsor delegates the bounty to one applicant in a single click: accept
+ * that application, auto-reject the rest, snapshot their payout wallet, flip
+ * OPEN → DELEGATED and start the delivery clock. THIS is the moment delegation
+ * happens — there is no separate contributor accept step.
+ *
+ * The payout wallet comes from the application (bound at apply); legacy
+ * applications written before wallet-at-apply fall back to the applicant's
+ * account wallet. There is no chain write, but we re-probe the trustline
+ * defensively — release later reads assigneeAddress and does NOT re-check, so a
+ * wallet that lapsed since apply must be caught here, not at payout time.
+ */
+export async function delegateToApplicant(
   bountyId: string,
   githubId: number,
-  actorLogin?: string | null
-): LifecycleResult {
+  actorLogin?: string | null,
+  chain: EscrowChain = defaultChain
+): Promise<LifecycleResult> {
   const b = getBounty(bountyId);
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status !== "OPEN") return { ok: false, reason: `not_open_${b.status.toLowerCase()}` };
-  const apps = b.applications.map((a) =>
-    a.githubId === githubId
-      ? { ...a, status: "approved" as const }
-      : a.status === "approved"
-        ? { ...a, status: "pending" as const } // only one approved at a time
-        : a
-  );
-  if (!apps.some((a) => a.githubId === githubId && a.status === "approved")) {
+  const target = b.applications.find((a) => a.githubId === githubId);
+  // Accept a still-live application: "pending", or legacy "approved" (left over
+  // from the old two-step handshake).
+  if (!target || (target.status !== "pending" && target.status !== "approved")) {
     return { ok: false, reason: "no_such_application" };
   }
-  patchBounty(bountyId, { applications: apps });
-  const applicant = apps.find((a) => a.githubId === githubId);
-  recordBountyEvent(bountyId, "application_approved", {
-    actor: actorLogin ?? null,
-    subject: applicant?.githubLogin ?? null,
-    subjectGithubId: githubId,
-    detail: applicant ? `@${applicant.githubLogin} picked` : null,
-  });
+
+  // Resolve the payout wallet: bound-at-apply, else the account wallet.
+  const user = db.find("users", (u) => u.githubId === githubId);
+  const address = target.address ?? user?.stellarPayoutAddress ?? "";
+  const memo = (target.address ? target.memo : user?.stellarPayoutMemo) || null;
+  if (!address) return { ok: false, reason: "no_contributor_wallet" };
+  try {
+    assertValidAddress(address);
+  } catch {
+    return { ok: false, reason: "invalid_address" };
+  }
+  const trustline = await chain.hasUsdcTrustline(address);
+  if (!trustline) return { ok: false, reason: "contributor_trustline_lapsed" };
+
+  // Re-verify status after the async trustline check: the await is a yield point,
+  // so a concurrent delegate/cancel could have moved the bounty out of OPEN since
+  // the snapshot above. Re-read and write against the fresh row.
+  const b2 = getBounty(bountyId);
+  if (!b2 || b2.status !== "OPEN") {
+    return { ok: false, reason: `not_open_${b2?.status.toLowerCase() ?? "not_found"}` };
+  }
+  // …and re-verify the target application itself: a contributor can withdraw
+  // (which leaves the bounty OPEN, so the status guard above wouldn't catch it)
+  // during the async probe, and we must not delegate to a vanished application.
+  const freshTarget = b2.applications.find((a) => a.githubId === githubId);
+  if (!freshTarget || (freshTarget.status !== "pending" && freshTarget.status !== "approved")) {
+    return { ok: false, reason: "no_such_application" };
+  }
+
+  // Accept the winner; auto-reject everyone else still in the running. The
+  // sponsor confirm copy has always promised this — until now nothing did it.
+  const apps = b2.applications.map((a) =>
+    a.githubId === githubId
+      ? { ...a, status: "accepted" as const, address, memo, trustline: true }
+      : a.status === "pending" || a.status === "approved"
+        ? { ...a, status: "rejected" as const }
+        : a
+  );
+
+  // Log the auto-rejections (timeline truthfulness) — but no per-loser push, to
+  // avoid a notification burst; only an explicit reject pings the applicant.
+  for (const a of b2.applications) {
+    if (a.githubId !== githubId && (a.status === "pending" || a.status === "approved")) {
+      recordBountyEvent(bountyId, "application_rejected", {
+        actor: actorLogin ?? null,
+        subject: a.githubLogin,
+        subjectGithubId: a.githubId,
+        detail: `@${a.githubLogin}'s application`,
+      });
+    }
+  }
+
+  finalizeDelegation(
+    b2,
+    { githubId, githubLogin: freshTarget.githubLogin, userId: user?.id },
+    apps,
+    address,
+    memo
+  );
   const bounty = getBounty(bountyId);
-  return { ok: true, reason: "approved", bounty: bounty ?? undefined };
+  return { ok: true, reason: "delegated", bounty: bounty ?? undefined };
 }
 
 export function rejectApplication(
@@ -516,63 +674,6 @@ export function withdrawApplication(
   });
   const bounty = getBounty(bountyId);
   return { ok: true, reason: "withdrawn", bounty: bounty ?? undefined };
-}
-
-/**
- * The approved contributor accepts by providing their payout address. THIS is the
- * moment the delivery clock starts (deadlineAt = now + deliveryDays). Verifies the
- * address is well-formed and can receive USDC (trustline). Links the payout
- * address to the contributor's user so githubLogin ↔ wallet is recorded.
- */
-export async function acceptAndStartClock(
-  bountyId: string,
-  contributor: { githubId: number; githubLogin: string; userId?: string },
-  payoutAddress: string,
-  payoutMemo: string = "",
-  chain: EscrowChain = defaultChain
-): Promise<LifecycleResult> {
-  const b = getBounty(bountyId);
-  if (!b) return { ok: false, reason: "not_found" };
-  if (b.status !== "OPEN") return { ok: false, reason: `not_open_${b.status.toLowerCase()}` };
-  const app = b.applications.find((a) => a.githubId === contributor.githubId);
-  if (!app || app.status !== "approved") return { ok: false, reason: "not_approved" };
-  try {
-    assertValidAddress(payoutAddress);
-  } catch {
-    return { ok: false, reason: "invalid_address" };
-  }
-  const trustline = await chain.hasUsdcTrustline(payoutAddress);
-  if (!trustline) return { ok: false, reason: "no_trustline" };
-
-  const now = Date.now();
-  const apps = b.applications.map((a) =>
-    a.githubId === contributor.githubId ? { ...a, status: "accepted" as const } : a
-  );
-  patchBounty(bountyId, {
-    status: "DELEGATED",
-    applications: apps,
-    assigneeGithubId: contributor.githubId,
-    assigneeGithubLogin: contributor.githubLogin,
-    assigneeAddress: payoutAddress,
-    assigneeMemo: payoutMemo || null,
-    acceptedAt: now,
-    deadlineAt: now + b.deliveryDays * DAY_MS,
-  });
-  recordBountyEvent(bountyId, "accepted", {
-    actor: contributor.githubLogin,
-    detail: `${b.deliveryDays}-day delivery clock started`,
-    at: now,
-  });
-  // Persist the payout wallet on the user (links githubLogin ↔ address always).
-  if (contributor.userId) {
-    db.update("users", (u) => u.id === contributor.userId, {
-      stellarPayoutAddress: payoutAddress,
-      stellarPayoutMemo: payoutMemo,
-      stellarPayoutTrustline: true,
-    });
-  }
-  const bounty = getBounty(bountyId);
-  return { ok: true, reason: "delegated", bounty: bounty ?? undefined };
 }
 
 /** The contributor opened a PR referencing the bounty issue. */

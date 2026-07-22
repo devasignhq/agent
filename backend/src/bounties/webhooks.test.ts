@@ -13,8 +13,7 @@ import {
   createBounty,
   recordFunding,
   applyToBounty,
-  approveApplication,
-  acceptAndStartClock,
+  delegateToApplicant,
   getBounty,
   applyTxnOutcome,
   defaultChain,
@@ -74,9 +73,8 @@ async function seedDelegated(issueNumber = 7) {
   recordFunding(b.id, ADDR(), { hash: "H_ESCROW", status: "pending" });
   const txn = db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${b.taskId}`)!;
   applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
-  applyToBounty(b.id, { githubId: DELEGATE, githubLogin: "dev" });
-  approveApplication(b.id, DELEGATE);
-  await acceptAndStartClock(b.id, { githubId: DELEGATE, githubLogin: "dev" }, ADDR(), "", fakeChain);
+  await applyToBounty(b.id, { githubId: DELEGATE, githubLogin: "dev", address: ADDR() }, fakeChain);
+  await delegateToApplicant(b.id, DELEGATE, "sponsor", fakeChain);
   return getBounty(b.id)!;
 }
 

@@ -10,12 +10,18 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
+import { Keypair } from "@stellar/stellar-sdk";
 import { db } from "../db.js";
 import { signSession } from "../github/oauth.js";
 import { verifyBountyLinkToken } from "../bounties/links.js";
-import { createBounty, applyToBounty, recordFunding, applyTxnOutcome } from "../bounties/service.js";
+import { createBounty, applyToBounty, recordFunding, applyTxnOutcome, type EscrowChain } from "../bounties/service.js";
 import { config } from "../config.js";
 import { getBountyHandler, listBountiesHandler } from "./bounties.js";
+
+// Apply now binds a wallet and probes the trustline; these projection tests only
+// need an application to exist, so a stub chain that always has a trustline.
+const ADDR = () => Keypair.random().publicKey();
+const okChain = { hasUsdcTrustline: async () => true } as unknown as EscrowChain;
 
 // createBounty stamps config.stellar.contractId onto the row; give it a value
 // so rows are well-formed (no chain calls happen in these tests).
@@ -77,7 +83,7 @@ test("sponsor list carries verifiable Fund/Cancel links on a PENDING_FUNDING bou
   assert.equal(verifyBountyLinkToken(fundToken, "cancel"), null, "purposes don't cross");
 });
 
-test("sponsor detail carries the links; an applicant's detail does not", () => {
+test("sponsor detail carries the links; an applicant's detail does not", async () => {
   const { sponsorId, applicantId, applicantGh, bounty } = seed();
   // Fund + confirm so the applicant can apply (links must then be absent for
   // everyone — the bounty is no longer PENDING_FUNDING).
@@ -88,7 +94,7 @@ test("sponsor detail carries the links; an applicant's detail does not", () => {
   recordFunding(bounty.id, "G".padEnd(56, "A"), { hash: "H", status: "pending" } as any);
   const txn = db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${bounty.taskId}`)!;
   applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
-  applyToBounty(bounty.id, { githubId: applicantGh, githubLogin: "applicant" });
+  await applyToBounty(bounty.id, { githubId: applicantGh, githubLogin: "applicant", address: ADDR() }, okChain);
 
   const ares = fakeRes();
   getBountyHandler(authedReq(applicantId, { id: bounty.id }), ares);
@@ -104,12 +110,12 @@ test("sponsor detail carries the links; an applicant's detail does not", () => {
   assert.equal(verifyBountyLinkToken(openCancelToken, "cancel"), bounty.id);
 });
 
-test("any signed-in user can read a bounty; applications stay scoped", () => {
+test("any signed-in user can read a bounty; applications stay scoped", async () => {
   const { sponsorId, applicantId, applicantGh, bounty } = seed();
   recordFunding(bounty.id, "G".padEnd(56, "A"), { hash: "H", status: "pending" } as any);
   const txn = db.find("escrowTransactions", (t) => t.idempotencyKey === `escrow:${bounty.taskId}`)!;
   applyTxnOutcome(txn.id, { status: "success", ledger: 1 });
-  applyToBounty(bounty.id, { githubId: applicantGh, githubLogin: "applicant" });
+  await applyToBounty(bounty.id, { githubId: applicantGh, githubLogin: "applicant", address: ADDR() }, okChain);
 
   // A stranger (no installation, never applied) can read the bounty — this is
   // where the bot comment's Apply CTA lands — but gets no sponsor links and no

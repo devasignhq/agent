@@ -107,6 +107,10 @@ export type BountyApplication = {
   note?: string;
   appliedAt: number;
   status: "pending" | "approved" | "accepted" | "rejected";
+  // Payout wallet bound at apply time ("approved" is a legacy substatus).
+  address?: string;
+  memo?: string | null;
+  trustline?: boolean;
 };
 
 export type SupportingLink = { type: string; url: string; addedAt: number };
@@ -285,16 +289,12 @@ export const api = {
       `/api/bounties/${id}`
     ),
 
-  // Apply / accept
-  applyToBounty: (id: string, note?: string) =>
+  // Apply — the payout wallet is bound to the application here (there is no
+  // longer a separate accept step; the sponsor's delegate starts the clock).
+  applyToBounty: (id: string, address: string, memo: string, note?: string) =>
     request<{ ok: true }>(`/api/bounties/${id}/apply`, {
       method: "POST",
-      body: JSON.stringify(note ? { note } : {}),
-    }),
-  acceptBounty: (id: string, address: string, memo: string) =>
-    request<{ ok: true; bounty: unknown }>(`/api/bounties/${id}/accept`, {
-      method: "POST",
-      body: JSON.stringify({ address, memo }),
+      body: JSON.stringify({ address, memo, ...(note ? { note } : {}) }),
     }),
 
   // My bounties + workspace actions
