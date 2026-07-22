@@ -3293,10 +3293,10 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .drawer-title {
   font-family: var(--mono);
-  font-size: 22px;
+  font-size: 18px;
   font-weight: 500;
   letter-spacing: -0.01em;
-  line-height: 1.25;
+  line-height: 1.3;
   margin: 0 0 12px;
 }
 .drawer-section { margin-bottom: 26px; }
