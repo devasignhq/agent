@@ -40,7 +40,7 @@ const AMOUNT_ANCHORED: RegExp[] = [
   new RegExp(String.raw`(${NUM})\s*(?:usdc|usd|dollars?|bucks?)`, "i"), // 100 USDC, 100 dollars
   new RegExp(String.raw`(?:usdc|usd)\s*(${NUM})`, "i"), // USDC 100
 ];
-const AMOUNT_BARE = new RegExp(String.raw`(?<![\d.$#])(${NUM})`, "i");
+const AMOUNT_BARE = new RegExp(String.raw`(?<![\d.$#\-/])(${NUM})`, "i");
 
 // Standard Levenshtein edit distance. Only ever run on short tokens (a candidate
 // keyword or a unit word), so the DP is trivially cheap.
@@ -67,7 +67,7 @@ function levenshtein(a: string, b: string): number {
 function isBountyWord(token: string): boolean {
   if (token.startsWith("bount")) return true; // bounty, bounties, bounti, bount…
   return (
-    token.length >= 4 &&
+    token.length >= 5 &&
     token.length <= 8 &&
     token[0] === "b" &&
     levenshtein(token, "bounty") <= 2 // bouny, bunty, bonty, boutny…

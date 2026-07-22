@@ -82,6 +82,11 @@ test("keyword leniency does not fire on casual mentions or near-words", () => {
   assert.equal(parseBountyCommand("bounty this in 3 days if you can"), null); // window, no amount
   // "county" is edit-distance 1 from "bounty" but must not trigger a bounty.
   assert.equal(parseBountyCommand("the county fair spent $100 over 2 days"), null);
+  // "bout" is a real word and should not trigger a bounty.
+  assert.equal(parseBountyCommand("I had a bout of flu, $100 for 2 days"), null);
+  // PR/issue references should not be parsed as bare amounts.
+  assert.equal(parseBountyCommand("bounty 2 days for PR-123"), null);
+  assert.equal(parseBountyCommand("bounty 2 days in org/repo/123"), null);
 });
 
 test("looksLikeBountyCommand is a cheap keyword gate", () => {
