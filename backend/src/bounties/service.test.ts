@@ -321,6 +321,49 @@ test("delegate falls back to the account wallet for a legacy application with no
   assert.equal(bb.assigneeMemo, "old-memo");
 });
 
+test("apply re-checks status after the async trustline probe (a concurrent close wins)", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  // The bounty is cancelled while our trustline probe is in flight (the await is
+  // a yield point; another request runs, then we resume against a stale snapshot).
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      db.update("bounties", (x) => x.id === b.id, { status: "CANCELLED" });
+      return true;
+    },
+  });
+  const r = await applyToBounty(b.id, { githubId: 1, githubLogin: "dev", address: ADDR() }, racy.chain);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^not_open_/);
+  assert.equal(getBounty(b.id)!.applications.length, 0, "no application recorded on the closed bounty");
+});
+
+test("delegate re-checks status after the async trustline probe (a concurrent delegate wins)", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "one", address: ADDR() }, fakeChain().chain);
+  await applyToBounty(b.id, { githubId: 2, githubLogin: "two", address: ADDR() }, fakeChain().chain);
+  // Applicant 2 is delegated while our probe for applicant 1 is in flight.
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      db.update("bounties", (x) => x.id === b.id, {
+        status: "DELEGATED",
+        assigneeGithubId: 2,
+        applications: getBounty(b.id)!.applications.map((a) =>
+          a.githubId === 2 ? { ...a, status: "accepted" as const } : a
+        ),
+      });
+      return true;
+    },
+  });
+  const r = await delegateToApplicant(b.id, 1, "sponsor", racy.chain);
+  assert.equal(r.ok, false);
+  assert.match(r.reason, /^not_open_/);
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.assigneeGithubId, 2, "the concurrent winner is not overwritten");
+  assert.equal(bb.applications.find((a) => a.githubId === 1)!.status, "pending", "applicant 1 untouched");
+});
+
 test("delegate snapshots the apply-time payout memo; the release stamps the dest wallet on the payout row", async () => {
   const { chain } = fakeChain();
   const b = mkBounty();

@@ -434,6 +434,14 @@ export async function applyToBounty(
   const trustline = await chain.hasUsdcTrustline(applicant.address);
   if (!trustline) return { ok: false, reason: "no_trustline" };
 
+  // Re-verify status after the async trustline check: node is single-threaded but
+  // the await is a yield point, so a concurrent delegate/cancel could have closed
+  // the bounty since the snapshot above. Re-read and use the fresh row.
+  const b2 = getBounty(bountyId);
+  if (!b2 || b2.status !== "OPEN") {
+    return { ok: false, reason: `not_open_${b2?.status.toLowerCase() ?? "not_found"}` };
+  }
+
   const memo = applicant.memo || null;
   // Remember the wallet as the contributor's account default too (links
   // githubLogin ↔ address even before delegation).
@@ -445,7 +453,7 @@ export async function applyToBounty(
     });
   }
 
-  const apps = [...b.applications];
+  const apps = [...b2.applications];
   const idx = apps.findIndex((a) => a.githubId === applicant.githubId);
   const existing = idx >= 0 ? apps[idx] : null;
 
@@ -570,9 +578,17 @@ export async function delegateToApplicant(
   const trustline = await chain.hasUsdcTrustline(address);
   if (!trustline) return { ok: false, reason: "contributor_trustline_lapsed" };
 
+  // Re-verify status after the async trustline check: the await is a yield point,
+  // so a concurrent delegate/cancel could have moved the bounty out of OPEN since
+  // the snapshot above. Re-read and write against the fresh row.
+  const b2 = getBounty(bountyId);
+  if (!b2 || b2.status !== "OPEN") {
+    return { ok: false, reason: `not_open_${b2?.status.toLowerCase() ?? "not_found"}` };
+  }
+
   // Accept the winner; auto-reject everyone else still in the running. The
   // sponsor confirm copy has always promised this — until now nothing did it.
-  const apps = b.applications.map((a) =>
+  const apps = b2.applications.map((a) =>
     a.githubId === githubId
       ? { ...a, status: "accepted" as const, address, memo, trustline: true }
       : a.status === "pending" || a.status === "approved"
@@ -582,7 +598,7 @@ export async function delegateToApplicant(
 
   // Log the auto-rejections (timeline truthfulness) — but no per-loser push, to
   // avoid a notification burst; only an explicit reject pings the applicant.
-  for (const a of b.applications) {
+  for (const a of b2.applications) {
     if (a.githubId !== githubId && (a.status === "pending" || a.status === "approved")) {
       recordBountyEvent(bountyId, "application_rejected", {
         actor: actorLogin ?? null,
@@ -594,7 +610,7 @@ export async function delegateToApplicant(
   }
 
   finalizeDelegation(
-    b,
+    b2,
     { githubId, githubLogin: target.githubLogin, userId: user?.id },
     apps,
     address,
