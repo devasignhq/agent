@@ -324,6 +324,10 @@ test("delegate falls back to the account wallet for a legacy application with no
 test("apply re-checks status after the async trustline probe (a concurrent close wins)", async () => {
   const b = mkBounty();
   fundAndConfirm(b.id);
+  const uid = "user-racer";
+  db.insert("users", {
+    id: uid, githubId: 1, githubLogin: "dev", email: "d@x.io", plan: "free", createdAt: 1,
+  } as any);
   // The bounty is cancelled while our trustline probe is in flight (the await is
   // a yield point; another request runs, then we resume against a stale snapshot).
   const racy = fakeChain({
@@ -332,10 +336,17 @@ test("apply re-checks status after the async trustline probe (a concurrent close
       return true;
     },
   });
-  const r = await applyToBounty(b.id, { githubId: 1, githubLogin: "dev", address: ADDR() }, racy.chain);
+  const r = await applyToBounty(
+    b.id,
+    { githubId: 1, githubLogin: "dev", userId: uid, address: ADDR() },
+    racy.chain
+  );
   assert.equal(r.ok, false);
   assert.match(r.reason, /^not_open_/);
   assert.equal(getBounty(b.id)!.applications.length, 0, "no application recorded on the closed bounty");
+  // The status guard runs BEFORE the account-default write, so a lost race must
+  // also leave the contributor's wallet untouched (regression guard for 42fcf3f).
+  assert.equal(db.find("users", (u) => u.id === uid)!.stellarPayoutAddress, undefined);
 });
 
 test("delegate re-checks status after the async trustline probe (a concurrent delegate wins)", async () => {
