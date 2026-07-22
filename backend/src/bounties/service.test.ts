@@ -375,6 +375,30 @@ test("delegate re-checks status after the async trustline probe (a concurrent de
   assert.equal(bb.applications.find((a) => a.githubId === 1)!.status, "pending", "applicant 1 untouched");
 });
 
+test("delegate aborts if the target withdrew during the async trustline probe", async () => {
+  const b = mkBounty();
+  fundAndConfirm(b.id);
+  await applyToBounty(b.id, { githubId: 1, githubLogin: "one", address: ADDR() }, fakeChain().chain);
+  await applyToBounty(b.id, { githubId: 2, githubLogin: "two", address: ADDR() }, fakeChain().chain);
+  // Applicant 1 withdraws while our delegate probe for them is in flight. Withdraw
+  // leaves the bounty OPEN, so only the fresh-target re-check catches it — the
+  // status guard alone would delegate to a vanished application.
+  const racy = fakeChain({
+    async hasUsdcTrustline() {
+      withdrawApplication(b.id, { githubId: 1, githubLogin: "one" });
+      return true;
+    },
+  });
+  const r = await delegateToApplicant(b.id, 1, "sponsor", racy.chain);
+  assert.equal(r.ok, false);
+  assert.equal(r.reason, "no_such_application");
+  const bb = getBounty(b.id)!;
+  assert.equal(bb.status, "OPEN", "bounty not delegated to the withdrawn applicant");
+  assert.equal(bb.assigneeGithubId ?? null, null, "no assignee set");
+  // The abort happens before any write, so the other applicant is not auto-rejected.
+  assert.equal(bb.applications.find((a) => a.githubId === 2)!.status, "pending", "the other applicant is untouched");
+});
+
 test("delegate snapshots the apply-time payout memo; the release stamps the dest wallet on the payout row", async () => {
   const { chain } = fakeChain();
   const b = mkBounty();

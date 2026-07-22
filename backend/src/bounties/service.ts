@@ -585,6 +585,13 @@ export async function delegateToApplicant(
   if (!b2 || b2.status !== "OPEN") {
     return { ok: false, reason: `not_open_${b2?.status.toLowerCase() ?? "not_found"}` };
   }
+  // …and re-verify the target application itself: a contributor can withdraw
+  // (which leaves the bounty OPEN, so the status guard above wouldn't catch it)
+  // during the async probe, and we must not delegate to a vanished application.
+  const freshTarget = b2.applications.find((a) => a.githubId === githubId);
+  if (!freshTarget || (freshTarget.status !== "pending" && freshTarget.status !== "approved")) {
+    return { ok: false, reason: "no_such_application" };
+  }
 
   // Accept the winner; auto-reject everyone else still in the running. The
   // sponsor confirm copy has always promised this — until now nothing did it.
@@ -611,7 +618,7 @@ export async function delegateToApplicant(
 
   finalizeDelegation(
     b2,
-    { githubId, githubLogin: target.githubLogin, userId: user?.id },
+    { githubId, githubLogin: freshTarget.githubLogin, userId: user?.id },
     apps,
     address,
     memo
