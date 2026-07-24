@@ -50,13 +50,29 @@ export class ApiError extends Error {
 // NOTE: 503 `not_durable` is deliberately NOT lumped in here — it only rides on
 // mutations, which never reach the retry path below, and its call sites inspect
 // the 503 to keep optimistic state. isTransientApiError is for READ recovery.
+// Raised when a `fetch` REJECTS — the request never got an HTTP answer (server
+// unreachable during a deploy/restart/cold start, DNS failure, offline). We wrap
+// the raw DOMException/TypeError so classification can key off THIS type rather
+// than `instanceof Error`, which would also match a genuine programming bug
+// (TypeError/ReferenceError from the render/fetch cycle) and silently swallow it.
+export class NetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NetworkError";
+  }
+}
+
 const RETRYABLE_STATUS = new Set([502, 503, 504]);
 
 export function isTransientApiError(err: unknown): boolean {
-  if (err instanceof ApiError) return RETRYABLE_STATUS.has(err.status);
-  // A DOMException/TypeError from fetch (Chrome "Failed to fetch", Safari
-  // "Load failed", Firefox "NetworkError…") — the request never landed.
-  return err instanceof Error;
+  if (err instanceof ApiError) {
+    // not_durable rides ONLY on mutations and has dedicated optimistic handling
+    // at its call sites — it is never a generic swallow-able read blip.
+    if (err.status === 503 && err.message === "not_durable") return false;
+    return RETRYABLE_STATUS.has(err.status);
+  }
+  // Only a real network failure is transient — not every stray runtime Error.
+  return err instanceof NetworkError;
 }
 
 // Only idempotent reads are auto-retried. Retrying a mutation after a network
@@ -92,13 +108,20 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
         },
       });
     } catch (netErr) {
+      // An aborted request (component unmounted, user navigated away) must NOT
+      // be retried — that just delays the abort and leaks background traffic.
+      // Propagate it untouched.
+      const isAbort = netErr instanceof Error && netErr.name === "AbortError";
       // Server unreachable / offline. Retry idempotent reads a few times so a
       // few-second backend blip never reaches the caller; otherwise re-throw.
-      if (retryable && attempt < MAX_ATTEMPTS) {
+      if (retryable && !isAbort && attempt < MAX_ATTEMPTS) {
         await sleep(retryDelayMs(attempt));
         continue;
       }
-      throw netErr;
+      if (isAbort) throw netErr;
+      // Wrap so isTransientApiError can tell a real network failure apart from a
+      // stray runtime Error.
+      throw new NetworkError(netErr instanceof Error ? netErr.message : String(netErr));
     }
     const text = await res.text();
     const body = text ? safeParse(text) : null;

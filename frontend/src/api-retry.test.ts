@@ -5,7 +5,7 @@
 // classifies what the screens are allowed to swallow.
 import test from "node:test";
 import assert from "node:assert/strict";
-import { api, ApiError, isTransientApiError } from "./api.ts";
+import { api, ApiError, isTransientApiError, NetworkError } from "./api.ts";
 
 // Swap globalThis.fetch for a scripted queue of outcomes. Each entry is either a
 // Response to resolve with or an Error to reject with (a network-level failure).
@@ -26,21 +26,23 @@ function scriptFetch(outcomes: Array<Response | Error>) {
 const json = (body: unknown, status = 200) =>
   new Response(JSON.stringify(body), { status, headers: { "Content-Type": "application/json" } });
 
-test("isTransientApiError: fetch rejections and upstream 5xx are transient", () => {
-  assert.equal(isTransientApiError(new TypeError("Failed to fetch")), true);
-  assert.equal(isTransientApiError(new Error("Load failed")), true); // Safari
+test("isTransientApiError: network failures and upstream 5xx are transient", () => {
+  assert.equal(isTransientApiError(new NetworkError("Failed to fetch")), true);
+  assert.equal(isTransientApiError(new NetworkError("Load failed")), true); // Safari
   assert.equal(isTransientApiError(new ApiError(503, "Service Unavailable")), true);
   assert.equal(isTransientApiError(new ApiError(502, "Bad Gateway")), true);
   assert.equal(isTransientApiError(new ApiError(504, "Gateway Timeout")), true);
 });
 
-test("isTransientApiError: real HTTP errors are NOT transient", () => {
+test("isTransientApiError: real HTTP errors and stray runtime errors are NOT transient", () => {
   assert.equal(isTransientApiError(new ApiError(401, "unauthorized")), false);
   assert.equal(isTransientApiError(new ApiError(404, "not_found")), false);
   assert.equal(isTransientApiError(new ApiError(500, "boom")), false);
+  // A genuine programming bug must surface, not be swallowed as a network blip.
+  assert.equal(isTransientApiError(new TypeError("x is undefined")), false);
   // not_durable rides on mutations and is inspected at the call site — it must
   // not be classed as a swallow-able read blip.
-  assert.equal(isTransientApiError(new ApiError(503, "not_durable")), true);
+  assert.equal(isTransientApiError(new ApiError(503, "not_durable")), false);
 });
 
 test("a read rides over a transient network blip (retries, then succeeds)", async () => {
@@ -72,10 +74,15 @@ test("a read retries an upstream 502 then succeeds", async () => {
   }
 });
 
-test("a persistent outage still throws a transient error after exhausting retries", async () => {
+test("a persistent outage throws a NetworkError after exhausting retries", async () => {
   const { calls, restore } = scriptFetch([new TypeError("Failed to fetch")]);
   try {
-    await assert.rejects(() => api.reviews());
+    await assert.rejects(() => api.reviews(), (e: unknown) => {
+      // The raw fetch TypeError is wrapped so callers can classify it safely.
+      assert.ok(e instanceof NetworkError);
+      assert.equal(isTransientApiError(e), true);
+      return true;
+    });
     assert.equal(calls.length, 3, "tried the max number of times");
   } finally {
     restore();
