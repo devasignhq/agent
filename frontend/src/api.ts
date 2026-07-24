@@ -38,26 +38,84 @@ export class ApiError extends Error {
   }
 }
 
+// A transient failure is one where the request never got a real answer from the
+// app: the server was momentarily unreachable (a deploy/restart/cold start on the
+// API host drops the listening socket for a few seconds), the browser is offline,
+// or an edge proxy returned a bare 502/503/504. These self-heal, so a plain
+// read should ride over them rather than surface as an error. A `fetch` REJECTION
+// is always network-level (our request() only ever throws ApiError for a real
+// HTTP response), so anything that isn't an ApiError is transient by definition;
+// on top of that, treat upstream 502/503/504 as transient too.
+//
+// NOTE: 503 `not_durable` is deliberately NOT lumped in here — it only rides on
+// mutations, which never reach the retry path below, and its call sites inspect
+// the 503 to keep optimistic state. isTransientApiError is for READ recovery.
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+export function isTransientApiError(err: unknown): boolean {
+  if (err instanceof ApiError) return RETRYABLE_STATUS.has(err.status);
+  // A DOMException/TypeError from fetch (Chrome "Failed to fetch", Safari
+  // "Load failed", Firefox "NetworkError…") — the request never landed.
+  return err instanceof Error;
+}
+
+// Only idempotent reads are auto-retried. Retrying a mutation after a network
+// failure is unsafe (it may have applied server-side before the socket dropped),
+// so POST/PUT/PATCH/DELETE throw on the first failure exactly as before and their
+// call sites decide what to do (e.g. the not_durable optimistic path).
+const RETRY_SAFE_METHODS = new Set(["GET", "HEAD"]);
+const MAX_ATTEMPTS = 3;
+// Backoff between read retries. Kept short so a failed one-shot load still
+// resolves quickly, but long enough to bridge a brief backend restart. Jitter
+// avoids a thundering-herd retry when many tabs blip at the same instant.
+function retryDelayMs(attempt: number): number {
+  return Math.round(400 * Math.pow(2.5, attempt - 1) * (0.75 + Math.random() * 0.5));
+}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    credentials: "include",
-    ...init,
-    headers: {
-      Accept: "application/json",
-      "X-Devasign-Tab": tabId,
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...(init.headers || {}),
-    },
-  });
-  const text = await res.text();
-  const body = text ? safeParse(text) : null;
-  if (!res.ok) {
-    const message =
-      (body && typeof body === "object" && "error" in (body as any) && (body as any).error) ||
-      `HTTP ${res.status}`;
-    throw new ApiError(res.status, String(message), body);
+  const method = (init.method || "GET").toUpperCase();
+  const retryable = RETRY_SAFE_METHODS.has(method);
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}${path}`, {
+        credentials: "include",
+        ...init,
+        headers: {
+          Accept: "application/json",
+          "X-Devasign-Tab": tabId,
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...(init.headers || {}),
+        },
+      });
+    } catch (netErr) {
+      // Server unreachable / offline. Retry idempotent reads a few times so a
+      // few-second backend blip never reaches the caller; otherwise re-throw.
+      if (retryable && attempt < MAX_ATTEMPTS) {
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      throw netErr;
+    }
+    const text = await res.text();
+    const body = text ? safeParse(text) : null;
+    if (!res.ok) {
+      // A bare upstream 5xx on a read is the same class of transient blip — one
+      // more chance before it becomes a real error to the caller.
+      if (retryable && RETRYABLE_STATUS.has(res.status) && attempt < MAX_ATTEMPTS) {
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      const message =
+        (body && typeof body === "object" && "error" in (body as any) && (body as any).error) ||
+        `HTTP ${res.status}`;
+      throw new ApiError(res.status, String(message), body);
+    }
+    return body as T;
   }
-  return body as T;
 }
 
 function safeParse(s: string): unknown {

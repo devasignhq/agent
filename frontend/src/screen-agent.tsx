@@ -4,7 +4,7 @@ import React from "react";
 import DOMPurify from "dompurify";
 import { escapeHtml, safeUrl, sourceLink, SANITIZE_ALLOWED_TAGS, SANITIZE_ALLOWED_ATTR } from "./sanitize";
 import { Icon } from "./icons";
-import { api } from "./api";
+import { api, isTransientApiError } from "./api";
 import { pushRecent } from "./recent-reviews";
 import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
@@ -1460,13 +1460,24 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   const [detail, setDetail] = React.useState(null);         // { review, logs, task }
   const [error, setError] = React.useState(null);
 
+  // Have we ever painted a real queue? Once we have, a later poll that fails on
+  // a transient backend blip must NOT blank it with a red banner — the API
+  // client already retried the read, and the next poll will reconcile. We keep
+  // the last good queue on screen and stay silent. A hard error (auth, a real
+  // 4xx/5xx that isn't a transient blip) still surfaces, and so does a failure
+  // on the very first load when there's nothing yet to fall back to.
+  const loadedOnceRef = React.useRef(false);
   const refreshList = React.useCallback(async () => {
     try {
       const [reviews, repoList] = await Promise.all([api.reviews(), api.repositories()]);
       setRepos(repoList);
       setLiveReviews(reviews);
+      loadedOnceRef.current = true;
       setError(null);
     } catch (err) {
+      // Swallow a transient blip once we have something to show — the user never
+      // sees a self-healing few-second outage. Surface everything else.
+      if (isTransientApiError(err) && loadedOnceRef.current) return;
       setError(err.message || String(err));
     }
   }, []);
