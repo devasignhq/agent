@@ -114,3 +114,19 @@ test("a non-retryable HTTP error is not retried and surfaces as an ApiError", as
     restore();
   }
 });
+
+test("an aborted request is NOT retried and propagates untouched", async () => {
+  const abortError = new DOMException("The user aborted a request.", "AbortError");
+  const { calls, restore } = scriptFetch([abortError]);
+  try {
+    await assert.rejects(() => api.reviews(), (e: unknown) => {
+      // Propagated as-is — not wrapped in NetworkError, not classed transient.
+      assert.ok(e instanceof DOMException);
+      assert.equal((e as DOMException).name, "AbortError");
+      return true;
+    });
+    assert.equal(calls.length, 1, "aborted request failed immediately, no retry");
+  } finally {
+    restore();
+  }
+});
