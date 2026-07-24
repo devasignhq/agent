@@ -399,6 +399,7 @@ const Pager = ({ cur, pages, onGo }: { cur: number; pages: number; onGo: (p: num
 const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hidden?: boolean }) => {
   const subs = b.prNumber ? 1 : 0;
   const pendingExt = b.extension?.status === "pending";
+  const extDays = b.extension?.days;
   const unread = (b.applications || []).some((a) => a.status === "pending") || pendingExt;
   return (
     <div className={`bounty-row ${unread ? "has-unread" : ""}`} onClick={onClick}>
@@ -408,14 +409,14 @@ const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hid
       <span className="mono mute" style={{ fontSize: 11 }}>{b.repo}#{b.issueNumber}</span>
       <span className="mono" style={{ fontVariantNumeric: "tabular-nums", color: hidden ? "var(--fg-mute)" : undefined }}>{hidden ? MASK : money(b.amountUsdc)}</span>
       <span className={`pill ${ST_CLS[b.status]}`}><i className="dot" />{ST_LABEL[b.status]}</span>
-      <span>
+      <span className="bounty-row-badges">
         {subs > 0 && <span className="subs-badge"><Icon name="git" size={11} /> {subs}</span>}
-        {pendingExt && (
+        {pendingExt && extDays !== undefined && (
           <span
             className="ext-badge"
-            title={`Timeline extension requested — ${b.extension!.days} day${b.extension!.days === 1 ? "" : "s"}`}
+            title={`Timeline extension requested — ${extDays} day${extDays === 1 ? "" : "s"}`}
           >
-            <Icon name="clock" size={11} /> +{b.extension!.days}d
+            <Icon name="clock" size={11} /> +{extDays}d
           </span>
         )}
         {!subs && !pendingExt && <span className="mute">–</span>}

@@ -1244,8 +1244,15 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .ext-badge svg { color: var(--warn); }
 
-.bounty-row > span:has(.subs-badge),
-.bounty-row > span:has(.ext-badge) { overflow: visible; }
+/* Holds the in-row submission / extension badges: a flex track so the two
+   space cleanly (gap) when both are present, and overflow-visible so the
+   marker isn't clipped by the .bounty-row > * ellipsis rule. */
+.bounty-row-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: visible;
+}
 
 /* Outline CTA — used for inbox primary actions (Merge & pay, Approve, etc.) */
 .btn.outline {
