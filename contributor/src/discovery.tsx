@@ -120,6 +120,7 @@ const ApplyModal = ({
         code === "invalid_address" ? "That Stellar address doesn't validate — double-check it." :
         code === "invalid_memo" ? "Memo is too long — 28 bytes max." :
         code === "no_trustline" ? "That wallet can't receive USDC yet — add a USDC trustline in your wallet app, then apply." :
+        code === "own_bounty" ? "You can't apply to a bounty you sponsor or maintain." :
         String(code).startsWith("not_open") ? "This bounty is no longer open for applications." :
         code === "stellar_unconfigured" ? "Bounties are momentarily unavailable — try again shortly." :
         "Couldn't submit your application — try again."

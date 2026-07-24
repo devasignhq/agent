@@ -159,6 +159,10 @@ export type User = {
   avatarUrl?: string;
   plan: Plan;
   createdAt: number;
+  // Which app minted this account. In the sponsor dashboard this is always
+  // "maintainer" — the same GitHub identity has a separate "contributor" account
+  // on the contributor app. Optional here so older payloads type-check.
+  accountKind?: "maintainer" | "contributor";
 };
 
 export type Plan = "free" | "pro" | "max";
