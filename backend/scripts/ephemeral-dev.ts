@@ -18,7 +18,12 @@ process.env.PORT ||= "8787"; // ||= so a caller can run a second instance elsewh
 // funding tx is actually built, which will just error against the fake ids.
 process.env.STELLAR_ESCROW_CONTRACT_ID ||= "C_EPHEMERAL_TEST";
 process.env.STELLAR_USDC_SAC_ID ||= "C_EPHEMERAL_TEST";
-process.env.STELLAR_ADMIN_SECRET ||= "S_EPHEMERAL_TEST";
+// The admin secret, unlike the contract ids above, is decoded at boot: the
+// server's listen banner logs the admin PUBLIC key via adminAddress() →
+// Keypair.fromSecret(), which throws on a non-strkey placeholder. So this one
+// must be a format-valid (funds-less, throwaway) ed25519 seed, not "S_…TEST".
+const { Keypair } = await import("@stellar/stellar-sdk");
+process.env.STELLAR_ADMIN_SECRET ||= Keypair.random().secret();
 
 // Dynamic import so the assignments above run first (static imports hoist).
 await import("../src/server.js");
