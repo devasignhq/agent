@@ -675,7 +675,7 @@ const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => 
 
   return (
     <div className="app-card new" style={{ marginBottom: 14 }}>
-      <div className="app-card-row">
+      <div className="app-card-row" style={{ padding: "10px 14px" }}>
         <div style={{ minWidth: 0 }}>
           <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
             <span className="mono" style={{ fontWeight: 600 }}>@{ext.requestedBy}</span>
@@ -694,15 +694,15 @@ const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => 
         )}
       </div>
       <div className="sub-card-note" style={{ marginTop: 8 }}>“{ext.reason}”</div>
-      <div className="mono" style={{ fontSize: 11, marginTop: 8, color: "var(--fg-mute)" }}>
+      <div className="mono" style={{ fontSize: 11, marginTop: 8, padding: "0 14px", color: "var(--fg-mute)" }}>
         <Icon name="clock" size={11} /> No response within {EXTENSION_AUTO_APPROVE_HOURS}h approves this automatically.
       </div>
       {pastDue && (
-        <div className="mono" style={{ fontSize: 11, marginTop: 8, color: "var(--warn, #d6a354)" }}>
+        <div className="mono" style={{ fontSize: 11, marginTop: 8, padding: "0 14px", color: "var(--warn, #d6a354)" }}>
           <Icon name="warn" size={11} /> Past due — the automatic refund is on hold until you respond.
         </div>
       )}
-      {err && <div className="mono" style={{ fontSize: 11, color: "var(--danger)", marginTop: 8 }}>{err}</div>}
+      {err && <div className="mono" style={{ fontSize: 11, color: "var(--danger)", marginTop: 8, padding: "0 14px" }}>{err}</div>}
       {confirming && (
         <div className={`app-confirm ${confirming === "decline" ? "reject" : "delegate"}`}>
           {confirming === "decline" && <span className="app-confirm-icon"><Icon name="warn" size={15} /></span>}
