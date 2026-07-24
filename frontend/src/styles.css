@@ -1232,7 +1232,20 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   color: var(--info);
 }
 .subs-badge svg { color: var(--info); }
-.bounty-row > span:has(.subs-badge) { overflow: visible; }
+
+/* In-row pending timeline-extension marker (amber = time-sensitive request) */
+.ext-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--warn);
+}
+.ext-badge svg { color: var(--warn); }
+
+.bounty-row > span:has(.subs-badge),
+.bounty-row > span:has(.ext-badge) { overflow: visible; }
 
 /* Outline CTA — used for inbox primary actions (Merge & pay, Approve, etc.) */
 .btn.outline {
