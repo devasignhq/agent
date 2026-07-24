@@ -38,26 +38,107 @@ export class ApiError extends Error {
   }
 }
 
-async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
-  const res = await fetch(`${API_BASE}${path}`, {
-    credentials: "include",
-    ...init,
-    headers: {
-      Accept: "application/json",
-      "X-Devasign-Tab": tabId,
-      ...(init.body ? { "Content-Type": "application/json" } : {}),
-      ...(init.headers || {}),
-    },
-  });
-  const text = await res.text();
-  const body = text ? safeParse(text) : null;
-  if (!res.ok) {
-    const message =
-      (body && typeof body === "object" && "error" in (body as any) && (body as any).error) ||
-      `HTTP ${res.status}`;
-    throw new ApiError(res.status, String(message), body);
+// A transient failure is one where the request never got a real answer from the
+// app: the server was momentarily unreachable (a deploy/restart/cold start on the
+// API host drops the listening socket for a few seconds), the browser is offline,
+// or an edge proxy returned a bare 502/503/504. These self-heal, so a plain
+// read should ride over them rather than surface as an error. A `fetch` REJECTION
+// is always network-level (our request() only ever throws ApiError for a real
+// HTTP response), so anything that isn't an ApiError is transient by definition;
+// on top of that, treat upstream 502/503/504 as transient too.
+//
+// NOTE: 503 `not_durable` is deliberately NOT lumped in here — it only rides on
+// mutations, which never reach the retry path below, and its call sites inspect
+// the 503 to keep optimistic state. isTransientApiError is for READ recovery.
+// Raised when a `fetch` REJECTS — the request never got an HTTP answer (server
+// unreachable during a deploy/restart/cold start, DNS failure, offline). We wrap
+// the raw DOMException/TypeError so classification can key off THIS type rather
+// than `instanceof Error`, which would also match a genuine programming bug
+// (TypeError/ReferenceError from the render/fetch cycle) and silently swallow it.
+export class NetworkError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "NetworkError";
   }
-  return body as T;
+}
+
+const RETRYABLE_STATUS = new Set([502, 503, 504]);
+
+export function isTransientApiError(err: unknown): boolean {
+  if (err instanceof ApiError) {
+    // not_durable rides ONLY on mutations and has dedicated optimistic handling
+    // at its call sites — it is never a generic swallow-able read blip.
+    if (err.status === 503 && err.message === "not_durable") return false;
+    return RETRYABLE_STATUS.has(err.status);
+  }
+  // Only a real network failure is transient — not every stray runtime Error.
+  return err instanceof NetworkError;
+}
+
+// Only idempotent reads are auto-retried. Retrying a mutation after a network
+// failure is unsafe (it may have applied server-side before the socket dropped),
+// so POST/PUT/PATCH/DELETE throw on the first failure exactly as before and their
+// call sites decide what to do (e.g. the not_durable optimistic path).
+const RETRY_SAFE_METHODS = new Set(["GET", "HEAD"]);
+const MAX_ATTEMPTS = 3;
+// Backoff between read retries. Kept short so a failed one-shot load still
+// resolves quickly, but long enough to bridge a brief backend restart. Jitter
+// avoids a thundering-herd retry when many tabs blip at the same instant.
+function retryDelayMs(attempt: number): number {
+  return Math.round(400 * Math.pow(2.5, attempt - 1) * (0.75 + Math.random() * 0.5));
+}
+const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method || "GET").toUpperCase();
+  const retryable = RETRY_SAFE_METHODS.has(method);
+  let attempt = 0;
+  for (;;) {
+    attempt++;
+    let res: Response;
+    try {
+      res = await fetch(`${API_BASE}${path}`, {
+        credentials: "include",
+        ...init,
+        headers: {
+          Accept: "application/json",
+          "X-Devasign-Tab": tabId,
+          ...(init.body ? { "Content-Type": "application/json" } : {}),
+          ...(init.headers || {}),
+        },
+      });
+    } catch (netErr) {
+      // An aborted request (component unmounted, user navigated away) must NOT
+      // be retried — that just delays the abort and leaks background traffic.
+      // Propagate it untouched.
+      const isAbort = netErr instanceof Error && netErr.name === "AbortError";
+      // Server unreachable / offline. Retry idempotent reads a few times so a
+      // few-second backend blip never reaches the caller; otherwise re-throw.
+      if (retryable && !isAbort && attempt < MAX_ATTEMPTS) {
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      if (isAbort) throw netErr;
+      // Wrap so isTransientApiError can tell a real network failure apart from a
+      // stray runtime Error.
+      throw new NetworkError(netErr instanceof Error ? netErr.message : String(netErr));
+    }
+    const text = await res.text();
+    const body = text ? safeParse(text) : null;
+    if (!res.ok) {
+      // A bare upstream 5xx on a read is the same class of transient blip — one
+      // more chance before it becomes a real error to the caller.
+      if (retryable && RETRYABLE_STATUS.has(res.status) && attempt < MAX_ATTEMPTS) {
+        await sleep(retryDelayMs(attempt));
+        continue;
+      }
+      const message =
+        (body && typeof body === "object" && "error" in (body as any) && (body as any).error) ||
+        `HTTP ${res.status}`;
+      throw new ApiError(res.status, String(message), body);
+    }
+    return body as T;
+  }
 }
 
 function safeParse(s: string): unknown {
