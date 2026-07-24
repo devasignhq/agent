@@ -58,8 +58,10 @@ export const config = {
   // (contributors.devasign.ai in prod; the Vite dev server on :3002 locally).
   // Must be a devasign.ai subdomain in prod: the session cookie is set on
   // api.devasign.ai with SameSite=None and stays first-party only within the
-  // same site. Feeds allowedWebOrigins() below (CORS + CSRF) and the OAuth
-  // return-to-initiating-app redirect in github/oauth.ts.
+  // same site. Feeds allowedWebOrigins() below (CORS + CSRF), the OAuth
+  // return-to-initiating-app redirect, AND — because the two apps mint separate
+  // maintainer/contributor accounts — the per-request choice of which session
+  // cookie (hence which account) to resolve (see kindForRequest in github/oauth.ts).
   contributorOrigin: process.env.CONTRIBUTOR_ORIGIN || "http://localhost:3002",
   // Cross-site session cookies need SameSite=None; Secure, which is only valid
   // (and only wanted) once the dashboard is served over https — i.e. prod. In

@@ -7,6 +7,7 @@ import { config, isProductionLike } from "../config.js";
 import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
+import { maintainerByGithubId } from "../users.js";
 import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { triggerOutcome } from "../review/decisions.js";
@@ -603,12 +604,15 @@ function handleAppAuthorization(event: any) {
     console.log("[webhook] github_app_authorization revoked: no sender id — ignored");
     return;
   }
-  const user = db.find("users", (u) => u.githubId === senderId);
+  // Independent deletion: the GitHub App authorization is the maintainer side, so
+  // a revoke tears down only the maintainer account. A contributor account for the
+  // same identity is left intact — it's deleted from the contributor app itself.
+  const user = maintainerByGithubId(senderId);
   if (!user) {
-    // No account for this GitHub user (never signed up, or already deleted — a
-    // re-delivery after the wipe lands here). Nothing to do.
+    // No maintainer account for this GitHub user (never installed, or already
+    // deleted — a re-delivery after the wipe lands here). Nothing to do.
     console.log(
-      `[webhook] github_app_authorization revoked: no DevAsign account for github id ${senderId} — ignored`
+      `[webhook] github_app_authorization revoked: no DevAsign maintainer account for github id ${senderId} — ignored`
     );
     return;
   }
@@ -636,9 +640,9 @@ function handleInstallation(event: any) {
     // popup handshake making it back to our origin for the install to
     // become visible to the frontend.
     const senderId: number | undefined = event.sender?.id;
-    const owner = senderId
-      ? db.find("users", (u) => u.githubId === senderId)
-      : null;
+    // Installing the App is a maintainer action — link it to the maintainer
+    // account (a contributor account never owns installs).
+    const owner = senderId ? maintainerByGithubId(senderId) : null;
     const install = {
       id: uuid(),
       userId: owner?.id || "",
@@ -703,8 +707,10 @@ function handleInstallationRepos(event: any) {
   // shipped, or sender didn't match a user at install time), try to claim it
   // for whoever triggered this repos-changed event.
   const senderId: number | undefined = event.sender?.id;
+  // Claim an unlinked install for the maintainer account of whoever triggered the
+  // repos-changed event (installs are maintainer-owned).
   const claimedUserId = !install.userId && senderId
-    ? db.find("users", (u) => u.githubId === senderId)?.id
+    ? maintainerByGithubId(senderId)?.id
     : null;
   db.update(
     "installations",

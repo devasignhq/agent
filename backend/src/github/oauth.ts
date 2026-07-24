@@ -7,6 +7,7 @@ import { config, isGithubOAuthConfigured, isStripeConfigured } from "../config.j
 import { db } from "../db.js";
 import type { User } from "../types.js";
 import { addInstallMember } from "./installations.js";
+import { accountKindOf, contributorByGithubId, maintainerByGithubId, type AccountKind } from "../users.js";
 import { reconcileSubscriptionFromStripe } from "../billing/stripe.js";
 import { track } from "../statsig.js";
 
@@ -16,7 +17,7 @@ const STATE_TTL_MS = 5 * 60 * 1000;
 // and an optional same-app path to land back on, so finishOAuth can return the
 // user to the app/page that initiated sign-in (e.g. a contributor's bounty
 // discovery page) instead of always bouncing to the sponsor dashboard.
-type PendingOAuth = { expiresAt: number; origin: string; returnTo: string };
+type PendingOAuth = { expiresAt: number; origin: string; returnTo: string; kind: AccountKind };
 const pendingState = new Map<string, PendingOAuth>();
 
 function pruneState() {
@@ -28,6 +29,12 @@ function pruneState() {
 // sponsor dashboard, preserving the pre-multi-app behavior bit for bit.
 function originForApp(app: string | undefined): string {
   return app === "contributor" ? config.contributorOrigin : config.webOrigin;
+}
+
+// Which account kind an `?app=` key mints. Anything other than the contributor
+// app is the maintainer (sponsor dashboard) — the default, matching originForApp.
+function kindForApp(app: string | undefined): AccountKind {
+  return app === "contributor" ? "contributor" : "maintainer";
 }
 
 // A safe same-app return path: must be a single-slash-rooted path (rejects
@@ -62,6 +69,30 @@ function sessionCookieOptions() {
     path: "/",
     maxAge: SESSION_TTL_SECONDS * 1000,
   };
+}
+
+// The same GitHub identity owns two accounts, so a session must be scoped to the
+// app it belongs to. Both first-party apps call the SAME api host, so the cookie
+// can't be separated by host (it's host-only, no Domain) — instead each kind gets
+// its own NAME and the server picks the name by the caller's Origin. The
+// maintainer name is the original `devasign_session`, so existing sponsor
+// sessions keep working untouched; only the contributor app gets a new cookie.
+const MAINTAINER_COOKIE = "devasign_session";
+const CONTRIBUTOR_COOKIE = "devasign_session_contributor";
+function cookieNameForKind(kind: AccountKind): string {
+  return kind === "contributor" ? CONTRIBUTOR_COOKIE : MAINTAINER_COOKIE;
+}
+
+// Which account a request is acting as, inferred from its Origin. Cross-origin
+// XHR from either first-party app always carries Origin (both hit the api host
+// cross-site with credentials), so this is reliable for API calls. Top-level
+// navigations — the GitHub and Linear OAuth callbacks — carry no Origin and fall
+// back to the maintainer side, which is correct: both are maintainer-only flows,
+// and it preserves the pre-split single-cookie behavior bit for bit.
+function kindForRequest(req: Request): AccountKind {
+  // Read the header directly (not req.get) so this stays robust to the lightweight
+  // req mocks in unit tests; Express lowercases header names, so `origin` is right.
+  return req.headers?.origin === config.contributorOrigin ? "contributor" : "maintainer";
 }
 
 // The session cookie's value is a JWT signed with SESSION_SECRET (HS256). The
@@ -109,6 +140,7 @@ export function startOAuth(req: Request, res: Response) {
     expiresAt: Date.now() + STATE_TTL_MS,
     origin: originForApp(app),
     returnTo: sanitizeReturnTo(returnTo),
+    kind: kindForApp(app),
   });
   // Bind the state to *this* browser (login-CSRF defense). The pending-state map
   // alone can't distinguish the browser that started the flow from a victim's:
@@ -180,8 +212,12 @@ async function syncStripeEmail(user: User): Promise<void> {
 // True when a *different* user already holds this email — keeps the write path
 // from minting duplicate-email rows (a verified GitHub address can migrate
 // between accounts over time). There is no DB constraint; users are keyed by id.
-const emailTakenByOther = (email: string, selfId: string | null): boolean =>
-  !!db.find("users", (u) => u.email === email && u.id !== selfId);
+// Scoped to one account kind: the maintainer and contributor accounts for the
+// same human legitimately share a verified email, so an email is only "taken" by
+// a DIFFERENT row OF THE SAME KIND. Without this, minting the sibling account
+// would collide and fall back to a noreply address.
+const emailTakenByOther = (email: string, selfId: string | null, kind: AccountKind): boolean =>
+  !!db.find("users", (u) => u.email === email && u.id !== selfId && accountKindOf(u) === kind);
 
 export async function finishOAuth(req: Request, res: Response) {
   const { code, state } = req.query as { code?: string; state?: string };
@@ -240,9 +276,12 @@ export async function finishOAuth(req: Request, res: Response) {
     me.email ||
     `${me.login}@users.noreply.github.com`;
 
-  // Find-or-create
+  // Find-or-create THIS app's account. The same githubId has a separate maintainer
+  // and contributor row, so scope the lookup to the kind that started the flow —
+  // signing into the contributor app must never resolve (or mutate) the sponsor
+  // account, and vice-versa.
   let isNewUser = false;
-  let user = db.find("users", (u) => u.githubId === me.id);
+  let user = pending.kind === "contributor" ? contributorByGithubId(me.id) : maintainerByGithubId(me.id);
   if (!user) {
     isNewUser = true;
     // Anti-masquerade / self-heal: if this browser still presents a validly-signed
@@ -253,7 +292,7 @@ export async function finishOAuth(req: Request, res: Response) {
     // behind a brand-new identity. Safe: the id comes from a token we signed
     // (HS256, httpOnly), so it can only be this browser's own prior id — and if the
     // store really was wiped there's nothing left to mis-link to anyway.
-    const recoveredId = peekSessionUserId(req);
+    const recoveredId = peekSessionUserId(req, pending.kind);
     const reuseId = !!recoveredId && !db.find("users", (u) => u.id === recoveredId);
     const newId = reuseId ? recoveredId! : uuid();
     if (reuseId) {
@@ -266,9 +305,24 @@ export async function finishOAuth(req: Request, res: Response) {
     // Don't mint a duplicate-email row if a verified address already belongs to
     // another account; fall back to the per-login (unique) noreply instead.
     let email = resolvedEmail;
-    if (isRealEmail(email) && emailTakenByOther(email, null)) {
+    if (isRealEmail(email) && emailTakenByOther(email, null, pending.kind)) {
       console.warn(`[oauth] ${email} already in use; new user ${me.login} gets noreply`);
       email = `${me.login}@users.noreply.github.com`;
+    }
+    // Migration smoothing: a brand-new contributor account inherits any payout
+    // wallet already registered on the same person's maintainer row (which, for a
+    // legacy pre-split account, is where an early contributor's wallet landed) —
+    // so they don't have to re-enter it on their first contributor sign-in.
+    let inheritedWallet: Partial<User> = {};
+    if (pending.kind === "contributor") {
+      const prior = maintainerByGithubId(me.id);
+      if (prior?.stellarPayoutAddress) {
+        inheritedWallet = {
+          stellarPayoutAddress: prior.stellarPayoutAddress,
+          stellarPayoutMemo: prior.stellarPayoutMemo,
+          stellarPayoutTrustline: prior.stellarPayoutTrustline,
+        };
+      }
     }
     user = {
       id: newId,
@@ -278,11 +332,14 @@ export async function finishOAuth(req: Request, res: Response) {
       avatarUrl: me.avatar_url,
       plan: "free",
       createdAt: Date.now(),
+      accountKind: pending.kind,
+      ...inheritedWallet,
     } satisfies User;
     db.insert("users", user);
-    // Reuse may re-link a subscription that outlived the user row; only seed a
-    // fresh free subscription when none already exists for this id.
-    if (!db.find("subscriptions", (s) => s.userId === user!.id)) {
+    // Billing lives on the maintainer account only — contributor accounts carry no
+    // plan/subscription. Reuse may re-link a subscription that outlived the user
+    // row; only seed a fresh free subscription when none already exists.
+    if (pending.kind === "maintainer" && !db.find("subscriptions", (s) => s.userId === user!.id)) {
       db.insert("subscriptions", {
         id: uuid(),
         userId: user.id,
@@ -306,7 +363,7 @@ export async function finishOAuth(req: Request, res: Response) {
       // Backfill stale/noreply emails — but never downgrade a good address to a
       // noreply fallback (isRealEmail guards that), and never duplicate an
       // address another account already holds.
-      if (emailTakenByOther(resolvedEmail, user.id)) {
+      if (emailTakenByOther(resolvedEmail, user.id, pending.kind)) {
         console.warn(`[oauth] skipping email backfill for user ${user.id}: ${resolvedEmail} already in use`);
       } else {
         updates.email = resolvedEmail;
@@ -330,7 +387,7 @@ export async function finishOAuth(req: Request, res: Response) {
   // and — the common case — state lost when the store was wiped on a redeploy.
   // Best-effort: a Stripe hiccup must never block sign-in. Re-read the user since
   // a successful reconcile mirrors the new plan onto the user row.
-  if (isStripeConfigured()) {
+  if (pending.kind === "maintainer" && isStripeConfigured()) {
     try {
       await reconcileSubscriptionFromStripe(user);
       user = db.find("users", (u) => u.id === user!.id) ?? user;
@@ -343,10 +400,15 @@ export async function finishOAuth(req: Request, res: Response) {
   // where they're an owner/admin — so an org install set up by another owner shows
   // up on their account automatically. Uses the OAuth token (not persisted), which
   // is only in scope here. Best-effort: never block sign-in.
-  try {
-    await adoptUserInstallations(user, tokenBody.access_token);
-  } catch (err) {
-    console.warn(`[oauth] install adoption failed for user ${user.id}:`, err);
+  // Installations are a maintainer concern. A contributor account must never adopt
+  // one (its personal-account install would enroll the contributor row as a member
+  // and hand it sponsor access), so only the maintainer sign-in adopts.
+  if (pending.kind === "maintainer") {
+    try {
+      await adoptUserInstallations(user, tokenBody.access_token);
+    } catch (err) {
+      console.warn(`[oauth] install adoption failed for user ${user.id}:`, err);
+    }
   }
 
   if (isNewUser) {
@@ -366,7 +428,7 @@ export async function finishOAuth(req: Request, res: Response) {
   // Session cookie: a JWT signed with SESSION_SECRET (HS256), unforgeable and
   // self-expiring — see signSession/verifySession above.
   const session = signSession(user.id);
-  res.cookie("devasign_session", session, sessionCookieOptions());
+  res.cookie(cookieNameForKind(pending.kind), session, sessionCookieOptions());
   // Land on a sentinel URL so the popup handshake in main.tsx can detect a
   // successful sign-in and signal the opener. For top-level (non-popup)
   // navigation the frontend just strips the query and renders normally.
@@ -457,11 +519,19 @@ async function adoptUserInstallations(user: User, accessToken: string): Promise<
 }
 
 export function getSessionUser(req: Request): User | null {
-  const raw = req.cookies?.devasign_session;
+  const kind = kindForRequest(req);
+  const raw = req.cookies?.[cookieNameForKind(kind)];
   if (!raw) return null;
   const userId = verifySession(raw);
   if (!userId) return null;
-  return db.find("users", (u) => u.id === userId);
+  const user = db.find("users", (u) => u.id === userId);
+  // Kind-match: a cookie for one app must only ever resolve that app's account.
+  // Guards the transition — a legacy `devasign_session` pointing at a row later
+  // classified as a contributor must NOT resolve on the sponsor origin (and a
+  // forged/misrouted cookie can't cross accounts). accountKindOf treats a missing
+  // value as maintainer, so genuine legacy maintainer sessions still resolve.
+  if (!user || accountKindOf(user) !== kind) return null;
+  return user;
 }
 
 // The user id a valid, unexpired session cookie *claims* — even when no matching
@@ -471,8 +541,8 @@ export function getSessionUser(req: Request): User | null {
 // deletion, or — the case we must not paper over — a store wiped on a redeploy).
 // Callers use this to tell the two apart instead of funnelling a wipe into a
 // fresh sign-up. Returns null only when there is genuinely no valid session.
-export function peekSessionUserId(req: Request): string | null {
-  const raw = req.cookies?.devasign_session;
+export function peekSessionUserId(req: Request, kind: AccountKind = kindForRequest(req)): string | null {
+  const raw = req.cookies?.[cookieNameForKind(kind)];
   if (!raw) return null;
   return verifySession(raw);
 }
@@ -480,12 +550,14 @@ export function peekSessionUserId(req: Request): string | null {
 // Clear the session cookie. clearCookie only overwrites the cookie when
 // path/sameSite/secure match how it was set; reuse the same attributes (maxAge
 // is irrelevant when clearing). Shared by signOut and account deletion.
-export function clearSessionCookie(res: Response): void {
+export function clearSessionCookie(res: Response, req: Request): void {
   const { maxAge: _ignored, ...clearOpts } = sessionCookieOptions();
-  res.clearCookie("devasign_session", clearOpts);
+  // Clear only the cookie for the app that made this request, so signing out of
+  // one app never signs the same person out of the other.
+  res.clearCookie(cookieNameForKind(kindForRequest(req)), clearOpts);
 }
 
-export function signOut(_req: Request, res: Response) {
-  clearSessionCookie(res);
+export function signOut(req: Request, res: Response) {
+  clearSessionCookie(res, req);
   res.json({ ok: true });
 }
