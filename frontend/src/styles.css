@@ -1232,7 +1232,27 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   color: var(--info);
 }
 .subs-badge svg { color: var(--info); }
-.bounty-row > span:has(.subs-badge) { overflow: visible; }
+
+/* In-row pending timeline-extension marker (amber = time-sensitive request) */
+.ext-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--warn);
+}
+.ext-badge svg { color: var(--warn); }
+
+/* Holds the in-row submission / extension badges: a flex track so the two
+   space cleanly (gap) when both are present, and overflow-visible so the
+   marker isn't clipped by the .bounty-row > * ellipsis rule. */
+.bounty-row-badges {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  overflow: visible;
+}
 
 /* Outline CTA — used for inbox primary actions (Merge & pay, Approve, etc.) */
 .btn.outline {
