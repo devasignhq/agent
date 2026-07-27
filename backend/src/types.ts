@@ -8,6 +8,15 @@ export type User = {
   avatarUrl?: string;
   plan: "free" | "pro" | "max";
   createdAt: number;
+  // Which app minted this account. The SAME GitHub identity yields TWO separate
+  // `users` rows (distinct ids): a "maintainer" account for the sponsor dashboard
+  // (installs, billing, sponsored bounties) and a "contributor" account for the
+  // contributor app (applies to bounties, owns the payout wallet). OAuth keys
+  // find-or-create on (githubId, accountKind); the session cookie is chosen per
+  // app so each side resolves its own account. Optional so legacy rows load
+  // unchanged — a missing value is treated as "maintainer" (see accountKindOf in
+  // users.ts and the boot backfill that stamps existing rows by installation).
+  accountKind?: "maintainer" | "contributor";
   // Bounty payout wallet. A contributor authenticates with GitHub, then MANUALLY
   // enters the Stellar address (G…) their bounty payouts should go to — so their
   // GitHub identity is linked to the receiving address at all times. Optional so

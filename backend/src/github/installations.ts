@@ -8,6 +8,7 @@
 // org's repos/reviews without clobbering the first owner's claim.
 import { db } from "../db.js";
 import type { Installation } from "../types.js";
+import { maintainerByGithubId } from "../users.js";
 
 // The DevAsign users linked to an installation. Falls back to [userId] for rows
 // written before `userIds` existed (and drops "" placeholders from unlinked rows).
@@ -54,7 +55,10 @@ export function attributedUserFor(
   githubActorId: number | null | undefined
 ): string | null {
   if (!install || typeof githubActorId !== "number") return null;
-  const actor = db.find("users", (u) => u.githubId === githubActorId);
+  // Billing/quota attribution is a maintainer concern: only the maintainer account
+  // owns a subscription and can be an install member. The same githubId may also
+  // have a contributor account, so resolve the maintainer side explicitly.
+  const actor = maintainerByGithubId(githubActorId);
   if (!actor) return null;
   return userInInstall(install, actor.id) ? actor.id : null;
 }

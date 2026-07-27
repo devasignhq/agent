@@ -1,6 +1,8 @@
 // Session context. Loads /api/me once on mount, exposes user, reload(), and
-// signOut(). The session cookie lives on api.devasign.ai and is shared with the
-// sponsor dashboard — signing in on either app signs into both.
+// signOut(). This app has its OWN session cookie (devasign_session_contributor,
+// set on api.devasign.ai): the same GitHub identity has a separate contributor
+// account here and maintainer account on the sponsor dashboard, so signing into
+// one app does NOT sign into the other — each resolves its own account by Origin.
 import React from "react";
 import { api, oauthStartUrl } from "./api";
 import type { Subscription, User } from "./api";

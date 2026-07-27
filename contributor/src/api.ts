@@ -86,6 +86,10 @@ export type User = {
   avatarUrl?: string;
   plan: "free" | "pro" | "max";
   createdAt: number;
+  // Which app minted this account. In the contributor app this is always
+  // "contributor" — the same GitHub identity has a separate "maintainer" account
+  // on the sponsor dashboard. Optional here so older payloads type-check.
+  accountKind?: "maintainer" | "contributor";
   stellarPayoutAddress?: string;
   stellarPayoutMemo?: string;
   stellarPayoutTrustline?: boolean;

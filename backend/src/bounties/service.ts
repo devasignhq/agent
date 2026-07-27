@@ -32,6 +32,7 @@ import {
 } from "../stellar/escrow.js";
 import { parseInvokeContractCall, parseTxSource, sendSignedXdr, type SendResult } from "../stellar/submit.js";
 import { pushNotification } from "../notifications.js";
+import { contributorByGithubId, contributorNotifyTarget } from "../users.js";
 import { enqueueBountyCriteria } from "../queue.js";
 import { checkGate, GATES } from "../statsig.js";
 import { bountyActor } from "./owner.js";
@@ -72,7 +73,9 @@ export function getBounty(id: string): Bounty | null {
 /** The DevAsign user row for a bounty's assignee, for notifications. */
 export function assigneeUser(b: Bounty) {
   if (b.assigneeGithubId == null) return null;
-  return db.find("users", (u) => u.githubId === b.assigneeGithubId);
+  // The assignee is a contributor — send their bells to the contributor account
+  // (falling back to a maintainer account only for an in-flight, pre-split assignee).
+  return contributorNotifyTarget(b.assigneeGithubId);
 }
 
 function nextSeq(): number {
@@ -565,8 +568,11 @@ export async function delegateToApplicant(
     return { ok: false, reason: "no_such_application" };
   }
 
-  // Resolve the payout wallet: bound-at-apply, else the account wallet.
-  const user = db.find("users", (u) => u.githubId === githubId);
+  // Resolve the payout wallet: bound-at-apply, else the account wallet. MUST be
+  // the contributor account (strict) — the wallet lives there, and finalizeDelegation
+  // caches the snapshot back onto this same id. Landing on a same-githubId maintainer
+  // account would pull the wrong/absent wallet and cache it on the wrong row.
+  const user = contributorByGithubId(githubId);
   const address = target.address ?? user?.stellarPayoutAddress ?? "";
   const memo = (target.address ? target.memo : user?.stellarPayoutMemo) || null;
   if (!address) return { ok: false, reason: "no_contributor_wallet" };

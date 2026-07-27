@@ -6,6 +6,7 @@
 //   e. Eval (LLM-as-judge; out-of-band, not in this hot path)
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import { contributorNotifyTarget } from "../users.js";
 import { dismissPRReview, dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
 import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 import { complete, completeWithMeta, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
@@ -826,7 +827,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
       const assignee =
         bounty?.assigneeGithubId != null
-          ? db.find("users", (u) => u.githubId === bounty.assigneeGithubId)
+          ? contributorNotifyTarget(bounty.assigneeGithubId)
           : null;
       if (bounty && assignee) {
         pushNotification(
@@ -1015,7 +1016,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       const bounty = db.find("bounties", (b) => b.id === review.bountyId);
       const assignee =
         bounty?.assigneeGithubId != null
-          ? db.find("users", (u) => u.githubId === bounty.assigneeGithubId)
+          ? contributorNotifyTarget(bounty.assigneeGithubId)
           : null;
       if (bounty && assignee) {
         pushNotification(

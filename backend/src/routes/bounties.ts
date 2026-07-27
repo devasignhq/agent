@@ -10,6 +10,7 @@ import { db } from "../db.js";
 import type { Bounty } from "../types.js";
 import { isStellarConfigured } from "../config.js";
 import { getSessionUser } from "../github/oauth.js";
+import { contributorNotifyTarget, maintainerByGithubId } from "../users.js";
 import { installationsForUser, userInInstall } from "../github/installations.js";
 import { assertValidAddress } from "../stellar/scval.js";
 import { validateMemo } from "../stellar/memo.js";
@@ -318,8 +319,27 @@ bounties.post("/bounties/:id/cancel", async (req, res) => {
 bounties.post("/bounties/:id/apply", async (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
-  if (!requireStellar(res)) return; // apply now probes the USDC trustline on-chain
   if (user.githubId == null) return void res.status(400).json({ error: "no_github_identity" });
+
+  // You can't apply to a bounty you sponsor/maintain. Under the two-account model
+  // the applicant is a CONTRIBUTOR account while the sponsor is a MAINTAINER
+  // account — different user ids for the same human — so this must be checked in
+  // githubId-space, never by user.id. Two ways to be "your own bounty": you're the
+  // explicit sponsor (sponsorUserId → its githubId), or your maintainer account is
+  // a member of the installation that owns the repo (the comment/Linear path).
+  // Runs before requireStellar so a blocked sponsor gets 403, not a 503.
+  const b = getBounty(req.params.id);
+  if (!b) return void res.status(404).json({ error: "not_found" });
+  const sponsorGithubId = b.sponsorUserId
+    ? db.find("users", (u) => u.id === b.sponsorUserId)?.githubId ?? null
+    : null;
+  const asMaintainer = maintainerByGithubId(user.githubId);
+  const maintainsRepo = !!asMaintainer && userInstallationIds(asMaintainer.id).has(b.installationId);
+  if (sponsorGithubId === user.githubId || maintainsRepo) {
+    return void res.status(403).json({ error: "own_bounty" });
+  }
+
+  if (!requireStellar(res)) return; // apply now probes the USDC trustline on-chain
   const address = String(req.body?.address || "");
   const memoCheck = validateMemo(req.body?.memo);
   if (!memoCheck.ok) return void res.status(400).json({ error: "invalid_memo" });
@@ -381,7 +401,7 @@ bounties.post("/bounties/:id/applications/:githubId/:action", async (req, res) =
   // "accept". A reject still matters so a turned-down application doesn't sit in
   // their dashboard looking live. (The losers auto-rejected by a delegate are
   // intentionally NOT pinged here, to avoid a notification burst.)
-  const applicant = db.find("users", (u) => u.githubId === githubId);
+  const applicant = contributorNotifyTarget(githubId);
   if (applicant && action === "approve") {
     pushNotification(
       applicant.id,

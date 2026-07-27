@@ -170,6 +170,19 @@ test("attributedUserFor resolves only install-members", () => {
   assert.equal(attributedUserFor(install, outsider.githubId), null);
 });
 
+test("attributedUserFor attributes to the MAINTAINER account, not a same-githubId contributor", () => {
+  const owner = seedUser(2200, "attr-dual"); // maintainer (install member; un-stamped legacy → maintainer)
+  const { install } = seedLinkedRepo(owner);
+  // The same human also has a contributor account. Billing/quota is a maintainer
+  // concern, so attribution must land on the install-member maintainer account —
+  // never the contributor (which isn't an install member and owns no subscription).
+  db.insert("users", {
+    id: uuid(), githubId: 2200, githubLogin: "attr-dual", email: "c@e.com",
+    plan: "free", createdAt: Date.now(), accountKind: "contributor",
+  } as any);
+  assert.equal(attributedUserFor(install, 2200), owner.id);
+});
+
 // ── Per-user attribution on the opened webhook ──────────────────────────────
 
 test("member-authored PR is reviewed and counted against the author", () => {

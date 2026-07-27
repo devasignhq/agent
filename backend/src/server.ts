@@ -32,6 +32,8 @@ import { bounties } from "./routes/bounties.js";
 import { contributor } from "./routes/contributor.js";
 import { closeAllStreams } from "./notifications-stream.js";
 import { dedupePRReviews } from "./review/dedupe.js";
+import { backfillAccountKinds } from "./users.js";
+import { installationsForUser } from "./github/installations.js";
 import { startWorker } from "./worker.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
@@ -253,6 +255,16 @@ try {
 const mergedReviews = dedupePRReviews();
 if (mergedReviews > 0) {
   console.log(`[server] merged ${mergedReviews} duplicate PR review row${mergedReviews === 1 ? "" : "s"}`);
+}
+
+// One-time split of the single-account world into the two-account model: stamp
+// every un-classified `users` row by installation presence (owns/joined an
+// install → maintainer account; otherwise → contributor account). Idempotent —
+// only touches rows still missing `accountKind`, so it's a no-op after the first
+// boot. Must run after initDb() (reads the loaded snapshot) and before we serve.
+const stampedAccounts = backfillAccountKinds((userId) => installationsForUser(userId).length);
+if (stampedAccounts > 0) {
+  console.log(`[server] classified ${stampedAccounts} account${stampedAccounts === 1 ? "" : "s"} by installation (two-account migration)`);
 }
 
 // Analytics. Non-fatal by design: initStatsig() swallows its own errors, so a

@@ -307,7 +307,7 @@ test("delegate falls back to the account wallet for a legacy application with no
   const addr = ADDR();
   db.insert("users", {
     id: "user-legacy", githubId: 55, githubLogin: "legacy", email: "l@x.io", plan: "free",
-    createdAt: 1, stellarPayoutAddress: addr, stellarPayoutMemo: "old-memo",
+    createdAt: 1, accountKind: "contributor", stellarPayoutAddress: addr, stellarPayoutMemo: "old-memo",
   } as any);
   // A pre-wallet-at-apply application: pending, no address bound to it.
   db.update("bounties", (x) => x.id === b.id, {

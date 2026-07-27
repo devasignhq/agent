@@ -64,7 +64,7 @@ export function meHandler(req: Request, res: Response) {
     // No valid token, or a healthy store where only this row is gone (e.g. the
     // account was deleted on another device): a genuine signed-out state. Clear
     // any stale ghost cookie so it can't keep resolving to nothing.
-    if (ghostId) clearSessionCookie(res);
+    if (ghostId) clearSessionCookie(res, req);
     res.status(401).json({ error: "not_signed_in" });
     return;
   }
@@ -93,8 +93,9 @@ export async function deleteAccountHandler(
   await purgeAccount(user.id, deps);
 
   // Clear the session cookie (same attributes as signOut, or the browser won't
-  // overwrite it). The account no longer exists, so the user is signed out.
-  clearSessionCookie(res);
+  // overwrite it). The account no longer exists, so the user is signed out — of
+  // this app only; deletion is per-account, so the sibling account is untouched.
+  clearSessionCookie(res, req);
   res.json({ ok: true });
 }
 

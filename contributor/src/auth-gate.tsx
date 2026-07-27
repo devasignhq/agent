@@ -15,7 +15,9 @@ export function AuthGate() {
   const bountyId = params.get("bounty");
   const [connecting, setConnecting] = React.useState(false);
 
-  // Already signed in (e.g. via the other DevAsign app) — skip the gate.
+  // Already has a contributor session — skip the gate. (A maintainer session on
+  // the sponsor dashboard does NOT count: this app has its own account/cookie, so
+  // a maintainer who lands here signs in as a contributor through this gate.)
   if (auth.status === "signed_in") {
     return <Navigate to={bountyId ? `/bounties/${bountyId}?apply=1` : "/dashboard"} replace />;
   }
