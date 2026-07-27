@@ -354,6 +354,11 @@ export function Discovery({ bountyId }: { bountyId: string }) {
         </div>
 
         <div className="c-disc-main">
+          {bounty.issueUrl && bounty.issueNumber > 0 ? (
+            <a href={bounty.issueUrl} target="_blank" rel="noopener noreferrer" className="c-disc-back">
+              ← Back to issue #{bounty.issueNumber}
+            </a>
+          ) : null}
           <div className="c-disc-eyebrow">
             <a href={bounty.issueUrl} target="_blank" rel="noopener noreferrer"><Icon name="github" size={13} /> {bounty.repo}</a>
             <span className="sep">/</span>

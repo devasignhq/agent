@@ -993,6 +993,11 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
               ? <>Cancel <span className="mono">{bounty.code}</span> — {bounty.title}. Any escrowed funds are refunded to your wallet.</>
               : "Cancel this bounty and refund any escrowed funds to your wallet."}
           </div>
+          {bounty && bounty.issueUrl && bounty.issueNumber > 0 ? (
+            <a className="cb-back" href={bounty.issueUrl} target="_blank" rel="noopener noreferrer">
+              <Icon name="github" size={12} /> ← Back to issue #{bounty.issueNumber}
+            </a>
+          ) : null}
         </div>
 
         {phase === "done" ? (
@@ -1010,6 +1015,11 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
                 "No funds were in escrow."
               )}
             </div>
+            {bounty && bounty.issueUrl && bounty.issueNumber > 0 ? (
+              <a className="cb-back" href={bounty.issueUrl} target="_blank" rel="noopener noreferrer">
+                <Icon name="github" size={12} /> ← Back to issue #{bounty.issueNumber}
+              </a>
+            ) : null}
           </div>
         ) : (
           <>

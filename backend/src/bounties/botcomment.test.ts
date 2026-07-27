@@ -26,12 +26,14 @@ test("OPEN body says funded and carries the tokenless Apply CTA", () => {
   assert.ok(body.includes("$100 USDC"));
   assert.ok(body.includes(`](${applyUrl("b-1")})`), "CTA links to the apply page");
   assert.ok(!body.includes("token="), "apply link is tokenless — it sits in a public comment");
+  assert.match(body, /open it in a new tab/, "hints that ⌘/Ctrl-click opens a new tab (GitHub strips target=_blank)");
 });
 
 test("confirm body still carries the tokenized Fund/Cancel links", () => {
   const body = renderConfirmBody(bounty({ status: "PENDING_FUNDING" }));
   assert.ok(body.includes("/fund?token="));
   assert.ok(body.includes("/cancel?token="));
+  assert.match(body, /open it in a new tab/, "hints that ⌘/Ctrl-click opens a new tab (GitHub strips target=_blank)");
 });
 
 test("DELEGATED body has no Apply CTA (the window for applying is over)", () => {
