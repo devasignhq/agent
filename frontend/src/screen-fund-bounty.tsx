@@ -342,6 +342,11 @@ export const FundBountyPage = () => {
     <div className="fb-page">
       <div className="fb-shell">
         <div className="fb-head">
+          {bounty.issueUrl && bounty.issueNumber > 0 ? (
+            <a href={bounty.issueUrl} target="_blank" rel="noopener noreferrer" className="fb-link fb-back">
+              ← Back to issue #{bounty.issueNumber}
+            </a>
+          ) : null}
           <div className="fb-eyebrow">Fund bounty</div>
           <h1 className="fb-title">{bounty.title}</h1>
           <div className="fb-meta mono">
@@ -389,6 +394,11 @@ export const FundBountyPage = () => {
                 </>
               )}
             </div>
+            {bounty.issueUrl && bounty.issueNumber > 0 ? (
+              <a href={bounty.issueUrl} target="_blank" rel="noopener noreferrer" className="fb-link fb-back">
+                ← Back to issue #{bounty.issueNumber}
+              </a>
+            ) : null}
           </div>
         ) : (
           <>

@@ -24,7 +24,7 @@ export function renderConfirmBody(bounty: Bounty): string {
     ``,
     `**[💰 Fund bounty →](${fund})**  ·  [✖ Cancel](${cancel})`,
     ``,
-    `<sub>Funds are locked in a Stellar USDC escrow. Delegate a contributor and, once their PR merges within the window, the escrow releases to them automatically; if the window elapses first, it's refunded to your wallet.</sub>`,
+    `<sub>Funds are locked in a Stellar USDC escrow. Delegate a contributor and, once their PR merges within the window, the escrow releases to them automatically; if the window elapses first, it's refunded to your wallet. Tip: ⌘-click (Ctrl-click) a link to open it in a new tab.</sub>`,
   ].join("\n");
 }
 
@@ -71,7 +71,7 @@ export function renderStatusBody(bounty: Bounty): string {
         `**[🚀 Apply for this bounty →](${applyUrl(bounty.id)})**`,
         ...renderAcceptance(bounty),
         ``,
-        `<sub>Applying takes a minute — sign in with GitHub and introduce yourself. The sponsor approves one applicant to delegate the work; once their PR merges within the ${bounty.deliveryDays}-day window, the escrow pays out automatically.</sub>`,
+        `<sub>Applying takes a minute — sign in with GitHub and introduce yourself. The sponsor approves one applicant to delegate the work; once their PR merges within the ${bounty.deliveryDays}-day window, the escrow pays out automatically. Tip: ⌘-click (Ctrl-click) the link to open it in a new tab.</sub>`,
       ].join("\n");
     case "DELEGATED":
       return `🤖 **DevAsign Bounty** — 👤 delegated to ${dev}.${due} Merge their PR to release the ${amt}, or it refunds when the window elapses.`;
