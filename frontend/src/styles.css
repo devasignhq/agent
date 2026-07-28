@@ -5903,6 +5903,12 @@ pre.vln-code, .vln-code {
 .vln-rule code { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
 .vln-blk { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .vln-blk:last-child { border-bottom: 0; }
+/* Per-repo gate card (the "All repositories" merge-gate view): the verdict box
+   with its blocking findings attached directly beneath it. */
+.vln-gate-card { display: flex; flex-direction: column; }
+.vln-gate-card-blk { border: 1px solid var(--line); border-top: 0; background: var(--bg-1); }
+/* Repo separator heading that labels each editor in the stacked policy view. */
+.vln-repo-sep { font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; color: var(--fg-dim); padding-bottom: 2px; border-bottom: 1px solid var(--line); }
 .vln-blk-t { font-size: 12.5px; color: var(--fg); }
 .vln-blk-l { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vln-term { background: var(--bg); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; line-height: 1.75; color: #c8ccd1; padding: 13px 15px; overflow-x: auto; min-height: 200px; max-height: 520px; overflow-y: auto; }

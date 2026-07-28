@@ -278,6 +278,7 @@ export const SecurityPage = ({
           overview={overview}
           repoFilter={repoFilter}
           onOpen={(id) => navigate(`/security/findings/${id}`, { state: { from: "gate" } })}
+          onSelectRepo={setRepoFilter}
         />
       )}
       {view === "policy" && (
@@ -1135,31 +1136,124 @@ const FindingDetail = ({
 
 // ─── merge gate ───────────────────────────────────────────────────────────────
 
+// The merge gate is inherently per-repo. With a specific repo selected we show
+// its full detail (rules, blocking findings, scan terminal); with "All
+// repositories" and more than one repo we stack a compact per-repo summary so
+// the sponsor sees every gate's stats at a glance and can drill into one.
 const GateView = ({
   overview,
   repoFilter,
   onOpen,
+  onSelectRepo,
 }: {
   overview: SecurityOverview;
   repoFilter: string;
   onOpen: (id: string) => void;
+  onSelectRepo: (id: string) => void;
 }) => {
-  // The gate is per-repo; "all" shows the first repo with a failing gate (or
-  // the first repo).
-  const repo =
-    (repoFilter !== "all" ? overview.repos.find((r) => r.id === repoFilter) : null) ??
-    overview.repos.find((r) => r.gate.verdict === "fail") ??
-    overview.repos[0];
+  const repos =
+    repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter);
+  if (repos.length === 0) {
+    return <div className="vln-empty">Connect a repository to see its merge gate.</div>;
+  }
+  if (repoFilter === "all" && repos.length > 1) {
+    return (
+      <div className="col gap-4">
+        {repos.map((r) => (
+          <GateRepoSummary
+            key={r.id}
+            repo={r}
+            findings={overview.findings}
+            onOpen={onOpen}
+            onSelectRepo={onSelectRepo}
+          />
+        ))}
+      </div>
+    );
+  }
+  return <GateRepoDetail repo={repos[0]} overview={overview} onOpen={onOpen} />;
+};
+
+// Compact per-repo gate card for the "all repositories" view: verdict, rule
+// pass count, and the blocking findings, with a drill-in to the full detail.
+const GateRepoSummary = ({
+  repo,
+  findings,
+  onOpen,
+  onSelectRepo,
+}: {
+  repo: SecurityRepoView;
+  findings: SecurityFinding[];
+  onOpen: (id: string) => void;
+  onSelectRepo: (id: string) => void;
+}) => {
+  const gate = repo.gate;
+  const blocking = findings.filter((f) => gate.blockingFindingIds.includes(f.id));
+  const blocked = gate.verdict === "fail";
+  const passed = gate.rules.filter((r) => r.pass).length;
+  return (
+    <div className="vln-gate-card">
+      <div className={`vln-verdict ${blocked ? "fail" : "pass"}`}>
+        <div className="vln-verdict-icon">
+          <Icon name={blocked ? "warn" : "check"} size={16} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="vln-verdict-t">
+            {blocked ? "MERGE BLOCKED" : "MERGE CLEAR"} · {repo.owner}/{repo.name}
+          </div>
+          <div className="vln-verdict-s">
+            {passed} of {gate.rules.length} gate rules pass · {blocking.length} blocking ·{" "}
+            enforced on <span className="mono" style={{ color: "var(--fg-dim)" }}>{repo.defaultBranch}</span>
+          </div>
+        </div>
+        <button className="btn ghost sm" onClick={() => onSelectRepo(repo.id)}>
+          Details
+        </button>
+      </div>
+      {blocking.length > 0 && (
+        <div className="vln-gate-card-blk">
+          {blocking.map((f) => (
+            <div key={f.id} className="vln-blk">
+              <SevPill sev={f.severity} />
+              <div style={{ minWidth: 0 }}>
+                <div className="vln-blk-t">{f.title}</div>
+                <div className="vln-blk-l">
+                  {displayId(f)} · {f.path}
+                  {f.line ? `:${f.line}` : ""}
+                  {f.bounty ? ` · bounty ${f.bounty.code} · ${f.bounty.amountUsdc} USDC` : ""}
+                </div>
+              </div>
+              <button className="btn sm" onClick={() => onOpen(f.id)}>
+                Review
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Full single-repo gate: rules, blocking findings, and the live scan terminal.
+const GateRepoDetail = ({
+  repo,
+  overview,
+  onOpen,
+}: {
+  repo: SecurityRepoView;
+  overview: SecurityOverview;
+  onOpen: (id: string) => void;
+}) => {
   const [scan, setScan] = React.useState<SecurityScanRun | null>(null);
-  const latest = repo
-    ? overview.scans.filter((s) => s.repoId === repo.id).sort((a, b) => b.startedAt - a.startedAt)[0]
-    : null;
+  const latest =
+    overview.scans.filter((s) => s.repoId === repo.id).sort((a, b) => b.startedAt - a.startedAt)[0] ??
+    null;
 
   // (Re)fetch the terminal log whenever the latest run row changes — the live
   // topic refetches the overview on every log append, so this streams.
   React.useEffect(() => {
     let alive = true;
-    if (!repo || !latest) {
+    if (!latest) {
       setScan(null);
       return;
     }
@@ -1173,11 +1267,8 @@ const GateView = ({
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repo?.id, latest?.id, (latest as any)?.finishedAt, (latest as any)?.status, overview]);
+  }, [repo.id, latest?.id, (latest as any)?.finishedAt, (latest as any)?.status, overview]);
 
-  if (!repo) {
-    return <div className="vln-empty">Connect a repository to see its merge gate.</div>;
-  }
   const gate: GateResult = repo.gate;
   const blocking = overview.findings.filter((f) => gate.blockingFindingIds.includes(f.id));
   const blocked = gate.verdict === "fail";
@@ -1299,6 +1390,9 @@ const Tog = ({ on, onClick }: { on: boolean; onClick: () => void }) => (
   </button>
 );
 
+// Scan policy is per-repo. A specific selection edits that one repo; "All
+// repositories" (with more than one) stacks an independent editor per repo,
+// each with its own dirty-tracking and Save, under a repo heading.
 const PolicyView = ({
   overview,
   repoFilter,
@@ -1308,22 +1402,46 @@ const PolicyView = ({
   repoFilter: string;
   refresh: () => Promise<void>;
 }) => {
-  const repo =
-    (repoFilter !== "all" ? overview.repos.find((r) => r.id === repoFilter) : null) ??
-    overview.repos[0];
-  const [policy, setPolicy] = React.useState<RepoSecurityPolicy | null>(repo?.policy ?? null);
+  const repos =
+    repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter);
+  if (repos.length === 0) {
+    return <div className="vln-empty">Connect a repository to configure its scan policy.</div>;
+  }
+  if (repoFilter === "all" && repos.length > 1) {
+    return (
+      <div className="col gap-5">
+        {repos.map((r) => (
+          <div key={r.id} className="col gap-3">
+            <div className="vln-repo-sep">{r.owner}/{r.name}</div>
+            <PolicyRepoEditor repo={r} refresh={refresh} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return <PolicyRepoEditor repo={repos[0]} refresh={refresh} />;
+};
+
+const PolicyRepoEditor = ({
+  repo,
+  refresh,
+}: {
+  repo: SecurityRepoView;
+  refresh: () => Promise<void>;
+}) => {
+  const [policy, setPolicy] = React.useState<RepoSecurityPolicy | null>(repo.policy ?? null);
   const [dirty, setDirty] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    setPolicy(repo?.policy ?? null);
+    setPolicy(repo.policy ?? null);
     setDirty(false);
     setErr(null);
-  }, [repo?.id]);
+  }, [repo.id]);
 
-  if (!repo || !policy) {
+  if (!policy) {
     return <div className="vln-empty">Connect a repository to configure its scan policy.</div>;
   }
 
