@@ -8,7 +8,9 @@ import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
 import { maintainerByGithubId } from "../users.js";
-import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
+import { effectiveSecurityPolicy } from "../security/policy.js";
+import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { triggerOutcome } from "../review/decisions.js";
 import { notifyForReview } from "../notifications.js";
@@ -861,7 +863,54 @@ function handlePullRequest(event: any) {
           }
         }
         db.update("repositories", (r) => r.id === repo.id, { indexState: "stale" });
-        enqueueIndex({ repoId: repo.id, full: false, changedPaths: { added, modified, removed, renamed } });
+        const changedPaths = { added, modified, removed, renamed };
+        enqueueIndex({ repoId: repo.id, full: false, changedPaths });
+        // Security audit rides the same merge signal, AFTER the index enqueue:
+        // both drain FIFO in the index bucket, so the audit reads a fresh index
+        // (its file gate is the index's securityFlags). Skipped when an audit
+        // is already queued/running for this repo — enqueueSecurityAudit would
+        // dedupe the job anyway, and creating a second run row would leave it
+        // wedged in "queued" forever.
+        if (effectiveSecurityPolicy(repo).triggers.onMerge) {
+          const inFlight = db.find(
+            "securityScans",
+            (s) => s.repoId === repo.id && (s.status === "queued" || s.status === "running")
+          );
+          if (!inFlight) {
+            const scanRun: SecurityScanRun = {
+              id: uuid(),
+              repoId: repo.id,
+              trigger: "merge",
+              full: false,
+              prNumber: pullReq.number,
+              prTitle: pullReq.title ?? null,
+              mergeSha: pullReq.merge_commit_sha ?? null,
+              prAuthor: pullReq.user?.login ?? null,
+              status: "queued",
+              startedAt: Date.now(),
+              filesScanned: 0,
+              cacheHits: 0,
+              introduced: 0,
+              resolved: 0,
+              stillOpen: 0,
+              log: [],
+            };
+            db.insert("securityScans", scanRun);
+            enqueueSecurityAudit({
+              repoId: repo.id,
+              scanRunId: scanRun.id,
+              trigger: "merge",
+              full: false,
+              changedPaths,
+              pr: {
+                number: pullReq.number,
+                title: pullReq.title ?? "",
+                mergeSha: pullReq.merge_commit_sha ?? "",
+                author: pullReq.user?.login ?? "",
+              },
+            });
+          }
+        }
         console.log(
           `[webhook] merge to ${repo.defaultBranch}: ${owner}/${name}#${pullReq.number} → ` +
           `${added.length}A ${modified.length}M ${removed.length}D ${renamed.length}R`

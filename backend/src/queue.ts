@@ -87,13 +87,35 @@ export type BountyCriteriaJob = {
   attempts: number;
 };
 
+// Whole-codebase security audit (backend/src/security/audit.ts). Drains in the
+// index bucket and is enqueued AFTER the merge's enqueueIndex, so FIFO within
+// the bucket guarantees the index refresh (whose securityFlags gate the audit's
+// file selection) lands before the audit reads it.
+export type SecurityAuditJobPayload = {
+  repoId: string;
+  scanRunId: string; // pre-created SecurityScanRun row (status "queued")
+  trigger: "merge" | "manual" | "nightly";
+  full: boolean;
+  changedPaths?: IndexJobPayload["changedPaths"];
+  pr?: { number: number; title: string; mergeSha: string; author: string } | null;
+};
+
+export type SecurityAuditJob = {
+  id: string;
+  type: "security_audit";
+  payload: SecurityAuditJobPayload;
+  enqueuedAt: number;
+  attempts: number;
+};
+
 export type Job =
   | ReviewJob
   | MaintainerFeedbackJob
   | IndexJob
   | LinearIngestJob
   | GuidanceIngestJob
-  | BountyCriteriaJob;
+  | BountyCriteriaJob
+  | SecurityAuditJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -187,6 +209,25 @@ export function enqueueGuidanceIngest(
   const job: GuidanceIngestJob = {
     id: uuid(),
     type: "guidance_ingest",
+    payload,
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.index.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueSecurityAudit(payload: SecurityAuditJobPayload): SecurityAuditJob {
+  // Idempotent per repo: a webhook redelivery (or a manual re-scan racing a
+  // merge) must not run two audits over the same files and double-pay the LLM.
+  const waiting = pending.index.find(
+    (j): j is SecurityAuditJob => j.type === "security_audit" && j.payload.repoId === payload.repoId
+  );
+  if (waiting) return waiting;
+  const job: SecurityAuditJob = {
+    id: uuid(),
+    type: "security_audit",
     payload,
     enqueuedAt: Date.now(),
     attempts: 0,

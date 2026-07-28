@@ -37,9 +37,13 @@ import { installationsForUser } from "./github/installations.js";
 import { startWorker } from "./worker.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
+import { startSecurityLiveSignals } from "./security/live.js";
+import { backfillLegacyVulnerabilities } from "./security/migrate.js";
+import { effectiveSecurityPolicy } from "./security/policy.js";
+import type { SecurityScanRun } from "./types.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { durabilityBarrier } from "./durability.js";
-import { enqueueIndex } from "./queue.js";
+import { enqueueIndex, enqueueSecurityAudit } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 import { requestContext } from "./request-context.js";
 
@@ -314,7 +318,14 @@ startBountyKeeper();
 // contributor app. Subscribes to the db change emitter; a no-op while no
 // client holds an open stream. See bounties/live.ts.
 startBountyLiveSignals();
+// Same for security findings/scan runs → the sponsor app's Security page, plus
+// the bounty→finding state linkage. See security/live.ts.
+startSecurityLiveSignals();
+// One-shot, idempotent: legacy index-embedded vulnerabilities → the
+// first-class securityFindings collection (see security/migrate.ts).
+backfillLegacyVulnerabilities();
 backfillRepoIndex();
+startNightlySecuritySweep();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no
@@ -392,4 +403,43 @@ function backfillRepoIndex() {
     }, i * 5_000);
     i++;
   }
+}
+
+// Nightly security sweep (policy-driven, off by default). Checked hourly: a
+// repo whose policy enables `nightly` and whose last completed audit is >24h
+// old gets a full-scope audit. Cheap in steady state — the per-blob
+// securityScannedSha cache means an unchanged repo scans nothing.
+function startNightlySecuritySweep() {
+  const HOUR = 60 * 60 * 1000;
+  const tick = () => {
+    for (const repo of db.filter("repositories", (r) => r.reviewsEnabled)) {
+      if (!effectiveSecurityPolicy(repo).triggers.nightly) continue;
+      const inFlight = db.find(
+        "securityScans",
+        (s) => s.repoId === repo.id && (s.status === "queued" || s.status === "running")
+      );
+      if (inFlight) continue;
+      const lastCompleted = db
+        .filter("securityScans", (s) => s.repoId === repo.id && s.status === "completed")
+        .sort((a, b) => (b.finishedAt ?? 0) - (a.finishedAt ?? 0))[0];
+      if (lastCompleted && (lastCompleted.finishedAt ?? 0) > Date.now() - 24 * HOUR) continue;
+      const run: SecurityScanRun = {
+        id: crypto.randomUUID(),
+        repoId: repo.id,
+        trigger: "nightly",
+        full: true,
+        status: "queued",
+        startedAt: Date.now(),
+        filesScanned: 0,
+        cacheHits: 0,
+        introduced: 0,
+        resolved: 0,
+        stillOpen: 0,
+        log: [],
+      };
+      db.insert("securityScans", run);
+      enqueueSecurityAudit({ repoId: repo.id, scanRunId: run.id, trigger: "nightly", full: true });
+    }
+  };
+  setInterval(tick, HOUR);
 }

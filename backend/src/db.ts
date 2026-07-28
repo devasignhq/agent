@@ -36,6 +36,8 @@ const empty: DB = {
   linearProjectUpdates: [],
   bounties: [],
   escrowTransactions: [],
+  securityFindings: [],
+  securityScans: [],
 };
 
 // Collection key -> Postgres table name. Unquoted identifiers fold to
@@ -55,6 +57,8 @@ const TABLES: Record<keyof DB, string> = {
   linearProjectUpdates: "linear_project_updates",
   bounties: "bounties",
   escrowTransactions: "escrow_transactions",
+  securityFindings: "security_findings",
+  securityScans: "security_scans",
 };
 
 const COLLECTIONS = Object.keys(TABLES) as (keyof DB)[];

@@ -13,6 +13,7 @@ import { WorkflowPage } from "./screen-workflow";
 import { BountiesPage } from "./screen-bounties";
 import { FundBountyPage } from "./screen-fund-bounty";
 import { SettingsPage } from "./screens-rest";
+import { SecurityPage } from "./screen-security";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
 import { LiveProvider, useLiveTopic } from "./live-context";
@@ -36,8 +37,8 @@ export { useIsMobile };
 const NAV = [
   { key: "agent",     name: "Agents",    icon: "agent" },
   { key: "workflow",  name: "Workflow",  icon: "workflow" },
+  { key: "security",  name: "Security",  icon: "shield" },
   { key: "bounty",    name: "Bounty",    icon: "bounties" },
-  { key: "settings",  name: "Settings",  icon: "settings" },
 ];
 
 const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
@@ -314,13 +315,17 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
   );
 };
 
-const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowRepo }) => {
+const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowRepo, securityCrumbs, onCrumbNavigate }) => {
   const labels = {
-    agent: "Agents", workflow: "Workflow", bounty: "Bounty", settings: "Settings"
+    agent: "Agents", workflow: "Workflow", bounty: "Bounty", security: "Security", settings: "Settings"
   };
   // On the Workflow page the selected repo becomes the final crumb:
   // user / Workflow / repo-name.
   const showRepoCrumb = current === "workflow" && !!workflowRepo;
+  // On the Security page the sub-view (and, inside a finding, where it was opened
+  // from) becomes a clickable trail: user / Security / Merge gate / VLN-… — each
+  // earlier segment navigates back. Reported by the screen via onCrumbs.
+  const showSecurityTrail = current === "security" && Array.isArray(securityCrumbs) && securityCrumbs.length > 0;
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
   const unread = notifications?.unreadCount ?? 0;
@@ -331,7 +336,21 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
       )}
       <div className="crumbs">
         <span>{user?.githubLogin || "workspace"}</span><span className="sep">/</span>
-        {showRepoCrumb ? (
+        {showSecurityTrail ? (
+          securityCrumbs.map((c, i) => {
+            const isLast = i === securityCrumbs.length - 1;
+            return (
+              <React.Fragment key={i}>
+                {i > 0 && <span className="sep">/</span>}
+                {c.path && !isLast ? (
+                  <span className="crumb-link" onClick={() => onCrumbNavigate(c.path)}>{c.label}</span>
+                ) : (
+                  <span className={isLast ? "now" : ""}>{c.label}</span>
+                )}
+              </React.Fragment>
+            );
+          })
+        ) : showRepoCrumb ? (
           <>
             {!isMobile && <><span>{labels[current]}</span><span className="sep">/</span></>}
             <span className="now">{workflowRepo}</span>
@@ -365,6 +384,12 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
             />
           )}
         </div>
+        <button
+          className={`btn ghost sm ${current === "settings" ? "is-active" : ""}`}
+          onClick={() => onNavigate?.("settings")}
+          aria-label="Settings">
+          <Icon name="settings" size={13}/>
+        </button>
         <div style={{ position: "relative" }}>
           <button
             className={`sb-avatar avatar-btn ${userOpen ? "is-active" : ""}`}
@@ -442,7 +467,7 @@ const AppContent = () => {
   // site (sidebar, mobile tabs, popovers, keyboard chords) keeps working unchanged.
   const location = useLocation();
   const navigate = useNavigate();
-  const PAGE_KEYS = ["agent", "workflow", "bounty", "settings"];
+  const PAGE_KEYS = ["agent", "workflow", "bounty", "security", "settings"];
   const rawSeg = location.pathname.split("/")[1];
   // The bounty deep links from the bot comment (/bounties/:id/fund|cancel|apply)
   // are PLURAL, so they miss the singular nav key and would fall through to the
@@ -453,6 +478,9 @@ const AppContent = () => {
   // The Workflow screen's selected repo name, surfaced for the header breadcrumb
   // (WorkflowPage reports it via onRepoChange).
   const [workflowRepo, setWorkflowRepo] = React.useState<string | null>(null);
+  // The Security screen's breadcrumb trail (Security → Merge gate → finding …),
+  // reported via onCrumbs so the header reflects navigation within the section.
+  const [securityCrumbs, setSecurityCrumbs] = React.useState(null);
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
@@ -736,6 +764,8 @@ const AppContent = () => {
           user={auth.user}
           notifications={notifications}
           workflowRepo={workflowRepo}
+          securityCrumbs={securityCrumbs}
+          onCrumbNavigate={(path) => navigate(path)}
         />
         <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           <Routes>
@@ -744,6 +774,10 @@ const AppContent = () => {
             <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
             <Route path="/bounties/:id/fund" element={<FundBountyPage />} />
             <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
+            <Route path="/security" element={<SecurityPage view="dashboard" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path="/security/findings/:findingId" element={<SecurityPage view="detail" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path="/security/gate" element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path="/security/policy" element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
             <Route path="/" element={<Navigate to="/agent" replace />} />

@@ -222,6 +222,10 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .crumbs .sep { color: var(--fg-faint); }
 .crumbs .now { color: var(--fg); }
+/* Clickable breadcrumb segment (Security sub-view trail) — links back to an
+   earlier screen. The current page stays as .now (not a link). */
+.crumbs .crumb-link { color: var(--fg-mute); cursor: pointer; }
+.crumbs .crumb-link:hover { color: var(--accent); }
 .topbar-spacer { flex: 1; }
 .topbar-actions { display: flex; align-items: center; gap: 8px; }
 .kbd-hint {
@@ -4591,6 +4595,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   }
   .topbar-logo { display: block; }
   .crumbs span:first-child,
+  .crumbs .crumb-link,
   .crumbs .sep { display: none; }
   .crumbs .now {
     font-size: 14px;
@@ -5487,3 +5492,434 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
    than warns (a stale Fund link landing on an already-escrowed bounty). */
 .fb-notice-ok { border-color: rgba(61, 220, 151, .35); background: rgba(61, 220, 151, .07); }
 .fb-notice-ok svg { color: var(--green); }
+
+/* ═══ Security page (.vln-*) ═══════════════════════════════════════════════
+   The dedicated surface for the security audit agent's findings. Prefix is
+   vln- (NOT sec- — that's the 2FA settings flow, and bare .sev-* belongs to
+   .finding-card). Severity tokens ride the existing semantic palette:
+   critical → --danger, high → --warn, medium → --info, low → --fg-mute. */
+
+/* Full-bleed page: the Security views (wide findings table, two-column gate,
+   12-column chart) are cramped by the shared 1280px .page cap, so they span the
+   content area edge to edge. Padding is inherited from .page — only the cap is
+   lifted. */
+.page.vln-page { max-width: none; }
+
+/* severity chip */
+.vln-sev {
+  display: inline-flex; align-items: center; gap: 6px;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.1em;
+  text-transform: uppercase; padding: 2px 7px; height: 19px;
+  border: 1px solid currentColor; background: rgba(255,255,255,.02);
+  white-space: nowrap;
+}
+.vln-sev i { width: 5px; height: 5px; background: currentColor; display: block; }
+.vln-sev.critical { color: var(--danger); }
+.vln-sev.high     { color: var(--warn); }
+.vln-sev.medium   { color: var(--info); }
+.vln-sev.low      { color: var(--fg-mute); }
+
+/* state / misc tags */
+.vln-tag {
+  display: inline-flex; align-items: center; gap: 5px; white-space: nowrap;
+  font-family: var(--mono); font-size: 10px; letter-spacing: 0.08em;
+  text-transform: uppercase; padding: 2px 6px; height: 18px;
+  border: 1px solid var(--line-2); color: var(--fg-mute);
+}
+.vln-tag.new { color: var(--accent); border-color: rgba(255,122,61,.4); background: rgba(255,122,61,.08); font-weight: 600; }
+.vln-tag.ok { color: var(--green); border-color: rgba(61,220,151,.35); background: rgba(61,220,151,.07); }
+.vln-tag.plain { color: var(--fg-faint); }
+.vln-tag.surface { color: var(--fg); border-color: var(--line-2); }
+.vln-tag.req { color: var(--danger); border-color: rgba(255,90,95,.35); }
+
+/* sub-nav tabs under the page head */
+.vln-subnav { display: flex; gap: 0; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.vln-subtab {
+  background: none; border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px;
+  padding: 9px 13px; font-family: var(--mono); font-size: 12px; color: var(--fg-mute);
+  cursor: pointer;
+}
+.vln-subtab:hover { color: var(--fg-dim); }
+.vln-subtab.on { color: var(--fg); border-bottom-color: var(--accent); }
+
+/* scan status strip */
+.vln-strip {
+  display: grid; grid-template-columns: minmax(0,1fr) auto auto; align-items: center; gap: 20px;
+  border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  background: linear-gradient(90deg, rgba(255,122,61,.05), rgba(255,122,61,0) 45%), var(--bg-1);
+  padding: 12px 16px; margin-bottom: 14px;
+}
+.vln-strip-k { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-faint); margin-bottom: 5px; }
+.vln-strip-v { font-family: var(--mono); font-size: 12.5px; color: var(--fg); display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.vln-strip-v em { font-style: normal; color: var(--fg-mute); }
+.vln-strip-meta { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); display: flex; gap: 16px; }
+.vln-strip-meta b { color: var(--fg-dim); font-weight: 500; }
+
+/* stat tiles */
+.vln-stats {
+  display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px;
+  background: var(--line); border: 1px solid var(--line); margin-bottom: 14px;
+}
+.vln-stat { background: var(--bg-1); padding: 14px 16px 16px; }
+.vln-stat .k { font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
+/* Type matches the Agents page stat grid (.agent-stats): 22px value, 10px hint,
+   so the two dashboards read as one system. */
+.vln-stat .v { font-family: var(--mono); font-size: 22px; font-weight: 500; letter-spacing: -0.02em; font-variant-numeric: tabular-nums; line-height: 1.1; }
+.vln-stat .d { font-family: var(--mono); font-size: 10px; color: var(--fg-mute); }
+/* Value + hint share one baseline-aligned row rather than stacking (same shape
+   as the Bounties cost stats). nowrap keeps the hint on that row. */
+.vln-stat-row { display: flex; align-items: baseline; gap: 8px; margin-top: 11px; flex-wrap: wrap; }
+.vln-stat-row .v, .vln-stat-row .d { margin-top: 0; white-space: nowrap; }
+.vln-stat.alarm { background: linear-gradient(180deg, rgba(255,90,95,.08), rgba(255,90,95,0)), var(--bg-1); }
+.vln-stat.alarm .v, .vln-stat.alarm .d { color: var(--danger); }
+
+/* mid row: chart + surface breakdown. Fixed height so the chart fills its card
+   instead of collapsing to bar height — both panels share the row's height and
+   the chart's stacks stretch into it. */
+/* No fixed height: the row is sized by the attack-surface list's own content,
+   and the chart — a stretched grid item — inherits exactly that height. That
+   inheritance is load-bearing, not cosmetic: the bars are percentage heights,
+   so they need a definite container height or they collapse to their min. The
+   min-height below only guards the degenerate case where the surface list is
+   shorter than the chart needs to stay readable. */
+.vln-mid { display: grid; grid-template-columns: minmax(0,1fr) 400px; gap: 14px; margin-bottom: 14px; align-items: stretch; }
+.vln-mid > .vln-pnl { min-height: 0; container-type: inline-size; }
+.vln-mid > .vln-pnl:first-child { min-height: 280px; }
+/* Only the surface list scrolls. The chart body must NOT become a scroll
+   container — that would clip the hover readout, which sits above the bars. */
+.vln-mid > .vln-pnl:last-child > div:not(.vln-pnl-head) { overflow-y: auto; }
+.vln-pnl { background: var(--bg-1); border: 1px solid var(--line); display: flex; flex-direction: column; min-height: 0; }
+.vln-pnl-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.vln-pnl-head-wrap { flex-wrap: wrap; }
+.vln-pnl-t { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-dim); margin: 0; }
+.vln-pnl-s { font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); }
+.vln-pnl-body { padding: 14px; }
+/* The chart wants more breathing room than a plain panel body. */
+.vln-mg-body { padding: 20px 20px 16px; }
+.vln-empty { padding: 22px 16px; font-family: var(--mono); font-size: 12px; color: var(--fg-mute); text-align: center; }
+
+/* introduced-vs-resolved chart (pure CSS bars)
+   Layout: a fixed axis gutter on the left, then one column per scan. Each
+   column is a 4-row grid — [introduced stack | axis | resolved stack | label]
+   — so every column shares one axis line and both halves scale off the same
+   peak. The stacks fill the panel height, so the chart grows with the card. */
+.vln-mg-body { display: flex; flex-direction: column; gap: 0; flex: 1; min-height: 0; }
+.vln-mg { display: flex; gap: clamp(4px, 1%, 12px); flex: 1; min-height: 0; min-width: 0; }
+.vln-mg-y {
+  /* Scales with the card so the plot keeps its room when the panel narrows. */
+  width: clamp(42px, 7%, 74px); flex-shrink: 0; position: relative;
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.12em;
+  text-transform: uppercase; color: var(--fg-faint);
+  /* Same 4-row rhythm as a column, so the labels sit against the right rows. */
+  display: grid; grid-template-rows: 1fr 1px 0.45fr 20px;
+}
+.vln-mg-y { overflow: hidden; }
+.vln-mg-y .up { align-self: start; text-align: right; }
+.vln-mg-y .dn { grid-row: 3; align-self: start; text-align: right; padding-top: 6px; }
+/* Always fits: columns floor at 0 (never a min width that could force a
+   scrollbar) and the gap scales with the container, so any number of scans
+   squeezes to fit rather than overflowing. No overflow-x here — a scrollbar
+   would also clip the hover readout. */
+.vln-mg-cols {
+  display: grid; grid-auto-flow: column; grid-auto-columns: minmax(0, 1fr);
+  gap: clamp(2px, 0.9%, 10px); flex: 1; min-width: 0;
+}
+.vln-mg-col { display: grid; grid-template-rows: 1fr 1px 0.45fr 20px; position: relative; }
+/* The latest scan is the one the page is really about — box it like the design. */
+.vln-mg-col.now::after {
+  content: ""; position: absolute; inset: -6px -5px 0;
+  border: 1px dashed rgba(255,122,61,.4); pointer-events: none;
+}
+.vln-mg-col.now .vln-mg-x { color: var(--accent); }
+.vln-mg-col.running .vln-mg-x { color: var(--accent); opacity: .7; }
+/* Introduced grows up from the axis; segments are emitted critical-first and
+   justify-end stacks them so critical ends up on top. */
+.vln-mg-up { display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; min-height: 0; }
+.vln-mg-ax { background: var(--line-2); }
+.vln-mg-dn { display: flex; flex-direction: column; gap: 1px; min-height: 0; }
+.vln-mg-b { width: 100%; min-height: 3px; }
+.vln-mg-b.sev-critical { background: var(--danger); }
+.vln-mg-b.sev-high     { background: var(--warn); }
+.vln-mg-b.sev-medium   { background: var(--info); }
+.vln-mg-b.sev-low      { background: var(--fg-mute); }
+.vln-mg-b.sev-unknown  { background: var(--fg-faint); }
+.vln-mg-b.sev-resolved { background: rgba(61,220,151,.55); }
+.vln-mg-x {
+  font-family: var(--mono); font-size: 9px; color: var(--fg-faint);
+  text-align: center; padding-top: 6px;
+  /* Clipped rather than wrapped: a wrapped label would grow the label row and
+     shove the plot. The hover readout carries the full label anyway. */
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+/* Hover readout — the counts behind a stack, without a click. Anchored INSIDE
+   the plot area (top of the column) rather than above it: the panel is a fixed
+   height, so a tooltip hung above the bars escapes the card. */
+.vln-mg-tip {
+  display: none; position: absolute; top: 0; left: 50%;
+  transform: translateX(-50%); background: var(--bg-2); border: 1px solid var(--line-2);
+  padding: 7px 10px; white-space: nowrap; font-family: var(--mono); font-size: 10.5px;
+  color: var(--fg); flex-direction: column; align-items: flex-start; gap: 5px;
+  z-index: 10; box-shadow: 0 8px 20px rgba(0,0,0,.45);
+}
+.vln-mg-col:hover .vln-mg-tip { display: flex; }
+/* The rightmost columns would push the readout past the card edge — flip them
+   to anchor on their right, and the leftmost on their left. */
+.vln-mg-col:nth-last-child(-n+3) .vln-mg-tip { left: auto; right: 0; transform: none; }
+.vln-mg-col:nth-child(-n+3) .vln-mg-tip { left: 0; right: auto; transform: none; }
+.vln-mg-tip b { color: var(--accent); font-weight: 500; }
+.vln-mg-tip span { display: inline-flex; align-items: center; gap: 6px; }
+.vln-mg-tip i, .vln-mg-legend i { width: 8px; height: 8px; display: block; flex-shrink: 0; }
+.vln-mg-tip i.sev-critical, .vln-mg-legend i.sev-critical { background: var(--danger); }
+.vln-mg-tip i.sev-high,     .vln-mg-legend i.sev-high     { background: var(--warn); }
+.vln-mg-tip i.sev-medium,   .vln-mg-legend i.sev-medium   { background: var(--info); }
+.vln-mg-tip i.sev-low,      .vln-mg-legend i.sev-low      { background: var(--fg-mute); }
+.vln-mg-tip i.sev-unknown,  .vln-mg-legend i.sev-unknown  { background: var(--fg-faint); }
+.vln-mg-tip i.sev-resolved, .vln-mg-legend i.sev-resolved { background: rgba(61,220,151,.7); }
+.vln-mg-legend {
+  display: flex; gap: 14px; align-items: center; flex-wrap: wrap;
+  font-family: var(--mono); font-size: 10px; color: var(--fg-mute);
+  padding-top: 12px; margin-top: 14px; border-top: 1px dashed var(--line);
+}
+.vln-mg-legend span { display: flex; align-items: center; gap: 6px; }
+.vln-mg-legend .right { margin-left: auto; }
+
+/* The chart adapts to its OWN width, not the viewport's — the panel is a query
+   container, so this holds whether it is narrow because the window is small or
+   because the row is sharing space. Type shrinks first; the gutter is dropped
+   only when its words genuinely cannot fit (the legend still names both sides). */
+@container (max-width: 1000px) {
+  .vln-mg-y { font-size: 8px; letter-spacing: 0.03em; }
+}
+@container (max-width: 760px) {
+  .vln-mg-y { display: none; }
+  .vln-mg-x { font-size: 8px; }
+}
+
+/* attack-surface rows */
+.vln-sf-row { display: grid; grid-template-columns: 20px minmax(0,1fr) auto; align-items: center; gap: 11px; padding: 12px 14px; border-bottom: 1px solid var(--line); }
+.vln-sf-row:last-child { border-bottom: 0; }
+.vln-sf-row .ico { color: var(--fg-mute); }
+.vln-sf-n { font-size: 12.5px; color: var(--fg); }
+.vln-sf-new { color: var(--accent); font-family: var(--mono); font-size: 10px; font-weight: 600; }
+.vln-sf-e { font-family: var(--mono); font-size: 10px; color: var(--fg-faint); margin-top: 2px; }
+.vln-sf-bar { display: flex; gap: 1px; height: 5px; margin-top: 5px; }
+.vln-sf-bar i { display: block; height: 100%; }
+.vln-sf-bar i.critical { background: var(--danger); }
+.vln-sf-bar i.high { background: var(--warn); }
+.vln-sf-bar i.medium { background: var(--info); }
+.vln-sf-bar i.low { background: var(--fg-mute); }
+.vln-sf-c { font-family: var(--mono); font-size: 16px; color: var(--fg); font-variant-numeric: tabular-nums; text-align: right; }
+
+/* filter chips */
+.vln-chips { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.vln-chip {
+  font-family: var(--mono); font-size: 11px; color: var(--fg-mute); padding: 4px 9px;
+  border: 1px solid var(--line); background: var(--bg); display: inline-flex; align-items: center;
+  gap: 7px; white-space: nowrap; cursor: pointer;
+}
+.vln-chip b { color: var(--fg-dim); font-weight: 500; }
+.vln-chip:hover { color: var(--fg-dim); border-color: var(--line-2); }
+.vln-chip.on { color: var(--fg); border-color: rgba(255,122,61,.45); background: rgba(255,122,61,.07); }
+.vln-chip.on b { color: var(--accent); }
+
+/* findings table */
+.vln-fx-head, .vln-fx-row {
+  display: grid;
+  grid-template-columns: 96px 96px minmax(0,1fr) 90px 140px 48px 110px;
+  align-items: center; gap: 12px; padding: 0 14px;
+}
+.vln-fx-head { height: 30px; background: var(--bg); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
+.vln-fx-row { min-height: 54px; border-bottom: 1px solid var(--line); border-left: 2px solid transparent; cursor: pointer; }
+.vln-fx-row:last-child { border-bottom: 0; }
+.vln-fx-row:hover { background: var(--bg-2); }
+.vln-fx-row.critical { border-left-color: var(--danger); }
+.vln-fx-row.high { border-left-color: var(--warn); }
+.vln-fx-row.medium { border-left-color: var(--info); }
+.vln-fx-row.low { border-left-color: var(--fg-mute); }
+.vln-fx-row.fresh { background: rgba(255,122,61,.035); }
+.vln-fx-row.fresh:hover { background: var(--bg-2); }
+.vln-fx-row > * { min-width: 0; }
+/* A grid item blockifies, so an inline-flex pill stretches to fill its column
+   and reads as a fixed-width box. justify-self keeps each tag at its content
+   width; the columns stay fixed so header and rows still line up (they are two
+   separate grids sharing one template). */
+.vln-fx-row > .vln-sev,
+.vln-fx-row > .vln-tag { justify-self: start; width: max-content; overflow: visible; }
+.vln-fx-id { font-family: var(--mono); font-size: 11px; color: var(--fg-faint); }
+.vln-fx-t { display: block; font-size: 13px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-fx-l { display: block; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-fx-l u { text-decoration: none; color: var(--fg-dim); }
+.vln-fx-o { font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-fx-o em { font-style: normal; color: var(--fg-faint); display: block; font-size: 10.5px; margin-top: 3px; }
+.vln-fx-a { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); text-align: right; font-variant-numeric: tabular-nums; }
+
+/* finding detail */
+.vln-dt { display: flex; flex-direction: column; }
+.vln-dt-head { padding: 0 0 14px; border-bottom: 1px solid var(--line); }
+.vln-dt-title { font-size: 19px; color: var(--fg); margin: 11px 0 0; line-height: 1.3; letter-spacing: -0.01em; font-weight: 500; }
+.vln-back { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); cursor: pointer; background: none; border: 0; }
+.vln-back:hover { color: var(--fg); }
+.vln-back .mute { margin-left: 6px; }
+.vln-dt-tabs { display: flex; border-bottom: 1px solid var(--line); }
+.vln-dt-tab { padding: 11px 13px; font-family: var(--mono); font-size: 11.5px; color: var(--fg-mute); border: 0; border-bottom: 2px solid transparent; margin-bottom: -1px; background: none; cursor: pointer; }
+.vln-dt-tab:hover { color: var(--fg-dim); }
+.vln-dt-tab.on { color: var(--fg); border-bottom-color: var(--accent); }
+.vln-dt-body { padding: 18px 0; }
+.vln-kv { margin-bottom: 20px; }
+.vln-block { margin-bottom: 20px; }
+.vln-h {
+  font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase;
+  color: var(--fg-mute); padding-bottom: 7px; border-bottom: 1px solid var(--line); margin-bottom: 11px;
+  display: flex; align-items: center; justify-content: space-between;
+}
+.vln-h span { color: var(--fg-faint); letter-spacing: 0.06em; text-transform: none; }
+.vln-copy { display: inline-flex; align-items: center; gap: 5px; background: none; border: 1px solid var(--line-2); color: var(--fg-mute); font-family: var(--mono); font-size: 10px; padding: 2px 8px; cursor: pointer; }
+.vln-copy:hover { color: var(--fg); border-color: #3a4250; }
+pre.vln-code, .vln-code {
+  margin: 0; background: var(--bg); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11.5px; line-height: 1.65; color: #c8ccd1;
+  padding: 11px 13px; overflow-x: auto; white-space: pre-wrap; word-break: break-word;
+}
+.vln-analysis {
+  background: var(--bg-1); border: 1px solid var(--line); border-left: 2px solid var(--accent);
+  padding: 12px 14px; font-size: 12.5px; line-height: 1.7; color: var(--fg-dim);
+}
+.vln-invariant { margin-top: 10px; padding-top: 9px; border-top: 1px dashed var(--line); font-size: 12px; }
+.vln-invariant b { color: var(--fg); font-weight: 600; }
+
+/* Links inside the detail (GitHub file/PR deep links). The app has no global
+   anchor style, so without this they render as default browser blue. */
+.vln-dt a, .vln-kv a { color: var(--accent); text-decoration: none; }
+.vln-dt a:hover, .vln-kv a:hover { color: #ffa070; text-decoration: underline; }
+
+/* exploit path / dataflow steps */
+.vln-tp { display: flex; flex-direction: column; }
+.vln-tp-s { display: grid; grid-template-columns: 22px minmax(0,1fr); gap: 12px; position: relative; padding-bottom: 12px; }
+.vln-tp-s:last-child { padding-bottom: 0; }
+.vln-tp-s::before { content: ""; position: absolute; left: 10px; top: 22px; bottom: 0; width: 1px; background: var(--line-2); }
+.vln-tp-s:last-child::before { display: none; }
+.vln-tp-d { width: 21px; height: 21px; border: 1px solid var(--line-2); background: var(--bg-1); display: grid; place-items: center; font-family: var(--mono); font-size: 10px; color: var(--fg-mute); position: relative; z-index: 1; }
+.vln-tp-s.hit .vln-tp-d { border-color: var(--danger); color: var(--danger); background: rgba(255,90,95,.08); }
+.vln-tp-s.sink .vln-tp-d { border-color: var(--accent); color: var(--accent); background: rgba(255,122,61,.08); }
+.vln-tp-n { font-size: 12.5px; color: var(--fg); padding-top: 2px; line-height: 1.55; }
+
+/* history + similar */
+.vln-hist { display: flex; gap: 12px; padding: 9px 0; font-size: 12.5px; color: var(--fg-dim); align-items: baseline; border-bottom: 1px solid var(--line); }
+.vln-hist:last-child { border-bottom: 0; }
+.vln-hist .t { font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); min-width: 64px; flex-shrink: 0; }
+.vln-sim { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); cursor: pointer; }
+.vln-sim:last-child { border-bottom: 0; }
+.vln-sim:hover { background: var(--bg-2); }
+.vln-sim-t { font-size: 12.5px; color: var(--fg); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* detail footer actions */
+.vln-dt-foot { padding: 14px 0; border-top: 1px solid var(--line); display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
+.vln-confirm { display: inline-flex; align-items: center; gap: 10px; font-family: var(--mono); font-size: 12px; color: var(--fg-dim); }
+.vln-confirm-yes, .vln-confirm-no { background: none; border: 0; font-family: var(--mono); font-size: 12px; font-weight: 600; cursor: pointer; }
+.vln-confirm-yes { color: var(--green); }
+.vln-confirm-no { color: var(--danger); }
+.vln-confirm-yes:hover, .vln-confirm-no:hover { text-decoration: underline; }
+.vln-pop { position: absolute; bottom: calc(100% + 6px); right: 0; width: 220px; max-height: 260px; overflow-y: auto; background: var(--bg-1); border: 1px solid var(--line-2); box-shadow: 0 16px 40px rgba(0,0,0,.45); z-index: 40; }
+.vln-pop-item { display: flex; align-items: center; gap: 9px; padding: 8px 11px; font-size: 12px; color: var(--fg-dim); cursor: pointer; }
+.vln-pop-item:hover { background: var(--bg-2); color: var(--fg); }
+.vln-pop-item .av { width: 20px; height: 20px; background: var(--bg-3); border: 1px solid var(--line-2); display: grid; place-items: center; font-family: var(--mono); font-size: 10px; color: var(--fg); flex-shrink: 0; }
+
+/* merge gate */
+/* Rules + blocking list are the primary content; the terminal is reference,
+   so the left column gets the larger share. */
+.vln-gate { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(300px, 1fr); gap: 16px; align-items: start; }
+.vln-verdict { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); }
+.vln-verdict.fail { border-color: rgba(255,90,95,.4); border-left: 2px solid var(--danger); background: linear-gradient(90deg, rgba(255,90,95,.09), rgba(255,90,95,0) 60%), var(--bg-1); }
+.vln-verdict.pass { border-color: rgba(61,220,151,.4); border-left: 2px solid var(--green); background: linear-gradient(90deg, rgba(61,220,151,.09), rgba(61,220,151,0) 60%), var(--bg-1); }
+.vln-verdict-icon { width: 34px; height: 34px; display: grid; place-items: center; border: 1px solid var(--line-2); flex-shrink: 0; }
+.vln-verdict.fail .vln-verdict-icon { border-color: rgba(255,90,95,.5); color: var(--danger); }
+.vln-verdict.pass .vln-verdict-icon { border-color: rgba(61,220,151,.5); color: var(--green); }
+.vln-verdict-t { font-family: var(--mono); font-size: 14px; letter-spacing: 0.02em; }
+.vln-verdict.fail .vln-verdict-t { color: var(--danger); }
+.vln-verdict.pass .vln-verdict-t { color: var(--green); }
+.vln-verdict-s { font-size: 12px; color: var(--fg-dim); margin-top: 3px; line-height: 1.55; }
+.vln-rule { display: grid; grid-template-columns: 18px minmax(0,1fr) auto; align-items: center; gap: 11px; padding: 9px 14px; border-bottom: 1px solid var(--line); font-size: 12.5px; color: var(--fg-dim); }
+.vln-rule:last-child { border-bottom: 0; }
+.vln-rule .st { width: 16px; height: 16px; display: grid; place-items: center; border: 1px solid var(--line-2); color: var(--fg-faint); }
+.vln-rule.fail { color: var(--fg); }
+.vln-rule.fail .st { border-color: var(--danger); color: var(--danger); background: rgba(255,90,95,.09); }
+.vln-rule.pass .st { border-color: rgba(61,220,151,.45); color: var(--green); }
+.vln-rule code { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
+.vln-blk { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.vln-blk:last-child { border-bottom: 0; }
+.vln-blk-t { font-size: 12.5px; color: var(--fg); }
+.vln-blk-l { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-term { background: var(--bg); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; line-height: 1.75; color: #c8ccd1; padding: 13px 15px; overflow-x: auto; min-height: 200px; max-height: 520px; overflow-y: auto; }
+.vln-term-l { white-space: pre-wrap; word-break: break-word; min-height: 20px; }
+.vln-term-l.err { color: var(--danger); }
+.vln-term-l.ok { color: var(--green); }
+.vln-term-l.warn { color: var(--warn); }
+.vln-term-l.cmd { color: var(--accent); }
+.vln-term-l.dim { color: var(--fg-faint); }
+
+/* The app has no global .btn:disabled rule, so a disabled Save/Re-scan would
+   look clickable. Scoped to this page rather than made global. */
+.vln-pol .btn:disabled,
+.page-actions .btn:disabled,
+.vln-dt-foot .btn:disabled { opacity: .5; cursor: default; }
+
+/* scan policy */
+.vln-pol { display: flex; flex-direction: column; gap: 16px; }
+.vln-eng { display: grid; grid-template-columns: 20px minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.vln-eng:last-child { border-bottom: 0; }
+.vln-eng.off { opacity: .55; }
+.vln-eng .ico { color: var(--accent); }
+.vln-eng-n { font-size: 12.5px; color: var(--fg); }
+.vln-eng-n b { color: var(--accent); font-weight: 500; }
+.vln-eng-d { font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); margin-top: 3px; }
+.vln-sw { width: 30px; height: 17px; background: var(--accent); position: relative; flex-shrink: 0; border: 0; cursor: pointer; padding: 0; }
+.vln-sw i { position: absolute; top: 2px; right: 2px; width: 13px; height: 13px; background: var(--bg); display: block; }
+.vln-sw.off { background: var(--bg-3); border: 1px solid var(--line-2); }
+.vln-sw.off i { right: auto; left: 2px; background: var(--fg-faint); }
+.vln-gates { display: grid; grid-template-columns: repeat(4, 1fr); gap: 1px; background: var(--line); border-top: 1px solid var(--line); }
+.vln-gates > div { background: var(--bg-1); padding: 11px 13px; }
+.vln-gates-row { display: flex; gap: 4px; margin-top: 10px; }
+.vln-gate-opt { background: var(--bg); border: 1px solid var(--line-2); color: var(--fg-mute); font-family: var(--mono); font-size: 10px; padding: 3px 8px; cursor: pointer; }
+.vln-gate-opt:hover:not(:disabled) { color: var(--fg-dim); }
+.vln-gate-opt.on { color: var(--accent); border-color: rgba(255,122,61,.45); background: rgba(255,122,61,.07); }
+.vln-gate-opt:disabled { opacity: .35; cursor: default; }
+
+/* responsive */
+/* Mid widths: the seven fixed columns plus gaps outgrow the table before the
+   layout is anywhere near mobile, and the finding title — the only column that
+   matters — is the flexible one, so it collapses to nothing. Drop the two
+   lowest-value columns (id, origin) and give the title the room. */
+@media (max-width: 1300px) {
+  .vln-fx-head, .vln-fx-row { grid-template-columns: 96px minmax(0,1fr) 90px 48px 110px; }
+  .vln-fx-head > :nth-child(2),  /* id */
+  .vln-fx-head > :nth-child(5),  /* origin */
+  .vln-fx-row > .vln-fx-id,
+  .vln-fx-row > .vln-fx-o { display: none; }
+}
+@media (max-width: 1180px) {
+  /* Stacked: the chart no longer shares a row with the surface list, so there
+     is nothing to inherit a height from — give it its own definite height so
+     the percentage-height bars still resolve. */
+  .vln-mid { grid-template-columns: 1fr; }
+  .vln-mid > .vln-pnl:first-child { height: 360px; }
+  .vln-gate { grid-template-columns: 1fr; }
+  .vln-stats { grid-template-columns: repeat(2, 1fr); }
+}
+@media (max-width: 820px) {
+  .vln-stats { grid-template-columns: 1fr; }
+  .vln-gates { grid-template-columns: repeat(2, 1fr); }
+  .vln-strip { grid-template-columns: 1fr; gap: 10px; }
+  .vln-fx-head { display: none; }
+  .vln-fx-row {
+    grid-template-columns: auto minmax(0,1fr) auto;
+    grid-template-areas: "sev title state";
+    padding: 10px 12px;
+  }
+  .vln-fx-row > .vln-sev { grid-area: sev; }
+  .vln-fx-row > :nth-child(2), /* id */
+  .vln-fx-row > .vln-tag.surface,
+  .vln-fx-row > .vln-fx-o,
+  .vln-fx-row > .vln-fx-a { display: none; }
+  .vln-fx-row > :nth-child(3) { grid-area: title; }
+  .vln-fx-row > .vln-tag:last-child { grid-area: state; }
+}
