@@ -248,13 +248,17 @@ test("pre-existing vulnerabilities: advisory section, labelled 'not introduced b
     holistic,
     { prTitle: "Touch db.ts", repoFullName: "devasign/app" }
   );
-  assert.match(body, /### Pre-existing security issues/);
-  assert.match(body, /not introduced by this PR/);
-  assert.match(body, /\[sql-injection\] User input concatenated/);
+  // Pointer-only: the comment carries a count + Security-page link, never the
+  // finding detail (that lives on the Security page).
+  assert.match(body, /1 pre-existing security finding touches files in this PR/);
+  assert.match(body, /not introduced by it/);
+  assert.match(body, /\/security\?repo=devasign%2Fapp/);
+  assert.doesNotMatch(body, /\[sql-injection\] User input concatenated/);
   // Advisory: it must NOT be filed under the introduced-findings "Repo-wide concerns".
   assert.doesNotMatch(body, /### Repo-wide concerns/);
-  // It still rides the consolidated "fix all" prompt (findings.length > 0 even with no unmet criteria).
-  assert.match(body, /One prompt to fix all of this/);
+  // Pre-existing findings no longer ride the consolidated "fix all" prompt —
+  // with nothing else to fix, the prompt is omitted entirely.
+  assert.doesNotMatch(body, /One prompt to fix all of this/);
   assert.doesNotMatch(body, EMOJI);
 });
 

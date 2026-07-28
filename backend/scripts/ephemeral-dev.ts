@@ -11,7 +11,8 @@ process.env.DATABASE_URL = "";
 process.env.ANTHROPIC_API_KEY = "";
 process.env.GEMINI_API_KEY = "";
 process.env.STATSIG_SECRET_KEY = "";
-process.env.WEB_ORIGIN = "http://localhost:3001";
+// ||= so a second, parallel instance can point at its own frontend port.
+process.env.WEB_ORIGIN ||= "http://localhost:3001";
 process.env.PORT ||= "8787"; // ||= so a caller can run a second instance elsewhere
 // Dummy Stellar config so isStellarConfigured() passes and the bounty surfaces
 // (create/list/links) are exercisable — nothing here reaches a chain until a
@@ -215,3 +216,272 @@ console.log(
   `[ephemeral] seeded contributor ephemeral-contributor-1 — cookie: devasign_session=${signSession("ephemeral-contributor-1")}`
 );
 console.log(`[ephemeral] funded bounty apply page: http://localhost:3001/bounties/${openBounty.id}/apply`);
+
+// ── Security page seed ───────────────────────────────────────────────────────
+// A repository row + findings across severities/states + scan runs, so the
+// Security page (dashboard, detail, merge gate terminal, policy) renders with
+// real data. One finding sits on issue #2 — the FUNDED bounty above — which
+// exercises the issue→bounty linkage end-to-end.
+const now = Date.now();
+const HOUR = 60 * 60 * 1000;
+db.insert("repositories", {
+  id: "ephemeral-repo-1",
+  installationId: "ephemeral-install-1",
+  owner: "ephemeral-tester",
+  name: "demo",
+  defaultBranch: "main",
+  private: false,
+  defaultModel: "",
+  modelOverrides: {},
+  reviewsEnabled: true,
+  indexState: "ready",
+  indexedAt: now - HOUR,
+  indexedCommit: "8c1a2f0",
+  indexedFileCount: 42,
+});
+// Index rows for every path the findings below sit on. The index IS the audit's
+// file inventory — without it a full run has nothing to scan and can't tell a
+// deleted file from an unbuilt index, so it (correctly) skips.
+for (const [path, flags] of [
+  ["api/routes/payouts.ts", ["handles-auth", "moves-funds"]],
+  ["api/ledger/export.ts", ["raw-sql"]],
+  ["web/app/invite/page.tsx", ["parses-user-input"]],
+  ["api/auth/otp.ts", ["handles-auth"]],
+  ["package-lock.json", []],
+  ["api/middleware/error.ts", []],
+  ["infra/s3.tf", []],
+]) {
+  db.insert("repoIndex", {
+    id: `ephemeral-idx-${path.replace(/[^a-z0-9]/gi, "-")}`,
+    repoId: "ephemeral-repo-1",
+    path,
+    sha: `sha-${path.length}`,
+    size: 2048,
+    language: path.split(".").pop(),
+    summary: `Seeded index entry for ${path}.`,
+    exports: [],
+    imports: [],
+    securityFlags: flags,
+    securityScannedSha: `sha-${path.length}`, // already audited at this blob
+    indexedAt: now - HOUR,
+    model: "mock",
+  });
+}
+const seedFinding = (over) => {
+  const row = {
+    id: `ephemeral-vln-${Math.random().toString(36).slice(2, 8)}`,
+    fingerprint: Math.random().toString(16).slice(2, 18),
+    repoId: "ephemeral-repo-1",
+    path: "api/routes/payouts.ts",
+    class: "missing-authz",
+    surface: "api",
+    severity: "critical",
+    confidence: "confirmed",
+    title: "finding",
+    concern: "seeded",
+    state: "open",
+    firstDetectedAt: now - 26 * HOUR,
+    lastSeenAt: now - HOUR,
+    detectedSha: "8c1a2f0",
+    model: "mock",
+    activity: [
+      { at: now - 26 * HOUR, kind: "detected", detail: "Detected by security audit after merge of PR #487", actor: "audit-agent" },
+    ],
+    ...over,
+  };
+  db.insert("securityFindings", row);
+  return row;
+};
+seedFinding({
+  line: 88,
+  symbol: "registerRoutes",
+  cwe: "CWE-306",
+  severity: "critical",
+  state: "new",
+  title: "Payout route reachable without authentication",
+  concern:
+    "The route-registration rewrite dropped requireAuth and requireScope from the payouts group while every other group kept them. Any caller who can reach the edge can create a transfer to an arbitrary destination.",
+  evidence: 'line 88: app.post("/v1/payouts", createPayout) — no auth middleware in the chain',
+  dataflow: { source: "POST /v1/payouts (public edge)", sink: "stripe.transfers.create()", steps: ["idempotency() passes the body through untouched", "createPayout(req.body) reads destination and amount from the caller"] },
+  exploitNarrative: [
+    "Send POST /v1/payouts from any host — the route has no auth middleware",
+    "Set destination to an attacker account and amount to the per-tx cap",
+    "The handler calls stripe.transfers.create() and real funds move",
+  ],
+  blastRadius: "funds — up to the 25,000 USDC per-transaction cap",
+  invariant: "every payout call is authenticated and scoped to payouts:write",
+  remediation:
+    'Fix: restore auth on the payouts group\n\nFile: api/routes/payouts.ts\nSymbol: registerRoutes\n\nIssue:\nThe consolidation removed requireAuth + requireScope("payouts:write").\n\nSuggested approach:\nRe-add app.use("/v1/payouts", requireAuth, requireScope("payouts:write")) before the idempotency middleware.',
+  regressionTest: 'expect(await post("/v1/payouts", { noAuth: true })).toHaveStatus(401);',
+  introducedByPr: 487,
+  introducedSha: "8c1a2f0",
+  introducedByAuthor: "dmitri",
+  firstDetectedAt: now - 2 * HOUR,
+  lastSeenAt: now - HOUR,
+});
+seedFinding({
+  path: "api/ledger/export.ts",
+  line: 203,
+  class: "sql-injection",
+  cwe: "CWE-89",
+  severity: "high",
+  state: "open",
+  title: "Ledger export builds SQL by string interpolation",
+  concern: "The rewrite swapped a parameterized query for a template string. Any future caller, or a compromised admin session, can inject arbitrary SQL.",
+  evidence: "line 203: const q = `SELECT * FROM ledger WHERE date BETWEEN ${'${range.from}'} AND ${'${range.to}'}`",
+  exploitNarrative: [
+    "Authenticate as an admin (or compromise an admin session)",
+    "Call GET /v1/ledger/export with range.from = \"1 UNION SELECT * FROM users --\"",
+    "db.raw() executes the injected statement against Postgres",
+  ],
+  blastRadius: "ledger DB — read access to all tables",
+  remediation: "Fix: parameterize the export query\n\nFile: api/ledger/export.ts",
+  introducedByPr: 487,
+  introducedSha: "8c1a2f0",
+  introducedByAuthor: "dmitri",
+});
+seedFinding({
+  path: "web/app/invite/page.tsx",
+  line: 47,
+  class: "xss",
+  cwe: "CWE-79",
+  surface: "frontend",
+  severity: "high",
+  state: "issue_created",
+  issueNumber: 2,
+  issueUrl: "https://github.com/ephemeral-tester/demo/issues/2",
+  title: "Reflected XSS via ?ref on the invite page",
+  concern: "The invited-by label switched from an escaped sanitize() call to dangerouslySetInnerHTML with no encoding.",
+  exploitNarrative: [
+    "Craft an invite link with ?ref=<script payload>",
+    "Send the link to a victim (the page needs no auth)",
+    "The payload executes in the visitor's session",
+  ],
+  blastRadius: "session — invite-page visitors",
+  remediation: "Fix: restore sanitize() on the ref label\n\nFile: web/app/invite/page.tsx",
+  introducedByPr: 401,
+  introducedByAuthor: "priya",
+  activity: [
+    { at: now - 26 * HOUR, kind: "detected", detail: "Detected by security audit", actor: "audit-agent" },
+    { at: now - 20 * HOUR, kind: "issue_created", detail: "GitHub issue #2 created", actor: "ephemeral-tester" },
+  ],
+});
+seedFinding({
+  path: "api/auth/otp.ts",
+  line: 34,
+  class: "missing-rate-limit",
+  cwe: "CWE-307",
+  severity: "medium",
+  state: "snoozed",
+  snoozeUntil: now + 5 * 24 * HOUR,
+  title: "No rate limit on OTP verification endpoint",
+  concern: "A scripted attacker can attempt all 10,000 OTP codes against a single session inside typical expiry windows.",
+  exploitNarrative: ["Request an OTP for the victim account", "Script all 10,000 codes against /verify", "Session is taken over"],
+  blastRadius: "account takeover — one account per attack",
+})
+seedFinding({
+  path: "package-lock.json",
+  class: "vulnerable-dependency",
+  surface: "deps",
+  severity: "medium",
+  state: "fix_ready",
+  stateReason: "Fix verified on PR #489",
+  title: "axios 1.6.2 leaks auth header across redirects",
+  concern: "Reachable where the app follows cross-origin redirects with an Authorization header attached — 2 call sites match.",
+  exploitNarrative: ["Induce a request to an attacker-controlled redirecting endpoint", "axios forwards the Authorization header cross-origin", "Attacker replays the captured token"],
+  blastRadius: "auth tokens on outbound requests",
+});
+seedFinding({
+  path: "api/middleware/error.ts",
+  line: 19,
+  class: "info-disclosure",
+  cwe: "CWE-209",
+  severity: "low",
+  state: "accepted",
+  stateReason: "Accepted risk — guarded by NODE_ENV; reviewed quarterly.",
+  title: "Stack traces returned on 500 in production",
+  concern: "Guarded by an environment check that has held for 90+ days of scans; staging is occasionally misconfigured.",
+  exploitNarrative: ["Trigger any unhandled exception", "Read the stack from the 500 body", "Use internals to aim further attacks"],
+  blastRadius: "internal detail disclosure only",
+});
+seedFinding({
+  path: "infra/s3.tf",
+  line: 31,
+  class: "misconfiguration",
+  surface: "infra",
+  severity: "high",
+  state: "resolved",
+  resolvedAt: now - 8 * HOUR,
+  title: "Receipts bucket allowed public read",
+  concern: "acl was flipped to public-read; receipt object keys are guessable.",
+  exploitNarrative: ["Guess a {userId}/{txId}.pdf key", "GET the object unauthenticated", "Read customer receipts"],
+  blastRadius: "customer receipts — read-only",
+});
+// Scan-run history: a running one streams the terminal; completed ones fill
+// the introduced-vs-resolved chart.
+const seedScan = (over) =>
+  db.insert("securityScans", {
+    id: `ephemeral-scan-${Math.random().toString(36).slice(2, 8)}`,
+    repoId: "ephemeral-repo-1",
+    trigger: "merge",
+    full: false,
+    status: "completed",
+    startedAt: now - 2 * HOUR,
+    finishedAt: now - 2 * HOUR + 38_000,
+    filesScanned: 12,
+    cacheHits: 30,
+    introduced: 0,
+    resolved: 0,
+    stillOpen: 5,
+    log: [],
+    ...over,
+  });
+// Per-severity splits so the chart's stacked bars have every colour to show.
+const SPLITS = [
+  { high: 1 },
+  {},
+  { high: 1, medium: 1 },
+  { medium: 1 },
+  {},
+  { low: 1 },
+  { critical: 1, high: 1, medium: 1 },
+  {},
+  { medium: 1, low: 1 },
+  { high: 1 },
+  {},
+];
+for (let i = 0; i < SPLITS.length; i++) {
+  const split = SPLITS[i];
+  seedScan({
+    prNumber: 476 + i,
+    prTitle: `Merge #${476 + i}`,
+    mergeSha: `a${i}f00${i}`,
+    prAuthor: i % 2 ? "dmitri" : "priya",
+    startedAt: now - (13 - i) * 24 * HOUR,
+    finishedAt: now - (13 - i) * 24 * HOUR + 40_000,
+    introduced: Object.values(split).reduce((n, v) => n + v, 0),
+    introducedBySeverity: split,
+    resolved: [0, 2, 1, 0, 4, 1, 2, 3, 1, 5, 2][i],
+  });
+}
+seedScan({
+  prNumber: 487,
+  prTitle: "Add instant payout rail",
+  mergeSha: "8c1a2f0",
+  prAuthor: "dmitri",
+  startedAt: now - 2 * HOUR,
+  finishedAt: now - 2 * HOUR + 38_000,
+  introduced: 2,
+  introducedBySeverity: { critical: 1, high: 1 },
+  resolved: 1,
+  stillOpen: 5,
+  log: [
+    "$ devasign security-audit ephemeral-tester/demo --trigger merge --merge #487",
+    "scope differential · 42 indexed · 12 to scan · 30 cache hits",
+    "✗ CRITICAL api/routes/payouts.ts:88 — Payout route reachable without authentication",
+    "✗ HIGH     api/ledger/export.ts:203 — Ledger export builds SQL by string interpolation",
+    "✓ 1 finding(s) resolved in infra/s3.tf",
+    "done in 38.0s · 2 new · 1 resolved · 5 open",
+  ].map((line, i) => ({ at: now - 2 * HOUR + i * 4000, line })),
+});
+console.log("[ephemeral] seeded security findings + scan runs for ephemeral-repo-1");

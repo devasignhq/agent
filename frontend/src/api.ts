@@ -226,6 +226,9 @@ export type Repository = {
   reviewsEnabled: boolean;
   // Attached by GET /api/repositories for the Workflow rail cards (not persisted).
   reviewStats?: { total: number; approved: number; blocked: number };
+  // Repo-index state (backend RepoIndexState) — "none" until first indexed.
+  indexState?: "none" | "queued" | "indexing" | "ready" | "stale" | "errored";
+  indexedAt?: number;
 };
 
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
@@ -495,6 +498,133 @@ export type EscrowTransaction = {
 
 export type BountySummary = { total: number; active: number; inEscrow: number; paidOut: number };
 
+// --- Security page (mirror of backend/src/types.ts + security/policy.ts) ---
+
+export type SecuritySeverity = "critical" | "high" | "medium" | "low";
+export type SecurityConfidence = "confirmed" | "probable" | "needs_human";
+export type AttackSurface = "api" | "frontend" | "infra" | "deps" | "secrets";
+export type SecurityFindingState =
+  | "new"
+  | "open"
+  | "issue_created"
+  | "bounty"
+  | "fix_ready"
+  | "resolved"
+  | "accepted"
+  | "false_positive"
+  | "snoozed";
+
+export type SecurityFindingEvent = {
+  at: number;
+  kind: string;
+  detail: string;
+  actor?: string;
+};
+
+export type SecurityFinding = {
+  id: string;
+  fingerprint: string;
+  repoId: string;
+  repo: string; // "owner/name", attached by the overview endpoint
+  path: string;
+  line?: number;
+  symbol?: string;
+  class: string;
+  cwe?: string;
+  surface: AttackSurface;
+  severity: SecuritySeverity;
+  confidence: SecurityConfidence;
+  title: string;
+  concern: string;
+  evidence?: string;
+  dataflow?: { source: string; sink: string; steps: string[] };
+  exploitNarrative?: string[];
+  blastRadius?: string;
+  invariant?: string;
+  remediation?: string;
+  regressionTest?: string;
+  state: SecurityFindingState;
+  stateReason?: string | null;
+  assigneeLogin?: string | null;
+  issueNumber?: number | null;
+  issueUrl?: string | null;
+  bountyId?: string | null;
+  snoozeUntil?: number | null;
+  introducedByPr?: number | null;
+  introducedSha?: string | null;
+  introducedByAuthor?: string | null;
+  firstDetectedAt: number;
+  lastSeenAt: number;
+  resolvedAt?: number | null;
+  detectedSha: string;
+  model: string;
+  activity: SecurityFindingEvent[];
+  // Live bounty on this finding's issue (joined by the overview endpoint).
+  bounty: { id: string; code: string; status: string; amountUsdc: number } | null;
+};
+
+export type SecurityScanSummary = {
+  id: string;
+  repoId: string;
+  trigger: "merge" | "manual" | "nightly";
+  full: boolean;
+  prNumber?: number | null;
+  prTitle?: string | null;
+  mergeSha?: string | null;
+  prAuthor?: string | null;
+  status: "queued" | "running" | "completed" | "errored";
+  startedAt: number;
+  finishedAt?: number | null;
+  filesScanned: number;
+  cacheHits: number;
+  introduced: number;
+  // Per-severity split of `introduced` (absent on runs written before the chart).
+  introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
+  resolved: number;
+  stillOpen: number;
+  error?: string | null;
+  costUsd?: number;
+};
+
+export type SecurityScanRun = SecurityScanSummary & {
+  log: Array<{ at: number; line: string }>;
+};
+
+export type SeverityGateAction = "block" | "warn" | "track";
+export type RepoSecurityPolicy = {
+  version: 1;
+  triggers: { onMerge: boolean; onPrPush: boolean; nightly: boolean; advisories: boolean };
+  engines: { api: boolean; frontend: boolean; infra: boolean; secrets: boolean; deps: boolean };
+  gates: Record<SecuritySeverity, SeverityGateAction>;
+};
+
+export type GateRule = {
+  id: string;
+  label: string;
+  pass: boolean;
+  required: boolean;
+  count: number;
+};
+export type GateResult = { verdict: "pass" | "fail"; rules: GateRule[]; blockingFindingIds: string[] };
+
+export type SecurityRepoView = {
+  id: string;
+  owner: string;
+  name: string;
+  defaultBranch: string;
+  indexState: string;
+  indexedAt: number | null;
+  policy: RepoSecurityPolicy;
+  gate: GateResult;
+  latestScan: SecurityScanSummary | null;
+};
+
+export type SecurityOverview = {
+  repos: SecurityRepoView[];
+  scans: SecurityScanSummary[];
+  findings: SecurityFinding[];
+};
+
 // --- Endpoints ---
 
 export const api = {
@@ -555,6 +685,41 @@ export const api = {
     ),
   deleteRepoGuidance: (id: string, itemId: string) =>
     request<{ ok: true }>(`/api/repositories/${id}/guidance/${itemId}`, { method: "DELETE" }),
+
+  // security (the dedicated Security page; findings come from the audit agent)
+  securityOverview: () => request<SecurityOverview>("/api/security/overview"),
+  securityScanLog: (repoId: string, scanId: string) =>
+    request<{ scan: SecurityScanRun }>(`/api/repositories/${repoId}/security/scans/${scanId}`),
+  startSecurityScan: (repoId: string, full = false) =>
+    request<{ ok: true; scanRunId: string }>(`/api/repositories/${repoId}/security/scan`, {
+      method: "POST",
+      body: JSON.stringify({ full }),
+    }),
+  // One-click GitHub issue from a finding. Idempotent server-side.
+  createFindingIssue: (repoId: string, findingId: string) =>
+    request<{ ok: true; issueNumber: number; issueUrl: string }>(
+      `/api/repositories/${repoId}/security/findings/${findingId}/issue`,
+      { method: "POST", body: "{}" }
+    ),
+  patchFinding: (
+    repoId: string,
+    findingId: string,
+    body: {
+      action: "false_positive" | "accept" | "reopen";
+      reason?: string;
+    }
+  ) =>
+    request<{ ok: true; finding: SecurityFinding }>(
+      `/api/repositories/${repoId}/security/findings/${findingId}`,
+      { method: "PATCH", body: JSON.stringify(body) }
+    ),
+  securityPolicy: (repoId: string) =>
+    request<{ policy: RepoSecurityPolicy }>(`/api/repositories/${repoId}/security/policy`),
+  setSecurityPolicy: (repoId: string, policy: RepoSecurityPolicy) =>
+    request<{ ok: true; policy: RepoSecurityPolicy }>(
+      `/api/repositories/${repoId}/security/policy`,
+      { method: "PUT", body: JSON.stringify({ policy }) }
+    ),
 
   // reviews
   reviews: (status?: PRReviewStatus) =>

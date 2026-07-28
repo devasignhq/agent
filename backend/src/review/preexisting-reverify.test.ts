@@ -11,42 +11,23 @@ import {
   formatPreexistingFinding,
   formatResolvedFinding,
 } from "./pipeline.js";
-import type { RepoIndexEntry, Vulnerability } from "../types.js";
+import type { PreexistingVulnLike } from "./pipeline.js";
 
-const vuln = (over: Partial<Vulnerability> = {}): Vulnerability => ({
+const vuln = (over: Partial<PreexistingVulnLike> = {}): PreexistingVulnLike => ({
   id: "v",
   class: "sql-injection",
-  severity: "blocker",
   path: "backend/src/db.ts",
   concern: "raw query built from user input",
   fixPrompt: "fix",
-  detectedSha: "sha",
-  detectedAt: 0,
-  model: "m",
   ...over,
 });
 
-const entry = (path: string, vulns: Vulnerability[]): RepoIndexEntry => ({
-  id: path,
-  repoId: "r1",
-  path,
-  sha: "sha",
-  size: 100,
-  language: "ts",
-  summary: "",
-  exports: [],
-  imports: [],
-  securityFlags: ["raw-sql"],
-  vulnerabilities: vulns,
-  securityScannedSha: "sha",
-  indexedAt: 0,
-  model: "m",
-});
+const entry = (path: string, vulns: PreexistingVulnLike[]) => ({ path, vulns });
 
 // ── formatters ──────────────────────────────────────────────────────────────
 
 test("formatPreexistingFinding: forces advisory 'warn', labels pre-existing, keeps fixPrompt + locator", () => {
-  const f = formatPreexistingFinding(vuln({ severity: "blocker", symbol: "runQuery", line: 12 }));
+  const f = formatPreexistingFinding(vuln({ symbol: "runQuery", line: 12 }));
   assert.equal(f.severity, "warn");
   assert.equal(f.path, "backend/src/db.ts");
   assert.match(f.concern, /\[sql-injection\]/);

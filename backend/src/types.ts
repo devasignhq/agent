@@ -125,6 +125,9 @@ export type Repository = {
   // injected as authoritative guidance into every review on this repo. Optional
   // so rows written before this feature load unchanged; treat undefined as [].
   guidance?: RepoGuidanceItem[];
+  // Per-repo security audit policy (triggers/engines/severity gates). Optional;
+  // read through effectiveSecurityPolicy() which merges defaults.
+  securityPolicy?: RepoSecurityPolicy;
 }
 
 // A repo-scoped guidance material attached on the Workflow "Ingest context"
@@ -195,6 +198,149 @@ export type RepoIndexEntry = {
   securityScannedSha?: string;
   indexedAt: number;
   model: string;             // model that produced this entry
+};
+
+// ── Security audit (dedicated agent, backend/src/security/) ─────────────────
+// First-class findings produced by the security audit agent that runs on every
+// merge to the default branch (and on manual/nightly triggers). Unlike the
+// legacy index-embedded Vulnerability rows, these are keyed by a stable
+// fingerprint so triage state (issue links, accepted-risk, assignee) survives
+// re-scans. The indexer's security sub-pass is superseded by this agent.
+
+export type SecuritySeverity = "critical" | "high" | "medium" | "low";
+
+// Confidence per the audit contract: "confirmed" = the agent verified the
+// control is absent; "probable" = strong evidence but unverified assumptions;
+// "needs_human" = depends on something outside the repo (WAF, IaC, ops).
+export type SecurityConfidence = "confirmed" | "probable" | "needs_human";
+
+export type AttackSurface = "api" | "frontend" | "infra" | "deps" | "secrets";
+
+export type SecurityFindingState =
+  | "new"            // fresh from the latest completed scan run
+  | "open"           // carried over from an earlier run
+  | "issue_created"  // a GitHub issue was filed from the finding
+  | "bounty"         // a bounty exists on that issue
+  | "fix_ready"      // a PR-review re-verify saw the fix on an open PR head
+  | "resolved"       // no longer detected (or its fix merged)
+  | "accepted"       // accepted risk — suppressed, kept by fingerprint
+  | "false_positive" // suppressed, kept by fingerprint so it can't come back
+  | "snoozed";
+
+export type SecurityFindingEvent = {
+  at: number;
+  kind:
+    | "detected"
+    | "redetected"
+    | "state_change"
+    | "issue_created"
+    | "assigned"
+    | "resolved"
+    | "reopened";
+  detail: string;
+  actor?: string; // github login, or "audit-agent" for machine transitions
+};
+
+export type SecurityFinding = {
+  id: string;
+  // Stable across runs: hash of repoId|path|class|symbol-or-slug. Line numbers
+  // and prose wording are deliberately excluded so re-detections match.
+  fingerprint: string;
+  repoId: string;
+  path: string;
+  line?: number;             // updated on each re-detection; NOT in fingerprint
+  symbol?: string;
+  class: string;             // taxonomy tag: "sql-injection", "missing-authz", ...
+  cwe?: string;              // "CWE-89" when the model maps one
+  surface: AttackSurface;
+  severity: SecuritySeverity;
+  confidence: SecurityConfidence;
+  title: string;             // one line, specific
+  concern: string;           // what it is and why it's exploitable
+  evidence?: string;         // quoted file:line evidence the model actually read
+  dataflow?: { source: string; sink: string; steps: string[] };
+  exploitNarrative?: string[]; // exactly 3 concrete attacker steps
+  blastRadius?: string;      // one sentence: what an attacker gets
+  invariant?: string;        // the rule that should hold
+  remediation?: string;      // copy-pasteable fix prompt (successor of fixPrompt)
+  regressionTest?: string;   // a test that fails today, passes after the fix
+  state: SecurityFindingState;
+  stateReason?: string | null; // note on accepted / false_positive / snoozed
+  assigneeLogin?: string | null;
+  issueNumber?: number | null;
+  issueUrl?: string | null;
+  bountyId?: string | null;
+  snoozeUntil?: number | null;
+  // Origin attribution: the merged PR whose scan first surfaced the finding.
+  introducedByPr?: number | null;
+  introducedSha?: string | null;
+  introducedByAuthor?: string | null;
+  firstDetectedAt: number;
+  lastSeenAt: number;
+  resolvedAt?: number | null;
+  detectedSha: string;       // blob sha last detected on
+  model: string;
+  activity: SecurityFindingEvent[]; // capped at 50, newest last
+};
+
+export type SecurityScanTrigger = "merge" | "manual" | "nightly";
+export type SecurityScanStatus = "queued" | "running" | "completed" | "errored";
+
+export type SecurityScanRun = {
+  id: string;
+  repoId: string;
+  trigger: SecurityScanTrigger;
+  full: boolean;
+  // Merge-trigger metadata (the PR whose merge caused this run).
+  prNumber?: number | null;
+  prTitle?: string | null;
+  mergeSha?: string | null;
+  prAuthor?: string | null;
+  status: SecurityScanStatus;
+  startedAt: number;
+  finishedAt?: number | null;
+  filesScanned: number;
+  cacheHits: number;
+  introduced: number;        // findings created by this run
+  // Per-severity split of `introduced`, so the dashboard's introduced-vs-
+  // resolved chart can stack a run's bar by severity without re-deriving it
+  // from findings (whose severity is re-assessed on later runs). Absent on
+  // rows written before the chart existed — treat as "unknown split".
+  introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
+  resolved: number;          // findings auto-resolved by this run
+  stillOpen: number;         // active findings after the run
+  error?: string | null;
+  costUsd?: number;
+  log: Array<{ at: number; line: string }>; // terminal log, capped at 300 lines
+};
+
+export type SeverityGateAction = "block" | "warn" | "track";
+
+export type RepoSecurityPolicy = {
+  version: 1;
+  triggers: {
+    onMerge: boolean;   // audit on every merge to the default branch
+    onPrPush: boolean;  // publish the security check-run on PR reviews
+    nightly: boolean;   // daily cache-driven sweep
+    advisories: boolean; // reserved: dependency advisory feed
+  };
+  engines: {
+    api: boolean;
+    frontend: boolean;
+    infra: boolean;
+    secrets: boolean;
+    deps: boolean;
+  };
+  gates: Record<SecuritySeverity, SeverityGateAction>;
+};
+
+// Snapshot of security findings the review pipeline attributed to a PR's head,
+// persisted on the PRReview row so the merge-gate view can list PR-introduced
+// findings without re-parsing review logs.
+export type PRSecurityFinding = {
+  path?: string;
+  concern: string;
+  severity: SecuritySeverity;
 };
 
 export type IntegrationType = "slack" | "linear" | "discord";
@@ -316,6 +462,11 @@ export type PRReview = {
   // pipeline notify the bounty assignee when verdicts land. Absent on ordinary
   // (non-bounty) reviews and rows written before bounties existed.
   bountyId?: string | null;
+  // Security findings this review attributed to the PR head (introduced by the
+  // diff, not pre-existing). Stamped when the verdict lands; read by the merge
+  // gate's "no open PR introduces a block-gated finding" rule. Absent on rows
+  // written before the Security page existed.
+  securityFindings?: PRSecurityFinding[];
   createdAt: number;
   updatedAt: number;
 };
@@ -681,4 +832,6 @@ export type DB = {
   linearProjectUpdates: LinearProjectUpdate[];
   bounties: Bounty[];
   escrowTransactions: EscrowTransaction[];
+  securityFindings: SecurityFinding[];
+  securityScans: SecurityScanRun[];
 };

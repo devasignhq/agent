@@ -30,7 +30,10 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Bounty, Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, Task, User, Vulnerability } from "../types.js";
+import type { Bounty, Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, SecurityFinding, SecuritySeverity, Task, User, Vulnerability } from "../types.js";
+import { normalizeSeverity, severityToLegacy } from "../security/severity.js";
+import { ACTIVE_STATES as SECURITY_ACTIVE_STATES } from "../security/policy.js";
+import { publishGateForPR } from "../security/gate.js";
 import { resolveBountyForPR } from "../bounties/prlink.js";
 import { recordBountyEvent } from "../bounties/service.js";
 import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
@@ -97,7 +100,7 @@ type FindingCategory =
 function emitFindingLog(
   reviewId: string,
   category: Exclude<FindingCategory, "suggestion">,
-  finding: { path?: string; concern: string; severity: "blocker" | "warn" | "nit"; fixPrompt?: string }
+  finding: { path?: string; concern: string; severity: "blocker" | "warn" | "nit"; securitySeverity?: SecuritySeverity; fixPrompt?: string }
 ) {
   const titleByCategory: Record<typeof category, string> = {
     regression: "Possible regression",
@@ -115,6 +118,7 @@ function emitFindingLog(
     meta: {
       category,
       severity: finding.severity,
+      ...(finding.securitySeverity ? { securitySeverity: finding.securitySeverity } : {}),
       ...(finding.path ? { path: finding.path } : {}),
       title: titleByCategory[category],
       body: finding.concern,
@@ -559,44 +563,47 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       );
     }
 
-    // c.1b Pre-existing vulnerabilities (advisory): vulns already stored in the
-    // repo index for files this PR touches or depends on. Never gates the merge —
-    // the PR didn't introduce these, so blocking it would be hostile.
+    // c.1b Pre-existing vulnerabilities (advisory): active security findings
+    // stored for files this PR touches or depends on (the security audit
+    // agent's `securityFindings` collection). Never gates the merge — the PR
+    // didn't introduce these, so blocking it would be hostile. The comment only
+    // carries a pointer to the Security page; the collected findings drive
+    // that pointer's counts and the in-app timeline.
     //
-    // The index is built against the DEFAULT BRANCH and isn't rebuilt for an open
-    // PR, so a vuln this PR fixes would otherwise be re-surfaced verbatim. Split
-    // by whether the PR modifies the file: dependents (the PR doesn't touch them)
-    // keep the read-only index-driven path; touched files are re-verified against
-    // the PR head so a fix is recognized — resolved ones drop and are confirmed
-    // positively. The re-verify is gated on having an install + stored vulns in a
-    // touched file, so a clean PR (or dev with no install) pays nothing.
+    // Findings are detected against the DEFAULT BRANCH, so a vuln this PR fixes
+    // would otherwise be re-surfaced verbatim. Split by whether the PR modifies
+    // the file: dependents (the PR doesn't touch them) keep the read-only
+    // stored-findings path; touched files are re-verified against the PR head
+    // so a fix is recognized — resolved ones drop, are confirmed positively,
+    // and flip to "fix_ready" on the Security page. The re-verify is gated on
+    // having an install + stored findings in a touched file, so a clean PR (or
+    // dev with no install) pays nothing.
     const touchedEntries = holistic.entries.slice(0, holistic.touchedCount);
     const dependentEntries = holistic.entries.slice(holistic.touchedCount);
-    const dependentVulns = collectPreexistingVulns({
-      ...holistic,
-      entries: dependentEntries,
-      touchedCount: 0,
-      dependentCount: dependentEntries.length,
-    });
+    const activeFindingsIn = (entries: RepoIndexEntry[]): SecurityFinding[] => {
+      if (!entries.length) return [];
+      const paths = new Set(entries.map((e) => e.path));
+      return db.filter(
+        "securityFindings",
+        (f) => f.repoId === repo.id && paths.has(f.path) && SECURITY_ACTIVE_STATES.includes(f.state)
+      );
+    };
+    const dependentVulns = collectPreexistingVulns(activeFindingsIn(dependentEntries));
     let touchedVulns: HolisticFinding[];
     let resolvedVulns: HolisticFinding[] = [];
-    if (install && touchedEntries.some((e) => (e.vulnerabilities?.length ?? 0) > 0)) {
+    const touchedFindings = activeFindingsIn(touchedEntries);
+    if (install && touchedFindings.length > 0) {
       const reverified = await reverifyTouchedPreexistingVulns({
         review,
         repo,
         install,
-        touchedEntries,
+        findings: touchedFindings,
         extraInstructions: wf.prompts?.holistic,
       });
       touchedVulns = reverified.stillPresent;
       resolvedVulns = reverified.resolved;
     } else {
-      touchedVulns = collectPreexistingVulns({
-        ...holistic,
-        entries: touchedEntries,
-        touchedCount: touchedEntries.length,
-        dependentCount: 0,
-      });
+      touchedVulns = collectPreexistingVulns(touchedFindings);
     }
     // Combine and re-apply the dedupe + cap collectPreexistingVulns enforces on a
     // single source, now that two sources feed the list.
@@ -749,6 +756,14 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       // Persist the regressions (met by an earlier commit, broken by this diff)
       // so the GitHub comment and the in-app timeline can flag them.
       regressedCriteriaIds,
+      // Snapshot the security findings this diff INTRODUCES (4-tier severity)
+      // so the merge gate's "no open PR introduces a block-gated finding" rule
+      // reads the row instead of re-parsing review logs.
+      securityFindings: holisticVerdict.securityFindings.map((f) => ({
+        ...(f.path ? { path: f.path } : {}),
+        concern: f.concern,
+        severity: f.securitySeverity ?? (f.severity === "blocker" ? "critical" : "medium"),
+      })),
     });
 
     // Route the verdict to a GitHub review action. We never auto-APPROVE a PR
@@ -861,6 +876,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // catch block and overwrite the verdict with a failure banner — the GitHub
     // output phase is already done. (The row keeps its id for the record.)
     progressCommentId = null;
+    // Security merge-gate check-run on this PR's head: a PR that introduces a
+    // block-gated finding fails `devasign/security` immediately, alongside the
+    // End-goal check. Best-effort — the review itself already landed.
+    if (install) {
+      const freshReview = db.find("prReviews", (r) => r.id === review.id) ?? review;
+      void publishGateForPR({ repo, install, review: freshReview }).catch(() => {});
+    }
     // Stamp the sha this run evaluated as the base for the NEXT push's incremental
     // delta (b.2). Done only after the GitHub output phase so a run that errored
     // earlier doesn't advance the base — the next push still diffs from the last
@@ -2421,37 +2443,45 @@ export function formatReviewBody(
     if (holistic.summary) lines.push(holistic.summary, "");
     appendHolisticGroup(lines, "Regressions", holistic.regressions);
     appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
-    appendHolisticGroup(lines, "Security findings", holistic.securityFindings);
-    lines.push("");
-  }
-
-  // Pre-existing vulnerabilities in files this PR touches (from the repo index's
-  // security audit). Advisory — clearly labelled as NOT introduced by this PR so
-  // a reviewer doesn't read them as a reason to block the merge.
-  if (holistic.preexistingVulns.length) {
-    lines.push("### Pre-existing security issues");
-    lines.push(
-      "These vulnerabilities already exist in files this PR touches — they were not introduced by this PR and don't block the merge, but they're worth fixing while you're here:",
-      ""
-    );
-    appendHolisticGroup(lines, "Pre-existing", holistic.preexistingVulns);
-    lines.push("");
-  }
-
-  // Pre-existing vulnerabilities this PR resolved (re-verified against the PR
-  // head). Positive confirmation that the agent saw the fix — advisory, no fix
-  // prompt (nothing to fix), rendered without a severity tag.
-  if (holistic.resolvedPreexisting.length) {
-    lines.push("### ✅ Resolved in this PR");
-    lines.push(
-      "These previously-flagged vulnerabilities in files this PR touches are no longer present at this commit:",
-      ""
-    );
-    for (const f of holistic.resolvedPreexisting) {
-      const where = f.path ? `\`${f.path}\` — ` : "";
-      lines.push(`- ${where}${f.concern}`);
+    // Security detail deliberately does NOT render in the PR comment — it
+    // lives on the Security page. The comment carries only the count + a
+    // pointer; a critical finding still gates the verdict (REQUEST_CHANGES),
+    // so the merge can't proceed silently.
+    if (holistic.securityFindings.length) {
+      const critical = holistic.securityFindings.filter(
+        (f) => (f.securitySeverity ?? "medium") === "critical"
+      ).length;
+      const counts =
+        `${holistic.securityFindings.length} security finding${holistic.securityFindings.length === 1 ? "" : "s"}` +
+        (critical ? ` (${critical} critical — blocks this PR)` : "");
+      lines.push(
+        `**Security:** this PR introduces ${counts}. Details and remediation are on the ` +
+          `[Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}).`
+      );
     }
     lines.push("");
+  }
+
+  // Pre-existing security findings in files this PR touches: pointer only —
+  // the Security page owns the detail. Advisory; never blocks the merge.
+  if (holistic.preexistingVulns.length) {
+    lines.push(
+      `**Security:** ${holistic.preexistingVulns.length} pre-existing security finding${holistic.preexistingVulns.length === 1 ? "" : "s"} ` +
+        `touch${holistic.preexistingVulns.length === 1 ? "es" : ""} files in this PR (not introduced by it) — ` +
+        `[view on the Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}).`,
+      ""
+    );
+  }
+
+  // Pre-existing findings this PR resolved (re-verified against the PR head):
+  // one positive line; the findings flip to "fix ready" on the Security page.
+  if (holistic.resolvedPreexisting.length) {
+    lines.push(
+      `**Security:** this PR fixes ${holistic.resolvedPreexisting.length} previously-flagged security finding${holistic.resolvedPreexisting.length === 1 ? "" : "s"} — ` +
+        `confirmed against this commit; ${holistic.resolvedPreexisting.length === 1 ? "it resolves" : "they resolve"} on the ` +
+        `[Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}) when merged.`,
+      ""
+    );
   }
 
   // DEVASIGN.md nits (advisory). Convention violations the diff newly introduced
@@ -2535,8 +2565,11 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
 }> = [
   { key: "regressions", label: "Regression" },
   { key: "criticalErrors", label: "Critical error" },
+  // Introduced security findings keep their fixPrompt in the consolidated
+  // copy-paste prompt (they gate approval; the developer needs the fix in one
+  // paste). PRE-EXISTING findings are deliberately absent — their detail lives
+  // on the Security page, not in the PR conversation.
   { key: "securityFindings", label: "Security" },
-  { key: "preexistingVulns", label: "Pre-existing security" },
   { key: "commitIntentFindings", label: "New-commit review" },
   { key: "consistencyFindings", label: "Consistency" },
   { key: "deferrals", label: "Deferred work" },
@@ -4086,6 +4119,11 @@ type HolisticFinding = {
   // gate the merge and render as nitpicks. Only "blocker" gates (see the status
   // gate in runReviewJob).
   severity: "blocker" | "warn" | "nit";
+  // 4-tier severity for SECURITY findings only (the Security page's model).
+  // The legacy 2-tier field above is derived from it (critical → "blocker",
+  // everything else → "warn") so every renderer and the verdict gate keep
+  // working — and "blocker gates" now means exactly "critical gates".
+  securitySeverity?: SecuritySeverity;
   // Self-contained prompt the user can paste into an external AI coding agent
   // to land the fix. Includes the relevant diff hunk inline.
   fixPrompt?: string;
@@ -4234,10 +4272,13 @@ async function reviewAgainstRepo(args: {
     "Only flag a vulnerability the diff actually creates — never pre-existing code, never speculation. " +
     'Emit ONLY JSON: {"regressions": [{"path": string, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
     '"criticalErrors": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
-    '"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], ' +
+    '"securityFindings": [{"path": string?, "concern": string, "severity": "critical"|"high"|"medium"|"low", "fixPrompt": string}], ' +
     '"summary": string}. ' +
-    'Use severity="blocker" only when an issue would clearly break a feature, corrupt state, or expose data. ' +
-    'Use severity="warn" for plausible concerns that need human eyes. ' +
+    'For regressions/criticalErrors use severity="blocker" only when an issue would clearly break a feature, corrupt state, or expose data; ' +
+    'use severity="warn" for plausible concerns that need human eyes. ' +
+    "securityFindings rank severity by blast radius: critical = directly exploitable auth bypass, data exposure, code execution, or fund movement; " +
+    "high = single-user compromise, credential exposure, or privilege escalation; medium = requires chaining or is a missing defense-in-depth control; " +
+    "low = hardening opportunity with no direct exploit path. " +
     "Never invent risks the diff doesn't actually create. Quote symbol names or paths from the provided summaries when you cite a concern. " +
     "When nothing material surfaces, return empty arrays — do not pad. " +
     "This applies to `warn` findings as much as `blocker` findings: a `warn` is still a claim that must point to something concrete in the diff. Prefer empty arrays over speculative concerns. " +
@@ -4292,7 +4333,7 @@ async function reviewAgainstRepo(args: {
     ...EMPTY_HOLISTIC,
     regressions: normaliseFindings(parsed.regressions),
     criticalErrors: normaliseFindings(parsed.criticalErrors),
-    securityFindings: normaliseFindings(parsed.securityFindings),
+    securityFindings: normaliseSecurityFindings(parsed.securityFindings),
     summary: String(parsed.summary || ""),
   };
 }
@@ -4317,9 +4358,10 @@ async function reviewDiffSecurity(args: {
     "touches), find real vulnerabilities the diff INTRODUCES: injection (SQL/command/template), missing or broken " +
     "authentication/authorization, secrets or credentials committed in source, unsafe deserialization, SSRF, path " +
     "traversal, XSS, weak or misused cryptography, and unvalidated/untrusted input reaching a dangerous sink. " +
-    'Emit ONLY JSON: {"securityFindings": [{"path": string?, "concern": string, "severity": "blocker"|"warn", "fixPrompt": string}], "summary": string}. ' +
-    'Use severity="blocker" only when the vulnerability is directly exploitable — exposes data, allows code/command ' +
-    'execution, or bypasses auth; use "warn" for a plausible weakness that needs human review. ' +
+    'Emit ONLY JSON: {"securityFindings": [{"path": string?, "concern": string, "severity": "critical"|"high"|"medium"|"low", "fixPrompt": string}], "summary": string}. ' +
+    "Rank severity by blast radius: critical = directly exploitable auth bypass, data exposure, code/command execution, " +
+    "or fund movement; high = single-user compromise, credential exposure, or privilege escalation; medium = requires " +
+    "chaining or is a missing defense-in-depth control; low = hardening opportunity with no direct exploit path. " +
     "Only flag issues the diff actually creates — never pre-existing code, never speculation. Prefer empty arrays over padding. " +
     "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
     "Use this exact template:\n" +
@@ -4351,33 +4393,46 @@ async function reviewDiffSecurity(args: {
   });
   const parsed = tryParseJSON<{ securityFindings?: unknown; summary?: unknown }>(raw, {});
   return {
-    securityFindings: normaliseFindings(parsed.securityFindings),
+    securityFindings: normaliseSecurityFindings(parsed.securityFindings),
     summary: String(parsed.summary || ""),
   };
 }
 
-// Flatten stored vulnerabilities from the files this PR touches or depends on
-// into advisory findings. Forced severity "warn": these are PRE-EXISTING (not
-// introduced by this PR), so they surface as context and never gate the merge.
-// Deduped by path+concern and capped so a vuln-heavy file can't flood the
-// review. Exported for testing alongside the review pipeline.
-export function collectPreexistingVulns(holistic: HolisticContext): HolisticFinding[] {
+// Minimal vuln-like shape that both the legacy embedded Vulnerability and the
+// first-class SecurityFinding rows satisfy structurally — the pre-existing
+// surfacing/re-verify helpers below operate on it so the source of truth could
+// move from the index to `securityFindings` without rewriting them.
+export type PreexistingVulnLike = {
+  id?: string;
+  class: string;
+  concern: string;
+  path: string;
+  symbol?: string;
+  line?: number;
+  fixPrompt?: string;    // legacy Vulnerability
+  remediation?: string;  // SecurityFinding
+};
+
+// Flatten pre-existing security findings (for files this PR touches or depends
+// on) into advisory findings. Forced severity "warn": these are PRE-EXISTING
+// (not introduced by this PR), so they surface as context and never gate the
+// merge. Deduped by path+concern and capped so a vuln-heavy file can't flood
+// the review. Exported for testing alongside the review pipeline.
+export function collectPreexistingVulns(vulns: PreexistingVulnLike[]): HolisticFinding[] {
   const out: HolisticFinding[] = [];
   const seen = new Set<string>();
-  for (const e of holistic.entries) {
-    for (const v of e.vulnerabilities ?? []) {
-      const key = `${v.path}::${v.concern}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      out.push(formatPreexistingFinding(v));
-      if (out.length >= 20) return out;
-    }
+  for (const v of vulns) {
+    const key = `${v.path}::${v.concern}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(formatPreexistingFinding(v));
+    if (out.length >= 20) return out;
   }
   return out;
 }
 
 // "symbol:line" / "line N" locator suffix for a stored vuln, or "" when unknown.
-function vulnLocator(v: Vulnerability): string {
+function vulnLocator(v: PreexistingVulnLike): string {
   return v.symbol
     ? ` (${v.symbol}${v.line ? `:${v.line}` : ""})`
     : v.line
@@ -4385,24 +4440,25 @@ function vulnLocator(v: Vulnerability): string {
     : "";
 }
 
-// Format one stored Vulnerability into an advisory "pre-existing" finding:
+// Format one stored finding into an advisory "pre-existing" line:
 // "[class] concern (symbol:line) — pre-existing…", forced severity "warn" (the
 // PR didn't introduce it, so it never gates). Pure; reused by both the
-// index-driven collector and the re-verify step. Exported for unit testing.
-export function formatPreexistingFinding(v: Vulnerability): HolisticFinding {
+// stored-findings collector and the re-verify step. Exported for unit testing.
+export function formatPreexistingFinding(v: PreexistingVulnLike): HolisticFinding {
+  const fixPrompt = v.fixPrompt || v.remediation;
   return {
     path: v.path,
     concern: `[${v.class}] ${v.concern}${vulnLocator(v)} — pre-existing in this file, not introduced by this PR.`,
     severity: "warn",
-    ...(v.fixPrompt ? { fixPrompt: v.fixPrompt } : {}),
+    ...(fixPrompt ? { fixPrompt } : {}),
   };
 }
 
-// Format a stored Vulnerability the PR resolved into a positive note. Same
-// locator, framed as fixed; no fixPrompt (nothing to fix). severity "warn" is
-// just the HolisticFinding shape — it never gates and renders in its own
-// positive section. Pure; exported for unit testing.
-export function formatResolvedFinding(v: Vulnerability): HolisticFinding {
+// Format a stored finding the PR resolved into a positive note. Same locator,
+// framed as fixed; no fixPrompt (nothing to fix). severity "warn" is just the
+// HolisticFinding shape — it never gates and renders in its own positive
+// section. Pure; exported for unit testing.
+export function formatResolvedFinding(v: PreexistingVulnLike): HolisticFinding {
   return {
     path: v.path,
     concern: `[${v.class}] ${v.concern}${vulnLocator(v)} — resolved by this PR.`,
@@ -4424,39 +4480,43 @@ export type ReverifiedVulns = {
   stillPresent: HolisticFinding[];
   // Vulns the PR resolved — surfaced positively, never gates, nothing to fix.
   resolved: HolisticFinding[];
+  // Row ids (when the inputs carried them) of the resolved findings, so the
+  // caller can flip the stored rows to state "fix_ready".
+  resolvedIds: string[];
 };
 
-// Pure shaper: given the touched entries and the model's per-file verdicts
-// (entry path → array of {index, status}), partition every stored vuln into
+// Pure shaper: given per-file finding lists and the model's per-file verdicts
+// (path → array of {index, status}), partition every stored finding into
 // still-present vs resolved. Safe default: anything not explicitly "resolved"
 // (no verdict for the file, out-of-range index, any non-"resolved" status) stays
 // still-present, so a real vuln is never hidden by a flaky/absent verdict.
-// Deduped by path+concern across entries (mirrors collectPreexistingVulns).
+// Deduped by path+concern across files (mirrors collectPreexistingVulns).
 // Exported for offline testing.
 export function partitionReverifiedVulns(
-  touchedEntries: RepoIndexEntry[],
+  files: Array<{ path: string; vulns: PreexistingVulnLike[] }>,
   verdictsByPath: Map<string, Array<{ index: number; status: string }>>
 ): ReverifiedVulns {
   const stillPresent: HolisticFinding[] = [];
   const resolved: HolisticFinding[] = [];
+  const resolvedIds: string[] = [];
   const seen = new Set<string>();
-  for (const e of touchedEntries) {
+  for (const e of files) {
     const verdicts = verdictsByPath.get(e.path);
-    const vulns = e.vulnerabilities ?? [];
-    for (let i = 0; i < vulns.length; i++) {
-      const v = vulns[i];
+    for (let i = 0; i < e.vulns.length; i++) {
+      const v = e.vulns[i];
       const key = `${v.path}::${v.concern}`;
       if (seen.has(key)) continue;
       seen.add(key);
       const verdict = verdicts?.find((r) => r.index === i);
       if (verdict && verdict.status === "resolved") {
         resolved.push(formatResolvedFinding(v));
+        if (v.id) resolvedIds.push(v.id);
       } else {
         stillPresent.push(formatPreexistingFinding(v));
       }
     }
   }
-  return { stillPresent, resolved };
+  return { stillPresent, resolved, resolvedIds };
 }
 
 const PREEXISTING_REVERIFY_SYSTEM =
@@ -4470,26 +4530,33 @@ const PREEXISTING_REVERIFY_SYSTEM =
   'Emit ONLY JSON: {"results": [{"index": number, "status": "present"|"resolved", "evidence": string}]}. ' +
   "`index` must echo the provided vulnerability index. `evidence` is one short phrase citing the code (or its absence) that justifies the call.";
 
-// Re-verify the stored vulnerabilities of the files this PR modifies against the
-// file contents at the PR head. One blob fetch + one LLM call per touched file
-// that carries stored vulns (most PRs touch none). Best-effort throughout: a
-// fetch or LLM failure for a file leaves it out of the verdict map, so
-// partitionReverifiedVulns keeps that file's vulns as still-present.
+// Re-verify the stored security findings of the files this PR modifies against
+// the file contents at the PR head. One blob fetch + one LLM call per touched
+// file that carries stored findings (most PRs touch none). Best-effort
+// throughout: a fetch or LLM failure for a file leaves it out of the verdict
+// map, so partitionReverifiedVulns keeps that file's findings as still-present.
+// A finding the model confirms fixed at the PR head is flipped to state
+// "fix_ready" — the audit that runs after the merge confirms it "resolved".
 async function reverifyTouchedPreexistingVulns(args: {
   review: PRReview;
   repo: Repository;
   install: Installation;
-  touchedEntries: RepoIndexEntry[];
+  findings: SecurityFinding[]; // active stored findings in files this PR touches
   extraInstructions?: string;
 }): Promise<ReverifiedVulns> {
-  const { review, repo, install, touchedEntries } = args;
-  const withVulns = touchedEntries.filter((e) => (e.vulnerabilities?.length ?? 0) > 0);
-  if (!withVulns.length) return { stillPresent: [], resolved: [] };
+  const { review, repo, install, findings } = args;
+  if (!findings.length) return { stillPresent: [], resolved: [], resolvedIds: [] };
+
+  const byPath = new Map<string, SecurityFinding[]>();
+  for (const f of findings) {
+    byPath.set(f.path, [...(byPath.get(f.path) ?? []), f]);
+  }
+  const files = [...byPath.entries()].map(([path, vulns]) => ({ path, vulns }));
 
   const system = withMaintainerInstructions(PREEXISTING_REVERIFY_SYSTEM, args.extraInstructions);
   const verdictsByPath = new Map<string, Array<{ index: number; status: string }>>();
 
-  for (const e of withVulns) {
+  for (const e of files) {
     let content: string;
     try {
       const encodedPath = e.path.split("/").map(encodeURIComponent).join("/");
@@ -4502,8 +4569,7 @@ async function reverifyTouchedPreexistingVulns(args: {
       console.warn(`[reverify] fetch ${e.path}@${review.headSha.slice(0, 7)} failed:`, err);
       continue; // leave unset → this file's vulns stay still-present
     }
-    const vulns = e.vulnerabilities ?? [];
-    const vulnList = vulns
+    const vulnList = e.vulns
       .map((v, i) => {
         const loc = v.symbol ? ` symbol=${v.symbol}` : "";
         const ln = v.line ? ` line=${v.line}` : "";
@@ -4533,7 +4599,29 @@ async function reverifyTouchedPreexistingVulns(args: {
     }
   }
 
-  return partitionReverifiedVulns(withVulns, verdictsByPath);
+  const partitioned = partitionReverifiedVulns(files, verdictsByPath);
+  // Flip resolved-at-head findings to fix_ready (idempotent: skip rows already
+  // there). The Security page shows "fix PR open"; the post-merge audit is what
+  // moves them to "resolved".
+  const now = Date.now();
+  for (const id of partitioned.resolvedIds) {
+    const f = db.find("securityFindings", (x) => x.id === id);
+    if (!f || f.state === "fix_ready") continue;
+    db.update("securityFindings", (x) => x.id === id, {
+      state: "fix_ready",
+      stateReason: `Fix verified on PR #${review.prNumber}`,
+      activity: [
+        ...(f.activity ?? []),
+        {
+          at: now,
+          kind: "state_change" as const,
+          detail: `Fix verified at the head of PR #${review.prNumber} — resolves when merged`,
+          actor: "audit-agent",
+        },
+      ].slice(-50),
+    });
+  }
+  return partitioned;
 }
 
 // Dedupe HolisticFindings by path+concern and cap the count. Merges the
@@ -4797,6 +4885,31 @@ function normaliseFindings(input: unknown): HolisticFinding[] {
     out.push({
       concern,
       severity: sev,
+      ...(typeof path === "string" && path ? { path } : {}),
+      ...(typeof fixPrompt === "string" && fixPrompt ? { fixPrompt } : {}),
+    });
+  }
+  return out;
+}
+
+// Security findings use the 4-tier severity model (the Security page's model).
+// The legacy 2-tier field is derived — critical → "blocker", everything else →
+// "warn" — so renderers and the verdict gate stay unchanged while gating
+// tightens to exactly "critical gates". Exported for offline testing.
+export function normaliseSecurityFindings(input: unknown): HolisticFinding[] {
+  if (!Array.isArray(input)) return [];
+  const out: HolisticFinding[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    const concern = String((item as any).concern || "").trim();
+    if (!concern) continue;
+    const tier = normalizeSeverity((item as any).severity);
+    const path = (item as any).path;
+    const fixPrompt = (item as any).fixPrompt;
+    out.push({
+      concern,
+      severity: severityToLegacy(tier),
+      securitySeverity: tier,
       ...(typeof path === "string" && path ? { path } : {}),
       ...(typeof fixPrompt === "string" && fixPrompt ? { fixPrompt } : {}),
     });

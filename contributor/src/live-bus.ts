@@ -29,7 +29,8 @@ export type FrameType =
   | "notifications-changed"
   | "notifications-read"
   | "bounties-changed"
-  | "wallet-changed";
+  | "wallet-changed"
+  | "security-changed";
 
 // The whole routing policy, in one readable object — "what does frame X
 // refresh?" is answered by reading this rather than by tracing control flow.
@@ -48,6 +49,10 @@ export const TOPIC_ROUTES: Record<FrameType, readonly Topic[]> = {
   "bounties-changed": ["bounties"],
   // A payout confirming changes the ledger AND the bounty's status/paidAt.
   "wallet-changed": ["wallet", "bounties"],
+  // Sponsor-app-only signal (the Security page). Contributors never receive it
+  // — the backend audience is sponsor userIds — but knowing the type keeps a
+  // stray frame from tripping the unknown-frame refresh-everything fallback.
+  "security-changed": [],
 };
 
 // How long to collect frames before refetching. The dominant cost control on

@@ -3,8 +3,11 @@ import express, { Router } from "express";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
-import type { RepoGuidanceItem, Repository, User } from "../types.js";
-import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview } from "../queue.js";
+import type { RepoGuidanceItem, Repository, SecurityFinding, SecurityFindingEvent, SecurityScanRun, User } from "../types.js";
+import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
+import { effectiveSecurityPolicy, normalizeSecurityPolicy } from "../security/policy.js";
+import { computeGateForRepo, publishGateForRepo } from "../security/gate.js";
+import { createFindingIssue, IssueCreationError } from "../security/issue.js";
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
@@ -624,36 +627,261 @@ api.get("/repositories/:id/guidance", (req, res) => {
   res.json({ items: ctx.repo.guidance ?? [] });
 });
 
-// Whole-repo security audit: aggregate the vulnerabilities the indexer's
-// security sub-pass stored across this repo's files. Read-only and owner-scoped,
-// with no LLM cost (pure aggregation over the repo index). Empty until the index
-// has been (re)built with the security pass — `indexState` tells the caller
-// whether a build is pending so an empty list reads as "not scanned yet" rather
-// than "clean".
-api.get("/repositories/:id/security", (req, res) => {
+// ─── Security page (findings dashboard / detail / merge gate / scan policy) ──
+//
+// Findings are produced by the security audit agent (backend/src/security/)
+// and stored first-class in `securityFindings`; scan runs in `securityScans`.
+// All routes are owner-scoped. The aggregate overview powers the whole page in
+// one request; the per-scan log endpoint is split out because the terminal log
+// is the only heavy field.
+
+const SEV_RANK: Record<string, number> = { critical: 0, high: 1, medium: 2, low: 3 };
+
+function scanSummary(s: SecurityScanRun) {
+  const { log, ...rest } = s;
+  return rest;
+}
+
+// Session-scoped aggregate across every repo the user's installations own.
+api.get("/security/overview", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const installs = installationsForUser(user.id);
+  const installIds = new Set(installs.map((i) => i.id));
+  const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
+  const repoIds = new Set(repos.map((r) => r.id));
+  const repoNameById = new Map(repos.map((r) => [r.id, `${r.owner}/${r.name}`]));
+
+  const findings = db
+    .filter("securityFindings", (f) => repoIds.has(f.repoId))
+    .sort((a, b) => {
+      const sr = (SEV_RANK[a.severity] ?? 2) - (SEV_RANK[b.severity] ?? 2);
+      if (sr !== 0) return sr;
+      return b.lastSeenAt - a.lastSeenAt;
+    });
+
+  // Attach live bounty status by the issue join (repo "owner/name" + issue
+  // number) so the page renders "bounty · OPEN · 400 USDC" without a second
+  // request. bountyId on the finding is the fast path; the join is the truth.
+  const bountyByKey = new Map(
+    db
+      .filter("bounties", (b) => b.issueNumber > 0)
+      .map((b) => [`${b.repo}#${b.issueNumber}`, b] as const)
+  );
+  const findingViews = findings.map((f) => {
+    const repoName = repoNameById.get(f.repoId) ?? "";
+    const bounty =
+      f.issueNumber != null ? bountyByKey.get(`${repoName}#${f.issueNumber}`) ?? null : null;
+    return {
+      ...f,
+      repo: repoName,
+      bounty: bounty
+        ? { id: bounty.id, code: bounty.code, status: bounty.status, amountUsdc: bounty.amountUsdc }
+        : null,
+    };
+  });
+
+  // Last 12 scans per repo (completed or not — a queued/running row is what
+  // drives the "Scanning…" affordance), newest first, logs stripped.
+  const scans = repos.flatMap((r) =>
+    db
+      .filter("securityScans", (s) => s.repoId === r.id)
+      .sort((a, b) => b.startedAt - a.startedAt)
+      .slice(0, 12)
+      .map(scanSummary)
+  );
+
+  const repoViews = repos.map((repo) => {
+    const openPrNumbers = new Set(
+      db
+        .filter("prReviews", (r) => r.repoId === repo.id)
+        .map((r) => r.prNumber)
+    );
+    return {
+      id: repo.id,
+      owner: repo.owner,
+      name: repo.name,
+      defaultBranch: repo.defaultBranch,
+      indexState: repo.indexState ?? "none",
+      indexedAt: repo.indexedAt ?? null,
+      policy: effectiveSecurityPolicy(repo),
+      gate: computeGateForRepo(
+        repo,
+        // The gate's R2 wants open PRs only; GitHub state isn't stored on the
+        // review row, so approximate with reviews not yet merged-and-indexed:
+        // rows updated in the last 30 days. Cheap and errs toward visibility.
+        db.filter(
+          "prReviews",
+          (r) => r.repoId === repo.id && r.updatedAt > Date.now() - 30 * 24 * 60 * 60 * 1000
+        )
+      ),
+      latestScan:
+        db
+          .filter("securityScans", (s) => s.repoId === repo.id)
+          .sort((a, b) => b.startedAt - a.startedAt)
+          .map(scanSummary)[0] ?? null,
+    };
+  });
+
+  res.json({ repos: repoViews, scans, findings: findingViews });
+});
+
+// Full scan run including the terminal log (the merge-gate view's console).
+api.get("/repositories/:id/security/scans/:scanId", (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
-  const entries = db.filter("repoIndex", (e) => e.repoId === ctx.repo.id);
-  const vulnerabilities = entries
-    .flatMap((e) => e.vulnerabilities ?? [])
-    .sort((a, b) => {
-      // Blockers first, then by file path for stable grouping.
-      if (a.severity !== b.severity) return a.severity === "blocker" ? -1 : 1;
-      return a.path.localeCompare(b.path);
+  const scan = db.find(
+    "securityScans",
+    (s) => s.id === req.params.scanId && s.repoId === ctx.repo.id
+  );
+  if (!scan) return void res.status(404).json({ error: "scan_not_found" });
+  res.json({ scan });
+});
+
+// Manual re-scan. One in-flight run per repo; the audit drains in the index
+// queue bucket so it never starves PR reviews.
+api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const inFlight = db.find(
+    "securityScans",
+    (s) => s.repoId === ctx.repo.id && (s.status === "queued" || s.status === "running")
+  );
+  if (inFlight) return void res.status(409).json({ error: "scan_in_progress", scanRunId: inFlight.id });
+  const full = req.body?.full === true;
+  const run: SecurityScanRun = {
+    id: uuid(),
+    repoId: ctx.repo.id,
+    trigger: "manual",
+    full,
+    status: "queued",
+    startedAt: Date.now(),
+    filesScanned: 0,
+    cacheHits: 0,
+    introduced: 0,
+    resolved: 0,
+    stillOpen: 0,
+    log: [],
+  };
+  db.insert("securityScans", run);
+  enqueueSecurityAudit({ repoId: ctx.repo.id, scanRunId: run.id, trigger: "manual", full });
+  res.json({ ok: true, scanRunId: run.id });
+});
+
+// One-click GitHub issue from a finding. Idempotent — an existing issue is
+// returned, never duplicated. The created issue is the handoff to the Bounties
+// flow ("issue first, then bounty").
+api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimiter, async (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const finding = db.find(
+    "securityFindings",
+    (f) => f.id === req.params.findingId && f.repoId === ctx.repo.id
+  );
+  if (!finding) return void res.status(404).json({ error: "finding_not_found" });
+  if (finding.issueNumber != null && finding.issueUrl) {
+    return void res.json({ ok: true, issueNumber: finding.issueNumber, issueUrl: finding.issueUrl });
+  }
+  const install = db.find("installations", (i) => i.id === ctx.repo.installationId);
+  if (!install) return void res.status(409).json({ error: "no_installation" });
+  try {
+    const created = await createFindingIssue({
+      repo: ctx.repo,
+      install,
+      finding,
+      actorLogin: ctx.user.githubLogin,
     });
-  const blocker = vulnerabilities.filter((v) => v.severity === "blocker").length;
-  res.json({
-    indexState: ctx.repo.indexState ?? "none",
-    indexedAt: ctx.repo.indexedAt ?? null,
-    indexedCommit: ctx.repo.indexedCommit ?? null,
-    counts: {
-      total: vulnerabilities.length,
-      blocker,
-      warn: vulnerabilities.length - blocker,
-      affectedFiles: new Set(vulnerabilities.map((v) => v.path)).size,
-    },
-    vulnerabilities,
-  });
+    res.json({ ok: true, ...created });
+  } catch (err) {
+    if (err instanceof IssueCreationError) {
+      return void res
+        .status(err.code === "missing_issues_permission" ? 403 : 502)
+        .json({ error: err.code, message: err.message });
+    }
+    res.status(502).json({ error: "github_error", message: String(err).slice(0, 200) });
+  }
+});
+
+// Finding triage actions. Every transition appends an activity event with the
+// acting user's login; gate-affecting transitions republish the check-run.
+api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const finding = db.find(
+    "securityFindings",
+    (f) => f.id === req.params.findingId && f.repoId === ctx.repo.id
+  );
+  if (!finding) return void res.status(404).json({ error: "finding_not_found" });
+
+  const action = req.body?.action;
+  const reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 500) : "";
+  const now = Date.now();
+  const event = (kind: SecurityFindingEvent["kind"], detail: string): SecurityFindingEvent[] =>
+    [...(finding.activity ?? []), { at: now, kind, detail, actor: ctx.user.githubLogin }].slice(-50);
+
+  const TERMINAL = new Set(["resolved", "accepted", "false_positive"]);
+  let patch: Partial<SecurityFinding> | null = null;
+
+  switch (action) {
+    case "false_positive": {
+      if (TERMINAL.has(finding.state)) return void res.status(409).json({ error: "invalid_state" });
+      patch = {
+        state: "false_positive",
+        stateReason: reason || null,
+        activity: event("state_change", `Marked false positive${reason ? ` — ${reason}` : ""}`),
+      };
+      break;
+    }
+    case "accept": {
+      if (TERMINAL.has(finding.state)) return void res.status(409).json({ error: "invalid_state" });
+      patch = {
+        state: "accepted",
+        stateReason: reason || null,
+        activity: event("state_change", `Accepted as known risk${reason ? ` — ${reason}` : ""}`),
+      };
+      break;
+    }
+    case "reopen": {
+      // Bring back an accepted/false-positive/resolved finding. (Legacy snoozed
+      // rows are still reopenable even though snoozing is no longer offered.)
+      if (!TERMINAL.has(finding.state) && finding.state !== "snoozed") {
+        return void res.status(409).json({ error: "invalid_state" });
+      }
+      patch = {
+        state: finding.issueNumber != null ? "issue_created" : "open",
+        stateReason: null,
+        snoozeUntil: null,
+        resolvedAt: null,
+        activity: event("reopened", "Reopened for triage"),
+      };
+      break;
+    }
+    default:
+      return void res.status(400).json({ error: "invalid_action" });
+  }
+
+  const updated = db.update("securityFindings", (f) => f.id === finding.id, patch);
+  // State changes can alter the blocking set — republish best-effort.
+  void publishGateForRepo(ctx.repo).catch(() => {});
+  res.json({ ok: true, finding: updated });
+});
+
+// Scan policy (triggers / engines / severity gates).
+api.get("/repositories/:id/security/policy", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  res.json({ policy: effectiveSecurityPolicy(ctx.repo) });
+});
+
+api.put("/repositories/:id/security/policy", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const policy = normalizeSecurityPolicy(req.body?.policy ?? req.body);
+  db.update("repositories", (r) => r.id === ctx.repo.id, { securityPolicy: policy });
+  // Gate rules may have changed meaning — republish across open PRs.
+  const fresh = db.find("repositories", (r) => r.id === ctx.repo.id);
+  if (fresh) void publishGateForRepo(fresh).catch(() => {});
+  res.json({ ok: true, policy });
 });
 
 // Add a video or documentation link. Distils immediately via the queue.
