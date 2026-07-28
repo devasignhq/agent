@@ -13,6 +13,7 @@
   --bg-3: #202020;
   --line: #262626;
   --line-2: #333333;
+  --line-3: #3a3a3a;
   --white: #ffffff;
   --fg: #e6e8eb;
   /* Sidebar text/icons: intentionally pure white (brighter than --fg) for
@@ -65,7 +66,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 0; border: 0; }
-::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
 /* Layout */
@@ -230,14 +231,14 @@ input, textarea, select { font-family: inherit; color: inherit; }
   border-radius: 0;
   white-space: nowrap;
 }
-.btn:hover { background: var(--bg-3); border-color: #3a3a3a; }
+.btn:hover { background: var(--bg-3); border-color: var(--line-3); }
 .btn.primary {
   background: var(--accent);
   color: #052413;
   border-color: var(--accent);
   font-weight: 600;
 }
-.btn.primary:hover { background: #ffffff; border-color: #ffffff; color: #000000; }
+.btn.primary:hover { background: #ffffff; border-color: #ffffff; color: var(--bg); }
 .btn.ghost { background: transparent; border-color: var(--line); }
 .btn.ghost:hover { background: var(--bg-2); }
 .btn.danger { color: var(--danger); }
@@ -486,7 +487,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   width: 100%;
   height: 44px;
   background: var(--fg);
-  color: #000000;
+  color: var(--bg);
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 600;
@@ -1002,7 +1003,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
 
 /* Terminal */
 .terminal {
-  background: #060606;
+  background: var(--bg);
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.55;
@@ -1224,7 +1225,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
 }
 .btn.outline:hover {
   background: var(--fg);
-  color: #000000;
+  color: var(--bg);
   border-color: var(--fg);
 }
 .btn.outline svg { color: currentColor; }
@@ -3876,7 +3877,7 @@ input, textarea, select { font-family: inherit; color: inherit; }
   transition: background 120ms ease;
 }
 .composer.is-focused .composer-input-wrap {
-  background: #0d0d0d;
+  background: var(--bg-1);
 }
 .composer-prompt {
   flex-shrink: 0;
@@ -6061,7 +6062,7 @@ a.c-escrow-row.c-escrow-row-link:hover .v.addr { color: var(--info); }
   border: 1px solid var(--line-2); background: var(--bg); padding: 12px 13px; cursor: pointer;
   transition: border-color 0.12s ease, background 0.12s ease;
 }
-.c-resp-choice:hover { background: var(--bg-2); border-color: #3a3a3a; }
+.c-resp-choice:hover { background: var(--bg-2); border-color: var(--line-3); }
 .c-resp-choice .ic { width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line-2); background: var(--bg-1); color: var(--fg-mute); }
 .c-resp-choice .lbl { font-size: 13px; color: var(--fg); }
 .c-resp-choice .hint { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 2px; line-height: 1.45; }

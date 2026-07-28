@@ -13,6 +13,7 @@
   --bg-3: #202020;
   --line: #262626;
   --line-2: #333333;
+  --line-3: #3a3a3a;
   --white: #ffffff;
   --fg: #e6e8eb;
   /* Sidebar text/icons: intentionally pure white (brighter than --fg) for
@@ -83,7 +84,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 ::-webkit-scrollbar { width: 4px; height: 4px; }
 ::-webkit-scrollbar-track { background: transparent; }
 ::-webkit-scrollbar-thumb { background: var(--line-2); border-radius: 0; border: 0; }
-::-webkit-scrollbar-thumb:hover { background: #3a3a3a; }
+::-webkit-scrollbar-thumb:hover { background: var(--line-3); }
 ::-webkit-scrollbar-corner { background: transparent; }
 
 /* Layout */
@@ -272,14 +273,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   transition: background 0.12s ease, border-color 0.12s ease;
   border-radius: 0;
 }
-.btn:hover { background: var(--bg-3); border-color: #3a3a3a; }
+.btn:hover { background: var(--bg-3); border-color: var(--line-3); }
 .btn.primary {
   background: var(--accent);
   color: #052413;
   border-color: var(--accent);
   font-weight: 600;
 }
-.btn.primary:hover { background: #ffffff; border-color: #ffffff; color: #000000; }
+.btn.primary:hover { background: #ffffff; border-color: #ffffff; color: var(--bg); }
 .btn.ghost { background: transparent; border-color: var(--line); }
 .btn.ghost:hover { background: var(--bg-2); }
 .btn.danger { color: var(--danger); }
@@ -508,7 +509,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   width: 100%;
   height: 44px;
   background: var(--fg);
-  color: #000000;
+  color: var(--bg);
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 600;
@@ -1034,7 +1035,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 
 /* Terminal */
 .terminal {
-  background: #060606;
+  background: var(--bg);
   font-family: var(--mono);
   font-size: 12.5px;
   line-height: 1.55;
@@ -1275,7 +1276,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .btn.outline:hover {
   background: var(--fg);
-  color: #000000;
+  color: var(--bg);
   border-color: var(--fg);
 }
 .btn.outline svg { color: currentColor; }
@@ -4035,7 +4036,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   transition: background 120ms ease;
 }
 .composer.is-focused .composer-input-wrap {
-  background: #0d0d0d;
+  background: var(--bg-1);
 }
 .composer-prompt {
   flex-shrink: 0;
@@ -5047,7 +5048,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   font-family: var(--mono); font-size: 11px;
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
-.wf-mode-btn:hover { background: var(--bg-2); color: var(--fg); border-color: #3a3a3a; }
+.wf-mode-btn:hover { background: var(--bg-2); color: var(--fg); border-color: var(--line-3); }
 .wf-mode-btn.is-active {
   background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
 }
@@ -5076,7 +5077,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   cursor: grab; transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
 }
 .wf-node:active { cursor: grabbing; }
-.wf-node:hover { border-color: #3a3a3a; transform: translateY(-1px); }
+.wf-node:hover { border-color: var(--line-3); transform: translateY(-1px); }
 .wf-node.is-off { opacity: 0.5; }
 .wf-node.is-selected {
   border-color: var(--accent);
@@ -5317,7 +5318,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   font-family: var(--mono); font-size: 9px; font-weight: 600; letter-spacing: 0.04em;
   background: var(--bg-3); color: var(--fg-dim); border-radius: 0;
 }
-.tab-count.new { background: var(--accent); color: #000000; }
+.tab-count.new { background: var(--accent); color: var(--bg); }
 
 /* Acceptance-criteria list markers */
 .ac-list { list-style: none; }
@@ -5355,7 +5356,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .app-confirm-go.reject { background: var(--danger); border-color: var(--danger); color: #fff; }
 .app-confirm-go.reject:hover { background: var(--danger); border-color: var(--danger); filter: brightness(1.1); }
 .app-confirm-go.delegate { background: var(--accent); border-color: var(--accent); color: #052413; }
-.app-confirm-go.delegate:hover { background: #fff; border-color: #fff; color: #000000; }
+.app-confirm-go.delegate:hover { background: #fff; border-color: #fff; color: var(--bg); }
 
 @media (max-width: 1100px) {
   .bounty-dash { grid-template-columns: 1fr; }
