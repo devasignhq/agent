@@ -5883,10 +5883,33 @@ pre.vln-code, .vln-code {
 .vln-pop-item:hover { background: var(--bg-2); color: var(--fg); }
 .vln-pop-item .av { width: 20px; height: 20px; background: var(--bg-3); border: 1px solid var(--line-2); display: grid; place-items: center; font-family: var(--mono); font-size: 10px; color: var(--fg); flex-shrink: 0; }
 
+/* repo rail — left-hand repo selector for the gate / policy subpages */
+.vln-repo-layout { display: grid; grid-template-columns: 210px minmax(0, 1fr); gap: 16px; align-items: start; }
+.vln-repo-body { min-width: 0; }
+.vln-rail { display: flex; flex-direction: column; gap: 2px; position: sticky; top: 0; }
+.vln-rail-item {
+  display: flex; align-items: center; gap: 9px;
+  width: 100%; padding: 8px 10px;
+  background: transparent; border: 1px solid transparent; border-left: 2px solid transparent;
+  color: var(--fg-mute); font-family: var(--mono); font-size: 12px; text-align: left;
+  cursor: pointer; transition: background 0.12s ease, color 0.12s ease;
+}
+.vln-rail-item:hover { background: var(--bg-1); color: var(--fg-dim); }
+.vln-rail-item.on { background: var(--bg-2); color: var(--accent); border-left-color: var(--accent); }
+.vln-rail-n { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-rail-owner { color: var(--fg-faint); }
+.vln-rail-item.on .vln-rail-owner { color: var(--accent-dim); }
+.vln-rail-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.vln-rail-dot.fail { background: var(--danger); }
+.vln-rail-dot.pass { background: var(--green); }
+@media (max-width: 900px) {
+  .vln-repo-layout { grid-template-columns: 1fr; }
+  .vln-rail { flex-direction: row; overflow-x: auto; position: static; padding-bottom: 4px; }
+  .vln-rail-item { width: auto; flex-shrink: 0; border-left: 0; border-bottom: 2px solid transparent; }
+  .vln-rail-item.on { border-left: 0; border-bottom-color: var(--accent); }
+}
+
 /* merge gate */
-/* Rules + blocking list are the primary content; the terminal is reference,
-   so the left column gets the larger share. */
-.vln-gate { display: grid; grid-template-columns: minmax(0, 1.4fr) minmax(300px, 1fr); gap: 16px; align-items: start; }
 .vln-verdict { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); }
 .vln-verdict.fail { border-color: rgba(255,90,95,.4); border-left: 2px solid var(--danger); background: linear-gradient(90deg, rgba(255,90,95,.09), rgba(255,90,95,0) 60%), var(--bg-1); }
 .vln-verdict.pass { border-color: rgba(61,220,151,.4); border-left: 2px solid var(--green); background: linear-gradient(90deg, rgba(61,220,151,.09), rgba(61,220,151,0) 60%), var(--bg-1); }
@@ -5906,21 +5929,8 @@ pre.vln-code, .vln-code {
 .vln-rule code { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
 .vln-blk { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .vln-blk:last-child { border-bottom: 0; }
-/* Per-repo gate card (the "All repositories" merge-gate view): the verdict box
-   with its blocking findings attached directly beneath it. */
-.vln-gate-card { display: flex; flex-direction: column; }
-.vln-gate-card-blk { border: 1px solid var(--line); border-top: 0; background: var(--bg-1); }
-/* Repo separator heading that labels each editor in the stacked policy view. */
-.vln-repo-sep { font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; color: var(--fg-dim); padding-bottom: 2px; border-bottom: 1px solid var(--line); }
 .vln-blk-t { font-size: 12.5px; color: var(--fg); }
 .vln-blk-l { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.vln-term { background: var(--bg); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; line-height: 1.75; color: #c8ccd1; padding: 13px 15px; overflow-x: auto; min-height: 200px; max-height: 520px; overflow-y: auto; }
-.vln-term-l { white-space: pre-wrap; word-break: break-word; min-height: 20px; }
-.vln-term-l.err { color: var(--danger); }
-.vln-term-l.ok { color: var(--green); }
-.vln-term-l.warn { color: var(--warn); }
-.vln-term-l.cmd { color: var(--accent); }
-.vln-term-l.dim { color: var(--fg-faint); }
 
 /* The app has no global .btn:disabled rule, so a disabled Save/Re-scan would
    look clickable. Scoped to this page rather than made global. */
@@ -5969,7 +5979,6 @@ pre.vln-code, .vln-code {
      the percentage-height bars still resolve. */
   .vln-mid { grid-template-columns: 1fr; }
   .vln-mid > .vln-pnl:first-child { height: 360px; }
-  .vln-gate { grid-template-columns: 1fr; }
   .vln-stats { grid-template-columns: repeat(2, 1fr); }
 }
 @media (max-width: 820px) {
