@@ -285,14 +285,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .btn.danger { color: var(--danger); }
 /* Destructive outline: black fill, red text + red stroke. */
 .btn.danger-outline {
-  background: #000000;
+  background: var(--bg);
   color: var(--danger);
   border-color: var(--danger);
 }
 .btn.danger-outline:hover {
   background: var(--danger);
   border-color: var(--danger);
-  color: #000000;
+  color: var(--bg);
 }
 .btn.sm { height: 26px; padding: 0 9px; font-size: 11px; }
 .btn.lg { height: 40px; padding: 0 18px; font-size: 13px; }
