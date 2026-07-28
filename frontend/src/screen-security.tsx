@@ -368,6 +368,51 @@ const PageHead = ({
   );
 };
 
+// ─── first-run empty state ────────────────────────────────────────────────────
+
+// Shown before any audit has ever run — a fresh install/sign-up with no scans
+// and no findings on record. It sets the expectation that the agents kick in on
+// the first merge, rather than dropping the user into a dashboard of zeros. The
+// no-repo case points them at connecting a repository first, since nothing can
+// be audited until then.
+const FirstRunEmpty = ({ overview }: { overview: SecurityOverview }) => {
+  const hasRepos = overview.repos.length > 0;
+  const branches = [...new Set(overview.repos.map((r) => r.defaultBranch))].filter(Boolean);
+  const branch = branches.length === 1 ? branches[0] : "your default branch";
+  return (
+    <div className="vln-blank">
+      <div className="vln-blank-art">
+        <Icon name="shield" size={26} />
+      </div>
+      <div className="vln-blank-t">No security audit yet</div>
+      <div className="vln-blank-s">
+        {hasRepos ? (
+          <>
+            The security agents run their first audit automatically when you merge a pull
+            request to <b>{branch}</b>. Merge one to see findings appear here — or hit{" "}
+            <b>Re-scan</b> above to run an audit against the current code now.
+          </>
+        ) : (
+          <>
+            Connect a repository to get started. Once it's linked, the security agents run an
+            audit automatically every time a pull request merges — no setup required.
+          </>
+        )}
+      </div>
+      {hasRepos && (
+        <div className="vln-blank-surfaces">
+          {(Object.keys(SURFACE_META) as (keyof typeof SURFACE_META)[]).map((s) => (
+            <span className="vln-blank-surface" key={s}>
+              <Icon name={SURFACE_META[s].icon} size={13} />
+              {SURFACE_META[s].label}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─── findings dashboard ───────────────────────────────────────────────────────
 
 const Dashboard = ({
@@ -405,6 +450,15 @@ const Dashboard = ({
   const gate = overallGate(repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter));
 
   const peak = mergeDeltaPeak(series);
+
+  // Never audited: no scans have ever run and there are no findings on record.
+  // Show the first-run empty state instead of a dashboard full of zeros. This
+  // keys off the unscoped overview (not the repo-filtered slice) so it only
+  // fires for a genuinely fresh account, not a repo filter that happens to be
+  // empty.
+  if (overview.scans.length === 0 && overview.findings.length === 0) {
+    return <FirstRunEmpty overview={overview} />;
+  }
 
   return (
     <>
