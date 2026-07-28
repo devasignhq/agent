@@ -445,6 +445,17 @@ const Dashboard = ({
     overview.repos.find((r) => r.id === repoId)?.name ??
     "";
 
+  // GitHub blob URL for a finding's file, resolving the repo's default branch
+  // from the overview (falls back to HEAD, then to the repo root). Mirrors the
+  // link the finding-detail view builds. Returns null when we have no repo slug.
+  const repoFileUrl = (f: SecurityFinding): string | null => {
+    if (!f.repo) return null;
+    const base = `https://github.com/${f.repo}`;
+    if (!f.path) return base;
+    const branch = overview.repos.find((r) => r.id === f.repoId)?.defaultBranch ?? "HEAD";
+    return `${base}/blob/${branch}/${f.path}${f.line ? `#L${f.line}` : ""}`;
+  };
+
   const latest = [...scopedScans].sort((a, b) => b.startedAt - a.startedAt)[0] ?? null;
   const latestRepo = latest ? overview.repos.find((r) => r.id === latest.repoId) : null;
   const gate = overallGate(repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter));
@@ -696,38 +707,56 @@ const Dashboard = ({
           <span>finding</span>
           <span>surface</span>
           <span>origin</span>
+          <span>repo</span>
           <span style={{ textAlign: "right" }}>age</span>
           <span>state</span>
         </div>
-        {shown.map((f) => (
-          <div
-            key={f.id}
-            className={`vln-fx-row ${f.severity} ${f.state === "new" ? "fresh" : ""}`}
-            onClick={() => onOpen(f.id)}
-          >
-            <SevPill sev={f.severity} />
-            <span className="vln-fx-id">{displayId(f)}</span>
-            <span style={{ minWidth: 0 }}>
-              <span className="vln-fx-t">{f.title}</span>
-              <span className="vln-fx-l">
-                <u>{f.path}</u>
-                {f.line ? `:${f.line}` : ""}
-                {f.cwe ? ` · ${f.cwe}` : ""}
-                {repoFilter === "all" && f.repo ? ` · ${f.repo}` : ""}
+        {shown.map((f) => {
+          const repoHref = repoFileUrl(f);
+          return (
+            <div
+              key={f.id}
+              className={`vln-fx-row ${f.severity} ${f.state === "new" ? "fresh" : ""}`}
+              onClick={() => onOpen(f.id)}
+            >
+              <SevPill sev={f.severity} />
+              <span className="vln-fx-id">{displayId(f)}</span>
+              <span style={{ minWidth: 0 }}>
+                <span className="vln-fx-t">{f.title}</span>
+                <span className="vln-fx-l">
+                  <u>{f.path}</u>
+                  {f.line ? `:${f.line}` : ""}
+                  {f.cwe ? ` · ${f.cwe}` : ""}
+                </span>
               </span>
-            </span>
-            <span className="vln-tag surface">{f.surface}</span>
-            <span className="vln-fx-o">
-              {f.introducedByPr ? `#${f.introducedByPr}` : "—"}
-              <em>
-                {f.introducedByAuthor ? `@${f.introducedByAuthor}` : "audit"}
-                {f.introducedSha ? ` · ${short(f.introducedSha)}` : ""}
-              </em>
-            </span>
-            <span className="vln-fx-a">{ageLabel(f.firstDetectedAt, now)}</span>
-            <StateTag f={f} />
-          </div>
-        ))}
+              <span className="vln-tag surface">{f.surface}</span>
+              <span className="vln-fx-o">
+                {f.introducedByPr ? `#${f.introducedByPr}` : "—"}
+                <em>
+                  {f.introducedByAuthor ? `@${f.introducedByAuthor}` : "audit"}
+                  {f.introducedSha ? ` · ${short(f.introducedSha)}` : ""}
+                </em>
+              </span>
+              {/* repo URL path — owner/name linking to the file on GitHub. */}
+              {repoHref ? (
+                <a
+                  className="vln-fx-repo"
+                  href={repoHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  title={f.path ? `${f.repo} · ${f.path}${f.line ? `:${f.line}` : ""}` : f.repo}
+                >
+                  {f.repo || "—"}
+                </a>
+              ) : (
+                <span className="vln-fx-repo">{f.repo || "—"}</span>
+              )}
+              <span className="vln-fx-a">{ageLabel(f.firstDetectedAt, now)}</span>
+              <StateTag f={f} />
+            </div>
+          );
+        })}
         {shown.length === 0 && (
           <div className="vln-empty">
             {overview.findings.length === 0
