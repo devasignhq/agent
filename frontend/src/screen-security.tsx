@@ -278,6 +278,7 @@ export const SecurityPage = ({
           overview={overview}
           repoFilter={repoFilter}
           onOpen={(id) => navigate(`/security/findings/${id}`, { state: { from: "gate" } })}
+          onSelectRepo={setRepoFilter}
         />
       )}
       {view === "policy" && (
@@ -368,6 +369,51 @@ const PageHead = ({
   );
 };
 
+// ─── first-run empty state ────────────────────────────────────────────────────
+
+// Shown before any audit has ever run — a fresh install/sign-up with no scans
+// and no findings on record. It sets the expectation that the agents kick in on
+// the first merge, rather than dropping the user into a dashboard of zeros. The
+// no-repo case points them at connecting a repository first, since nothing can
+// be audited until then.
+const FirstRunEmpty = ({ overview }: { overview: SecurityOverview }) => {
+  const hasRepos = overview.repos.length > 0;
+  const branches = [...new Set(overview.repos.map((r) => r.defaultBranch))].filter(Boolean);
+  const branch = branches.length === 1 ? branches[0] : "your default branch";
+  return (
+    <div className="vln-blank">
+      <div className="vln-blank-art">
+        <Icon name="shield" size={26} />
+      </div>
+      <div className="vln-blank-t">No security audit yet</div>
+      <div className="vln-blank-s">
+        {hasRepos ? (
+          <>
+            The security agents run their first audit automatically when you merge a pull
+            request to <b>{branch}</b>. Merge one to see findings appear here — or hit{" "}
+            <b>Re-scan</b> above to run an audit against the current code now.
+          </>
+        ) : (
+          <>
+            Connect a repository to get started. Once it's linked, the security agents run an
+            audit automatically every time a pull request merges — no setup required.
+          </>
+        )}
+      </div>
+      {hasRepos && (
+        <div className="vln-blank-surfaces">
+          {(Object.keys(SURFACE_META) as (keyof typeof SURFACE_META)[]).map((s) => (
+            <span className="vln-blank-surface" key={s}>
+              <Icon name={SURFACE_META[s].icon} size={13} />
+              {SURFACE_META[s].label}
+            </span>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─── findings dashboard ───────────────────────────────────────────────────────
 
 const Dashboard = ({
@@ -400,11 +446,31 @@ const Dashboard = ({
     overview.repos.find((r) => r.id === repoId)?.name ??
     "";
 
+  // GitHub blob URL for a finding's file, resolving the repo's default branch
+  // from the overview (falls back to HEAD, then to the repo root). Mirrors the
+  // link the finding-detail view builds. Returns null when we have no repo slug.
+  const repoFileUrl = (f: SecurityFinding): string | null => {
+    if (!f.repo) return null;
+    const base = `https://github.com/${f.repo}`;
+    if (!f.path) return base;
+    const branch = overview.repos.find((r) => r.id === f.repoId)?.defaultBranch ?? "HEAD";
+    return `${base}/blob/${branch}/${f.path}${f.line ? `#L${f.line}` : ""}`;
+  };
+
   const latest = [...scopedScans].sort((a, b) => b.startedAt - a.startedAt)[0] ?? null;
   const latestRepo = latest ? overview.repos.find((r) => r.id === latest.repoId) : null;
   const gate = overallGate(repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter));
 
   const peak = mergeDeltaPeak(series);
+
+  // Never audited: no scans have ever run and there are no findings on record.
+  // Show the first-run empty state instead of a dashboard full of zeros. This
+  // keys off the unscoped overview (not the repo-filtered slice) so it only
+  // fires for a genuinely fresh account, not a repo filter that happens to be
+  // empty.
+  if (overview.scans.length === 0 && overview.findings.length === 0) {
+    return <FirstRunEmpty overview={overview} />;
+  }
 
   return (
     <>
@@ -642,38 +708,56 @@ const Dashboard = ({
           <span>finding</span>
           <span>surface</span>
           <span>origin</span>
+          <span>repo</span>
           <span style={{ textAlign: "right" }}>age</span>
           <span>state</span>
         </div>
-        {shown.map((f) => (
-          <div
-            key={f.id}
-            className={`vln-fx-row ${f.severity} ${f.state === "new" ? "fresh" : ""}`}
-            onClick={() => onOpen(f.id)}
-          >
-            <SevPill sev={f.severity} />
-            <span className="vln-fx-id">{displayId(f)}</span>
-            <span style={{ minWidth: 0 }}>
-              <span className="vln-fx-t">{f.title}</span>
-              <span className="vln-fx-l">
-                <u>{f.path}</u>
-                {f.line ? `:${f.line}` : ""}
-                {f.cwe ? ` · ${f.cwe}` : ""}
-                {repoFilter === "all" && f.repo ? ` · ${f.repo}` : ""}
+        {shown.map((f) => {
+          const repoHref = repoFileUrl(f);
+          return (
+            <div
+              key={f.id}
+              className={`vln-fx-row ${f.severity} ${f.state === "new" ? "fresh" : ""}`}
+              onClick={() => onOpen(f.id)}
+            >
+              <SevPill sev={f.severity} />
+              <span className="vln-fx-id">{displayId(f)}</span>
+              <span style={{ minWidth: 0 }}>
+                <span className="vln-fx-t">{f.title}</span>
+                <span className="vln-fx-l">
+                  <u>{f.path}</u>
+                  {f.line ? `:${f.line}` : ""}
+                  {f.cwe ? ` · ${f.cwe}` : ""}
+                </span>
               </span>
-            </span>
-            <span className="vln-tag surface">{f.surface}</span>
-            <span className="vln-fx-o">
-              {f.introducedByPr ? `#${f.introducedByPr}` : "—"}
-              <em>
-                {f.introducedByAuthor ? `@${f.introducedByAuthor}` : "audit"}
-                {f.introducedSha ? ` · ${short(f.introducedSha)}` : ""}
-              </em>
-            </span>
-            <span className="vln-fx-a">{ageLabel(f.firstDetectedAt, now)}</span>
-            <StateTag f={f} />
-          </div>
-        ))}
+              <span className="vln-tag surface">{f.surface}</span>
+              <span className="vln-fx-o">
+                {f.introducedByPr ? `#${f.introducedByPr}` : "—"}
+                <em>
+                  {f.introducedByAuthor ? `@${f.introducedByAuthor}` : "audit"}
+                  {f.introducedSha ? ` · ${short(f.introducedSha)}` : ""}
+                </em>
+              </span>
+              {/* repo URL path — owner/name linking to the file on GitHub. */}
+              {repoHref ? (
+                <a
+                  className="vln-fx-repo"
+                  href={repoHref}
+                  target="_blank"
+                  rel="noreferrer"
+                  onClick={(e) => e.stopPropagation()}
+                  title={f.path ? `${f.repo} · ${f.path}${f.line ? `:${f.line}` : ""}` : f.repo}
+                >
+                  {f.repo || "—"}
+                </a>
+              ) : (
+                <span className="vln-fx-repo">{f.repo || "—"}</span>
+              )}
+              <span className="vln-fx-a">{ageLabel(f.firstDetectedAt, now)}</span>
+              <StateTag f={f} />
+            </div>
+          );
+        })}
         {shown.length === 0 && (
           <div className="vln-empty">
             {overview.findings.length === 0
@@ -1052,31 +1136,124 @@ const FindingDetail = ({
 
 // ─── merge gate ───────────────────────────────────────────────────────────────
 
+// The merge gate is inherently per-repo. With a specific repo selected we show
+// its full detail (rules, blocking findings, scan terminal); with "All
+// repositories" and more than one repo we stack a compact per-repo summary so
+// the sponsor sees every gate's stats at a glance and can drill into one.
 const GateView = ({
   overview,
   repoFilter,
   onOpen,
+  onSelectRepo,
 }: {
   overview: SecurityOverview;
   repoFilter: string;
   onOpen: (id: string) => void;
+  onSelectRepo: (id: string) => void;
 }) => {
-  // The gate is per-repo; "all" shows the first repo with a failing gate (or
-  // the first repo).
-  const repo =
-    (repoFilter !== "all" ? overview.repos.find((r) => r.id === repoFilter) : null) ??
-    overview.repos.find((r) => r.gate.verdict === "fail") ??
-    overview.repos[0];
+  const repos =
+    repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter);
+  if (repos.length === 0) {
+    return <div className="vln-empty">Connect a repository to see its merge gate.</div>;
+  }
+  if (repoFilter === "all" && repos.length > 1) {
+    return (
+      <div className="col gap-4">
+        {repos.map((r) => (
+          <GateRepoSummary
+            key={r.id}
+            repo={r}
+            findings={overview.findings}
+            onOpen={onOpen}
+            onSelectRepo={onSelectRepo}
+          />
+        ))}
+      </div>
+    );
+  }
+  return <GateRepoDetail repo={repos[0]} overview={overview} onOpen={onOpen} />;
+};
+
+// Compact per-repo gate card for the "all repositories" view: verdict, rule
+// pass count, and the blocking findings, with a drill-in to the full detail.
+const GateRepoSummary = ({
+  repo,
+  findings,
+  onOpen,
+  onSelectRepo,
+}: {
+  repo: SecurityRepoView;
+  findings: SecurityFinding[];
+  onOpen: (id: string) => void;
+  onSelectRepo: (id: string) => void;
+}) => {
+  const gate = repo.gate;
+  const blocking = findings.filter((f) => gate.blockingFindingIds.includes(f.id));
+  const blocked = gate.verdict === "fail";
+  const passed = gate.rules.filter((r) => r.pass).length;
+  return (
+    <div className="vln-gate-card">
+      <div className={`vln-verdict ${blocked ? "fail" : "pass"}`}>
+        <div className="vln-verdict-icon">
+          <Icon name={blocked ? "warn" : "check"} size={16} />
+        </div>
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div className="vln-verdict-t">
+            {blocked ? "MERGE BLOCKED" : "MERGE CLEAR"} · {repo.owner}/{repo.name}
+          </div>
+          <div className="vln-verdict-s">
+            {passed} of {gate.rules.length} gate rules pass · {blocking.length} blocking ·{" "}
+            enforced on <span className="mono" style={{ color: "var(--fg-dim)" }}>{repo.defaultBranch}</span>
+          </div>
+        </div>
+        <button className="btn ghost sm" onClick={() => onSelectRepo(repo.id)}>
+          Details
+        </button>
+      </div>
+      {blocking.length > 0 && (
+        <div className="vln-gate-card-blk">
+          {blocking.map((f) => (
+            <div key={f.id} className="vln-blk">
+              <SevPill sev={f.severity} />
+              <div style={{ minWidth: 0 }}>
+                <div className="vln-blk-t">{f.title}</div>
+                <div className="vln-blk-l">
+                  {displayId(f)} · {f.path}
+                  {f.line ? `:${f.line}` : ""}
+                  {f.bounty ? ` · bounty ${f.bounty.code} · ${f.bounty.amountUsdc} USDC` : ""}
+                </div>
+              </div>
+              <button className="btn sm" onClick={() => onOpen(f.id)}>
+                Review
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Full single-repo gate: rules, blocking findings, and the live scan terminal.
+const GateRepoDetail = ({
+  repo,
+  overview,
+  onOpen,
+}: {
+  repo: SecurityRepoView;
+  overview: SecurityOverview;
+  onOpen: (id: string) => void;
+}) => {
   const [scan, setScan] = React.useState<SecurityScanRun | null>(null);
-  const latest = repo
-    ? overview.scans.filter((s) => s.repoId === repo.id).sort((a, b) => b.startedAt - a.startedAt)[0]
-    : null;
+  const latest =
+    overview.scans.filter((s) => s.repoId === repo.id).sort((a, b) => b.startedAt - a.startedAt)[0] ??
+    null;
 
   // (Re)fetch the terminal log whenever the latest run row changes — the live
   // topic refetches the overview on every log append, so this streams.
   React.useEffect(() => {
     let alive = true;
-    if (!repo || !latest) {
+    if (!latest) {
       setScan(null);
       return;
     }
@@ -1090,11 +1267,8 @@ const GateView = ({
       alive = false;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [repo?.id, latest?.id, (latest as any)?.finishedAt, (latest as any)?.status, overview]);
+  }, [repo.id, latest?.id, (latest as any)?.finishedAt, (latest as any)?.status, overview]);
 
-  if (!repo) {
-    return <div className="vln-empty">Connect a repository to see its merge gate.</div>;
-  }
   const gate: GateResult = repo.gate;
   const blocking = overview.findings.filter((f) => gate.blockingFindingIds.includes(f.id));
   const blocked = gate.verdict === "fail";
@@ -1216,6 +1390,9 @@ const Tog = ({ on, onClick }: { on: boolean; onClick: () => void }) => (
   </button>
 );
 
+// Scan policy is per-repo. A specific selection edits that one repo; "All
+// repositories" (with more than one) stacks an independent editor per repo,
+// each with its own dirty-tracking and Save, under a repo heading.
 const PolicyView = ({
   overview,
   repoFilter,
@@ -1225,22 +1402,46 @@ const PolicyView = ({
   repoFilter: string;
   refresh: () => Promise<void>;
 }) => {
-  const repo =
-    (repoFilter !== "all" ? overview.repos.find((r) => r.id === repoFilter) : null) ??
-    overview.repos[0];
-  const [policy, setPolicy] = React.useState<RepoSecurityPolicy | null>(repo?.policy ?? null);
+  const repos =
+    repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter);
+  if (repos.length === 0) {
+    return <div className="vln-empty">Connect a repository to configure its scan policy.</div>;
+  }
+  if (repoFilter === "all" && repos.length > 1) {
+    return (
+      <div className="col gap-5">
+        {repos.map((r) => (
+          <div key={r.id} className="col gap-3">
+            <div className="vln-repo-sep">{r.owner}/{r.name}</div>
+            <PolicyRepoEditor repo={r} refresh={refresh} />
+          </div>
+        ))}
+      </div>
+    );
+  }
+  return <PolicyRepoEditor repo={repos[0]} refresh={refresh} />;
+};
+
+const PolicyRepoEditor = ({
+  repo,
+  refresh,
+}: {
+  repo: SecurityRepoView;
+  refresh: () => Promise<void>;
+}) => {
+  const [policy, setPolicy] = React.useState<RepoSecurityPolicy | null>(repo.policy ?? null);
   const [dirty, setDirty] = React.useState(false);
   const [saving, setSaving] = React.useState(false);
   const [saved, setSaved] = React.useState(false);
   const [err, setErr] = React.useState<string | null>(null);
 
   React.useEffect(() => {
-    setPolicy(repo?.policy ?? null);
+    setPolicy(repo.policy ?? null);
     setDirty(false);
     setErr(null);
-  }, [repo?.id]);
+  }, [repo.id]);
 
-  if (!repo || !policy) {
+  if (!policy) {
     return <div className="vln-empty">Connect a repository to configure its scan policy.</div>;
   }
 

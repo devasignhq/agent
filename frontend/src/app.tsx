@@ -41,7 +41,7 @@ const NAV = [
   { key: "bounty",    name: "Bounty",    icon: "bounties" },
 ];
 
-const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
+const Sidebar = ({ current, setCurrent, iconOnly, user, counts }) => {
   const recents = useRecentReviews(user?.id, 3);
   return (
   <div className={`sidebar ${iconOnly ? "icon-only" : ""}`}>
@@ -51,14 +51,22 @@ const Sidebar = ({ current, setCurrent, iconOnly, user }) => {
 
     <div className="sb-section">workspace</div>
     <div className="sb-list">
-      {NAV.map(n => (
+      {NAV.map(n => {
+        const count = counts?.[n.key] || 0;
+        return (
         <div key={n.key}
              className={`sb-item ${current === n.key ? "active" : ""}`}
              onClick={() => setCurrent(n.key)}>
           <span className="icon"><Icon name={n.icon} size={15}/></span>
           <span className="sb-label">{n.name}</span>
+          {count > 0 && (
+            <span className="sb-badge" aria-label={`${count} unread`}>
+              {count > 99 ? "99+" : count}
+            </span>
+          )}
         </div>
-      ))}
+        );
+      })}
     </div>
 
     <div className="sb-section">recent</div>
@@ -159,6 +167,33 @@ function useNotifications(enabled) {
     }
   }, [refresh]);
   return { items, unreadCount, refresh, markAllRead };
+}
+
+// Per-section "needs attention" counts for the sidebar badges.
+//  - Agents & Bounty ride the already-open notifications feed, grouped by kind,
+//    so they clear the moment the user reads the bell (mark-all-read).
+//  - Security has no notification kind, so it counts "new" findings straight
+//    from the overview and refreshes on its own live topic ("security-changed").
+function useNavCounts(enabled, notifications) {
+  const [securityNew, setSecurityNew] = React.useState(0);
+  const refreshSecurity = React.useCallback(async () => {
+    if (!enabled) { setSecurityNew(0); return; }
+    try {
+      const ov = await api.securityOverview();
+      setSecurityNew(ov.findings.filter((f) => f.state === "new").length);
+    } catch (err) {
+      if (!(err && err.status === 401)) console.warn("[nav-counts] security poll failed:", err);
+    }
+  }, [enabled]);
+  useLiveTopic("security", () => void refreshSecurity());
+  React.useEffect(() => { void refreshSecurity(); }, [refreshSecurity]);
+
+  const unread = (notifications?.items || []).filter((n) => n.readAt === null);
+  return {
+    agent: unread.filter((n) => n.kind === "review" || n.kind === "blocker").length,
+    bounty: unread.filter((n) => n.kind === "bounty").length,
+    security: securityNew,
+  };
 }
 
 const NotificationsPopover = ({ onClose, items, unreadCount, onMarkAllRead, onNavigate }) => {
@@ -362,7 +397,7 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
       <div className="topbar-spacer"></div>
       <div className="topbar-actions">
         <div style={{ position: "relative" }}>
-          <button className={`btn ghost sm ${notifOpen ? "is-active" : ""}`}
+          <button className={`btn ghost sm icon-sq ${notifOpen ? "is-active" : ""}`}
                   style={{ position: "relative" }}
                   onClick={() => setNotifOpen(o => !o)}
                   aria-label="Notifications">
@@ -385,7 +420,7 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
           )}
         </div>
         <button
-          className={`btn ghost sm ${current === "settings" ? "is-active" : ""}`}
+          className={`btn ghost sm icon-sq ${current === "settings" ? "is-active" : ""}`}
           onClick={() => onNavigate?.("settings")}
           aria-label="Settings">
           <Icon name="settings" size={13}/>
@@ -433,23 +468,29 @@ const FONT_OPTIONS = {
   "Fira Code": "'Fira Code', ui-monospace, monospace",
 };
 
-const MobileTabBar = ({ current, setCurrent }) => (
+const MobileTabBar = ({ current, setCurrent, counts }) => (
   <nav className="mtab-bar" role="navigation" aria-label="Primary">
     <div className="mtab-glass" aria-hidden="true"></div>
     <div className="mtab-row">
-      {NAV.map(n => (
+      {NAV.map(n => {
+        const count = counts?.[n.key] || 0;
+        return (
         <button
           key={n.key}
           type="button"
           className={`mtab ${current === n.key ? "active" : ""}`}
           onClick={() => setCurrent(n.key)}
           aria-current={current === n.key ? "page" : undefined}
-          aria-label={n.name}
+          aria-label={count > 0 ? `${n.name}, ${count} unread` : n.name}
         >
-          <span className="mtab-icon"><Icon name={n.icon} size={19}/></span>
+          <span className="mtab-icon">
+            <Icon name={n.icon} size={19}/>
+            {count > 0 && <span className="mtab-badge">{count > 9 ? "9+" : count}</span>}
+          </span>
           <span className="mtab-label">{n.name}</span>
         </button>
-      ))}
+        );
+      })}
     </div>
   </nav>
 );
@@ -484,6 +525,7 @@ const AppContent = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
+  const navCounts = useNavCounts(auth.status === "signed_in", notifications);
 
   // Top-level fallback for the install round-trip: if popups were blocked and
   // we did a full-page nav, GitHub will have redirected back to the main tab
@@ -749,7 +791,7 @@ const AppContent = () => {
   return (
     <div className={`app density-${t.density} ${isMobile ? "is-mobile" : ""}`}>
       {!isMobile && (
-        <Sidebar current={current} setCurrent={setCurrent} iconOnly={t.sidebar === "icon-only"} user={auth.user} />
+        <Sidebar current={current} setCurrent={setCurrent} iconOnly={t.sidebar === "icon-only"} user={auth.user} counts={navCounts} />
       )}
       <div className="main">
         <TopBar
@@ -785,7 +827,7 @@ const AppContent = () => {
           </Routes>
         </div>
       </div>
-      {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} />}
+      {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} counts={navCounts} />}
       <TweaksUI t={t} setTweak={setTweak} />
     </div>
   );

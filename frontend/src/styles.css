@@ -25,6 +25,9 @@
   --accent: #ff7a3d;
   --accent-dim: #d6612a;
   --accent-glow: rgba(255, 122, 61, 0.15);
+  /* Foreground for text/icons sitting on an --accent fill (near-black so the
+     orange stays legible). */
+  --accent-fg: #07120a;
   --danger: #ff5a5f;
   --warn: #f5a524;
   --info: #4aa8ff;
@@ -180,6 +183,21 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .sb-item:hover { background: var(--bg-2); color: var(--sidebar-fg); }
 .sb-item.active { background: var(--bg-2); color: var(--accent); border-left-color: var(--accent); }
 .sb-item .icon { width: 16px; height: 16px; flex-shrink: 0; display: grid; place-items: center; color: currentColor; }
+/* Per-section count badge — sits at the right edge of a labeled nav row. */
+.sb-badge {
+  margin-left: auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  min-width: 16px; height: 15px; padding: 0 5px;
+  background: var(--accent); color: var(--accent-fg);
+  font-family: var(--mono); font-size: 10px; font-weight: 600;
+  line-height: 1; border-radius: 2px; letter-spacing: 0.02em; flex-shrink: 0;
+}
+/* Collapsed rail: no label to sit beside, so pin the count to the icon corner. */
+.sidebar.icon-only .sb-item { position: relative; }
+.sidebar.icon-only .sb-badge {
+  position: absolute; top: 2px; right: 2px; margin: 0;
+  min-width: 13px; height: 13px; padding: 0 3px; font-size: 8.5px;
+}
 
 .sb-foot {
   margin-top: auto;
@@ -301,6 +319,9 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .btn.sm { height: 26px; padding: 0 9px; font-size: 11px; }
 .btn.lg { height: 40px; padding: 0 18px; font-size: 13px; }
+/* Icon-only square button — a perfect square that matches the 28×28 avatar in
+   the header, so the bell / gear / avatar trio reads as one aligned row. */
+.btn.icon-sq { width: 28px; height: 28px; padding: 0; justify-content: center; flex-shrink: 0; }
 .btn .dot { width: 6px; height: 6px; background: currentColor; }
 
 /* Cards */
@@ -4506,6 +4527,17 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   display: grid;
   place-items: center;
   height: 19px;
+  position: relative;
+}
+/* Count badge pinned to the tab icon's top-right corner. */
+.mtab-badge {
+  position: absolute;
+  top: -5px; left: 11px;
+  min-width: 14px; height: 14px; padding: 0 3px;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: var(--accent); color: var(--accent-fg);
+  font-family: var(--mono); font-size: 8.5px; font-weight: 600;
+  line-height: 1; border-radius: 999px; border: 1.5px solid var(--bg);
 }
 .mtab-label {
   text-transform: lowercase;
@@ -5598,6 +5630,31 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .vln-mg-body { padding: 20px 20px 16px; }
 .vln-empty { padding: 22px 16px; font-family: var(--mono); font-size: 12px; color: var(--fg-mute); text-align: center; }
 
+/* First-run empty state: shown before any audit has run (fresh account). */
+.vln-blank { display: grid; place-items: center; text-align: center; padding: 80px 24px; }
+.vln-blank-art {
+  width: 64px; height: 64px; margin-bottom: 18px;
+  display: grid; place-items: center;
+  background: var(--bg-1); border: 1px solid var(--line);
+  color: var(--accent);
+}
+.vln-blank-t { font-family: var(--mono); font-size: 15px; color: var(--fg); margin-bottom: 9px; }
+.vln-blank-s {
+  font-size: 13px; color: var(--fg-mute); line-height: 1.65;
+  max-width: 440px; margin: 0 auto;
+}
+.vln-blank-s b { color: var(--fg-dim); font-weight: 500; }
+.vln-blank-surfaces {
+  display: flex; flex-wrap: wrap; justify-content: center; gap: 8px;
+  max-width: 460px; margin-top: 26px;
+}
+.vln-blank-surface {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 7px 11px; background: var(--bg-1); border: 1px solid var(--line);
+  font-family: var(--mono); font-size: 11px; color: var(--fg-dim);
+}
+.vln-blank-surface svg { color: var(--fg-mute); }
+
 /* introduced-vs-resolved chart (pure CSS bars)
    Layout: a fixed axis gutter on the left, then one column per scan. Each
    column is a 4-row grid — [introduced stack | axis | resolved stack | label]
@@ -5725,7 +5782,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 /* findings table */
 .vln-fx-head, .vln-fx-row {
   display: grid;
-  grid-template-columns: 96px 96px minmax(0,1fr) 90px 140px 48px 110px;
+  grid-template-columns: 96px 96px minmax(0,1fr) 90px 140px 150px 48px 110px;
   align-items: center; gap: 12px; padding: 0 14px;
 }
 .vln-fx-head { height: 30px; background: var(--bg); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
@@ -5751,6 +5808,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .vln-fx-l u { text-decoration: none; color: var(--fg-dim); }
 .vln-fx-o { font-family: var(--mono); font-size: 11.5px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vln-fx-o em { font-style: normal; color: var(--fg-faint); display: block; font-size: 10.5px; margin-top: 3px; }
+.vln-fx-repo { font-family: var(--mono); font-size: 11px; color: var(--fg-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-decoration: none; }
+a.vln-fx-repo:hover { color: var(--accent); text-decoration: underline; }
 .vln-fx-a { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); text-align: right; font-variant-numeric: tabular-nums; }
 
 /* finding detail */
@@ -5847,6 +5906,12 @@ pre.vln-code, .vln-code {
 .vln-rule code { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); }
 .vln-blk { display: grid; grid-template-columns: auto minmax(0,1fr) auto; align-items: center; gap: 12px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
 .vln-blk:last-child { border-bottom: 0; }
+/* Per-repo gate card (the "All repositories" merge-gate view): the verdict box
+   with its blocking findings attached directly beneath it. */
+.vln-gate-card { display: flex; flex-direction: column; }
+.vln-gate-card-blk { border: 1px solid var(--line); border-top: 0; background: var(--bg-1); }
+/* Repo separator heading that labels each editor in the stacked policy view. */
+.vln-repo-sep { font-family: var(--mono); font-size: 12px; letter-spacing: 0.04em; color: var(--fg-dim); padding-bottom: 2px; border-bottom: 1px solid var(--line); }
 .vln-blk-t { font-size: 12.5px; color: var(--fg); }
 .vln-blk-l { font-family: var(--mono); font-size: 11px; color: var(--fg-mute); margin-top: 3px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vln-term { background: var(--bg); border-top: 1px solid var(--line); font-family: var(--mono); font-size: 11.5px; line-height: 1.75; color: #c8ccd1; padding: 13px 15px; overflow-x: auto; min-height: 200px; max-height: 520px; overflow-y: auto; }
@@ -5893,7 +5958,9 @@ pre.vln-code, .vln-code {
   .vln-fx-head, .vln-fx-row { grid-template-columns: 96px minmax(0,1fr) 90px 48px 110px; }
   .vln-fx-head > :nth-child(2),  /* id */
   .vln-fx-head > :nth-child(5),  /* origin */
+  .vln-fx-head > :nth-child(6),  /* repo */
   .vln-fx-row > .vln-fx-id,
+  .vln-fx-row > .vln-fx-repo,
   .vln-fx-row > .vln-fx-o { display: none; }
 }
 @media (max-width: 1180px) {
@@ -5919,6 +5986,7 @@ pre.vln-code, .vln-code {
   .vln-fx-row > :nth-child(2), /* id */
   .vln-fx-row > .vln-tag.surface,
   .vln-fx-row > .vln-fx-o,
+  .vln-fx-row > .vln-fx-repo,
   .vln-fx-row > .vln-fx-a { display: none; }
   .vln-fx-row > :nth-child(3) { grid-area: title; }
   .vln-fx-row > .vln-tag:last-child { grid-area: state; }
