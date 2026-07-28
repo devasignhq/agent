@@ -169,31 +169,97 @@ function useNotifications(enabled) {
   return { items, unreadCount, refresh, markAllRead };
 }
 
-// Per-section "needs attention" counts for the sidebar badges.
-//  - Agents & Bounty ride the already-open notifications feed, grouped by kind,
-//    so they clear the moment the user reads the bell (mark-all-read).
-//  - Security has no notification kind, so it counts "new" findings straight
-//    from the overview and refreshes on its own live topic ("security-changed").
-function useNavCounts(enabled, notifications) {
-  const [securityNew, setSecurityNew] = React.useState(0);
+// Sidebar "unseen activity" badges. Each tracked page (Agents, Bounty,
+// Security) shows a count of NEW activity that landed WHILE THE USER WAS AWAY
+// from it — a nudge to look. The count is the number of activity events with a
+// timestamp after the moment the user last had that page open. Opening the page
+// (or being on it) clears the badge, since being there means you've seen it;
+// the per-page "seen" baseline is persisted per user so it survives reloads.
+//   Activity sources: Agents & Bounty from the notifications feed (by kind);
+//   Security from freshly-detected findings (firstDetectedAt).
+const NAV_ACTIVITY_KEYS = ["agent", "bounty", "security"];
+
+function loadSeen(storageKey) {
+  if (!storageKey || typeof window === "undefined") return {};
+  try {
+    return JSON.parse(window.localStorage.getItem(storageKey) || "{}") || {};
+  } catch {
+    return {};
+  }
+}
+function saveSeen(storageKey, val) {
+  if (!storageKey || typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(storageKey, JSON.stringify(val));
+  } catch {
+    /* private mode / quota — badges just won't persist */
+  }
+}
+
+function usePageBadges({ enabled, current, userId, notifications }) {
+  // Security activity comes from findings; agent/bounty ride the notifications
+  // feed the shell already keeps open.
+  const [findings, setFindings] = React.useState([]);
   const refreshSecurity = React.useCallback(async () => {
-    if (!enabled) { setSecurityNew(0); return; }
+    if (!enabled) { setFindings([]); return; }
     try {
       const ov = await api.securityOverview();
-      setSecurityNew(ov.findings.filter((f) => f.state === "new").length);
+      setFindings(ov.findings || []);
     } catch (err) {
-      if (!(err && err.status === 401)) console.warn("[nav-counts] security poll failed:", err);
+      if (!(err && err.status === 401)) console.warn("[page-badges] security poll failed:", err);
     }
   }, [enabled]);
   useLiveTopic("security", () => void refreshSecurity());
   React.useEffect(() => { void refreshSecurity(); }, [refreshSecurity]);
 
-  const unread = (notifications?.items || []).filter((n) => n.readAt === null);
-  return {
-    agent: unread.filter((n) => n.kind === "review" || n.kind === "blocker").length,
-    bounty: unread.filter((n) => n.kind === "bounty").length,
-    security: securityNew,
-  };
+  // Per-page activity timestamps (ms since epoch).
+  const notifItems = notifications?.items;
+  const activity = React.useMemo(() => {
+    const items = notifItems || [];
+    return {
+      agent: items.filter((n) => n.kind === "review" || n.kind === "blocker").map((n) => n.createdAt),
+      bounty: items.filter((n) => n.kind === "bounty").map((n) => n.createdAt),
+      security: findings.map((f) => f.firstDetectedAt).filter((t) => typeof t === "number"),
+    };
+  }, [notifItems, findings]);
+
+  const storageKey = userId ? `devasign_page_seen_${userId}` : null;
+  const [seenAt, setSeenAt] = React.useState({});
+
+  // Load this user's persisted baseline; any page never seen before starts at
+  // "now" so a brand-new session isn't greeted with a backlog count.
+  React.useEffect(() => {
+    const stored = loadSeen(storageKey);
+    const now = Date.now();
+    let changed = false;
+    for (const k of NAV_ACTIVITY_KEYS) {
+      if (stored[k] == null) { stored[k] = now; changed = true; }
+    }
+    if (changed) saveSeen(storageKey, stored);
+    setSeenAt(stored);
+  }, [storageKey]);
+
+  // While a tracked page is the current page, keep its baseline at "now" so
+  // nothing piles up. This is what makes opening (or staying on) the page clear
+  // its badge, and only activity that arrives AFTER you leave counts.
+  React.useEffect(() => {
+    if (!enabled || !NAV_ACTIVITY_KEYS.includes(current)) return;
+    const marker = Math.max(Date.now(), ...(activity[current] || []));
+    setSeenAt((prev) => {
+      if ((prev[current] || 0) >= marker) return prev;
+      const next = { ...prev, [current]: marker };
+      saveSeen(storageKey, next);
+      return next;
+    });
+  }, [enabled, current, activity, storageKey]);
+
+  const counts = {};
+  for (const key of NAV_ACTIVITY_KEYS) {
+    if (!enabled || current === key) { counts[key] = 0; continue; }
+    const base = seenAt[key] || 0;
+    counts[key] = (activity[key] || []).filter((ts) => ts > base).length;
+  }
+  return counts;
 }
 
 const NotificationsPopover = ({ onClose, items, unreadCount, onMarkAllRead, onNavigate }) => {
@@ -525,7 +591,12 @@ const AppContent = () => {
   const [t, setTweak] = useTweaks(TWEAK_DEFAULTS);
   const isMobile = useIsMobile();
   const notifications = useNotifications(auth.status === "signed_in");
-  const navCounts = useNavCounts(auth.status === "signed_in", notifications);
+  const navCounts = usePageBadges({
+    enabled: auth.status === "signed_in",
+    current,
+    userId: auth.user?.id,
+    notifications,
+  });
 
   // Top-level fallback for the install round-trip: if popups were blocked and
   // we did a full-page nav, GitHub will have redirected back to the main tab
