@@ -6119,8 +6119,8 @@ a.c-escrow-row.c-escrow-row-link:hover .v.addr { color: var(--info); }
 .c-bp-side { display: flex; flex-direction: column; }
 
 /* Left — list + filters */
-.c-bp-left { border-right: 1px solid var(--line); background: var(--bg-1); }
-.c-bp-filters { position: sticky; top: 0; z-index: 2; background: var(--bg-1); border-bottom: 1px solid var(--line); padding: 14px 14px 12px; }
+.c-bp-left { border-right: 1px solid var(--line); background: var(--bg); }
+.c-bp-filters { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line); padding: 14px 14px 12px; }
 .c-bp-filters-h { font-family: var(--mono); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-mute); margin-bottom: 10px; }
 .c-bp-ftabs { display: flex; gap: 0; border: 1px solid var(--line); }
 .c-bp-ftab {
