@@ -558,13 +558,15 @@ const BountyDrawer = ({ bounty, onClose, onChanged }: { bounty: Bounty; onClose:
                 ? "Awaiting funding · sign with Freighter to activate"
                 : delegated ? "Cannot cancel · bounty is delegated" : "This bounty can still be cancelled"}
             </span>
-            {bounty.cancelUrl && (
-              <a className="btn" href={bounty.cancelUrl}><Icon name="x" size={13} /> Cancel</a>
-            )}
-            {bounty.status === "PENDING_FUNDING" && bounty.fundingUrl && (
-              <a className="btn primary" href={bounty.fundingUrl}><Icon name="check" size={13} /> Fund bounty</a>
-            )}
-            <a className="btn" href={bounty.issueUrl} target="_blank" rel="noreferrer"><Icon name="github" size={13} /> View on GitHub</a>
+            <div className="drawer-foot-actions">
+              {bounty.cancelUrl && (
+                <a className="btn danger-outline" href={bounty.cancelUrl}><Icon name="x" size={13} /> Cancel</a>
+              )}
+              {bounty.status === "PENDING_FUNDING" && bounty.fundingUrl && (
+                <a className="btn primary" href={bounty.fundingUrl}><Icon name="check" size={13} /> Fund bounty</a>
+              )}
+              <a className="btn" href={bounty.issueUrl} target="_blank" rel="noreferrer"><Icon name="github" size={13} /> View on GitHub</a>
+            </div>
           </div>
         )}
       </div>
