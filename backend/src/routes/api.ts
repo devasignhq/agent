@@ -608,6 +608,18 @@ function guidanceLocked(user: User): boolean {
   return effectivePlan(sub) === "free";
 }
 
+// Pro/Max backstop for Security page mutations. Reads stay open on every plan
+// (a downgraded user can still see the findings they already have), exactly as
+// guidance does; only the actions that spend or configure are refused.
+function securityLocked(user: User): boolean {
+  return !PLAN_LIMITS[planForUser(user.id)].securityScans;
+}
+
+const UPGRADE_SECURITY = {
+  error: "upgrade_required",
+  message: "Security audits are available on Pro and Max.",
+} as const;
+
 // Friendly display title from a link's host + last path segment.
 function guidanceTitleFromUrl(url: string): string {
   try {
@@ -723,7 +735,9 @@ api.get("/security/overview", (req, res) => {
     };
   });
 
-  res.json({ repos: repoViews, scans, findings: findingViews });
+  // `locked` rides the overview (like `advancedLocked` on the workflow GET) so
+  // the page can paywall itself without a second request.
+  res.json({ repos: repoViews, scans, findings: findingViews, locked: securityLocked(user) });
 });
 
 // Full scan run including the terminal log (the merge-gate view's console).
@@ -743,6 +757,7 @@ api.get("/repositories/:id/security/scans/:scanId", (req, res) => {
 api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
+  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
   const inFlight = db.find(
     "securityScans",
     (s) => s.repoId === ctx.repo.id && (s.status === "queued" || s.status === "running")
@@ -774,6 +789,7 @@ api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
 api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimiter, async (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
+  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
   const finding = db.find(
     "securityFindings",
     (f) => f.id === req.params.findingId && f.repoId === ctx.repo.id
@@ -807,6 +823,7 @@ api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimite
 api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
+  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
   const finding = db.find(
     "securityFindings",
     (f) => f.id === req.params.findingId && f.repoId === ctx.repo.id
@@ -876,6 +893,7 @@ api.get("/repositories/:id/security/policy", (req, res) => {
 api.put("/repositories/:id/security/policy", (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
+  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
   const policy = normalizeSecurityPolicy(req.body?.policy ?? req.body);
   db.update("repositories", (r) => r.id === ctx.repo.id, { securityPolicy: policy });
   // Gate rules may have changed meaning — republish across open PRs.
@@ -1520,7 +1538,11 @@ api.get("/billing/subscription", (req, res) => {
     annualAvailable: isAnnualConfigured(),
     reviewsUsed: sub?.reviewsUsed ?? 0,
     reviewLimit: Number.isFinite(limits.monthlyReviews) ? limits.monthlyReviews : null,
-    features: { privateRepos: limits.privateRepos, linear: limits.linear },
+    features: {
+      privateRepos: limits.privateRepos,
+      linear: limits.linear,
+      securityScans: limits.securityScans,
+    },
   });
 });
 

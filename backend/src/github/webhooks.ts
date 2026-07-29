@@ -18,6 +18,7 @@ import {
   PLAN_LIMITS,
   chargeForNewPRReview,
   planForUser,
+  securityScanBlocked,
 } from "../billing/plans.js";
 import {
   isAccountOwner,
@@ -871,7 +872,13 @@ function handlePullRequest(event: any) {
         // is already queued/running for this repo — enqueueSecurityAudit would
         // dedupe the job anyway, and creating a second run row would leave it
         // wedged in "queued" forever.
-        if (effectiveSecurityPolicy(repo).triggers.onMerge) {
+        // Pro/Max only — runSecurityAudit enforces it too, but skipping here
+        // keeps a Free repo from collecting a no-op run row on every merge.
+        const auditOwnerId = db.find(
+          "installations",
+          (i) => i.id === repo.installationId
+        )?.userId;
+        if (effectiveSecurityPolicy(repo).triggers.onMerge && !securityScanBlocked(auditOwnerId)) {
           const inFlight = db.find(
             "securityScans",
             (s) => s.repoId === repo.id && (s.status === "queued" || s.status === "running")

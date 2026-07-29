@@ -6,6 +6,10 @@
 //     change, or policy save — republished across ALL open PRs.
 //   - publishGateForPR: from the review pipeline as a PR's own review lands, so
 //     a PR that introduces a critical fails on its own head immediately.
+// Both paths are Pro/Max — the check-run is part of the security feature, so a
+// Free repo never gets one. Gating inside the two publishers (rather than at
+// each call site) means every caller is covered by construction.
+import { securityScanBlocked } from "../billing/plans.js";
 import { db } from "../db.js";
 import { config } from "../config.js";
 import { gh } from "../github/app.js";
@@ -85,6 +89,7 @@ async function postCheckRun(
 export async function publishGateForRepo(repo: Repository): Promise<void> {
   const install = db.find("installations", (i) => i.id === repo.installationId);
   if (!install) return; // dev / unattached repo — nothing to publish to
+  if (securityScanBlocked(install.userId)) return;
   const policy = effectiveSecurityPolicy(repo);
   if (!policy.triggers.onPrPush) return;
   let open: OpenPR[] = [];
@@ -116,6 +121,7 @@ export async function publishGateForPR(args: {
   review: PRReview;
 }): Promise<void> {
   const { repo, install, review } = args;
+  if (securityScanBlocked(install.userId)) return;
   const policy = effectiveSecurityPolicy(repo);
   if (!policy.triggers.onPrPush) return;
   const gate = computeGate({

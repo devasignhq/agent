@@ -66,6 +66,59 @@ const StateTag = ({ f }: { f: SecurityFinding }) => {
 
 const short = (sha?: string | null) => (sha ? sha.slice(0, 7) : "");
 
+// ─── plan lock ────────────────────────────────────────────────────────────────
+//
+// Security audits are Pro/Max. The overview still loads on Free (reads are never
+// gated, so a downgraded account keeps seeing the findings it already has) and
+// carries `locked`; everything that spends or configures is turned off here,
+// with the backend refusing the same calls as the real boundary.
+
+const goUpgrade = () => (window.location.href = `${window.location.origin}/?billing=upgrade`);
+
+const ProLock = () => (
+  <span className="pill purple" title="Pro/Max feature">
+    <Icon name="lock" size={9} /> Pro
+  </span>
+);
+
+// Persistent banner shown above findings a locked account can still read.
+const LockedNotice = () => (
+  <div className="tu-notice" style={{ marginBottom: 12 }}>
+    Security audits are a Pro/Max feature — scans, triage and the merge gate are paused on
+    your plan.{" "}
+    <button className="btn sm" style={{ marginLeft: 8 }} onClick={goUpgrade}>
+      Upgrade
+    </button>
+  </div>
+);
+
+// Full paywall state — a locked account with nothing on record. Mirrors
+// FirstRunEmpty so the page reads the same whether it's empty or unavailable.
+const LockedEmpty = () => (
+  <div className="vln-blank">
+    <div className="vln-blank-art">
+      <Icon name="shield" size={26} />
+    </div>
+    <div className="vln-blank-t">Security audits are a Pro feature</div>
+    <div className="vln-blank-s">
+      On Pro and Max the security agents audit your repository on every merge, publish the{" "}
+      <b>devasign/security</b> merge gate on pull requests, and turn any finding into a GitHub
+      issue in one click. Upgrade to switch them on.
+    </div>
+    <div className="vln-blank-surfaces">
+      {(Object.keys(SURFACE_META) as (keyof typeof SURFACE_META)[]).map((s) => (
+        <span className="vln-blank-surface" key={s}>
+          <Icon name={SURFACE_META[s].icon} size={13} />
+          {SURFACE_META[s].label}
+        </span>
+      ))}
+    </div>
+    <button className="btn primary" style={{ marginTop: 16 }} onClick={goUpgrade}>
+      Upgrade to Pro
+    </button>
+  </div>
+);
+
 // ─── main page ────────────────────────────────────────────────────────────────
 
 type ViewKey = "dashboard" | "detail" | "gate" | "policy";
@@ -248,6 +301,7 @@ export const SecurityPage = ({
         onOpen={(id) => navigate(`/security/findings/${id}`, { state: { from: origin } })}
         applyFinding={applyFinding}
         refresh={refresh}
+        locked={overview.locked}
       />
     );
   }
@@ -263,16 +317,26 @@ export const SecurityPage = ({
         subNav={subNav}
       />
       {error && <div className="tu-notice" style={{ marginBottom: 12 }}>{error}</div>}
-      {view === "dashboard" && (
-        <Dashboard
-          overview={overview}
-          repoFilter={repoFilter}
-          chip={chip}
-          setChip={setChip}
-          onOpen={(id) => navigate(`/security/findings/${id}`)}
-        />
+      {/* Locked with nothing on record → the paywall state replaces the body;
+          locked with findings (a lapsed sub) → keep them readable under a
+          banner, with every action turned off. */}
+      {overview.locked && overview.findings.length > 0 && <LockedNotice />}
+      {view === "dashboard" &&
+        (overview.locked && overview.findings.length === 0 ? (
+          <LockedEmpty />
+        ) : (
+          <Dashboard
+            overview={overview}
+            repoFilter={repoFilter}
+            chip={chip}
+            setChip={setChip}
+            onOpen={(id) => navigate(`/security/findings/${id}`)}
+          />
+        ))}
+      {(view === "gate" || view === "policy") && overview.locked && overview.findings.length === 0 && (
+        <LockedEmpty />
       )}
-      {(view === "gate" || view === "policy") && (() => {
+      {(view === "gate" || view === "policy") && !(overview.locked && overview.findings.length === 0) && (() => {
         // Gate/policy show ONE repo at a time, chosen by the left rail. The
         // header's "all" default (and any unknown id) resolves to the first
         // repo so the body always has a concrete repo to render.
@@ -286,7 +350,12 @@ export const SecurityPage = ({
               onOpen={(id) => navigate(`/security/findings/${id}`, { state: { from: "gate" } })}
             />
           ) : (
-            <PolicyView overview={overview} repoFilter={selectedRepoId} refresh={refresh} />
+            <PolicyView
+              overview={overview}
+              repoFilter={selectedRepoId}
+              refresh={refresh}
+              locked={overview.locked}
+            />
           );
         // The rail appears once there's more than one repo to choose between.
         return overview.repos.length > 1 ? (
@@ -339,7 +408,14 @@ const PageHead = ({
       }
       await refresh();
     } catch (err) {
-      setScanErr(err instanceof Error ? err.message : String(err));
+      // The plan backstop — reachable if the sub lapses between load and click.
+      setScanErr(
+        err instanceof ApiError && err.status === 403
+          ? "Security audits are a Pro/Max feature."
+          : err instanceof Error
+          ? err.message
+          : String(err)
+      );
     } finally {
       setScanBusy(false);
     }
@@ -352,8 +428,15 @@ const PageHead = ({
         <div>
           <h1 className="page-title">Security</h1>
           <div className="page-sub">
-            {overview.repos.length} repo{overview.repos.length === 1 ? "" : "s"} · audit on every
-            merge to <span style={{ color: "var(--fg-dim)" }}>{branches || "main"}</span>
+            {overview.repos.length} repo{overview.repos.length === 1 ? "" : "s"} ·{" "}
+            {overview.locked ? (
+              <>audits paused — Pro/Max feature</>
+            ) : (
+              <>
+                audit on every merge to{" "}
+                <span style={{ color: "var(--fg-dim)" }}>{branches || "main"}</span>
+              </>
+            )}
           </div>
         </div>
         <div className="page-actions">
@@ -375,11 +458,18 @@ const PageHead = ({
             </select>
           )}
           {/* Re-scan lives on the findings dashboard only; the gate/policy
-              subpages are for reviewing and configuring, not triggering scans. */}
-          {view === "dashboard" && (
-            <button className="btn primary" disabled={scanBusy || scanning} onClick={() => void rescan()}>
-              <Icon name="play" size={12} /> {scanning ? "Scanning…" : scanBusy ? "Queuing…" : "Re-scan"}
+              subpages are for reviewing and configuring, not triggering scans.
+              On a locked plan it gives way to the upgrade CTA. */}
+          {overview.locked ? (
+            <button className="btn primary" onClick={goUpgrade}>
+              <Icon name="lock" size={12} /> Upgrade to Pro
             </button>
+          ) : (
+            view === "dashboard" && (
+              <button className="btn primary" disabled={scanBusy || scanning} onClick={() => void rescan()}>
+                <Icon name="play" size={12} /> {scanning ? "Scanning…" : scanBusy ? "Queuing…" : "Re-scan"}
+              </button>
+            )
           )}
         </div>
       </div>
@@ -802,6 +892,7 @@ const FindingDetail = ({
   onOpen,
   applyFinding,
   refresh,
+  locked,
 }: {
   finding: SecurityFinding | undefined;
   all: SecurityFinding[];
@@ -810,6 +901,7 @@ const FindingDetail = ({
   onOpen: (id: string) => void;
   applyFinding: (f: Partial<SecurityFinding> & { id: string }) => void;
   refresh: () => Promise<void>;
+  locked: boolean;
 }) => {
   const [tab, setTab] = React.useState<(typeof DT_TABS)[number]>("Overview");
   const [busy, setBusy] = React.useState<string | null>(null);
@@ -1091,6 +1183,10 @@ const FindingDetail = ({
         )}
       </div>
 
+      {/* A locked plan can still read the finding; issue creation and triage are
+          off, and the backend refuses them regardless. */}
+      {locked && <LockedNotice />}
+
       <div className="vln-dt-foot">
         {/* Issue / bounty flow: one-click issue first; bounties ride the issue. */}
         {f.issueUrl ? (
@@ -1098,11 +1194,16 @@ const FindingDetail = ({
             <Icon name="github" size={13} /> Issue #{f.issueNumber} <Icon name="external" size={10} />
           </a>
         ) : (
-          !terminal && (
+          !terminal &&
+          (locked ? (
+            <button className="btn" onClick={goUpgrade}>
+              <Icon name="github" size={13} /> Create GitHub issue <ProLock />
+            </button>
+          ) : (
             <button className="btn primary" disabled={busy === "issue"} onClick={() => void createIssue()}>
               <Icon name="github" size={13} /> {busy === "issue" ? "Creating…" : "Create GitHub issue"}
             </button>
-          )
+          ))
         )}
         {f.bounty ? (
           <span className="vln-tag ok" style={{ height: 26 }}>
@@ -1119,7 +1220,11 @@ const FindingDetail = ({
 
         <div style={{ flex: 1 }} />
 
-        {terminal ? (
+        {locked ? (
+          <span className="mono mute" style={{ fontSize: 11 }}>
+            {terminal ? f.stateReason || STATE_LABEL[f.state]?.label : "triage paused"} <ProLock />
+          </span>
+        ) : terminal ? (
           <>
             <span className="mono mute" style={{ fontSize: 11 }}>
               {f.stateReason || STATE_LABEL[f.state]?.label}
@@ -1305,8 +1410,13 @@ const GateRepoDetail = ({
 
 // ─── scan policy ──────────────────────────────────────────────────────────────
 
-const Tog = ({ on, onClick }: { on: boolean; onClick: () => void }) => (
-  <button className={`vln-sw ${on ? "" : "off"}`} onClick={onClick} aria-pressed={on}>
+const Tog = ({ on, onClick, disabled }: { on: boolean; onClick: () => void; disabled?: boolean }) => (
+  <button
+    className={`vln-sw ${on ? "" : "off"}`}
+    onClick={onClick}
+    disabled={disabled}
+    aria-pressed={on}
+  >
     <i />
   </button>
 );
@@ -1317,24 +1427,28 @@ const PolicyView = ({
   overview,
   repoFilter,
   refresh,
+  locked,
 }: {
   overview: SecurityOverview;
   repoFilter: string | undefined;
   refresh: () => Promise<void>;
+  locked: boolean;
 }) => {
   const repo = overview.repos.find((r) => r.id === repoFilter) ?? overview.repos[0];
   if (!repo) {
     return <div className="vln-empty">Connect a repository to configure its scan policy.</div>;
   }
-  return <PolicyRepoEditor repo={repo} refresh={refresh} />;
+  return <PolicyRepoEditor repo={repo} refresh={refresh} locked={locked} />;
 };
 
 const PolicyRepoEditor = ({
   repo,
   refresh,
+  locked,
 }: {
   repo: SecurityRepoView;
   refresh: () => Promise<void>;
+  locked: boolean;
 }) => {
   const [policy, setPolicy] = React.useState<RepoSecurityPolicy | null>(repo.policy ?? null);
   const [dirty, setDirty] = React.useState(false);
@@ -1353,6 +1467,7 @@ const PolicyRepoEditor = ({
   }
 
   const edit = (fn: (p: RepoSecurityPolicy) => RepoSecurityPolicy) => {
+    if (locked) return; // controls are disabled too; this is the belt-and-braces
     setPolicy((p) => (p ? fn(p) : p));
     setDirty(true);
     setSaved(false);
@@ -1392,7 +1507,7 @@ const PolicyRepoEditor = ({
     <div className="vln-pol">
       <div className="vln-pnl">
         <div className="vln-pnl-head">
-          <h3 className="vln-pnl-t">Triggers</h3>
+          <h3 className="vln-pnl-t">Triggers {locked && <ProLock />}</h3>
           <div className="vln-pnl-s">{repo.owner}/{repo.name}</div>
         </div>
         <div>
@@ -1407,6 +1522,7 @@ const PolicyRepoEditor = ({
               </div>
               <Tog
                 on={policy.triggers[t.k]}
+                disabled={locked}
                 onClick={() => edit((p) => ({ ...p, triggers: { ...p.triggers, [t.k]: !p.triggers[t.k] } }))}
               />
             </div>
@@ -1431,6 +1547,7 @@ const PolicyRepoEditor = ({
               </div>
               <Tog
                 on={policy.engines[e.k]}
+                disabled={locked}
                 onClick={() => edit((p) => ({ ...p, engines: { ...p.engines, [e.k]: !p.engines[e.k] } }))}
               />
             </div>
@@ -1450,7 +1567,7 @@ const PolicyRepoEditor = ({
               <div className="vln-gates-row">
                 {(["block", "warn", "track"] as const).map((a) => {
                   // Critical can't be silently tracked (the backend refuses too).
-                  const disabled = sev === "critical" && a === "track";
+                  const disabled = locked || (sev === "critical" && a === "track");
                   return (
                     <button
                       key={a}
@@ -1470,9 +1587,15 @@ const PolicyRepoEditor = ({
 
       {err && <div className="tu-notice">{err}</div>}
       <div className="flex items-center gap-3">
-        <button className="btn primary" disabled={!dirty || saving} onClick={() => void save()}>
-          {saving ? "Saving…" : "Save policy"}
-        </button>
+        {locked ? (
+          <button className="btn primary" onClick={goUpgrade}>
+            <Icon name="lock" size={12} /> Upgrade to edit the policy
+          </button>
+        ) : (
+          <button className="btn primary" disabled={!dirty || saving} onClick={() => void save()}>
+            {saving ? "Saving…" : "Save policy"}
+          </button>
+        )}
         {saved && !dirty && (
           <span className="mono" style={{ fontSize: 11, color: "var(--green)" }}>
             saved — gate republished across open PRs

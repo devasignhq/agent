@@ -18,6 +18,7 @@ export type PlanLimits = {
   monthlyReviews: number; // unique PRs reviewable per period; Infinity = unlimited
   privateRepos: boolean; // may review private repos
   linear: boolean; // Linear integration + acceptance-criteria sync
+  securityScans: boolean; // repo-wide security audits + merge gate (Security page)
   priceKey: "pricePro" | "priceMax" | null; // which config.stripe price funds it
 };
 
@@ -25,9 +26,9 @@ export type PlanLimits = {
 // (ANTHROPIC_MODEL — opus). Reading config.llm.model means a prod model bump
 // (e.g. opus-4-8) automatically applies to Pro/Max with no code change here.
 export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
-  free: { model: "claude-haiku-4-5", monthlyReviews: 10, privateRepos: false, linear: false, priceKey: null },
-  pro: { model: config.llm.model, monthlyReviews: 50, privateRepos: true, linear: true, priceKey: "pricePro" },
-  max: { model: config.llm.model, monthlyReviews: Infinity, privateRepos: true, linear: true, priceKey: "priceMax" },
+  free: { model: "claude-haiku-4-5", monthlyReviews: 10, privateRepos: false, linear: false, securityScans: false, priceKey: null },
+  pro: { model: config.llm.model, monthlyReviews: 50, privateRepos: true, linear: true, securityScans: true, priceKey: "pricePro" },
+  max: { model: config.llm.model, monthlyReviews: Infinity, privateRepos: true, linear: true, securityScans: true, priceKey: "priceMax" },
 };
 
 // Tier ordering for upgrade/downgrade comparisons (free < pro < max).
@@ -151,6 +152,20 @@ export function privateRepoBlocked(
 ): boolean {
   if (!isPrivate || !ownerUserId) return false;
   return !PLAN_LIMITS[planForUser(ownerUserId)].privateRepos;
+}
+
+// Single source of truth for the security-audit rule: the repo-wide audit, the
+// Security page mutations and the devasign/security check-run are Pro/Max. A
+// lapsed paid sub is Free here too (effectivePlan), so scanning stops when the
+// subscription does. Unlinked installs (no userId yet) get the same onboarding
+// grace as privateRepoBlocked and are never blocked. runSecurityAudit enforces
+// this for every enqueue path, so no audit runs on a blocked repo.
+//
+// NB: "gate" in security/gate.ts means the GitHub check-run, not billing —
+// hence the deliberately different name here.
+export function securityScanBlocked(ownerUserId: string | null | undefined): boolean {
+  if (!ownerUserId) return false;
+  return !PLAN_LIMITS[planForUser(ownerUserId)].securityScans;
 }
 
 // Monthly-cap enforcement for a *new* PR review, charged once per unique PR.

@@ -20,6 +20,7 @@ import {
   priceIdToPlanInterval,
   privateRepoBlocked,
   rollAndCheckUsage,
+  securityScanBlocked,
 } from "./plans.js";
 import type { Subscription, SubscriptionStatus } from "../types.js";
 
@@ -186,6 +187,28 @@ test("privateRepoBlocked: only private repos on a no-private-repos plan, only wh
   assert.equal(privateRepoBlocked(true, ""), false);
   assert.equal(privateRepoBlocked(true, null), false);
   assert.equal(privateRepoBlocked(true, undefined), false);
+});
+
+test("securityScanBlocked: audits are Pro/Max, and stop when the sub lapses", () => {
+  const free = uuid();
+  db.insert("subscriptions", sub({ userId: free, plan: "free" }));
+  const pro = uuid();
+  db.insert("subscriptions", sub({ userId: pro, plan: "pro", status: "active" }));
+  const max = uuid();
+  db.insert("subscriptions", sub({ userId: max, plan: "max", status: "trialing" }));
+  const lapsed = uuid();
+  db.insert("subscriptions", sub({ userId: lapsed, plan: "pro", status: "canceled" }));
+  const noSub = uuid();
+
+  assert.equal(securityScanBlocked(free), true);
+  assert.equal(securityScanBlocked(pro), false);
+  assert.equal(securityScanBlocked(max), false); // trialing counts as paying
+  assert.equal(securityScanBlocked(lapsed), true); // effectivePlan downgrades it
+  assert.equal(securityScanBlocked(noSub), true); // no row → Free
+  // Unlinked install (no userId yet) → onboarding grace, never blocked.
+  assert.equal(securityScanBlocked(""), false);
+  assert.equal(securityScanBlocked(null), false);
+  assert.equal(securityScanBlocked(undefined), false);
 });
 
 test("chargeForNewPRReview: charges a new under-cap PR exactly once", () => {
