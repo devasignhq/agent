@@ -28,12 +28,12 @@ import { api, type Repository, type RepoWorkflow, type StagePromptKey, type Acti
 import { runSave } from "./optimistic-save";
 import { useAuth } from "./auth-context";
 
-type StageKey = "holistic" | "deferrals" | "docs";
+type StageKey = "holistic" | "defects" | "deferrals" | "docs";
 type NodeId =
   // Main PR-review lane
   | "trigger" | "ingest" | "criteria" | "newcommit" | "review"
   | "holistic" | "backstop" | "secgate" | "preexisting"
-  | "deferrals" | "docs" | "verdict" | "actions"
+  | "defects" | "deferrals" | "docs" | "verdict" | "actions"
   // Maintainer-feedback lane (second entry path + loop back)
   | "mtrigger" | "manalyze" | "mrescore" | "mguide";
 
@@ -115,20 +115,24 @@ const NODE_DEFS: NodeDef[] = [
     pos: { x: X_MAIN, y: ROW * 6 },
     short: "Surfaced from the index ⟲ re-verified",
     desc: "Surface vulnerabilities already living in files this PR touches or depends on (from the index security audit). Touched files are re-verified against the PR head, so a vuln this PR fixes is dropped and credited as resolved. Advisory — never blocks the merge." },
-  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", color: "var(--warn)", mandatory: false, stageKey: "deferrals", promptKey: "deferrals", lane: "pr",
+  { id: "defects", name: "Bug detection", tag: "Agent", icon: "bug", color: "var(--danger)", mandatory: false, stageKey: "defects", promptKey: "defects", lane: "pr",
     pos: { x: X_MAIN, y: ROW * 7 },
+    short: "Correctness bugs, criteria aside",
+    desc: "Review the changed code for correctness and robustness on its own terms — logic errors, null handling, error paths, async and concurrency, resource leaks, API misuse, data integrity. Independent of the acceptance criteria: a PR can meet every requirement and still be wrong. Runs on every PR whether or not the repo index is built. A bug severe enough to break a feature or lose data blocks the merge." },
+  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", color: "var(--warn)", mandatory: false, stageKey: "deferrals", promptKey: "deferrals", lane: "pr",
+    pos: { x: X_MAIN, y: ROW * 8 },
     short: "TODOs, stubs & silent punts",
     desc: "Catch self-admitted punts — TODOs, stubs, NotImplemented buried in the diff." },
   { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", color: "var(--pink)", mandatory: false, stageKey: "docs", promptKey: "docs", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 8 },
+    pos: { x: X_MAIN, y: ROW * 9 },
     short: "Conventions & doc drift",
     desc: "Enforce your repo conventions & flag docs the change makes outdated." },
   { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", color: "var(--lemon)", mandatory: true, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 9 },
+    pos: { x: X_MAIN, y: ROW * 10 },
     short: "Check Run + PR review + notify",
     desc: "Post the Check Run + PR review and notify your connected integrations." },
   { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", color: "var(--danger)", mandatory: false, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 10 },
+    pos: { x: X_MAIN, y: ROW * 11 },
     short: "Dispatch a workflow on finish",
     desc: "Dispatch a chosen GitHub Actions workflow after the review (workflow_dispatch)." },
 
@@ -170,7 +174,8 @@ const EDGES: EdgeDef[] = [
   { from: "holistic", to: "secgate" },
   { from: "backstop", to: "secgate" },
   { from: "secgate", to: "preexisting" },
-  { from: "preexisting", to: "deferrals" },
+  { from: "preexisting", to: "defects" },
+  { from: "defects", to: "deferrals" },
   { from: "deferrals", to: "docs" },
   { from: "docs", to: "verdict" },
   { from: "verdict", to: "actions" },
@@ -187,17 +192,20 @@ const EDGES: EdgeDef[] = [
 const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdict">> = {
   strict: {
     trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-    stages: { holistic: true, docs: true, deferrals: true },
+    stages: { holistic: true, defects: true, docs: true, deferrals: true },
     verdict: { blocking: true },
   },
   balanced: {
     trigger: { onSynchronize: true, skipDrafts: true, skipBots: true },
-    stages: { holistic: true, docs: true, deferrals: true },
+    stages: { holistic: true, defects: true, docs: true, deferrals: true },
     verdict: { blocking: true },
   },
   light: {
     trigger: { onSynchronize: false, skipDrafts: true, skipBots: true },
-    stages: { holistic: false, docs: true, deferrals: false },
+    // Bug detection stays on even in Light: it's the one pass that catches a
+    // wrong-but-criteria-satisfying diff. Light's verdict.blocking:false already
+    // keeps it from stopping a merge.
+    stages: { holistic: false, defects: true, docs: true, deferrals: false },
     verdict: { blocking: false },
   },
 };
@@ -258,6 +266,7 @@ const matchesPreset = (wf: RepoWorkflow, t: typeof TEMPLATES[string]) =>
   wf.trigger.skipDrafts === t.trigger.skipDrafts &&
   wf.trigger.skipBots === t.trigger.skipBots &&
   wf.stages.holistic === t.stages.holistic &&
+  wf.stages.defects === t.stages.defects &&
   wf.stages.docs === t.stages.docs &&
   wf.stages.deferrals === t.stages.deferrals &&
   wf.verdict.blocking === t.verdict.blocking;

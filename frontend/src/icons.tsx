@@ -31,6 +31,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }: IconProps) => {
     case "terminal":   return <svg {...p}><rect x="2" y="3" width="12" height="10"/><path d="M5 7l2 1.5L5 10M8 10.5h3"/></svg>;
     case "brain":      return <svg {...p}><path d="M5 3a2 2 0 00-2 2v6a2 2 0 002 2h1V3H5zM11 3a2 2 0 012 2v6a2 2 0 01-2 2h-1V3h1z"/><path d="M6 6h1M6 10h1M9 6h1M9 10h1M6 8h4"/></svg>;
     case "warn":       return <svg {...p}><path d="M8 2l6 11H2z"/><path d="M8 7v3M8 12v.5"/></svg>;
+    case "bug":        return <svg {...p}><path d="M5 7a3 3 0 016 0v3a3 3 0 01-6 0V7z"/><path d="M6 5l-.8-1.6M10 5l.8-1.6"/><path d="M5 8H2.5M11 8h2.5M5.2 10.5L3 12M10.8 10.5L13 12M5.2 6.5L3 5M10.8 6.5L13 5"/></svg>;
     case "x":          return <svg {...p}><path d="M3 3l10 10M13 3L3 13"/></svg>;
     case "send":       return <svg {...p}><path d="M14 2L2 8l5 2 1 4 6-12z"/></svg>;
     case "message":    return <svg {...p}><path d="M2 3h12v8H6l-3 3V3z"/></svg>;

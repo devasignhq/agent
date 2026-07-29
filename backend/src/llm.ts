@@ -532,6 +532,53 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     });
   }
 
+  // General defect review (frontier model in production). Default to a clean
+  // result so mocked offline runs still pass — this stage GATES the merge, so a
+  // sample finding by default would fail every offline pipeline test. Set
+  // DEFECT_SAMPLE=1 to emit one blocker-severity defect and exercise the gate,
+  // the "Bugs and correctness issues" section, and the timeline finding card
+  // end-to-end without billing.
+  if (system?.includes("defect review step")) {
+    if (process.env.DEFECT_SAMPLE !== "1") {
+      return JSON.stringify({ defects: [], summary: "[mock] No defects surfaced in the changed code." });
+    }
+    return JSON.stringify({
+      defects: [
+        {
+          path: "src/handler.ts",
+          defectClass: "unhandled-error",
+          concern:
+            "[mock] The catch block logs the provider error and falls through to the success response, " +
+            "so a failed write is reported to the caller as if it succeeded.",
+          failureScenario:
+            "When the datastore rejects the write (a 500 or a timeout), listHandler still returns 200 with an " +
+            "empty body, and the caller records the operation as complete.",
+          severity: "blocker",
+          fixPrompt:
+            "Fix: Propagate the write failure instead of swallowing it\n\n" +
+            "File: src/handler.ts\n" +
+            "Symbol: listHandler\n\n" +
+            "Issue:\n" +
+            "The catch block logs the error and continues into the success path, so a failed write is " +
+            "indistinguishable from a successful one to the caller.\n\n" +
+            "Expected behavior:\n" +
+            "A failed write should surface as an error response so the caller can retry rather than record " +
+            "a phantom success.\n\n" +
+            "Suggested approach:\n" +
+            "Rethrow (or return an error result) from the catch block and let the route's error handler map it " +
+            "to a 5xx.\n\n" +
+            "Relevant diff:\n" +
+            "```diff\n" +
+            "+ } catch (err) {\n" +
+            "+   console.error(err);\n" +
+            "+ }\n" +
+            "```",
+        },
+      ],
+      summary: "[mock] 1 blocking defect detected in the changed code.",
+    });
+  }
+
   // Default: echo a terse acknowledgement
   return `[mock-llm] ${last.slice(0, 120)}`;
 }

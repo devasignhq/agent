@@ -12,8 +12,11 @@ import {
 test("effectiveWorkflow with no stored workflow reproduces prior behavior", () => {
   const wf = effectiveWorkflow({ workflow: undefined });
   // Every optional stage runs, and the trigger/verdict policy matches what the
-  // pipeline did before workflows existed.
-  assert.deepEqual(wf.stages, { holistic: true, docs: true, deferrals: true });
+  // pipeline did before workflows existed. `defects` is the deliberate exception
+  // to "reproduces prior behavior": bug detection ships on by default, because
+  // default-off would leave the criteria-only blind spot open for every repo
+  // that never opens the Workflow screen.
+  assert.deepEqual(wf.stages, { holistic: true, defects: true, docs: true, deferrals: true });
   assert.deepEqual(wf.trigger, { onSynchronize: true, skipDrafts: false, skipBots: false });
   assert.equal(wf.verdict.blocking, true);
   assert.deepEqual(wf, WORKFLOW_DEFAULTS);

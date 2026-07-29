@@ -9,7 +9,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { runReviewJob } from "./pipeline.js";
+import { DEFECT_STAGE_DISABLED, runReviewJob } from "./pipeline.js";
 
 const HOLISTIC_DISABLED = "Whole-repo review disabled by workflow";
 
@@ -70,4 +70,36 @@ test("stages.holistic=true → pipeline runs the whole-repo stage (does not log 
     logs.some((l) => l.action.includes("Repo index not yet built")),
     "holistic stage should run and note the empty index"
   );
+});
+
+// ─── Bug detection stage ────────────────────────────────────────────────────
+// The stage exists to close the "every criterion met, code still wrong" gap, so
+// the default matters as much as the toggle: a repo that never visits the
+// Workflow screen must still get it.
+
+test("stages.defects=false → pipeline skips the bug-detection stage", async () => {
+  const id = seedReview({ version: 1, stages: { defects: false } });
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(
+    logs.some((l) => l.action === DEFECT_STAGE_DISABLED),
+    `expected a "${DEFECT_STAGE_DISABLED}" log when stages.defects is off`
+  );
+});
+
+test("bug detection is ON for a repo with no stored workflow at all", async () => {
+  const id = seedReview(undefined);
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(
+    !logs.some((l) => l.action === DEFECT_STAGE_DISABLED),
+    "an un-customised repo must still get bug detection — that's the point of the default"
+  );
+});
+
+test("stages.defects=true → pipeline does not log the stage disabled", async () => {
+  const id = seedReview({ version: 1, stages: { defects: true } });
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(!logs.some((l) => l.action === DEFECT_STAGE_DISABLED));
 });
