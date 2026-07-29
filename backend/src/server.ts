@@ -27,6 +27,7 @@ import { handleWebhook } from "./github/webhooks.js";
 import { startLinearOAuth, finishLinearOAuth } from "./linear/oauth.js";
 import { handleLinearWebhook } from "./linear/webhooks.js";
 import { handleStripeWebhook } from "./billing/stripe.js";
+import { securityScanBlocked } from "./billing/plans.js";
 import { api } from "./routes/api.js";
 import { bounties } from "./routes/bounties.js";
 import { contributor } from "./routes/contributor.js";
@@ -414,6 +415,10 @@ function startNightlySecuritySweep() {
   const tick = () => {
     for (const repo of db.filter("repositories", (r) => r.reviewsEnabled)) {
       if (!effectiveSecurityPolicy(repo).triggers.nightly) continue;
+      // Pro/Max only (runSecurityAudit enforces it as well — this just keeps
+      // blocked repos from accruing a no-op run row every night).
+      const ownerId = db.find("installations", (i) => i.id === repo.installationId)?.userId;
+      if (securityScanBlocked(ownerId)) continue;
       const inFlight = db.find(
         "securityScans",
         (s) => s.repoId === repo.id && (s.status === "queued" || s.status === "running")

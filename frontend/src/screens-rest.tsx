@@ -663,14 +663,14 @@ export const PLANS = [
   tagline: "For developers shipping private code",
   price: "$15", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
   annual: { price: "$144", unit: "USD / year", original: "$180", note: "$12/mo · billed annually" },
-  features: ["Auto-reviews your own PRs", "Comment \"review\" to review any other PR", "Private + public repositories", "Frontier model", "50 PR reviews / month", "Linear sync"],
+  features: ["Auto-reviews your own PRs", "Comment \"review\" to review any other PR", "Private + public repositories", "Frontier model", "50 PR reviews / month", "Security audits + merge gate", "Linear sync"],
 },
 {
   id: "max", name: "Max", icon: "brain",
   tagline: "For teams reviewing at scale",
   price: "$45", unit: "USD / month", reassure: "14-day free trial · cancel anytime",
   annual: { price: "$432", unit: "USD / year", original: "$540", note: "$36/mo · billed annually" },
-  features: ["Auto-reviews every PR opened in your GitHub org", "Private + public repositories", "Frontier model", "Unlimited PR reviews", "Linear sync"],
+  features: ["Auto-reviews every PR opened in your GitHub org", "Private + public repositories", "Frontier model", "Unlimited PR reviews", "Security audits + merge gate", "Linear sync"],
 }];
 
 const planLabel = (p) => (p === "max" ? "Max" : p === "pro" ? "Pro" : "Free");

@@ -202,7 +202,7 @@ export type SubscriptionView = {
   annualAvailable: boolean; // whether the annual option is configured
   reviewsUsed: number;
   reviewLimit: number | null; // null = unlimited (Max)
-  features: { privateRepos: boolean; linear: boolean };
+  features: { privateRepos: boolean; linear: boolean; securityScans: boolean };
 };
 
 export type Installation = {
@@ -623,6 +623,9 @@ export type SecurityOverview = {
   repos: SecurityRepoView[];
   scans: SecurityScanSummary[];
   findings: SecurityFinding[];
+  // Security audits are Pro/Max. Reads stay open on Free (and on a lapsed paid
+  // sub) so existing findings remain visible; every mutation is refused.
+  locked: boolean;
 };
 
 // --- Endpoints ---

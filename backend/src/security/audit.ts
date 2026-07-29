@@ -4,6 +4,7 @@
 // collection. Inventory-first and cache-driven: the repo index supplies both
 // the file inventory and the per-blob securityFlags gate, and a file whose
 // securityScannedSha already matches its blob sha costs nothing.
+import { securityScanBlocked } from "../billing/plans.js";
 import { db } from "../db.js";
 import { currentUsage, withUsage } from "../llm.js";
 import { track } from "../statsig.js";
@@ -71,6 +72,16 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
     // so the run doesn't wedge in "queued".
     patchRun(run.id, { status: "completed", startedAt: Date.now(), finishedAt: Date.now() });
     logLine(run.id, "skipped — no installation token (dev mode)");
+    return;
+  }
+
+  // Plan gate. Every enqueue path (manual, merge webhook, nightly sweep) funnels
+  // through here, so this is the one place that has to hold — the callers gate
+  // too, but only to avoid creating no-op run rows. Complete as a no-op rather
+  // than error out so the row can never wedge in "queued".
+  if (securityScanBlocked(install.userId)) {
+    patchRun(run.id, { status: "completed", startedAt: Date.now(), finishedAt: Date.now() });
+    logLine(run.id, "skipped — security audits are a Pro/Max feature");
     return;
   }
 
