@@ -305,3 +305,73 @@ test("clean pass: no trailing prose recap or stray '---' divider after the met-c
   assert.match(body.trimEnd(), /<\/details>$/);
   assert.doesNotMatch(body, EMOJI);
 });
+
+// ─── Defect findings ────────────────────────────────────────────────────────
+// The defect section is the one that can fail an otherwise-passing PR, so these
+// pin that it renders its own section (not folded into Repo-wide concerns), that
+// the failure scenario survives to the reader, and — the subtle one — that the
+// spec-less "no blocking bugs surfaced" copy can't print above a list of bugs.
+
+const defect = (over: Record<string, unknown> = {}) => ({
+  path: "backend/src/pay.ts",
+  defectClass: "unhandled-error",
+  concern: "The catch block swallows the provider error and returns a success response.",
+  failureScenario:
+    "A 500 from the payment provider is reported to the caller as a completed charge; the order ships unpaid.",
+  severity: "blocker" as const,
+  fixPrompt: "Fix: rethrow the provider error\n\nFile: backend/src/pay.ts",
+  ...over,
+});
+
+test("defects: own section with the bug class, the failure scenario, and a blocking count", () => {
+  const holistic = { ...EMPTY_HOLISTIC, defects: [defect()] };
+  const body = formatReviewBody(
+    "Charge the card on checkout.",
+    [crit({ met: true, evidence: "ok" })],
+    [],
+    holistic,
+    { prTitle: "Add checkout", repoFullName: "devasign/app" }
+  );
+  assert.match(body, /### Bugs and correctness issues/);
+  assert.match(body, /1 of these blocks the merge/);
+  assert.match(body, /\*\*Blocker\*\* — `backend\/src\/pay\.ts` — `unhandled-error`/);
+  assert.match(body, /\*\*How it fails:\*\* A 500 from the payment provider/);
+  // Its own section — not folded into the introduced-findings block.
+  assert.doesNotMatch(body, /### Repo-wide concerns/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("defects: a warn-only set says nothing blocks the merge", () => {
+  const holistic = { ...EMPTY_HOLISTIC, defects: [defect({ severity: "warn" as const })] };
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [], holistic, {
+    prTitle: "PR",
+    repoFullName: "devasign/app",
+  });
+  assert.match(body, /None of these block the merge/);
+  assert.match(body, /^- Warn — /m);
+});
+
+test("defects ride the consolidated one-paste fix prompt", () => {
+  const holistic = { ...EMPTY_HOLISTIC, defects: [defect()] };
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [], holistic, {
+    prTitle: "Add checkout",
+    repoFullName: "devasign/app",
+  });
+  assert.match(body, /One prompt to fix all of this/);
+  assert.match(body, /Fix: rethrow the provider error/);
+});
+
+test("spec-less PR with defects: does NOT claim no bugs surfaced", () => {
+  const holistic = { ...EMPTY_HOLISTIC, defects: [defect()] };
+  const body = formatReviewBody("", [], [], holistic, {
+    prTitle: "Add checkout",
+    repoFullName: "devasign/app",
+  });
+  assert.doesNotMatch(body, /No blocking bugs, regressions, or security concerns surfaced/);
+  assert.match(body, /### Bugs and correctness issues/);
+});
+
+test("defects: section omitted entirely when the pass found nothing", () => {
+  const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [], EMPTY_HOLISTIC);
+  assert.doesNotMatch(body, /### Bugs and correctness issues/);
+});

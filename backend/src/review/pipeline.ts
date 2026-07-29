@@ -32,6 +32,7 @@ import {
 } from "./devasign.js";
 import type { Bounty, Criterion, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, SecurityFinding, SecuritySeverity, Task, User, Vulnerability } from "../types.js";
 import { normalizeSeverity, severityToLegacy } from "../security/severity.js";
+import { normalizeSlug } from "../security/fingerprint.js";
 import { ACTIVE_STATES as SECURITY_ACTIVE_STATES } from "../security/policy.js";
 import { publishGateForPR } from "../security/gate.js";
 import { resolveBountyForPR } from "../bounties/prlink.js";
@@ -81,6 +82,11 @@ type FindingCategory =
   | "regression"
   | "criticalError"
   | "security"
+  // A correctness/robustness bug the diff introduces, independent of whether
+  // any acceptance criterion covers it (reviewDiffDefects). Blocker-severity
+  // defects gate the merge — a PR whose every criterion is met can still be
+  // wrong, and that was the gap this category exists to close.
+  | "defect"
   // A vulnerability that already exists in a file this PR touches or depends on
   // (surfaced from the repo index's security audit). Advisory — the PR didn't
   // introduce it, so it never gates the merge.
@@ -100,12 +106,21 @@ type FindingCategory =
 function emitFindingLog(
   reviewId: string,
   category: Exclude<FindingCategory, "suggestion">,
-  finding: { path?: string; concern: string; severity: "blocker" | "warn" | "nit"; securitySeverity?: SecuritySeverity; fixPrompt?: string }
+  finding: {
+    path?: string;
+    concern: string;
+    severity: "blocker" | "warn" | "nit";
+    securitySeverity?: SecuritySeverity;
+    fixPrompt?: string;
+    defectClass?: string;
+    failureScenario?: string;
+  }
 ) {
   const titleByCategory: Record<typeof category, string> = {
     regression: "Possible regression",
     criticalError: "Critical error",
     security: "Security finding",
+    defect: "Bug / correctness issue",
     preexistingSecurity: "Pre-existing security issue",
     commitIntent: "New-commit review",
     consistency: "Consistency deviation",
@@ -122,6 +137,8 @@ function emitFindingLog(
       ...(finding.path ? { path: finding.path } : {}),
       title: titleByCategory[category],
       body: finding.concern,
+      ...(finding.defectClass ? { defectClass: finding.defectClass } : {}),
+      ...(finding.failureScenario ? { failureScenario: finding.failureScenario } : {}),
       ...(finding.fixPrompt ? { fixPrompt: finding.fixPrompt } : {}),
     },
   });
@@ -644,15 +661,64 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       };
     }
 
+    // c.1c General defect review. The one stage that asks "is this code correct?"
+    // rather than "does it do what was promised" — every other stage judges the
+    // diff against something the PR claimed. Runs on EVERY review with a diff,
+    // NOT gated on the repo index: a PR landing before the index walk finishes
+    // would otherwise get zero bug detection, which is the gap this closes.
+    // Index summaries sharpen it when present but aren't required. Findings the
+    // holistic pass already reported are dropped so nothing double-counts in the
+    // gate or the comment.
+    if (!wf.stages.defects) {
+      log(review.id, "holistic", DEFECT_STAGE_DISABLED);
+    } else if (context.diff) {
+      const { defects: rawDefects, summary: defectSummary } = await reviewDiffDefects({
+        review,
+        diff: context.diff,
+        touched: touchedEntries,
+        endGoal: endGoal || "",
+        criteria: filledCriteria,
+        extraInstructions: wf.prompts?.defects,
+      });
+      const defects = dedupeAndCapFindings(rawDefects, DEFECT_FINDING_CAP, [
+        ...holisticVerdict.regressions,
+        ...holisticVerdict.criticalErrors,
+        ...holisticVerdict.securityFindings,
+      ]);
+      holisticVerdict = { ...holisticVerdict, defects };
+      for (const f of defects) emitFindingLog(review.id, "defect", f);
+      const defectBlockers = defects.filter((f) => f.severity === "blocker").length;
+      log(
+        review.id,
+        "holistic",
+        defectBlockers
+          ? `Defect review found ${defectBlockers} blocking bug(s)`
+          : defects.length
+          ? `Defect review found ${defects.length} issue(s)`
+          : "Defect review clean",
+        {
+          detail:
+            defectSummary ||
+            (defects.length
+              ? "Correctness or robustness bugs in the changed code — see findings."
+              : "No correctness or robustness bugs surfaced in the changed code."),
+          meta: { defects: defects.length, blockers: defectBlockers },
+        }
+      );
+    }
+
     // Merge gate: only a blocker-severity finding the DIFF introduces (regression,
-    // critical error, or introduced security vuln) flips the verdict. Pre-existing
-    // vulns are deliberately excluded. hasSecurityBlocker is tracked separately so
-    // verdict routing can hold REQUEST_CHANGES firm even in advisory mode.
+    // critical error, introduced security vuln, or correctness defect) flips the
+    // verdict. Pre-existing vulns are deliberately excluded. hasSecurityBlocker is
+    // tracked separately so verdict routing can hold REQUEST_CHANGES firm even in
+    // advisory mode — defects deliberately do NOT get that treatment, so a repo on
+    // advisory verdicts still only gets a COMMENT for them.
     const hasSecurityBlocker = holisticVerdict.securityFindings.some((f) => f.severity === "blocker");
     const hasBlocker = [
       ...holisticVerdict.regressions,
       ...holisticVerdict.criticalErrors,
       ...holisticVerdict.securityFindings,
+      ...holisticVerdict.defects,
     ].some((f) => f.severity === "blocker");
     // Per-criterion suggestions land as findings too — same UI affordance, so
     // a user with one unmet criterion gets a copyable prompt to fix it.
@@ -983,6 +1049,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
           holisticVerdict.criticalErrors.length +
           holisticVerdict.securityFindings.length,
         holistic_blockers: hasBlocker,
+        defects: holisticVerdict.defects.length,
+        defect_blockers: holisticVerdict.defects.filter((f) => f.severity === "blocker").length,
         deferrals: holisticVerdict.deferrals.length,
         convention_nits: holisticVerdict.conventionFindings.length,
         doc_drift: holisticVerdict.docDriftFindings.length,
@@ -2246,8 +2314,13 @@ export function formatReviewBody(
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
+  // Defects count here too — otherwise the spec-less "no blocking bugs surfaced"
+  // copy below would print directly above a list of bugs.
   const holisticItemCount =
-    holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
+    holistic.regressions.length +
+    holistic.criticalErrors.length +
+    holistic.securityFindings.length +
+    holistic.defects.length;
   if (specless) {
     // The outcome header is supplied by verdictCommentBody, which embeds this
     // body beneath it — so we lead with just the explanatory paragraph to avoid
@@ -2382,6 +2455,25 @@ export function formatReviewBody(
       appendHolisticGroup(lines, "Intent check", holistic.commitIntentFindings);
       lines.push("");
     }
+  }
+
+  // Correctness/robustness bugs in the changed code, independent of the criteria.
+  // Placed directly under the criteria verdict because this is the section that
+  // can fail an otherwise-passing PR: a diff can satisfy every requirement and
+  // still be wrong. Each finding states the concrete failure it produces, and
+  // blocker-severity ones gate the merge.
+  if (holistic.defects.length) {
+    const blocking = holistic.defects.filter((f) => f.severity === "blocker").length;
+    lines.push("### Bugs and correctness issues");
+    lines.push(
+      "Found by reviewing the changed code for correctness, independent of the acceptance criteria" +
+        (blocking
+          ? `. ${blocking} of these block${blocking === 1 ? "s" : ""} the merge:`
+          : ". None of these block the merge:"),
+      ""
+    );
+    appendDefectGroup(lines, holistic.defects);
+    lines.push("");
   }
 
   // Self-admitted deferred / incomplete work the diff's own comments concede.
@@ -2554,6 +2646,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   key:
     | "regressions"
     | "criticalErrors"
+    | "defects"
     | "securityFindings"
     | "preexistingVulns"
     | "commitIntentFindings"
@@ -2565,6 +2658,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
 }> = [
   { key: "regressions", label: "Regression" },
   { key: "criticalErrors", label: "Critical error" },
+  { key: "defects", label: "Bug" },
   // Introduced security findings keep their fixPrompt in the consolidated
   // copy-paste prompt (they gate approval; the developer needs the fix in one
   // paste). PRE-EXISTING findings are deliberately absent — their detail lives
@@ -2690,6 +2784,26 @@ function buildConsolidatedFixPrompt(args: {
   lines.push("## Your task");
   lines.push("Work through every item above — the failed acceptance criteria and each review finding. For each one: understand the gap from \"What's wrong now\", implement the change so the Required behavior holds (each fix block's `Expected behavior` describes the target state), and use the `Relevant diff` hunks as the anchor for where to edit. After each change, re-verify it resolves the item. Treat **Blocker**-tagged items as required (they block approval); address the rest too.");
   return lines.join("\n").trimEnd();
+}
+
+// Defect findings render like holistic ones but carry two extra fields the
+// generic renderer has no slot for: the bug class (as a leading tag) and the
+// failure scenario (the thing that makes a finding actionable rather than an
+// assertion). Kept separate rather than branching inside appendHolisticGroup so
+// every other caller's output is byte-identical to before.
+function appendDefectGroup(lines: string[], findings: HolisticFinding[]) {
+  if (!findings.length) return;
+  for (const f of findings) {
+    const sev =
+      f.severity === "blocker" ? "**Blocker**" : f.severity === "nit" ? "Nit" : "Warn";
+    const where = f.path ? `\`${f.path}\` — ` : "";
+    const cls = f.defectClass ? `\`${f.defectClass}\` — ` : "";
+    lines.push(`- ${sev} — ${where}${cls}${f.concern}`);
+    if (f.failureScenario) {
+      lines.push(`  - **How it fails:** ${f.failureScenario}`);
+    }
+    appendFixPrompt(lines, f.fixPrompt, /* indented */ true);
+  }
 }
 
 function appendHolisticGroup(
@@ -4112,7 +4226,7 @@ function tryParseJSON<T>(raw: string, fallback: T): T {
 // acceptance-criteria check; a blocker-severity finding flips status to
 // changes_requested even when every criterion is otherwise met.
 
-type HolisticFinding = {
+export type HolisticFinding = {
   path?: string;
   concern: string;
   // "nit" sits below "warn": purely advisory DEVASIGN.md findings that never
@@ -4124,6 +4238,16 @@ type HolisticFinding = {
   // everything else → "warn") so every renderer and the verdict gate keep
   // working — and "blocker gates" now means exactly "critical gates".
   securitySeverity?: SecuritySeverity;
+  // Defect pass only (reviewDiffDefects): taxonomy tag for the bug class —
+  // "null-deref", "unhandled-error", "race-condition", "resource-leak",
+  // "api-misuse", "data-loss", etc. Display only; nothing branches on it.
+  defectClass?: string;
+  // Defect pass only: concrete inputs/state -> the wrong outcome that follows.
+  // REQUIRED by that pass — normaliseDefectFindings DROPS any finding without
+  // one, mirroring the security agent's "no 3-step exploit narrative, no
+  // finding" rule (security/agent.ts). A model that can't say what actually
+  // goes wrong is speculating, and speculation must not gate a merge.
+  failureScenario?: string;
   // Self-contained prompt the user can paste into an external AI coding agent
   // to land the fix. Includes the relevant diff hunk inline.
   fixPrompt?: string;
@@ -4133,6 +4257,13 @@ type HolisticVerdict = {
   regressions: HolisticFinding[];
   criticalErrors: HolisticFinding[];
   securityFindings: HolisticFinding[];
+  // General correctness/robustness bugs the diff introduces (reviewDiffDefects).
+  // Runs on EVERY review, independent of the repo index and of whether the PR
+  // has acceptance criteria — the criteria pass only judges what was asked for,
+  // and a diff that satisfies every requirement can still be wrong. Gating:
+  // blocker-severity defects feed hasBlocker exactly like regressions and
+  // criticalErrors do (and so respect the repo's advisory-verdict mode).
+  defects: HolisticFinding[];
   // Legacy advisory bucket for codebase-consistency deviations. No pass
   // currently populates it (the former spec-less pass was removed); kept so the
   // verdict shape and its renderers stay stable. Always empty today.
@@ -4174,6 +4305,7 @@ export const EMPTY_HOLISTIC: HolisticVerdict = {
   regressions: [],
   criticalErrors: [],
   securityFindings: [],
+  defects: [],
   consistencyFindings: [],
   deferrals: [],
   conventionFindings: [],
@@ -4394,6 +4526,131 @@ async function reviewDiffSecurity(args: {
   const parsed = tryParseJSON<{ securityFindings?: unknown; summary?: unknown }>(raw, {});
   return {
     securityFindings: normaliseSecurityFindings(parsed.securityFindings),
+    summary: String(parsed.summary || ""),
+  };
+}
+
+// ─── General defect review ─────────────────────────────────────────────────
+//
+// The gap this closes: every other stage judges the diff against something the
+// PR promised. reviewDiff scores acceptance criteria, reviewAgainstRepo asks
+// "does this break what already worked", reviewDiffSecurity hunts vulns. None
+// of them asks the plain question — is this code correct? A PR can satisfy
+// every criterion and still ship an inverted condition, a swallowed exception,
+// an unawaited write, or a destructive migration.
+//
+// Runs on EVERY review with a non-empty diff. Deliberately NOT gated on the
+// repo index (unlike reviewAgainstRepo, which is skipped entirely until the
+// index walk finishes): index summaries sharpen the pass when present but a
+// diff-only defect review is valid, and a PR that lands mid-walk must not
+// silently get zero bug detection. Same argument the security backstop makes.
+//
+// Precision is bought in code, not just in the prompt: every finding must carry
+// a concrete `failureScenario` or normaliseDefectFindings drops it. That matters
+// because blocker-severity defects gate the merge.
+const DEFECT_DIFF_CAP = 120_000;
+
+// Log action emitted when a maintainer has switched the stage off, mirroring
+// the holistic stage's "disabled by workflow" row. Exported so the offline
+// workflow test can assert on the exact string.
+export const DEFECT_STAGE_DISABLED = "Bug detection disabled by workflow";
+
+async function reviewDiffDefects(args: {
+  review: PRReview;
+  diff: string;
+  touched: RepoIndexEntry[];
+  endGoal: string;
+  criteria: Criterion[];
+  extraInstructions?: string;
+}): Promise<{ defects: HolisticFinding[]; summary: string }> {
+  const { touched } = args;
+  const system = withMaintainerInstructions(
+    "You are DevAsign's defect review step. Read the PR diff and find bugs the changed code actually contains. " +
+    "You are NOT checking whether the PR implements what it promised — a separate stage owns that, and its verdict " +
+    "is already decided. Your only question is whether the code that IS here is correct.\n\n" +
+    "Look for these classes of defect:\n" +
+    "- Logic: inverted conditions, wrong operator or comparison, off-by-one, the wrong variable used, a branch that " +
+    "is unreachable or always taken.\n" +
+    "- Null / undefined / optional: dereferencing a value that can be absent without a guard, a non-null assertion on " +
+    "a maybe-value, a default that silently masks a real absence.\n" +
+    "- Error handling: a swallowed exception, an unhandled rejection, an error path that leaves state half-written, a " +
+    "missing rollback or compensating action.\n" +
+    "- Async: an unawaited or floating promise, work that returns before the write it depends on lands, sequential " +
+    "awaits where the code needs parallelism (or parallel where it needs ordering), cleanup skipped on the error path.\n" +
+    "- Concurrency and shared state: time-of-check/time-of-use gaps, read-modify-write on shared or persisted state, a " +
+    "retry that is not idempotent, mutation of state another caller holds.\n" +
+    "- Resource lifecycle: an unclosed handle, connection, subscription, interval, or listener; a leak on the error path.\n" +
+    "- API and library misuse: arguments in the wrong order, a misread return contract (ignoring a falsy-vs-absent " +
+    "distinction, treating a rejected promise as a value), an unsafe or deprecated call.\n" +
+    "- Data integrity: a destructive or irreversible migration, a lossy conversion, an unbounded delete or update, a " +
+    "write missing its owner/tenant scope, money handled in floating point.\n" +
+    "- Boundaries: empty collection, zero, negative, very large input, unicode, timezone or DST, rounding.\n\n" +
+    "NON-NEGOTIABLE RULES:\n" +
+    "1. Report only what is verifiable in the diff and the file summaries provided. Never infer a defect from a " +
+    "filename or a framework convention. Cite the code you are talking about.\n" +
+    "2. If you cannot state a concrete failure scenario — specific inputs or state, and the wrong outcome that " +
+    "follows — it is NOT a defect. Drop it. `failureScenario` is required on every finding.\n" +
+    "3. The behavior may already be correct because of code outside this diff. When a finding rests on an assumption " +
+    'about code you cannot see, name that assumption in `concern` and use severity "warn" — never "blocker".\n' +
+    "4. Do NOT report a missing feature, an unimplemented requirement, or anything the acceptance criteria cover. " +
+    "Report only code that is present and wrong.\n" +
+    "5. Do NOT report security vulnerabilities. A separate stage owns those.\n" +
+    "6. Style, naming, formatting, file structure, test coverage, and taste are out of scope.\n" +
+    "7. Prefer under-reporting with high precision. An empty array is a good answer for a clean diff — never pad.\n\n" +
+    'Emit ONLY JSON: {"defects": [{"path": string, "line": number?, "defectClass": string, "concern": string, ' +
+    '"failureScenario": string, "severity": "blocker"|"warn"|"nit", "fixPrompt": string}], "summary": string}. ' +
+    '`defectClass` is a short kebab-case taxonomy tag ("null-deref", "unhandled-error", "race-condition", ' +
+    '"resource-leak", "api-misuse", "off-by-one", "data-loss", ...). ' +
+    '`concern` is 2-4 sentences: what the code does and why that is wrong. ' +
+    "`failureScenario` is 1-3 sentences naming concrete inputs or state and the incorrect result they produce. " +
+    'Severity: "blocker" = clearly produces wrong results, corrupts or loses data, crashes, or hangs on a realistic ' +
+    'path; "warn" = a real defect on a narrower path, or one resting on an assumption about unseen code; "nit" = ' +
+    "real but trivial. " +
+    "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
+    "Use this exact template:\n" +
+    "Fix: <one-line summary>\n\n" +
+    "File: <path or 'n/a'>\n" +
+    "Symbol: <function/class/component name, or 'n/a'>\n\n" +
+    "Issue:\n<2-3 sentence description of the defect and the failure it causes>\n\n" +
+    "Expected behavior:\n<1-2 sentences: the correct behavior once fixed>\n\n" +
+    "Suggested approach:\n<concrete steps to fix>\n\n" +
+    "Relevant diff:\n```diff\n<the exact hunk this finding refers to, copied verbatim from the PR diff>\n```\n" +
+    "Quote the hunk verbatim — never invent code that isn't in the diff. Omit the 'Relevant diff' section only when " +
+    "the finding doesn't map to a hunk. Never use emoji in any text you output.", args.extraInstructions);
+
+  const truncated = args.diff.length > DEFECT_DIFF_CAP;
+  const diffBlock = truncated
+    ? `${args.diff.slice(0, DEFECT_DIFF_CAP)}\n\n[diff truncated — later hunks are not shown]`
+    : args.diff;
+  const touchedBlock = touched
+    .map((e) =>
+      `### ${e.path}\n` +
+      `Exports: ${e.exports.join(", ") || "(none)"}\n` +
+      `Summary: ${e.summary}`
+    )
+    .join("\n\n");
+  // The criteria go in as READ-ONLY context. Without them the pass re-reports
+  // "this doesn't do X" as a bug; with them plus rule 4 it knows that ground is
+  // already covered and confines itself to code that is present and wrong.
+  const criteriaBlock = args.criteria.length
+    ? args.criteria.map((c) => `- ${c.id}: ${c.text}`).join("\n")
+    : "(none — this PR has no acceptance criteria)";
+
+  const userText =
+    `# Diff\n\`\`\`diff\n${diffBlock}\n\`\`\`\n\n` +
+    `# Touched files (repo index summaries)\n${touchedBlock || "(none indexed)"}\n\n` +
+    `# End goal (context only — do not score this)\n${args.endGoal || "(none)"}\n\n` +
+    `# Acceptance criteria (context only — another stage scores these; do not report them as defects)\n${criteriaBlock}`;
+
+  const raw = await complete({
+    system,
+    cacheSystem: true,
+    messages: [{ role: "user", content: userText }],
+    maxTokens: 4000,
+  });
+  const parsed = tryParseJSON<{ defects?: unknown; summary?: unknown }>(raw, {});
+  return {
+    defects: normaliseDefectFindings(parsed.defects),
     summary: String(parsed.summary || ""),
   };
 }
@@ -4624,14 +4881,30 @@ async function reverifyTouchedPreexistingVulns(args: {
   return partitioned;
 }
 
-// Dedupe HolisticFindings by path+concern and cap the count. Merges the
-// re-verified touched-file vulns with the index-driven dependent-file vulns,
-// reproducing the dedupe+cap collectPreexistingVulns applies to a single source.
-function dedupeAndCapFindings(findings: HolisticFinding[], cap: number): HolisticFinding[] {
+// Wording-tolerant identity for a finding: same file, same substance. Two
+// passes that spot the same bug phrase it differently ("returns before the
+// write lands" vs "Returns before the write lands."), so raw string equality
+// under-dedupes. normalizeSlug drops case and punctuation; the prefix keeps a
+// shared opening clause from collapsing genuinely different findings.
+function findingKey(f: Pick<HolisticFinding, "path" | "concern">): string {
+  return `${normalizeSlug(f.path ?? "")}::${normalizeSlug(f.concern).slice(0, 80)}`;
+}
+
+// Dedupe HolisticFindings by normalized path+concern and cap the count. Two
+// callers: merging the re-verified touched-file vulns with the index-driven
+// dependent-file ones (reproducing collectPreexistingVulns' single-source
+// dedupe+cap), and dropping defect-pass findings the holistic pass already
+// reported. `against` seeds the seen-set with findings that are already being
+// rendered elsewhere, so the returned list only contains what's genuinely new.
+export function dedupeAndCapFindings(
+  findings: HolisticFinding[],
+  cap: number,
+  against: HolisticFinding[] = []
+): HolisticFinding[] {
   const out: HolisticFinding[] = [];
-  const seen = new Set<string>();
+  const seen = new Set<string>(against.map(findingKey));
   for (const f of findings) {
-    const key = `${f.path ?? ""}::${f.concern}`;
+    const key = findingKey(f);
     if (seen.has(key)) continue;
     seen.add(key);
     out.push(f);
@@ -4888,6 +5161,55 @@ function normaliseFindings(input: unknown): HolisticFinding[] {
       ...(typeof path === "string" && path ? { path } : {}),
       ...(typeof fixPrompt === "string" && fixPrompt ? { fixPrompt } : {}),
     });
+  }
+  return out;
+}
+
+// Caps on the defect pass's free-text fields, mirroring the clamping
+// buildFindingRows applies to security findings — one verbose finding must not
+// be able to blow up a PR comment or a log row.
+const DEFECT_CONCERN_CAP = 1200;
+const DEFECT_SCENARIO_CAP = 800;
+const DEFECT_FIX_PROMPT_CAP = 6000;
+const DEFECT_CLASS_CAP = 60;
+export const DEFECT_FINDING_CAP = 12;
+
+// Normalize the defect pass's output. Unlike its sibling normalisers this one
+// is a FILTER, not just a coercer: a finding with no concrete `failureScenario`
+// is DROPPED rather than downgraded. That is the precision gate — the same
+// trick security/agent.ts uses when it drops findings without a 3-step exploit
+// narrative — and it is what makes it safe for a blocker here to stop a merge.
+// Unrecognized severities fall back to "warn", never "blocker", so a garbled
+// response can't gate. Exported for offline testing.
+export function normaliseDefectFindings(input: unknown): HolisticFinding[] {
+  if (!Array.isArray(input)) return [];
+  const out: HolisticFinding[] = [];
+  for (const item of input) {
+    if (!item || typeof item !== "object") continue;
+    const concern = String((item as any).concern || "").trim();
+    if (!concern) continue;
+    // The gate: no concrete failure scenario means the model is speculating.
+    const failureScenario = String((item as any).failureScenario || "").trim();
+    if (!failureScenario) continue;
+    const rawSev = (item as any).severity;
+    const severity: HolisticFinding["severity"] =
+      rawSev === "blocker" ? "blocker" : rawSev === "nit" ? "nit" : "warn";
+    const path = (item as any).path;
+    const fixPrompt = (item as any).fixPrompt;
+    const defectClass = (item as any).defectClass;
+    out.push({
+      concern: concern.slice(0, DEFECT_CONCERN_CAP),
+      failureScenario: failureScenario.slice(0, DEFECT_SCENARIO_CAP),
+      severity,
+      ...(typeof path === "string" && path ? { path: path.slice(0, 400) } : {}),
+      ...(typeof defectClass === "string" && defectClass.trim()
+        ? { defectClass: defectClass.trim().slice(0, DEFECT_CLASS_CAP) }
+        : {}),
+      ...(typeof fixPrompt === "string" && fixPrompt
+        ? { fixPrompt: fixPrompt.slice(0, DEFECT_FIX_PROMPT_CAP) }
+        : {}),
+    });
+    if (out.length >= DEFECT_FINDING_CAP) break;
   }
   return out;
 }

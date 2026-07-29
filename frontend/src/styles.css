@@ -3498,8 +3498,28 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   color: var(--fg-mute);
 }
 .finding-path { font-size: 11px; }
+/* Defect findings only: the bug-class tag and the concrete failure scenario.
+   The scenario is set apart from the concern because it's the part a reader
+   checks to decide whether the finding is real. */
+.finding-class {
+  font-size: 10px;
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+}
 .finding-title { font-size: 13px; color: var(--fg); font-weight: 500; }
 .finding-body { color: var(--fg-dim); white-space: pre-wrap; }
+.finding-scenario {
+  border-left: 2px solid var(--line-2);
+  padding-left: 8px;
+  color: var(--fg-mute);
+}
+.finding-scenario .lbl {
+  font-size: 10px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  margin-right: 6px;
+}
 
 /* Copy-prompt block — fenced, monospace, single-click clipboard. */
 .copy-prompt-block {

@@ -70,6 +70,7 @@ export type RepoWorkflow = {
   };
   stages: {
     holistic: boolean;  // whole-repo review against the index
+    defects: boolean;   // general correctness/robustness bug hunt on the diff
     docs: boolean;      // DEVASIGN.md conventions + doc-drift check
     deferrals: boolean; // self-admitted deferred/incomplete-work scan
   };
@@ -82,6 +83,7 @@ export type RepoWorkflow = {
     criteria?: string;  // criteria synthesis
     review?: string;    // diff vs. criteria review
     holistic?: string;  // whole-repo review
+    defects?: string;   // general defect review
     deferrals?: string; // deferred-work scan
     docs?: string;      // DEVASIGN.md guidance
   };

@@ -483,6 +483,7 @@ const CopyPromptBlock = ({ prompt }) => {
 const FINDING_LABEL = {
   regression: "Regression",
   criticalError: "Critical error",
+  defect: "Bug / correctness issue",
   security: "Security finding",
   preexistingSecurity: "Pre-existing security",
   commitIntent: "New-commit review",
@@ -541,6 +542,9 @@ const TimelineFor = ({ events, runningStageIdx }) =>
                     <i className="dot"></i> {e.finding.severity === "blocker" ? "Blocker" : e.finding.severity === "nit" ? "Nit" : "Warn"}
                   </span>
                   <span className="finding-cat">{FINDING_LABEL[e.finding.category] || "Finding"}</span>
+                  {e.finding.defectClass && (
+                    <span className="mono mute finding-class">{e.finding.defectClass}</span>
+                  )}
                   {e.finding.path && (
                     <span className="mono mute finding-path">{e.finding.path}</span>
                   )}
@@ -549,6 +553,13 @@ const TimelineFor = ({ events, runningStageIdx }) =>
                   <div className="finding-title">{e.finding.title}</div>
                 )}
                 <div className="finding-body">{e.finding.body}</div>
+                {/* The failure scenario is what makes a defect actionable rather
+                    than an assertion — the backend drops any finding without one. */}
+                {e.finding.failureScenario && (
+                  <div className="finding-scenario">
+                    <span className="lbl">How it fails</span> {e.finding.failureScenario}
+                  </div>
+                )}
                 {e.finding.fixPrompt && <CopyPromptBlock prompt={e.finding.fixPrompt} />}
               </div>
           }
@@ -1256,6 +1267,11 @@ function mapLogEntry(entry) {
         path: typeof entry.meta?.path === "string" ? entry.meta.path : undefined,
         title: typeof entry.meta?.title === "string" ? entry.meta.title : entry.action,
         body: typeof entry.meta?.body === "string" ? entry.meta.body : (entry.detail || ""),
+        // Defect findings only — absent on every other category.
+        defectClass:
+          typeof entry.meta?.defectClass === "string" ? entry.meta.defectClass : undefined,
+        failureScenario:
+          typeof entry.meta?.failureScenario === "string" ? entry.meta.failureScenario : undefined,
         fixPrompt: typeof entry.meta?.fixPrompt === "string" ? entry.meta.fixPrompt : undefined,
       }
     : undefined;

@@ -10,7 +10,7 @@ import type { Repository, RepoWorkflow } from "../types.js";
 
 // The stages that make an LLM call and can therefore carry maintainer
 // instructions. Shared by normalize/effective/advancedChanged and the pipeline.
-export const PROMPT_KEYS = ["criteria", "review", "holistic", "deferrals", "docs"] as const;
+export const PROMPT_KEYS = ["criteria", "review", "holistic", "defects", "deferrals", "docs"] as const;
 // Cap a single stage prompt so a pasted essay can't blow up the system prompt.
 const PROMPT_CAP = 2000;
 // Cap the stored workflow file name for the "Run GitHub Action" step.
@@ -18,10 +18,16 @@ const WORKFLOW_NAME_CAP = 200;
 
 // Defaults reproduce DevAsign's behavior before workflows existed, so any repo
 // whose `workflow` is undefined (every existing repo) reviews exactly as before.
+//
+// One exception, deliberate: `defects` defaults to true, which DOES change how
+// existing repos review. The general defect pass exists because criteria-only
+// review lets a PR that satisfies every requirement ship a real bug — shipping
+// it default-off would leave that gap open for every repo that never visits the
+// Workflow screen. Maintainers can turn it off there.
 export const WORKFLOW_DEFAULTS: RepoWorkflow = {
   version: 1,
   trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-  stages: { holistic: true, docs: true, deferrals: true },
+  stages: { holistic: true, defects: true, docs: true, deferrals: true },
   verdict: { blocking: true },
   prompts: {},
   actions: { enabled: false, workflow: "", runWhen: "passed" },
@@ -78,6 +84,7 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
     },
     stages: {
       holistic: b(s.holistic, WORKFLOW_DEFAULTS.stages.holistic),
+      defects: b(s.defects, WORKFLOW_DEFAULTS.stages.defects),
       docs: b(s.docs, WORKFLOW_DEFAULTS.stages.docs),
       deferrals: b(s.deferrals, WORKFLOW_DEFAULTS.stages.deferrals),
     },
