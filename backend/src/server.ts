@@ -408,8 +408,9 @@ function backfillRepoIndex() {
 
 // Nightly security sweep (policy-driven, off by default). Checked hourly: a
 // repo whose policy enables `nightly` and whose last completed audit is >24h
-// old gets a full-scope audit. Cheap in steady state — the per-blob
-// securityScannedSha cache means an unchanged repo scans nothing.
+// old gets a full-scope audit. Full means full: it bypasses the per-blob
+// securityScannedSha cache, so a nightly re-scans every eligible file (bounded
+// by the audit's MAX_FILES_PER_RUN cap), not just the ones that changed.
 function startNightlySecuritySweep() {
   const HOUR = 60 * 60 * 1000;
   const tick = () => {

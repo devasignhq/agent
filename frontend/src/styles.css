@@ -5681,7 +5681,16 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
    — so every column shares one axis line and both halves scale off the same
    peak. The stacks fill the panel height, so the chart grows with the card. */
 .vln-mg-body { display: flex; flex-direction: column; gap: 0; flex: 1; min-height: 0; }
-.vln-mg { display: flex; gap: clamp(4px, 1%, 12px); flex: 1; min-height: 0; min-width: 0; }
+/* position: relative anchors the flat-series caption over the plot. */
+.vln-mg { display: flex; gap: clamp(4px, 1%, 12px); flex: 1; min-height: 0; min-width: 0; position: relative; }
+/* Every column flat. Sits where the bars would have been so the panel reads as
+   "nothing changed" rather than "nothing loaded". pointer-events: none keeps
+   the per-column hover readout reachable underneath it. */
+.vln-mg-flat {
+  position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+  text-align: center; font-size: 11px; color: var(--fg-faint);
+  padding: 0 8px; pointer-events: none;
+}
 .vln-mg-y {
   /* Scales with the card so the plot keeps its room when the panel narrows. */
   width: clamp(42px, 7%, 74px); flex-shrink: 0; position: relative;
@@ -5709,6 +5718,16 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .vln-mg-col.now .vln-mg-x { color: var(--accent); }
 .vln-mg-col.running .vln-mg-x { color: var(--accent); opacity: .7; }
+/* A run that never scanned (plan-gated, no install, index not built). A hatched
+   stub at the axis — not a full-height wash, which would out-shout the real
+   bars — so it can't be mistaken for a scan that ran and found nothing. */
+.vln-mg-col.skipped .vln-mg-up::after {
+  content: ""; width: 100%; height: 18px; flex-shrink: 0;
+  background: repeating-linear-gradient(
+    45deg, transparent, transparent 3px, var(--line-2) 3px, var(--line-2) 4px
+  );
+}
+.vln-mg-col.skipped .vln-mg-x { color: var(--fg-faint); opacity: .6; }
 /* Introduced grows up from the axis; segments are emitted critical-first and
    justify-end stacks them so critical ends up on top. */
 .vln-mg-up { display: flex; flex-direction: column; justify-content: flex-end; gap: 1px; min-height: 0; }

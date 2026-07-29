@@ -2,15 +2,25 @@
 // manual / nightly triggers), scans the security-relevant slice of the repo
 // with the audit agent, and reconciles the results into the securityFindings
 // collection. Inventory-first and cache-driven: the repo index supplies both
-// the file inventory and the per-blob securityFlags gate, and a file whose
-// securityScannedSha already matches its blob sha costs nothing.
+// the file inventory and the per-blob securityFlags gate, and on a differential
+// run a file this engine already scanned at its current blob sha costs nothing.
+// A full run (manual re-scan, nightly, first-ever audit) deliberately ignores
+// that cache — "re-scan" has to mean re-scan.
 import { securityScanBlocked } from "../billing/plans.js";
 import { db } from "../db.js";
 import { currentUsage, withUsage } from "../llm.js";
 import { track } from "../statsig.js";
 import { fetchBlob } from "../review/indexer.js";
 import type { SecurityAuditJobPayload } from "../queue.js";
-import type { Installation, RepoIndexEntry, Repository, SecurityScanRun, SecuritySeverity, User } from "../types.js";
+import type {
+  Installation,
+  RepoIndexEntry,
+  RepoSecurityPolicy,
+  Repository,
+  SecurityScanRun,
+  SecuritySeverity,
+  User,
+} from "../types.js";
 import { AUDIT_MODEL, scanFile } from "./agent.js";
 import { classifySurface } from "./fingerprint.js";
 import { effectiveSecurityPolicy, isActiveState } from "./policy.js";
@@ -20,6 +30,11 @@ import { publishGateForRepo } from "./gate.js";
 const CONCURRENCY = 4;
 const MAX_FILES_PER_RUN = 500;
 const LOG_CAP = 300;
+
+// Which engine a `securityScannedSha` stamp came from. Bump this when a change
+// to the audit agent makes prior results stale: every file is then owed exactly
+// one re-scan, after which the cache is warm again.
+export const SECURITY_ENGINE = "audit-v1";
 
 // Append one terminal-log line to the run row. Each append is a db.update, so
 // the SSE fan-out (live.ts) streams the log to any open gate view.
@@ -34,6 +49,42 @@ function logLine(runId: string, line: string): void {
 
 function patchRun(runId: string, patch: Partial<SecurityScanRun>): void {
   db.update("securityScans", (r) => r.id === runId, patch);
+}
+
+// Inventory gate: a file is a candidate when its engine is enabled AND it
+// either carries securityFlags (the summariser marked it sensitive) or sits on
+// a surface whose risk is structural (deps manifests, infra).
+//
+// The blob cache only applies to differential runs, and only to stamps this
+// engine wrote. Both halves matter: a full run has to be able to re-scan a file
+// it already scanned, and the pre-audit-agent indexer stamped securityScannedSha
+// on every file it indexed — so without the engine check a repo indexed before
+// the audit agent shipped would take 100% cache hits forever and every run would
+// persist introduced/resolved = 0.
+//
+// Pure and exported so the gate can be unit-tested without GitHub or the LLM.
+export function selectCandidates(args: {
+  entries: RepoIndexEntry[];
+  policy: RepoSecurityPolicy;
+  scopePaths: Set<string> | null;
+  full: boolean;
+}): { candidates: RepoIndexEntry[]; cacheHits: number } {
+  const { entries, policy, scopePaths, full } = args;
+  const candidates: RepoIndexEntry[] = [];
+  let cacheHits = 0;
+  for (const e of entries) {
+    if (scopePaths && !scopePaths.has(e.path)) continue;
+    const surface = classifySurface(e.path);
+    if (!policy.engines[surface]) continue;
+    const flagged = (e.securityFlags?.length ?? 0) > 0;
+    if (!flagged && surface !== "deps" && surface !== "infra") continue;
+    if (!full && e.securityScannedSha === e.sha && e.securityEngine === SECURITY_ENGINE) {
+      cacheHits++;
+      continue;
+    }
+    candidates.push(e);
+  }
+  return { candidates, cacheHits };
 }
 
 function analyticsUser(userId: string | undefined): User | string | null {
@@ -63,14 +114,26 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
   const run = db.find("securityScans", (r) => r.id === payload.scanRunId);
   if (!repo || !run) {
     console.warn(`[security] audit skipped — missing ${!repo ? "repo" : "scan run"}`);
-    if (run) patchRun(run.id, { status: "errored", error: "repo_not_found", finishedAt: Date.now() });
+    if (run) {
+      patchRun(run.id, {
+        status: "errored",
+        error: "repo_not_found",
+        skipped: "repo_not_found",
+        finishedAt: Date.now(),
+      });
+    }
     return;
   }
   const install = db.find("installations", (i) => i.id === repo.installationId);
   if (!install) {
     // Dev / unattached repo: no token to fetch blobs with. Complete as a no-op
     // so the run doesn't wedge in "queued".
-    patchRun(run.id, { status: "completed", startedAt: Date.now(), finishedAt: Date.now() });
+    patchRun(run.id, {
+      status: "completed",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      skipped: "no_install",
+    });
     logLine(run.id, "skipped — no installation token (dev mode)");
     return;
   }
@@ -80,7 +143,12 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
   // too, but only to avoid creating no-op run rows. Complete as a no-op rather
   // than error out so the row can never wedge in "queued".
   if (securityScanBlocked(install.userId)) {
-    patchRun(run.id, { status: "completed", startedAt: Date.now(), finishedAt: Date.now() });
+    patchRun(run.id, {
+      status: "completed",
+      startedAt: Date.now(),
+      finishedAt: Date.now(),
+      skipped: "plan_locked",
+    });
     logLine(run.id, "skipped — security audits are a Pro/Max feature");
     return;
   }
@@ -119,6 +187,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         patchRun(run.id, {
           status: "completed",
           finishedAt: Date.now(),
+          skipped: "index_not_built",
           stillOpen: db.filter(
             "securityFindings",
             (f) => f.repoId === repo.id && isActiveState(f.state)
@@ -137,23 +206,12 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         ]);
       }
 
-      // Inventory gate: a file is a candidate when its engine is enabled AND it
-      // either carries securityFlags (the summariser marked it sensitive) or
-      // sits on a surface whose risk is structural (deps manifests, infra).
-      const candidates: RepoIndexEntry[] = [];
-      let cacheHits = 0;
-      for (const e of allEntries) {
-        if (scopePaths && !scopePaths.has(e.path)) continue;
-        const surface = classifySurface(e.path);
-        if (!policy.engines[surface]) continue;
-        const flagged = (e.securityFlags?.length ?? 0) > 0;
-        if (!flagged && surface !== "deps" && surface !== "infra") continue;
-        if (e.securityScannedSha === e.sha) {
-          cacheHits++;
-          continue;
-        }
-        candidates.push(e);
-      }
+      const { candidates, cacheHits } = selectCandidates({
+        entries: allEntries,
+        policy,
+        scopePaths,
+        full,
+      });
 
       const capped = candidates.slice(0, MAX_FILES_PER_RUN);
       if (candidates.length > capped.length) {
@@ -214,7 +272,10 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         const result = reconcileFile({ existing, detected: kept, ctx });
         for (const row of result.insert) db.insert("securityFindings", row);
         for (const u of result.update) db.update("securityFindings", (f) => f.id === u.id, u.patch);
-        db.update("repoIndex", (e) => e.id === entry.id, { securityScannedSha: entry.sha });
+        db.update("repoIndex", (e) => e.id === entry.id, {
+          securityScannedSha: entry.sha,
+          securityEngine: SECURITY_ENGINE,
+        });
         filesScanned++;
         introduced += result.introduced;
         for (const row of result.insert) {

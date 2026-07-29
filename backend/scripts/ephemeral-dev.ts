@@ -262,7 +262,9 @@ for (const [path, flags] of [
     exports: [],
     imports: [],
     securityFlags: flags,
-    securityScannedSha: `sha-${path.length}`, // already audited at this blob
+    securityScannedSha: `sha-${path.length}`, // already audited at this blob…
+    securityEngine: "audit-v1", // …by THIS engine — a bare sha is a legacy stamp
+
     indexedAt: now - HOUR,
     model: "mock",
   });
@@ -464,6 +466,30 @@ for (let i = 0; i < SPLITS.length; i++) {
     resolved: [0, 2, 1, 0, 4, 1, 2, 3, 1, 5, 2][i],
   });
 }
+// The two kinds of bar-less column, which the chart has to tell apart: a scan
+// that ran and found no change, and one that never ran at all. Seeded because
+// they look identical without the tooltip/hatch — which is how an audit that
+// silently scanned nothing read as a working chart full of empty columns.
+seedScan({
+  trigger: "manual",
+  prNumber: null,
+  startedAt: now - 6 * HOUR,
+  finishedAt: now - 6 * HOUR + 9_000,
+  filesScanned: 3,
+  stillOpen: 5,
+});
+seedScan({
+  trigger: "nightly",
+  full: true,
+  prNumber: null,
+  startedAt: now - 4 * HOUR,
+  finishedAt: now - 4 * HOUR,
+  filesScanned: 0,
+  cacheHits: 0,
+  skipped: "plan_locked",
+  stillOpen: 5,
+  log: [{ at: now - 4 * HOUR, line: "skipped — security audits are a Pro/Max feature" }],
+});
 seedScan({
   prNumber: 487,
   prTitle: "Add instant payout rail",
