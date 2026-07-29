@@ -582,6 +582,9 @@ export type SecurityScanSummary = {
   introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
   resolved: number;
   stillOpen: number;
+  // Set when the run completed without scanning anything (no install token,
+  // plan-gated, index not built) — lets the chart say why a column is flat.
+  skipped?: "no_install" | "plan_locked" | "index_not_built" | "repo_not_found";
   error?: string | null;
   costUsd?: number;
 };

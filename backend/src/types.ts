@@ -198,6 +198,11 @@ export type RepoIndexEntry = {
   // legacy row (or a flagged file not yet scanned at this sha) is recognized as
   // owing a scan even on a summary cache hit. Absent until first scanned.
   securityScannedSha?: string;
+  // Which engine wrote securityScannedSha. The pre-audit-agent indexer stamped
+  // securityScannedSha on EVERY file it indexed, scanned or not, so that stamp
+  // alone can't be trusted as "the audit agent has seen this blob" — an absent
+  // securityEngine means exactly that, and the file is owed one audit.
+  securityEngine?: string;
   indexedAt: number;
   model: string;             // model that produced this entry
 };
@@ -287,6 +292,12 @@ export type SecurityFinding = {
 
 export type SecurityScanTrigger = "merge" | "manual" | "nightly";
 export type SecurityScanStatus = "queued" | "running" | "completed" | "errored";
+// Machine-readable reason a run was a no-op — the log line's counterpart.
+export type SecurityScanSkipReason =
+  | "no_install"       // dev / unattached repo: no token to fetch blobs with
+  | "plan_locked"      // owner isn't on Pro/Max
+  | "index_not_built"  // repo index empty — nothing to scan, nothing to resolve
+  | "repo_not_found";
 
 export type SecurityScanRun = {
   id: string;
@@ -311,6 +322,10 @@ export type SecurityScanRun = {
   introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
   resolved: number;          // findings auto-resolved by this run
   stillOpen: number;         // active findings after the run
+  // Why this run completed without scanning anything. Set on the no-op early
+  // returns so the dashboard chart can render "skipped" distinctly from a run
+  // that scanned and legitimately found no change.
+  skipped?: SecurityScanSkipReason;
   error?: string | null;
   costUsd?: number;
   log: Array<{ at: number; line: string }>; // terminal log, capped at 300 lines

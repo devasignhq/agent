@@ -36,12 +36,14 @@ import {
   displayId,
   filterFindings,
   isOpenState,
+  mergeDeltaAllZero,
   mergeDeltaPeak,
   mergeDeltaSeries,
   overallGate,
   severityRank,
   SEVERITIES,
   similarFindings,
+  SKIP_REASON_LABEL,
   slaLabel,
   sortFindings,
   STATE_LABEL,
@@ -400,7 +402,9 @@ const PageHead = ({
     try {
       for (const r of targets) {
         try {
-          await api.startSecurityScan(r.id);
+          // Full: a manual re-scan bypasses the per-blob cache, so "Re-scan"
+          // re-audits every eligible file rather than only changed ones.
+          await api.startSecurityScan(r.id, true);
         } catch (err) {
           // A 409 just means a run is already in flight for that repo.
           if (!(err instanceof ApiError && err.status === 409)) throw err;
@@ -572,6 +576,9 @@ const Dashboard = ({
   const gate = overallGate(repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter));
 
   const peak = mergeDeltaPeak(series);
+  // Every column flat. Legitimate in steady state, so caption it — a bare grid
+  // of empty columns is indistinguishable from a chart that failed to load.
+  const flatSeries = mergeDeltaAllZero(series);
 
   // Never audited: no scans have ever run and there are no findings on record.
   // Show the first-run empty state instead of a dashboard full of zeros. This
@@ -700,11 +707,19 @@ const Dashboard = ({
                     {series.map((c, i) => (
                       <div
                         key={i}
-                        className={`vln-mg-col ${c.now ? "now" : ""} ${c.running ? "running" : ""}`}
+                        className={`vln-mg-col ${c.now ? "now" : ""} ${c.running ? "running" : ""} ${
+                          c.skipped ? "skipped" : ""
+                        }`}
                       >
                         <div className="vln-mg-tip">
                           <b>{c.label}</b>
-                          {c.segments.length === 0 && c.resolved === 0 && <span>nothing this scan</span>}
+                          {/* A skipped run never scanned; a flat one scanned and
+                              found no change. Both draw no bars — say which. */}
+                          {c.skipped ? (
+                            <span>{SKIP_REASON_LABEL[c.skipped]}</span>
+                          ) : (
+                            c.noop && <span>nothing this scan</span>
+                          )}
                           {c.segments.map((seg) => (
                             <span key={seg.severity}>
                               <i className={`sev-${seg.severity}`} />
@@ -742,6 +757,15 @@ const Dashboard = ({
                       </div>
                     ))}
                   </div>
+                  {flatSeries && (
+                    <div className="vln-mg-flat">
+                      {series.every((c) => c.skipped)
+                        ? "No scan in this window actually ran — hover a column for the reason."
+                        : `No findings introduced or resolved in the last ${series.length} scan${
+                            series.length === 1 ? "" : "s"
+                          }.`}
+                    </div>
+                  )}
                 </div>
                 <div className="vln-mg-legend">
                   {SEVERITIES.map((sev) => (

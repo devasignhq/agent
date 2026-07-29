@@ -12,6 +12,7 @@ import {
   computeStats,
   displayId,
   filterFindings,
+  mergeDeltaAllZero,
   mergeDeltaPeak,
   mergeDeltaSeries,
   overallGate,
@@ -157,6 +158,41 @@ test("mergeDeltaPeak: the taller side of the axis wins, and never returns 0", ()
   assert.equal(mergeDeltaPeak(mergeDeltaSeries([scan({ introduced: 2, resolved: 7 })], "r1", 12)), 7);
   assert.equal(mergeDeltaPeak(mergeDeltaSeries([scan({ introduced: 9, resolved: 1 })], "r1", 12)), 9);
   assert.equal(mergeDeltaPeak([]), 1);
+});
+
+// A column with no bars is ambiguous on its own — these flags are what let the
+// chart say "nothing changed" instead of rendering a silent blank.
+test("mergeDeltaSeries: flags flat columns and carries the skip reason", () => {
+  const out = mergeDeltaSeries(
+    [
+      scan({ introduced: 0, resolved: 0, startedAt: NOW - 2 * DAY }),
+      scan({ introduced: 0, resolved: 0, skipped: "plan_locked", startedAt: NOW - DAY }),
+      scan({ introduced: 3, resolved: 0, startedAt: NOW }),
+    ],
+    "r1",
+    12
+  );
+  assert.deepEqual(out.map((c) => c.noop), [true, true, false]);
+  assert.deepEqual(out.map((c) => c.skipped), [undefined, "plan_locked", undefined]);
+});
+
+test("mergeDeltaAllZero: true only when every column is flat", () => {
+  const flat = mergeDeltaSeries(
+    [scan({ introduced: 0, resolved: 0 }), scan({ introduced: 0, resolved: 0 })],
+    "r1",
+    12
+  );
+  assert.equal(mergeDeltaAllZero(flat), true);
+  // One resolved finding is still activity — the chart has something to draw.
+  assert.equal(
+    mergeDeltaAllZero(
+      mergeDeltaSeries([scan({ introduced: 0, resolved: 0 }), scan({ introduced: 0, resolved: 1 })], "r1", 12)
+    ),
+    false
+  );
+  // No scans at all is the pre-existing "no completed scans yet" empty state,
+  // not a flat chart — don't caption it.
+  assert.equal(mergeDeltaAllZero([]), false);
 });
 
 test("surfaceBreakdown counts open findings per surface with severity split", () => {

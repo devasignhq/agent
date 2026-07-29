@@ -149,6 +149,23 @@ export type MergeDeltaCol = {
   resolved: number;
   running: boolean;
   now: boolean;       // the most recent column — highlighted in the chart
+  // Nothing introduced and nothing resolved: the column draws no bars, so the
+  // chart has to say why rather than render a silent blank.
+  noop: boolean;
+  // Set when the run never scanned at all (plan-gated, no install token, index
+  // not built) — a different kind of flat from "scanned, nothing changed".
+  skipped?: SecurityScanSummary["skipped"];
+};
+
+// Why a run scanned nothing, in the tooltip's words.
+export const SKIP_REASON_LABEL: Record<
+  NonNullable<SecurityScanSummary["skipped"]>,
+  string
+> = {
+  no_install: "skipped — no GitHub installation",
+  plan_locked: "skipped — audits are a Pro/Max feature",
+  index_not_built: "skipped — repo index not built yet",
+  repo_not_found: "failed — repository not found",
 };
 
 // Last `limit` scan runs (any trigger), oldest → newest, as chart columns.
@@ -181,6 +198,8 @@ export function mergeDeltaSeries(
       resolved: s.resolved,
       running: s.status === "running",
       now: i === rows.length - 1,
+      noop: s.introduced === 0 && s.resolved === 0,
+      ...(s.skipped ? { skipped: s.skipped } : {}),
     };
   });
 }
@@ -189,6 +208,12 @@ export function mergeDeltaSeries(
 // Never 0 — callers divide by it.
 export function mergeDeltaPeak(cols: MergeDeltaCol[]): number {
   return Math.max(1, ...cols.map((c) => Math.max(c.introduced, c.resolved)));
+}
+
+// Every column flat. A legitimate steady state, but indistinguishable from a
+// broken pipeline unless the chart says so — so the panel captions itself.
+export function mergeDeltaAllZero(cols: MergeDeltaCol[]): boolean {
+  return cols.length > 0 && cols.every((c) => c.noop);
 }
 
 // ── attack-surface breakdown ────────────────────────────────────────────────

@@ -344,10 +344,11 @@ async function summariseAndUpsert(
 
   const language = path.split(".").pop()?.toLowerCase() || "";
   // Security scanning is the audit agent's job now: it keys off the
-  // securityFlags written here and stamps securityScannedSha itself. Prior
-  // legacy vulnerabilities (and any prior securityScannedSha, which no longer
-  // matches the new blob sha and so marks the file as owing an audit) survive
-  // via db.update's merge semantics on the update path.
+  // securityFlags written here and stamps securityScannedSha + securityEngine
+  // itself. Prior legacy vulnerabilities (and any prior stamp) survive via
+  // db.update's merge semantics on the update path — a legacy securityScannedSha
+  // carries no securityEngine, so the audit correctly treats the file as owed
+  // even when its blob sha is unchanged.
   const row: RepoIndexEntry = {
     id: prior?.id || uuid(),
     repoId: repo.id,
