@@ -375,3 +375,75 @@ test("defects: section omitted entirely when the pass found nothing", () => {
   const body = formatReviewBody("Some goal.", [crit({ met: true, evidence: "ok" })], [], EMPTY_HOLISTIC);
   assert.doesNotMatch(body, /### Bugs and correctness issues/);
 });
+
+// ── Structured evidence/patch rendering (upgraded prompt contract) ───────────
+
+test("unmet criterion with structured suggestedChange renders a before/after diff block", () => {
+  const c = crit({
+    evidence: "The label is still 'Submit'.",
+    suggestedChange: {
+      path: "src/handler.ts",
+      startLine: 52,
+      original: "<button>Submit</button>",
+      suggested: "<button>Send for review</button>",
+    },
+  });
+  const body = formatReviewBody("Goal.", [c], []);
+  assert.match(body, /\*\*Suggested change\*\* \(`src\/handler\.ts:52`\):/);
+  assert.match(body, /```diff/);
+  assert.match(body, /^-<button>Submit<\/button>$/m);
+  assert.match(body, /^\+<button>Send for review<\/button>$/m);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("criterion evidenceCode renders with its file anchor and language fence", () => {
+  const c = crit({
+    evidence: "Guard added.",
+    evidenceCode: {
+      path: "src/handler.ts",
+      startLine: 40,
+      language: "typescript",
+      code: "if (!items?.length) return { items: [] };",
+    },
+  });
+  const body = formatReviewBody("Goal.", [c], []);
+  assert.match(body, /\*\*Evidence\*\* \(`src\/handler\.ts:40`\):/);
+  assert.match(body, /```typescript/);
+  assert.match(body, /if \(!items\?\.length\) return \{ items: \[\] \};/);
+});
+
+test("a suggestion patch identical to the criterion's is rendered once, not twice", () => {
+  const patch = {
+    path: "src/handler.ts",
+    startLine: 52,
+    original: "<button>Submit</button>",
+    suggested: "<button>Send for review</button>",
+  };
+  const c = crit({ evidence: "e", suggestedChange: patch });
+  const body = formatReviewBody("Goal.", [c], [
+    { criterionId: "C1", title: "Rename", rationale: "r", severity: "warn", patch },
+  ]);
+  const occurrences = body.split("**Suggested change**").length - 1;
+  assert.equal(occurrences, 1, "identical criterion+suggestion patch must render once");
+});
+
+test("legacy criteria without the new fields render exactly as before (no new blocks)", () => {
+  const body = formatReviewBody("Goal.", [crit({ evidence: "old row" })], []);
+  assert.doesNotMatch(body, /\*\*Suggested change\*\*/);
+  assert.doesNotMatch(body, /\*\*Evidence\*\* \(/);
+});
+
+test("patch with backtick runs still fences safely", () => {
+  const c = crit({
+    evidence: "e",
+    suggestedChange: {
+      path: "README.md",
+      startLine: 1,
+      original: "``` old fence",
+      suggested: "```` new fence",
+    },
+  });
+  const body = formatReviewBody("Goal.", [c], []);
+  // The wrapping fence must be longer than the longest inner run (4) — 5+.
+  assert.match(body, /`{5,}diff/);
+});

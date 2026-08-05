@@ -249,7 +249,7 @@ export type Repository = {
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
 // `stages` is BASIC (free); `trigger`, `verdict`, `prompts` + `actions` are
 // ADVANCED (Pro/Max).
-export type StagePromptKey = "criteria" | "review" | "holistic" | "defects" | "deferrals" | "docs";
+export type StagePromptKey = "criteria" | "review" | "holistic" | "security" | "defects" | "deferrals" | "docs";
 export type RepoWorkflow = {
   version: 1;
   trigger: { onSynchronize: boolean; skipDrafts: boolean; skipBots: boolean };

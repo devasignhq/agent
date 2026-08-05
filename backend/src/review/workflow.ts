@@ -10,7 +10,7 @@ import type { Repository, RepoWorkflow } from "../types.js";
 
 // The stages that make an LLM call and can therefore carry maintainer
 // instructions. Shared by normalize/effective/advancedChanged and the pipeline.
-export const PROMPT_KEYS = ["criteria", "review", "holistic", "defects", "deferrals", "docs"] as const;
+export const PROMPT_KEYS = ["criteria", "review", "holistic", "security", "defects", "deferrals", "docs"] as const;
 // Cap a single stage prompt so a pasted essay can't blow up the system prompt.
 const PROMPT_CAP = 2000;
 // Cap the stored workflow file name for the "Run GitHub Action" step.
