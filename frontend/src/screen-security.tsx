@@ -52,6 +52,12 @@ import {
   SURFACE_META,
   type FilterChip,
 } from "./security-findings.ts";
+import {
+  defaultSelection,
+  scanningRepoIds,
+  scanProgressLabel,
+  summarizeRescan,
+} from "./security-rescan.ts";
 
 // ─── tiny shared pieces ───────────────────────────────────────────────────────
 
@@ -202,8 +208,9 @@ export const SecurityPage = ({
   useLiveTopic("security", () => void refresh());
 
   // Backstop poll while a scan is queued/running (mirrors the settling-txn poll
-  // on the Bounties page) — the SSE stream is the primary signal.
-  const scanning = overview?.scans.some((s) => s.status === "queued" || s.status === "running");
+  // on the Bounties page) — the SSE stream is the primary signal. Derived from
+  // the same helper the picker uses so the two can't disagree about who's busy.
+  const scanning = scanningRepoIds(overview?.scans ?? []).size > 0;
   React.useEffect(() => {
     if (!scanning) return;
     const t = setInterval(() => void refresh(), 5_000);
@@ -408,40 +415,13 @@ const PageHead = ({
   refresh: () => Promise<void>;
   subNav: React.ReactNode;
 }) => {
-  const [scanBusy, setScanBusy] = React.useState(false);
-  const [scanErr, setScanErr] = React.useState<string | null>(null);
-  const scanning = overview.scans.some((s) => s.status === "queued" || s.status === "running");
-  const targets =
-    repoFilter === "all" ? overview.repos : overview.repos.filter((r) => r.id === repoFilter);
-
-  const rescan = async () => {
-    setScanBusy(true);
-    setScanErr(null);
-    try {
-      for (const r of targets) {
-        try {
-          // Full: a manual re-scan bypasses the per-blob cache, so "Re-scan"
-          // re-audits every eligible file rather than only changed ones.
-          await api.startSecurityScan(r.id, true);
-        } catch (err) {
-          // A 409 just means a run is already in flight for that repo.
-          if (!(err instanceof ApiError && err.status === 409)) throw err;
-        }
-      }
-      await refresh();
-    } catch (err) {
-      // The plan backstop — reachable if the sub lapses between load and click.
-      setScanErr(
-        err instanceof ApiError && err.status === 403
-          ? "Security audits are a Pro/Max feature."
-          : err instanceof Error
-          ? err.message
-          : String(err)
-      );
-    } finally {
-      setScanBusy(false);
-    }
-  };
+  const [picking, setPicking] = React.useState(false);
+  // Outcome of the last re-scan ("queued for 4 repositories · 1 already
+  // scanning"). Failures never reach here — the picker keeps them inline so the
+  // user can retry without re-picking.
+  const [notice, setNotice] = React.useState<string | null>(null);
+  const scanning = scanningRepoIds(overview.scans);
+  const progress = scanProgressLabel(overview.repos, scanning);
 
   const branches = [...new Set(overview.repos.map((r) => r.defaultBranch))].join(", ");
   return (
@@ -460,6 +440,14 @@ const PageHead = ({
               </>
             )}
           </div>
+          {/* Scan progress lives here, not on the button — the button is a
+              control, and letting it double as a status readout is what made it
+              read "Scanning…" forever when a run was left stranded. */}
+          {progress && (
+            <div className="page-sub vln-scanning">
+              <span className="vln-scanning-dot" /> {progress}
+            </div>
+          )}
         </div>
         <div className="page-actions">
           {/* The gate/policy subpages select their repo with the left rail, so
@@ -479,25 +467,197 @@ const PageHead = ({
               ))}
             </select>
           )}
-          {/* Re-scan lives on the findings dashboard only; the gate/policy
+          {/* Rescan lives on the findings dashboard only; the gate/policy
               subpages are for reviewing and configuring, not triggering scans.
-              On a locked plan it gives way to the upgrade CTA. */}
+              On a locked plan it gives way to the upgrade CTA.
+
+              The label is constant and the button is always live: which repos
+              can actually be scanned is a per-repo question, answered in the
+              picker, not a reason to disable the way in. */}
           {overview.locked ? (
             <button className="btn primary" onClick={goUpgrade}>
               <Icon name="lock" size={12} /> Upgrade to Pro
             </button>
           ) : (
             view === "dashboard" && (
-              <button className="btn primary" disabled={scanBusy || scanning} onClick={() => void rescan()}>
-                <Icon name="play" size={12} /> {scanning ? "Scanning…" : scanBusy ? "Queuing…" : "Re-scan"}
+              <button className="btn primary" onClick={() => setPicking(true)}>
+                <Icon name="play" size={12} /> Rescan
               </button>
             )
           )}
         </div>
       </div>
       {subNav}
-      {scanErr && <div className="tu-notice" style={{ marginBottom: 12 }}>{scanErr}</div>}
+      {notice && (
+        <div className="tu-notice" style={{ marginBottom: 12, color: "var(--fg-dim)" }}>
+          {notice}
+        </div>
+      )}
+      {picking && (
+        <RescanModal
+          repos={overview.repos}
+          scanning={scanning}
+          repoFilter={repoFilter}
+          onClose={() => setPicking(false)}
+          onDone={setNotice}
+          refresh={refresh}
+        />
+      )}
     </>
+  );
+};
+
+// ─── rescan picker ────────────────────────────────────────────────────────────
+
+// "Which repositories?" — the popup behind the Rescan button. Any subset of the
+// repos the app is installed for, defaulting to the dashboard's current filter.
+//
+// A repo with a run already in flight is shown with a `scanning` badge and its
+// checkbox disabled, so a second scan for it can't be requested at all (the
+// backend would refuse it anyway, with a 409).
+const RescanModal = ({
+  repos,
+  scanning,
+  repoFilter,
+  onClose,
+  onDone,
+  refresh,
+}: {
+  repos: SecurityRepoView[];
+  scanning: Set<string>;
+  repoFilter: string;
+  onClose: () => void;
+  onDone: (summary: string) => void;
+  refresh: () => Promise<void>;
+}) => {
+  const [selected, setSelected] = React.useState<Set<string>>(() =>
+    defaultSelection(repos, scanning, repoFilter)
+  );
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+
+  const free = repos.filter((r) => !scanning.has(r.id));
+  const allPicked = free.length > 0 && free.every((r) => selected.has(r.id));
+
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  const submit = async () => {
+    setBusy(true);
+    setErr(null);
+    try {
+      // Full: a manual re-scan bypasses the per-blob cache, so it re-audits
+      // every eligible file rather than only the ones that changed.
+      const batch = await api.startSecurityScans([...selected], true);
+      await refresh();
+      onDone(summarizeRescan(batch));
+      onClose();
+    } catch (e) {
+      // The plan backstop — reachable if the sub lapses between load and click.
+      setErr(
+        e instanceof ApiError && e.status === 403
+          ? "Security audits are a Pro/Max feature."
+          : e instanceof Error
+          ? e.message
+          : String(e)
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close">
+          <Icon name="x" size={13} />
+        </button>
+        <div className="cb-modal-head">
+          <div className="cb-eyebrow">Security</div>
+          <h2 className="cb-modal-title">Re-scan repositories</h2>
+          <div className="cb-modal-sub">
+            Pick the repositories to audit — one, several, or all of them. Each runs a full
+            re-scan and refreshes the findings below.
+          </div>
+        </div>
+
+        <label className="vln-pick-row vln-pick-all">
+          <input
+            type="checkbox"
+            checked={allPicked}
+            disabled={free.length === 0}
+            ref={(el) => {
+              // Partial selection reads as neither on nor off.
+              if (el) el.indeterminate = !allPicked && selected.size > 0;
+            }}
+            onChange={() => setSelected(allPicked ? new Set() : new Set(free.map((r) => r.id)))}
+          />
+          <span className="vln-pick-name">All repositories</span>
+          <span className="vln-pick-badge">
+            {repos.length} installed
+          </span>
+        </label>
+
+        <div className="vln-pick-list">
+          {repos.map((r) => {
+            const busyRepo = scanning.has(r.id);
+            return (
+              <label
+                key={r.id}
+                className={`vln-pick-row${busyRepo ? " off" : ""}`}
+                aria-disabled={busyRepo || undefined}
+              >
+                <input
+                  type="checkbox"
+                  checked={selected.has(r.id)}
+                  disabled={busyRepo}
+                  onChange={() => toggle(r.id)}
+                />
+                <span className="vln-pick-name">
+                  <span className="vln-rail-owner">{r.owner}/</span>
+                  {r.name}
+                </span>
+                <span className={`vln-pick-badge${busyRepo ? " on" : ""}`}>
+                  {busyRepo
+                    ? "scanning"
+                    : r.latestScan?.finishedAt
+                    ? `scanned ${ageLabel(r.latestScan.finishedAt, Date.now())} ago`
+                    : "never scanned"}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        {err && (
+          <div className="mono" style={{ fontSize: 12, color: "var(--danger)", padding: "4px 0 0" }}>
+            {err}
+          </div>
+        )}
+
+        <div className="cb-modal-foot">
+          <button className="btn ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn primary" disabled={selected.size === 0 || busy} onClick={() => void submit()}>
+            <Icon name="play" size={12} /> {busy ? "Queuing…" : "Scan"}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 };
 

@@ -41,6 +41,7 @@ import { startBountyLiveSignals } from "./bounties/live.js";
 import { startSecurityLiveSignals } from "./security/live.js";
 import { backfillLegacyVulnerabilities } from "./security/migrate.js";
 import { effectiveSecurityPolicy } from "./security/policy.js";
+import { sweepStaleSecurityScans } from "./security/stale-scans.js";
 import type { SecurityScanRun } from "./types.js";
 import { db, initDb, shutdownDb } from "./db.js";
 import { durabilityBarrier } from "./durability.js";
@@ -327,6 +328,7 @@ startSecurityLiveSignals();
 backfillLegacyVulnerabilities();
 backfillRepoIndex();
 startNightlySecuritySweep();
+startStaleScanReaper();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no
@@ -448,4 +450,16 @@ function startNightlySecuritySweep() {
     }
   };
   setInterval(tick, HOUR);
+}
+
+// Settle scan runs that will never finish. The audit job lives in an in-memory
+// queue, so a redeploy or crash drops the job while its "running" row survives
+// in the DB — and that row then blocks every future scan of the repo (the
+// manual route 409s on it, the nightly sweep skips it, the Security page shows
+// the repo as forever scanning). Boot is the decisive moment: anything still
+// in flight in a freshly started process is orphaned by definition.
+function startStaleScanReaper() {
+  sweepStaleSecurityScans({ boot: true });
+  // Then on a timer, for a worker that dies without taking the process with it.
+  setInterval(() => sweepStaleSecurityScans({ boot: false }), 5 * 60 * 1000);
 }

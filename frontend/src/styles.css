@@ -5949,6 +5949,33 @@ pre.vln-code, .vln-code {
   .vln-rail-item.on { border-left: 0; border-bottom-color: var(--accent); }
 }
 
+/* Rescan picker — the repo checklist inside the modal, plus the in-progress
+   line under the page header that replaced the button's "Scanning…" label. */
+.vln-pick-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--line); }
+.vln-pick-row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 9px 11px;
+  font-family: var(--mono); font-size: 12px; color: var(--fg-dim);
+  cursor: pointer;
+  border-bottom: 1px solid var(--line);
+}
+.vln-pick-list .vln-pick-row:last-child { border-bottom: 0; }
+.vln-pick-row:hover { background: var(--bg-1); }
+.vln-pick-row.off { cursor: not-allowed; color: var(--fg-faint); }
+.vln-pick-row.off:hover { background: transparent; }
+.vln-pick-row input { accent-color: var(--accent); cursor: inherit; }
+.vln-pick-all { border: 1px solid var(--line); border-bottom: 0; background: var(--bg-1); color: var(--fg); }
+.vln-pick-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.vln-pick-badge { flex-shrink: 0; font-size: 11px; color: var(--fg-faint); }
+.vln-pick-badge.on { color: var(--accent); }
+
+.vln-scanning { display: flex; align-items: center; gap: 7px; margin-top: 3px; color: var(--accent); }
+.vln-scanning-dot {
+  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
+  animation: vlnPulse 1.4s ease-in-out infinite;
+}
+@keyframes vlnPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+
 /* merge gate */
 .vln-verdict { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); }
 .vln-verdict.fail { border-color: rgba(255,90,95,.4); border-left: 2px solid var(--danger); background: linear-gradient(90deg, rgba(255,90,95,.09), rgba(255,90,95,0) 60%), var(--bg-1); }
