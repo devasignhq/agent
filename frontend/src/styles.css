@@ -5954,7 +5954,9 @@ pre.vln-code, .vln-code {
 .vln-pick-list { max-height: 320px; overflow-y: auto; border: 1px solid var(--line); }
 .vln-pick-row {
   display: flex; align-items: center; gap: 10px;
-  padding: 9px 11px;
+  /* Horizontal padding matches .cb-modal-head / .cb-modal-foot so the checkbox
+     column lines up with the modal title and the footer buttons. */
+  padding: 9px 24px;
   font-family: var(--mono); font-size: 12px; color: var(--fg-dim);
   cursor: pointer;
   border-bottom: 1px solid var(--line);
@@ -5963,11 +5965,19 @@ pre.vln-code, .vln-code {
 .vln-pick-row:hover { background: var(--bg-1); }
 .vln-pick-row.off { cursor: not-allowed; color: var(--fg-faint); }
 .vln-pick-row.off:hover { background: transparent; }
-.vln-pick-row input { accent-color: var(--accent); cursor: inherit; }
+/* Zero the UA margin so the checkbox edge sits exactly on the 24px gutter the
+   title and footer buttons use, instead of 4px inside it. */
+.vln-pick-row input { accent-color: var(--accent); cursor: inherit; margin: 0; }
 .vln-pick-all { border: 1px solid var(--line); border-bottom: 0; background: var(--bg-1); color: var(--fg); }
 .vln-pick-name { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .vln-pick-badge { flex-shrink: 0; font-size: 11px; color: var(--fg-faint); }
 .vln-pick-badge.on { color: var(--accent); }
+/* Follow the modal head/foot down to the narrow gutter. Lives here, after the
+   .vln-pick-row shorthand above, because the shared 600px block earlier in this
+   file would lose to it on source order. */
+@media (max-width: 600px) {
+  .vln-pick-row { padding-left: 16px; padding-right: 16px; }
+}
 
 .vln-scanning { display: flex; align-items: center; gap: 7px; margin-top: 3px; color: var(--accent); }
 .vln-scanning-dot {
