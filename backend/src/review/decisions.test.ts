@@ -129,4 +129,8 @@ test("withMaintainerInstructions: a prompt is appended after the base, under a h
   assert.ok(out.startsWith(sys), "base prompt must stay first so the offline mock's markers still match");
   assert.ok(out.includes("## Maintainer instructions"));
   assert.ok(out.includes("Focus on error handling."), "trimmed maintainer text is appended");
+  assert.ok(
+    out.includes("<maintainer_instructions>\nFocus on error handling.\n</maintainer_instructions>"),
+    "maintainer text is delimited by XML tags so the model can tell it from prompt structure"
+  );
 });

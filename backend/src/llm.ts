@@ -239,10 +239,41 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       verdict: unmetIds.length ? "changes_requested" : "passed",
       summary:
         "The diff covers the main path, but two acceptance criteria are not yet visibly satisfied. See per-criterion notes.",
+      // First met criterion carries evidenceCode and the first unmet one a
+      // structured suggestedChange, so the new structured-fields path (parser →
+      // merge → renderer → timeline meta) is exercised offline end-to-end.
       criteria: ids.map((id, i) =>
         i < metCount
-          ? { id, met: true, evidence: "src/handler.ts updated to cover the new path." }
-          : { id, met: false, evidence: "Button label still reads 'Submit' instead of 'Send for review'." }
+          ? {
+              id,
+              met: true,
+              evidence: "src/handler.ts updated to cover the new path.",
+              evidenceCode:
+                i === 0
+                  ? {
+                      path: "src/handler.ts",
+                      startLine: 40,
+                      language: "typescript",
+                      code: "if (!items?.length) return { items: [] };",
+                    }
+                  : null,
+              suggestedChange: null,
+            }
+          : {
+              id,
+              met: false,
+              evidence: "Button label still reads 'Submit' instead of 'Send for review'.",
+              evidenceCode: null,
+              suggestedChange:
+                id === unmetIds[0]
+                  ? {
+                      path: "src/handler.ts",
+                      startLine: 52,
+                      original: "<button>Submit</button>",
+                      suggested: "<button>Send for review</button>",
+                    }
+                  : null,
+            }
       ),
       comments: [
         {
@@ -256,6 +287,13 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
           criterionId: unmetIds[0] ?? "3",
           title: "Rename the submit button label",
           rationale: "The ticket specifies 'Send for review' as the user-facing copy; update the JSX label.",
+          severity: "warn",
+          suggestedChange: {
+            path: "src/handler.ts",
+            startLine: 52,
+            original: "<button>Submit</button>",
+            suggested: "<button>Send for review</button>",
+          },
           codeExample: "<button>Send for review</button>",
           fixPrompt:
             "Fix: Rename submit button label to 'Send for review'\n\n" +
@@ -511,8 +549,9 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       deferrals: [
         {
           path: "src/handler.ts",
+          line: 12,
           concern:
-            "Contradicts criterion c1 — the added code defers part of the requested API: " +
+            "Contradicts goal: criterion c1 — the added code defers part of the requested API: " +
             '"// TODO: pagination (limit/offset) deferred to a follow-up PR". The end goal asked for the full query API.',
           fixPrompt:
             "Fix: Implement the deferred pagination params in src/handler.ts\n\n" +
@@ -544,6 +583,7 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({
       regressions: [],
       criticalErrors: [],
+      preexistingVulns: [],
       securityFindings: includeSample
         ? [
             {
@@ -586,6 +626,13 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       defects: [
         {
           path: "src/handler.ts",
+          line: 42,
+          suggestedChange: {
+            path: "src/handler.ts",
+            startLine: 42,
+            original: "  } catch (err) {\n    logger.warn(\"write failed\", err);\n  }",
+            suggested: "  } catch (err) {\n    logger.warn(\"write failed\", err);\n    throw err;\n  }",
+          },
           defectClass: "unhandled-error",
           concern:
             "[mock] The catch block logs the provider error and falls through to the success response, " +

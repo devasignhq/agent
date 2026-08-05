@@ -83,6 +83,7 @@ export type RepoWorkflow = {
     criteria?: string;  // criteria synthesis
     review?: string;    // diff vs. criteria review
     holistic?: string;  // whole-repo review
+    security?: string;  // focused security backstop (falls back to `holistic` when absent)
     defects?: string;   // general defect review
     deferrals?: string; // deferred-work scan
     docs?: string;      // DEVASIGN.md guidance
@@ -422,11 +423,38 @@ export type PRReviewStatus =
   | "changes_requested"
   | "errored";
 
+// A concrete code replacement attached to a finding or an unmet criterion.
+// `original` is the verbatim current text starting at `startLine` (new-file
+// coordinates); `suggested` is the drop-in replacement. Rendered as a
+// before/after diff in the GitHub comment. Additive to stored jsonb — rows
+// written before this existed simply lack the field.
+export type SuggestedChange = {
+  path: string;
+  startLine: number;
+  original: string;
+  suggested: string;
+};
+
+// The decisive code excerpt backing a criterion verdict. `startLine` is the
+// 1-based line in the NEW version of `path`; `language` is a lowercase
+// syntax-highlighting id ("typescript", "python", …) or null when unknown.
+export type EvidenceCode = {
+  path: string;
+  startLine: number;
+  language: string | null;
+  code: string;
+};
+
 export type Criterion = {
   id: string;
   text: string;
   met: boolean | null;
   evidence: string | null;
+  // Optional structured evidence/fix (additive — absent on legacy rows).
+  // evidenceCode backs any verdict tied to specific code; suggestedChange is
+  // attached to UNMET criteria and cleared whenever a dispute flips `met`.
+  evidenceCode?: EvidenceCode | null;
+  suggestedChange?: SuggestedChange | null;
 };
 
 export type PRReview = {
