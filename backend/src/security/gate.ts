@@ -40,7 +40,21 @@ export function computeGateForRepo(repo: Repository, openReviews: PRReview[]): G
   });
 }
 
-function gateOutput(repo: Repository, gate: GateResult): { title: string; summary: string } {
+// Check-run output on a PUBLIC repo is world-readable, so rendering the path,
+// line and title of an UNPATCHED finding has the gate broadcast the very
+// vulnerability it is blocking the fix for. Public repos get the failed-rule
+// counts and a pointer; private repos already share full source with everyone
+// who can read the check, so their output is unchanged. This mirrors the review
+// pipeline's PR comment, which has always kept security detail on the Security
+// page rather than in GitHub-visible output.
+//
+// Exported for gate.test.ts. Callers must pass a GateResult from computeGate:
+// a "fail" verdict is defined there as >= 1 failing required rule, which is what
+// guarantees the summary never opens with a bare newline.
+export function gateOutput(
+  repo: Repository,
+  gate: GateResult
+): { title: string; summary: string } {
   if (gate.verdict === "pass") {
     return {
       title: "Security gate passed",
@@ -49,6 +63,20 @@ function gateOutput(repo: Repository, gate: GateResult): { title: string; summar
         `Details: ${config.webOrigin}/security/gate`,
     };
   }
+  const failedRules = gate.rules.filter((r) => r.required && !r.pass);
+  const counts = failedRules.map((r) => `✗ ${r.label} — ${r.count} found`).join("\n");
+  const link = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/gate`;
+
+  if (!repo.private) {
+    // Conditional: an R2-only failure (an open PR introduces a finding) leaves
+    // blockingFindingIds empty and never had a detail block to withhold, so
+    // claiming redaction there would be false.
+    const withheld = gate.blockingFindingIds.length
+      ? "\n\nFinding details are withheld on public repos to avoid disclosing unpatched issues."
+      : "";
+    return { title: "Security gate blocked", summary: counts + withheld + link };
+  }
+
   const blocking = db
     .filter("securityFindings", (f) => gate.blockingFindingIds.includes(f.id))
     .slice(0, 10);
@@ -56,13 +84,9 @@ function gateOutput(repo: Repository, gate: GateResult): { title: string; summar
     (f) =>
       `- **${f.severity}** ${f.title} (\`${f.path}${f.line ? `:${f.line}` : ""}\`) — ${(f.confidence || "needs_human").replace("_", " ")}`
   );
-  const failedRules = gate.rules.filter((r) => r.required && !r.pass);
   return {
     title: "Security gate blocked",
-    summary:
-      failedRules.map((r) => `✗ ${r.label} — ${r.count} found`).join("\n") +
-      (lines.length ? `\n\n${lines.join("\n")}` : "") +
-      `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/gate`,
+    summary: counts + (lines.length ? `\n\n${lines.join("\n")}` : "") + link,
   };
 }
 
