@@ -22,6 +22,7 @@ import {
   isTransientApiError,
   type GateResult,
   type RepoSecurityPolicy,
+  type SecurityConfidence,
   type SecurityFinding,
   type SecurityOverview,
   type SecurityRepoView,
@@ -60,6 +61,23 @@ const SevPill = ({ sev }: { sev: SecuritySeverity }) => (
     {sev}
   </span>
 );
+
+// Unverified findings are severity-capped by the backend (critical/high
+// require "confirmed"); the chip makes them visually distinct so a human
+// knows verification is the next step. Confirmed findings render no chip.
+const ConfTag = ({ conf }: { conf: SecurityConfidence }) =>
+  !conf || conf === "confirmed" ? null : (
+    <span
+      className="vln-tag conf"
+      title={
+        conf === "probable"
+          ? "Strong evidence, but an assumption is unverified — severity capped at medium"
+          : "Depends on something outside the scanned file — severity capped at medium"
+      }
+    >
+      {conf.replace("_", " ")}
+    </span>
+  );
 
 const StateTag = ({ f }: { f: SecurityFinding }) => {
   const meta = STATE_LABEL[f.state] ?? { label: f.state, tone: "none" as const };
@@ -857,7 +875,9 @@ const Dashboard = ({
               <SevPill sev={f.severity} />
               <span className="vln-fx-id">{displayId(f)}</span>
               <span style={{ minWidth: 0 }}>
-                <span className="vln-fx-t">{f.title}</span>
+                <span className="vln-fx-t">
+                  {f.title} <ConfTag conf={f.confidence} />
+                </span>
                 <span className="vln-fx-l">
                   <u>{f.path}</u>
                   {f.line ? `:${f.line}` : ""}
@@ -1014,6 +1034,7 @@ const FindingDetail = ({
       <div className="vln-dt-head">
         <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
           <SevPill sev={f.severity} />
+          <ConfTag conf={f.confidence} />
           {f.state === "new" && <span className="vln-tag new">new</span>}
           {f.cwe && <span className="vln-tag">{f.cwe}</span>}
           <span className="vln-tag plain">{displayId(f)}</span>

@@ -374,6 +374,10 @@ seedFinding({
   class: "missing-rate-limit",
   cwe: "CWE-307",
   severity: "medium",
+  // Unconfirmed on purpose: a rate limit could live in edge middleware outside
+  // this file. Exercises the confidence chip + the severity cap invariant
+  // (unconfirmed findings never sit above medium).
+  confidence: "needs_human",
   state: "snoozed",
   snoozeUntil: now + 5 * 24 * HOUR,
   title: "No rate limit on OTP verification endpoint",
@@ -386,6 +390,8 @@ seedFinding({
   class: "vulnerable-dependency",
   surface: "deps",
   severity: "medium",
+  // "2 call sites match" is static evidence, not a verified exploit path.
+  confidence: "probable",
   state: "fix_ready",
   stateReason: "Fix verified on PR #489",
   title: "axios 1.6.2 leaks auth header across redirects",

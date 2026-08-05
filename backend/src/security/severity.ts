@@ -38,3 +38,12 @@ export function normalizeConfidence(input: unknown): SecurityConfidence {
   if (s === "probable") return "probable";
   return "needs_human";
 }
+
+// A finding whose confirming condition wasn't verified can't gate or page a
+// human at high urgency: an unverified assumption is by definition the
+// "needs chaining / missing defense-in-depth" tier, so anything short of
+// "confirmed" is capped at medium.
+export function capSeverityByConfidence(sev: SecuritySeverity, conf: SecurityConfidence): SecuritySeverity {
+  if (conf === "confirmed") return sev;
+  return severityRank(sev) < severityRank("medium") ? "medium" : sev;
+}

@@ -4,7 +4,7 @@
 //   node --import tsx/esm --test src/security/severity.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { normalizeConfidence, normalizeSeverity, severityRank, severityToLegacy } from "./severity.js";
+import { capSeverityByConfidence, normalizeConfidence, normalizeSeverity, severityRank, severityToLegacy } from "./severity.js";
 import { normaliseSecurityFindings } from "../review/pipeline.js";
 
 test("normalizeSeverity: 4-tier passthrough, legacy mapping, junk → medium", () => {
@@ -33,6 +33,21 @@ test("normalizeConfidence clamps to the enum with needs_human default", () => {
   assert.equal(normalizeConfidence("confirmed"), "confirmed");
   assert.equal(normalizeConfidence("probable"), "probable");
   assert.equal(normalizeConfidence("definitely"), "needs_human");
+});
+
+test("capSeverityByConfidence: confirmed passes through, anything less caps at medium", () => {
+  // Confirmed findings keep their blast-radius severity.
+  assert.equal(capSeverityByConfidence("critical", "confirmed"), "critical");
+  assert.equal(capSeverityByConfidence("high", "confirmed"), "high");
+  assert.equal(capSeverityByConfidence("low", "confirmed"), "low");
+  // An unverified assumption can't gate at high urgency.
+  assert.equal(capSeverityByConfidence("critical", "probable"), "medium");
+  assert.equal(capSeverityByConfidence("high", "probable"), "medium");
+  assert.equal(capSeverityByConfidence("critical", "needs_human"), "medium");
+  assert.equal(capSeverityByConfidence("high", "needs_human"), "medium");
+  // At or below the cap, severity is untouched.
+  assert.equal(capSeverityByConfidence("medium", "needs_human"), "medium");
+  assert.equal(capSeverityByConfidence("low", "probable"), "low");
 });
 
 test("normaliseSecurityFindings: 4-tier severity derives the legacy field; only critical gates", () => {

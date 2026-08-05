@@ -61,6 +61,33 @@ test("unknown severity/confidence clamp to medium / needs_human", () => {
   assert.equal(out[0].confidence, "needs_human");
 });
 
+test("unconfirmed findings can't be critical/high — severity caps at medium", () => {
+  const out = buildFindingRows(
+    {
+      findings: [
+        item({ severity: "high", confidence: "probable", stable_key: "k1", title: "t1" }),
+        item({ severity: "critical", confidence: "needs_human", stable_key: "k2", title: "t2" }),
+        item({ severity: "high", confidence: "confirmed", stable_key: "k3", title: "t3" }),
+        item({ severity: "low", confidence: "needs_human", stable_key: "k4", title: "t4" }),
+      ],
+    },
+    "api/x.ts"
+  );
+  assert.equal(out[0].severity, "medium"); // probable caps
+  assert.equal(out[1].severity, "medium"); // needs_human caps
+  assert.equal(out[2].severity, "high"); // confirmed keeps blast-radius severity
+  assert.equal(out[3].severity, "low"); // below the cap, untouched
+});
+
+test('"confirmed" without quoted evidence is demoted to needs_human — and capped', () => {
+  const out = buildFindingRows(
+    { findings: [item({ severity: "critical", confidence: "confirmed", evidence: "" })] },
+    "api/x.ts"
+  );
+  assert.equal(out[0].confidence, "needs_human");
+  assert.equal(out[0].severity, "medium");
+});
+
 test("a malformed cwe is dropped, a valid one is uppercased", () => {
   const bad = buildFindingRows({ findings: [item({ cwe: "not-a-cwe" })] }, "api/x.ts");
   assert.equal(bad[0].cwe, undefined);
