@@ -752,21 +752,24 @@ api.get("/repositories/:id/security/scans/:scanId", (req, res) => {
   res.json({ scan });
 });
 
-// Manual re-scan. One in-flight run per repo; the audit drains in the index
-// queue bucket so it never starves PR reviews.
-api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
-  const ctx = ownedRepo(req, res);
-  if (!ctx) return;
-  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
+// Queue one manual audit. One in-flight run per repo — a second request for a
+// repo already scanning is reported as skipped, never duplicated. The audit
+// drains in the index queue bucket so it never starves PR reviews.
+//
+// Shared by the single-repo route and the bulk route below so the in-flight
+// rule and the run row can't drift apart.
+function queueRepoScan(
+  repoId: string,
+  full: boolean
+): { scanRunId: string; skipped?: undefined } | { skipped: "in_progress"; scanRunId: string } {
   const inFlight = db.find(
     "securityScans",
-    (s) => s.repoId === ctx.repo.id && (s.status === "queued" || s.status === "running")
+    (s) => s.repoId === repoId && (s.status === "queued" || s.status === "running")
   );
-  if (inFlight) return void res.status(409).json({ error: "scan_in_progress", scanRunId: inFlight.id });
-  const full = req.body?.full === true;
+  if (inFlight) return { skipped: "in_progress", scanRunId: inFlight.id };
   const run: SecurityScanRun = {
     id: uuid(),
-    repoId: ctx.repo.id,
+    repoId,
     trigger: "manual",
     full,
     status: "queued",
@@ -779,9 +782,54 @@ api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
     log: [],
   };
   db.insert("securityScans", run);
-  enqueueSecurityAudit({ repoId: ctx.repo.id, scanRunId: run.id, trigger: "manual", full });
-  res.json({ ok: true, scanRunId: run.id });
+  enqueueSecurityAudit({ repoId, scanRunId: run.id, trigger: "manual", full });
+  return { scanRunId: run.id };
+}
+
+// Manual re-scan of one repo.
+api.post("/repositories/:id/security/scan", expensiveLimiter, (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
+  const queued = queueRepoScan(ctx.repo.id, req.body?.full === true);
+  if (queued.skipped) {
+    return void res.status(409).json({ error: "scan_in_progress", scanRunId: queued.scanRunId });
+  }
+  res.json({ ok: true, scanRunId: queued.scanRunId });
 });
+
+// Bulk re-scan: the Security page's "Rescan" picker posts the repos the user
+// ticked, or omits `repoIds` to mean every repo the app is installed for.
+//
+// One request rather than one per repo: the client used to loop the route
+// above, which trips `expensiveLimiter` (30/min) part-way through a large
+// install and leaves the user with a half-queued set and no way to tell.
+// Repos already scanning come back under `skipped` instead of failing the call.
+// Exported (like meHandler) so the auth + scoping + queueing is testable.
+export function securityScanBatchHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (securityLocked(user)) return void res.status(403).json(UPGRADE_SECURITY);
+
+  const installIds = new Set(installationsForUser(user.id).map((i) => i.id));
+  const owned = db.filter("repositories", (r) => installIds.has(r.installationId));
+  // An id outside the user's installations is dropped, not honoured — the
+  // request body picks from this set, it never widens it.
+  const wanted = Array.isArray(req.body?.repoIds) ? new Set<string>(req.body.repoIds) : null;
+  const targets = wanted && wanted.size > 0 ? owned.filter((r) => wanted.has(r.id)) : owned;
+  const full = req.body?.full !== false; // a manual re-scan is full by default
+
+  const queued: { repoId: string; scanRunId: string }[] = [];
+  const skipped: { repoId: string; reason: "in_progress" }[] = [];
+  for (const repo of targets) {
+    const r = queueRepoScan(repo.id, full);
+    if (r.skipped) skipped.push({ repoId: repo.id, reason: r.skipped });
+    else queued.push({ repoId: repo.id, scanRunId: r.scanRunId });
+  }
+  res.json({ ok: true, queued, skipped });
+}
+
+api.post("/security/scan", expensiveLimiter, securityScanBatchHandler);
 
 // One-click GitHub issue from a finding. Idempotent — an existing issue is
 // returned, never duplicated. The created issue is the handoff to the Bounties

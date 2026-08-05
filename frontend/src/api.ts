@@ -637,6 +637,14 @@ export type SecurityRepoView = {
   latestScan: SecurityScanSummary | null;
 };
 
+// Result of a bulk re-scan. `skipped` carries the repos that already had a run
+// in flight — not an error, just nothing new to queue for them.
+export type SecurityScanBatch = {
+  ok: true;
+  queued: { repoId: string; scanRunId: string }[];
+  skipped: { repoId: string; reason: "in_progress" }[];
+};
+
 export type SecurityOverview = {
   repos: SecurityRepoView[];
   scans: SecurityScanSummary[];
@@ -711,10 +719,15 @@ export const api = {
   securityOverview: () => request<SecurityOverview>("/api/security/overview"),
   securityScanLog: (repoId: string, scanId: string) =>
     request<{ scan: SecurityScanRun }>(`/api/repositories/${repoId}/security/scans/${scanId}`),
-  startSecurityScan: (repoId: string, full = false) =>
-    request<{ ok: true; scanRunId: string }>(`/api/repositories/${repoId}/security/scan`, {
+  // Re-scan for the Rescan picker. `repoIds: null` means every repo the app is
+  // installed for. One request whatever the count, so a large install can't be
+  // cut off half-way by the rate limiter the way a per-repo loop was.
+  // (POST /api/repositories/:id/security/scan still exists server-side for a
+  // single repo; nothing in the app needs it now that the picker sends a list.)
+  startSecurityScans: (repoIds: string[] | null, full = true) =>
+    request<SecurityScanBatch>("/api/security/scan", {
       method: "POST",
-      body: JSON.stringify({ full }),
+      body: JSON.stringify({ repoIds, full }),
     }),
   // One-click GitHub issue from a finding. Idempotent server-side.
   createFindingIssue: (repoId: string, findingId: string) =>
