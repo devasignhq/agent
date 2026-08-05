@@ -7,7 +7,7 @@
 import { config } from "../config.js";
 import { complete } from "../llm.js";
 import type { AttackSurface, RepoSecurityPolicy, SecurityConfidence, SecuritySeverity } from "../types.js";
-import { normalizeConfidence, normalizeSeverity } from "./severity.js";
+import { capSeverityByConfidence, normalizeConfidence, normalizeSeverity } from "./severity.js";
 import { classifySurfaceFor } from "./fingerprint.js";
 
 export const AUDIT_MODEL = config.llm.model;
@@ -67,7 +67,10 @@ const SECURITY_AUDIT_SYSTEM =
   "conventions. Never invent line numbers — cite only lines you can see.\n" +
   "2. If you cannot write a concrete 3-step exploit narrative, it is NOT a finding — drop it.\n" +
   "3. A control may exist outside this file (middleware applied elsewhere, a WAF, IaC). When your finding depends on " +
-  'such an assumption, set confidence to "needs_human" and name the assumption in the concern.\n' +
+  'such an assumption, set confidence to "needs_human" and name the assumption in the concern. Severity is capped by ' +
+  'confidence — enforced in code after you respond: only "confirmed" findings, where you verified in THIS file that ' +
+  "the control is absent and quoted the decisive evidence line, may be rated critical or high. Anything resting on an " +
+  "unverified assumption is at most medium, no matter its potential blast radius.\n" +
   "4. Prefer under-reporting with high precision over comprehensive noise. An empty array is a good answer for a " +
   "clean file.\n" +
   "5. You report; you do not fix. The remediation is advice for a human or coding agent.\n\n" +
@@ -75,8 +78,8 @@ const SECURITY_AUDIT_SYSTEM =
   '"stable_key": string,           // short kebab-case identity for THIS issue, stable across re-scans (e.g. "payout-route-missing-auth"). Never include line numbers.\n' +
   '"class": string,                // taxonomy tag: "sql-injection", "missing-authz", "hardcoded-secret", "idor", "ssrf", "missing-idempotency", "prompt-injection", ...\n' +
   '"cwe": string?,                 // "CWE-89" when one clearly applies\n' +
-  '"severity": "critical"|"high"|"medium"|"low",   // by blast radius: critical = cross-tenant access, auth bypass, unauthorized fund movement, pipeline compromise; high = single-tenant compromise, credential exposure, privilege escalation; medium = needs chaining / missing defense-in-depth; low = hardening only\n' +
-  '"confidence": "confirmed"|"probable"|"needs_human",\n' +
+  '"severity": "critical"|"high"|"medium"|"low",   // by blast radius: critical = cross-tenant access, auth bypass, unauthorized fund movement, pipeline compromise; high = single-tenant compromise, credential exposure, privilege escalation; medium = needs chaining / missing defense-in-depth; low = hardening only. Critical/high require confidence "confirmed" (rule 3)\n' +
+  '"confidence": "confirmed"|"probable"|"needs_human",   // confirmed = you verified in this file that the control is absent (quote the evidence); probable = strong evidence but an unverified assumption remains; needs_human = depends on something outside this file\n' +
   '"title": string,                // one line, specific ("payout endpoint lacks idempotency enforcement")\n' +
   '"concern": string,              // what it is and why it is exploitable, 2-4 sentences\n' +
   '"evidence": string,             // the decisive line(s), quoted from the file with the line number you actually see\n' +
@@ -92,7 +95,9 @@ const SECURITY_AUDIT_SYSTEM =
 
 // Coerce the model's output into hardened AgentFinding rows: drop items without
 // a concern/title or without the mandatory 3-step exploit narrative, clamp
-// enums, cap the per-file count. Exported for offline testing.
+// enums, cap severity at medium unless confidence is "confirmed" (and refuse
+// "confirmed" without quoted evidence), cap the per-file count. Exported for
+// offline testing.
 export function buildFindingRows(raw: unknown, path: string): AgentFinding[] {
   const parsed = raw && typeof raw === "object" ? (raw as any) : {};
   const list = Array.isArray(parsed.findings) ? parsed.findings : [];
@@ -128,16 +133,22 @@ export function buildFindingRows(raw: unknown, path: string): AgentFinding[] {
       const s = typeof v === "string" ? v.trim() : "";
       return s ? s.slice(0, cap) : undefined;
     };
+    const evidence = str(it.evidence, 1000);
+    // "Confirmed" means the agent verified the control is absent — a claim it
+    // must substantiate by quoting the decisive line. No evidence, no
+    // confirmation.
+    let confidence = normalizeConfidence(it.confidence);
+    if (confidence === "confirmed" && !evidence) confidence = "needs_human";
     out.push({
       slug: slug.slice(0, 120),
       class: cls,
       ...(cwe && /^cwe-\d+$/i.test(cwe) ? { cwe: cwe.toUpperCase() } : {}),
       surface: classifySurfaceFor(path, cls),
-      severity: normalizeSeverity(it.severity),
-      confidence: normalizeConfidence(it.confidence),
+      severity: capSeverityByConfidence(normalizeSeverity(it.severity), confidence),
+      confidence,
       title,
       concern: concern.slice(0, 2000),
-      ...(str(it.evidence, 1000) ? { evidence: str(it.evidence, 1000) } : {}),
+      ...(evidence ? { evidence } : {}),
       ...(dataflow ? { dataflow } : {}),
       exploitNarrative: narrative.slice(0, 3),
       ...(str(it.blast_radius, 300) ? { blastRadius: str(it.blast_radius, 300) } : {}),

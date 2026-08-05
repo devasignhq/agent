@@ -4495,6 +4495,9 @@ async function reviewDiffSecurity(args: {
     "or fund movement; high = single-user compromise, credential exposure, or privilege escalation; medium = requires " +
     "chaining or is a missing defense-in-depth control; low = hardening opportunity with no direct exploit path. " +
     "Only flag issues the diff actually creates — never pre-existing code, never speculation. Prefer empty arrays over padding. " +
+    "When a finding depends on an assumption about code outside this diff (middleware applied elsewhere, callers or " +
+    "config you cannot see), name the assumption in the concern and cap severity at \"medium\" — \"critical\" and " +
+    "\"high\" are reserved for vulnerabilities the diff provably introduces on its own. " +
     "Each finding MUST include a `fixPrompt` the user can paste into another AI coding agent (Cursor / Claude Code / Codex). " +
     "Use this exact template:\n" +
     "Fix: <one-line summary>\n\n" +

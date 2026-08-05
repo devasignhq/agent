@@ -5582,6 +5582,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .vln-tag.ok { color: var(--green); border-color: rgba(61,220,151,.35); background: rgba(61,220,151,.07); }
 .vln-tag.plain { color: var(--fg-faint); }
 .vln-tag.surface { color: var(--fg); border-color: var(--line-2); }
+.vln-tag.conf { color: var(--warn); border-color: rgba(245,165,36,.3); background: rgba(245,165,36,.06); }
 .vln-tag.req { color: var(--danger); border-color: rgba(255,90,95,.35); }
 
 /* sub-nav tabs under the page head */

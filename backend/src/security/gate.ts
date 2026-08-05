@@ -53,7 +53,8 @@ function gateOutput(repo: Repository, gate: GateResult): { title: string; summar
     .filter("securityFindings", (f) => gate.blockingFindingIds.includes(f.id))
     .slice(0, 10);
   const lines = blocking.map(
-    (f) => `- **${f.severity}** ${f.title} (\`${f.path}${f.line ? `:${f.line}` : ""}\`)`
+    (f) =>
+      `- **${f.severity}** ${f.title} (\`${f.path}${f.line ? `:${f.line}` : ""}\`) — ${(f.confidence || "needs_human").replace("_", " ")}`
   );
   const failedRules = gate.rules.filter((r) => r.required && !r.pass);
   return {

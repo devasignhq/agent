@@ -437,6 +437,46 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ vulnerabilities: [] });
   }
 
+  // Security audit agent (the whole-codebase auditor in security/agent.ts,
+  // frontier model in production). Default to a clean scan so offline audits
+  // run without billing. Set SECURITY_SAMPLE=1 to emit one finding carrying the
+  // FORBIDDEN severity/confidence pair (high + needs_human) — buildFindingRows
+  // must clamp it to medium, so this exercises the confidence cap through the
+  // real scanFile path end-to-end.
+  if (system?.includes("security audit agent")) {
+    if (process.env.SECURITY_SAMPLE !== "1") {
+      return JSON.stringify({ findings: [] });
+    }
+    return JSON.stringify({
+      findings: [
+        {
+          stable_key: "mock-payout-route-missing-auth",
+          class: "missing-authz",
+          cwe: "CWE-862",
+          severity: "high",
+          confidence: "needs_human",
+          title: "[mock] payout route appears to lack an authorization check",
+          concern:
+            "[mock] The payout handler reads the account id from the request body and moves funds without an " +
+            "in-file authorization check. Auth middleware may be applied in the router — that is the unverified " +
+            "assumption this finding depends on.",
+          evidence: 'line 42: `const accountId = req.body.accountId;`',
+          symbol: "payoutHandler",
+          line: 42,
+          exploit_narrative: [
+            "Attacker authenticates as any user and calls POST /payout directly.",
+            "They supply another tenant's accountId in the request body.",
+            "Funds move from the victim account because no ownership check runs.",
+          ],
+          blast_radius: "Any authenticated user can move funds from any account.",
+          invariant: "Value-bearing endpoints must verify the caller owns the target account.",
+          remediation: "Add an ownership check in payoutHandler before the transfer call.",
+          regression_test: "POST /payout with a foreign accountId returns 403 and moves nothing.",
+        },
+      ],
+    });
+  }
+
   // PR security review backstop (frontier model in production). Returns no
   // findings offline so the security pass runs clean without billing.
   if (system?.includes("PR security review step")) {
