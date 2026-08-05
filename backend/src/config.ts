@@ -55,13 +55,20 @@ export const config = {
   port: Number(process.env.PORT || 8787),
   webOrigin: process.env.WEB_ORIGIN || "http://localhost:5173",
   // The contributor (developer) app's origin — a second first-party frontend
-  // (contributors.devasign.ai in prod; the Vite dev server on :3002 locally).
-  // Must be a devasign.ai subdomain in prod: the session cookie is set on
-  // api.devasign.ai with SameSite=None and stays first-party only within the
-  // same site. Feeds allowedWebOrigins() below (CORS + CSRF), the OAuth
-  // return-to-initiating-app redirect, AND — because the two apps mint separate
-  // maintainer/contributor accounts — the per-request choice of which session
-  // cookie (hence which account) to resolve (see kindForRequest in github/oauth.ts).
+  // (its deployed URL in prod; the Vite dev server on :3002 locally). Feeds
+  // allowedWebOrigins() below (CORS + CSRF), the OAuth return-to-initiating-app
+  // redirect, AND — because the two apps mint separate maintainer/contributor
+  // accounts — the per-request choice of which session cookie (hence which
+  // account) to resolve (see kindForRequest in github/oauth.ts). That last use
+  // is an exact string compare, so a value that merely *resembles* the deployed
+  // origin resolves the maintainer account rather than erroring: match the
+  // scheme and host exactly, with no trailing slash.
+  //
+  // Deploying it under the same registrable domain as this API (e.g.
+  // contributors.devasign.ai against api.devasign.ai) keeps the session cookie
+  // first-party. Nothing here requires that — the allowlist is pure env — but on
+  // an unrelated domain (*.vercel.app → *.onrender.com) the cookie is genuinely
+  // third-party, which Safari blocks and Firefox partitions.
   contributorOrigin: process.env.CONTRIBUTOR_ORIGIN || "http://localhost:3002",
   // Cross-site session cookies need SameSite=None; Secure, which is only valid
   // (and only wanted) once the dashboard is served over https — i.e. prod. In

@@ -2,14 +2,29 @@
 // In dev the frontend (Vite, :3001) talks to the backend (:8787) directly with
 // credentials. localhost:3001 ↔ localhost:8787 is same-site (eTLD+1 = localhost),
 // so the SameSite=Lax session cookie set on /api/auth/github/callback flows on
-// XHR. In prod the API is deployed at https://api.devasign.ai so it stays
-// same-site with https://www.devasign.ai and the session cookie remains
-// first-party. Set VITE_API_BASE to override; the PROD fallback below encodes
-// that origin so a missing build-time env var can't silently ship localhost.
+// XHR. Setting VITE_API_BASE to an EMPTY value instead selects relative URLs,
+// which routes through the Vite dev proxy (see vite.config.ts).
+//
+// In prod there is deliberately no fallback origin. A hardcoded one can only
+// ever encode a single deployment's API host, so the moment the API moves it
+// silently aims every later build at a backend nobody owns — surfacing as a
+// broken login rather than as the misconfiguration it is. VITE_API_BASE is
+// required instead, and validated at build time in vite.config.ts, because Vite
+// INLINES it into the bundle: once built, it cannot be corrected at runtime.
 
-const API_BASE =
-  (import.meta as any).env?.VITE_API_BASE ??
-  ((import.meta as any).env?.PROD ? "https://api.devasign.ai" : "http://localhost:8787");
+const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE as string | undefined;
+
+if ((import.meta as any).env?.PROD && !RAW_API_BASE) {
+  throw new Error(
+    "VITE_API_BASE was not set when this bundle was built, so it has no API " +
+      "origin. Set it in the deployment's environment variables and rebuild.",
+  );
+}
+
+// Trailing slashes are stripped so `${API_BASE}/api/…` can't produce `//api/…`,
+// which Express does not route. "" survives the strip and keeps its meaning:
+// relative URLs, i.e. the dev proxy.
+const API_BASE = (RAW_API_BASE ?? "http://localhost:8787").replace(/\/+$/, "");
 
 export const apiBase = API_BASE;
 
