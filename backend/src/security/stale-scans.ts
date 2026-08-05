@@ -39,7 +39,10 @@ export function selectStaleScans(
     .filter((r) => {
       if (!inFlight(r)) return false;
       if (opts.boot) return true;
-      const lastBeat = r.log.length > 0 ? r.log[r.log.length - 1].at : r.startedAt;
+      // `log` is non-optional on the type, but a legacy or partially-written
+      // row can reach here without one — and a reaper that throws stops
+      // settling every run behind it.
+      const lastBeat = r.log?.length ? r.log[r.log.length - 1].at : r.startedAt;
       return now - lastBeat > STALE_MS;
     })
     .map((r) => r.id);

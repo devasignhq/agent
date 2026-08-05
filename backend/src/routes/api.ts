@@ -815,8 +815,12 @@ export function securityScanBatchHandler(req: Request, res: Response) {
   const owned = db.filter("repositories", (r) => installIds.has(r.installationId));
   // An id outside the user's installations is dropped, not honoured — the
   // request body picks from this set, it never widens it.
+  //
+  // Absent `repoIds` means "all"; a PRESENT array means exactly those, and an
+  // empty one therefore means none. Treating [] as "all" would turn a request
+  // to scan nothing into a scan of every repo the user owns.
   const wanted = Array.isArray(req.body?.repoIds) ? new Set<string>(req.body.repoIds) : null;
-  const targets = wanted && wanted.size > 0 ? owned.filter((r) => wanted.has(r.id)) : owned;
+  const targets = wanted === null ? owned : owned.filter((r) => wanted.has(r.id));
   const full = req.body?.full !== false; // a manual re-scan is full by default
 
   const queued: { repoId: string; scanRunId: string }[] = [];

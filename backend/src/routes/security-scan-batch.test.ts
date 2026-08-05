@@ -127,6 +127,18 @@ test("no repoIds means every repo the app is installed for", () => {
   assert.ok(runs.every((r) => r.status === "queued" && r.trigger === "manual" && r.full));
 });
 
+test("an explicit EMPTY repoIds queues nothing — it must not mean 'all'", () => {
+  reset();
+  const { userId } = seed(["a", "b", "c"]);
+  const res = fakeRes();
+  securityScanBatchHandler(reqFor(userId, { repoIds: [] }), res);
+  assert.equal(res.statusCode, 200);
+  assert.deepEqual(res.body.queued, []);
+  assert.deepEqual(res.body.skipped, []);
+  // The whole point: asking for nothing must not scan every repo the user owns.
+  assert.equal(db.filter("securityScans", () => true).length, 0);
+});
+
 test("an explicit subset queues only those repos", () => {
   reset();
   const { userId, repoIds } = seed(["a", "b", "c"]);

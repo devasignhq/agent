@@ -63,6 +63,17 @@ test("a settled run is never re-failed, however old", () => {
   assert.deepEqual(selectStaleScans(runs, NOW, { boot: true }), []);
 });
 
+test("a row with no log array falls back to startedAt instead of throwing", () => {
+  // `log` is non-optional on the type, but a legacy or partially-written row
+  // can reach the reaper without one — and throwing here would stop every run
+  // behind it from being settled.
+  const missing = { ...run("no-log", "running", NOW - STALE_MS - 1), log: undefined };
+  const fresh = { ...run("no-log-fresh", "running", NOW - 1000), log: undefined };
+  const runs = [missing, fresh] as unknown as SecurityScanRun[];
+  assert.deepEqual(selectStaleScans(runs, NOW, { boot: false }), ["no-log"]);
+  assert.deepEqual(selectStaleScans(runs, NOW, { boot: true }), ["no-log", "no-log-fresh"]);
+});
+
 test("exactly at the threshold is not yet stale", () => {
   const runs = [run("edge", "running", NOW - STALE_MS)];
   assert.deepEqual(selectStaleScans(runs, NOW, { boot: false }), []);
