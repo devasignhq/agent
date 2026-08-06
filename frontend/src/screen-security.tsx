@@ -109,7 +109,7 @@ const ProLock = () => (
 
 // Persistent banner shown above findings a locked account can still read.
 const LockedNotice = () => (
-  <div className="tu-notice" style={{ marginBottom: 12 }}>
+  <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>
     Security audits are a Pro/Max feature — scans, triage and the merge gate are paused on
     your plan.{" "}
     <button className="btn sm" style={{ marginLeft: 8 }} onClick={goUpgrade}>
@@ -306,7 +306,7 @@ export const SecurityPage = ({
             <h1 className="page-title">Security</h1>
           </div>
         </div>
-        <div className="tu-notice">
+        <div className="tu-notice page-notice">
           {error}{" "}
           <button className="btn sm" style={{ marginLeft: 8 }} onClick={() => void load()}>
             Retry
@@ -343,7 +343,7 @@ export const SecurityPage = ({
         refresh={refresh}
         subNav={subNav}
       />
-      {error && <div className="tu-notice" style={{ marginBottom: 12 }}>{error}</div>}
+      {error && <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>{error}</div>}
       {/* Locked with nothing on record → the paywall state replaces the body;
           locked with findings (a lapsed sub) → keep them readable under a
           banner, with every action turned off. */}
@@ -400,6 +400,11 @@ export const SecurityPage = ({
 
 // ─── header (shared by dashboard / gate / policy) ─────────────────────────────
 
+// How long the re-scan receipt survives without ever seeing its run in the
+// overview. Comfortably longer than the 5s backstop poll, so an observable run
+// always gets a chance to claim the notice before the fallback fires.
+const NOTICE_MAX_MS = 20_000;
+
 const PageHead = ({
   overview,
   view,
@@ -423,6 +428,28 @@ const PageHead = ({
   const scanning = scanningRepoIds(overview.scans);
   const progress = scanProgressLabel(overview.repos, scanning);
 
+  // The notice is a receipt for the run it announced, so it retires with that
+  // run: it clears once the scans it queued have settled. `sawRun` is what
+  // makes that safe — the queued rows land on a later poll than the POST, so
+  // "nothing scanning" right after submitting means "not started yet", not
+  // "finished". The timeout covers the run we never observe (a scan that
+  // settles between two polls, or one that never starts) so the receipt can't
+  // outlive its subject either way.
+  const sawRun = React.useRef(false);
+  React.useEffect(() => {
+    if (!notice) return;
+    if (progress) {
+      sawRun.current = true;
+      return;
+    }
+    if (sawRun.current) {
+      setNotice(null);
+      return;
+    }
+    const t = setTimeout(() => setNotice(null), NOTICE_MAX_MS);
+    return () => clearTimeout(t);
+  }, [notice, progress]);
+
   const branches = [...new Set(overview.repos.map((r) => r.defaultBranch))].join(", ");
   return (
     <>
@@ -439,15 +466,16 @@ const PageHead = ({
                 <span style={{ color: "var(--fg-dim)" }}>{branches || "main"}</span>
               </>
             )}
+            {/* Scan progress reads as one more clause of the subtitle, not as its
+                own status strip — and never as the button's label, which is what
+                left the button stuck on "Scanning…" when a run was stranded. */}
+            {progress && (
+              <>
+                {" · "}
+                <span className="vln-scanning">{progress}</span>
+              </>
+            )}
           </div>
-          {/* Scan progress lives here, not on the button — the button is a
-              control, and letting it double as a status readout is what made it
-              read "Scanning…" forever when a run was left stranded. */}
-          {progress && (
-            <div className="page-sub vln-scanning">
-              <span className="vln-scanning-dot" /> {progress}
-            </div>
-          )}
         </div>
         <div className="page-actions">
           {/* The gate/policy subpages select their repo with the left rail, so
@@ -489,7 +517,7 @@ const PageHead = ({
       </div>
       {subNav}
       {notice && (
-        <div className="tu-notice" style={{ marginBottom: 12, color: "var(--fg-dim)" }}>
+        <div className="tu-notice page-notice" style={{ marginBottom: 12, color: "var(--fg-dim)" }}>
           {notice}
         </div>
       )}
@@ -499,7 +527,10 @@ const PageHead = ({
           scanning={scanning}
           repoFilter={repoFilter}
           onClose={() => setPicking(false)}
-          onDone={setNotice}
+          onDone={(summary) => {
+            sawRun.current = false; // a fresh receipt waits for its own run
+            setNotice(summary);
+          }}
           refresh={refresh}
         />
       )}
