@@ -12,21 +12,35 @@ import type { SecurityFinding, SecurityPrecedent } from "../types.js";
 //
 // This is the guardrail metric too. A ruling that keeps getting contradicted is
 // the signal that the corpus is muting real work.
-export function contradictPrecedent(finding: Pick<SecurityFinding, "suppressedByPrecedentId">): void {
+// Two findings can contradict a ruling, and they are not the same one:
+//   - a finding the ruling MUTED (suppressedByPrecedentId), and
+//   - the finding the ruling was MADE ON (originFindingId), which carries no
+//     suppressedByPrecedentId because a human marked it by hand.
+// The second is the stronger signal — the maintainer is overturning their own
+// call — so missing it would leave the ruling that started this muting others.
+export function contradictPrecedent(finding: Pick<SecurityFinding, "id" | "suppressedByPrecedentId">): void {
   const id = finding.suppressedByPrecedentId;
-  if (!id) return;
-  db.update(
+  // db.update patches the FIRST match only, so sweep — the two clauses can name
+  // different rows, and one finding can have been ruled on more than once.
+  const hits = db.filter(
     "securityPrecedents",
-    (p) => p.id === id && p.status === "active",
-    { status: "needs_reconfirm", statusReason: "contradicted" }
+    (p) => p.status === "active" && (p.id === id || p.originFindingId === finding.id)
   );
+  for (const p of hits) {
+    db.update("securityPrecedents", (r) => r.id === p.id, {
+      status: "needs_reconfirm",
+      statusReason: "contradicted",
+    });
+  }
 }
 
-// Every ruling in scope for an account. Callers should do this once and reuse
-// it: db.filter is a full linear scan with no indexes.
-export function corpusForUser(ownerUserId: string | null | undefined): SecurityPrecedent[] {
-  if (!ownerUserId) return [];
-  return db.filter("securityPrecedents", (p) => p.ownerUserId === ownerUserId);
+// Every ruling in scope for one installation — what an audit run honours, and
+// what its maintainers see and can withdraw. Callers should do this once and
+// reuse it: db.filter is a full linear scan with no indexes.
+export function corpusForInstallations(installationIds: string[]): SecurityPrecedent[] {
+  if (!installationIds.length) return [];
+  const ids = new Set(installationIds);
+  return db.filter("securityPrecedents", (p) => ids.has(p.installationId));
 }
 
 // Withdraw a ruling and un-mute everything it suppressed. The findings go back
@@ -39,11 +53,23 @@ export function revokePrecedent(p: SecurityPrecedent, actorLogin: string, now: n
     revokedAt: now,
     revokedBy: actorLogin,
   });
-  const muted = db.filter("securityFindings", (f) => f.suppressedByPrecedentId === p.id);
+  // Everything the ruling muted, plus the finding it was made ON — the UI
+  // promises "bring back everything it suppressed", and to the maintainer the
+  // ruling and that first suppression were one action in one dialog. The origin
+  // is only restored while it still sits in the state the ruling produced: if
+  // it has since moved on (an issue was filed, someone reopened it), that later
+  // decision wins.
+  const muted = db.filter(
+    "securityFindings",
+    (f) =>
+      f.suppressedByPrecedentId === p.id ||
+      (f.id === p.originFindingId && (f.state === "false_positive" || f.state === "accepted"))
+  );
   for (const f of muted) {
     db.update("securityFindings", (r) => r.id === f.id, {
       state: f.issueNumber != null ? "issue_created" : "open",
       stateReason: null,
+      rulingCode: null,
       suppressedByPrecedentId: null,
       activity: [
         ...(f.activity ?? []),

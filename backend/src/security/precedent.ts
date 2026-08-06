@@ -92,6 +92,7 @@ export function precedentFromRuling(args: {
   code: SecurityRulingCode;
   note: string;
   scope: "repo" | "account";
+  installationId: string;
   ownerUserId: string;
   repoId: string;
   createdBy: string;
@@ -115,6 +116,7 @@ export function precedentFromRuling(args: {
   const f = args.finding;
   return {
     id: uuid(),
+    installationId: args.installationId,
     ownerUserId: args.ownerUserId,
     repoId: args.repoId,
     scope: args.scope,
@@ -142,15 +144,31 @@ export function precedentFromRuling(args: {
 // Expiry
 // ---------------------------------------------------------------------------
 
-// Strip the line-number gutter the agent quotes with ("42: const x = 1") and
-// collapse inner whitespace, so a reindent doesn't read as the code having
+// Collapse inner whitespace so a reindent doesn't read as the code having
 // moved. Line breaks are preserved: matching is done a line at a time.
 function normalizeLine(line: string): string {
-  return line.replace(/^\s*\d+\s*[:|]\s?/, "").replace(/\s+/g, " ").trim().toLowerCase();
+  return line.replace(/\s+/g, " ").trim().toLowerCase();
 }
 
 function normalizeBlock(text: string): string {
   return text.split("\n").map(normalizeLine).join("\n");
+}
+
+// The gutter the agent quotes evidence with. It has to be matched loosely
+// because it is model-authored prose, not a format we control: "42:", "42 |",
+// "line 42:" and "Line 42 |" all show up, since the prompt asks for "the
+// decisive line(s), quoted from the file with the line number you actually
+// see". Missing a form is not cosmetic — the prefix stays attached, the
+// evidence stops matching the file it came from, and the ruling expires on the
+// very next scan even though nothing changed.
+const EVIDENCE_GUTTER = /^\s*(?:lines?\s+)?\d+\s*[:|]\s?/i;
+
+// Evidence gets the gutter and any wrapping code fence stripped; file content
+// deliberately does NOT. Running the same strip over both would be worse than
+// running it over neither: a source line that genuinely starts "42: " would be
+// shortened on one side of the comparison and not the other.
+function normalizeEvidenceLine(line: string): string {
+  return normalizeLine(line.replace(EVIDENCE_GUTTER, "").replace(/^[`'"]+|[`'"]+$/g, ""));
 }
 
 // Does the code this ruling was made against still look the same?
@@ -169,8 +187,9 @@ export function anchorHolds(
   // Any one substantive quoted line surviving is enough: the agent often quotes
   // a line or two of context around the decisive one. Short lines ("});") are
   // dropped — they match everywhere and would keep a dead ruling alive.
-  const lines = normalizeBlock(p.anchorEvidence)
+  const lines = p.anchorEvidence
     .split("\n")
+    .map(normalizeEvidenceLine)
     .filter((s) => s.length >= 12);
   if (!lines.length) return file.sha === p.anchorSha;
   return lines.some((l) => haystack.includes(l));

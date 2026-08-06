@@ -323,7 +323,13 @@ export type SecurityFinding = {
 // We hard-mute solely in the repo where the maintainer actually looked.
 export type SecurityPrecedent = {
   id: string;
-  ownerUserId: string;         // the account — User is the account entity
+  // A ruling belongs to the INSTALLATION, not to whoever happened to type it.
+  // Any co-maintainer on an install triages the same findings, and the audit
+  // runs under the primary owner — key this on a person and a team member's
+  // rulings are invisible to the scan that should honour them, and to the
+  // ledger that should let anyone withdraw them.
+  installationId: string;
+  ownerUserId: string;         // who authored it — provenance, not access control
   repoId: string;              // the repo the ruling was made in
   scope: "repo" | "account";   // "account" is an explicit opt-in promotion
   code: SecurityRulingCode;

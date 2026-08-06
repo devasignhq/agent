@@ -18,7 +18,7 @@ import { effectiveSecurityPolicy, normalizeSecurityPolicy } from "../security/po
 import { computeGateForRepo, publishGateForRepo } from "../security/gate.js";
 import { createFindingIssue, IssueCreationError } from "../security/issue.js";
 import { RULING_CODES, codeFitsAction, precedentFromRuling } from "../security/precedent.js";
-import { contradictPrecedent, corpusForUser, revokePrecedent } from "../security/precedent-store.js";
+import { contradictPrecedent, corpusForInstallations, revokePrecedent } from "../security/precedent-store.js";
 import { SECURITY_ENGINE } from "../security/audit.js";
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
@@ -970,6 +970,10 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
       code,
       note: reason,
       scope,
+      // Scoped to the installation the repo belongs to, so a co-maintainer's
+      // ruling is honoured by the audit (which runs under the primary owner)
+      // and is visible to the whole team. ownerUserId records who made the call.
+      installationId: ctx.repo.installationId,
       ownerUserId: ctx.user.id,
       repoId: ctx.repo.id,
       createdBy: ctx.user.githubLogin,
@@ -994,17 +998,29 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
   res.json({ ok: true, finding: updated, precedent });
 });
 
-// The learned corpus for the signed-in account, newest first. Read-only, so it
-// follows the same convention as the security overview: readable on any plan,
-// with writes gated below.
+// Every ruling on the installations this user belongs to, newest first — the
+// same set the audit honours, so a co-maintainer sees (and can withdraw) what
+// is actually being suppressed rather than only what they typed themselves.
+// Read-only, so it follows the security overview's convention: readable on any
+// plan, with writes gated below.
 api.get("/security/precedents", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
-  const rows = corpusForUser(user.id)
+  const rows = corpusForInstallations(installationsForUser(user.id).map((i) => i.id))
     .filter((p) => p.status !== "revoked")
     .sort((a, b) => b.createdAt - a.createdAt);
   res.json({ precedents: rows, locked: securityLocked(user) });
 });
+
+// A ruling is the installation's, so any maintainer on it may withdraw or
+// rescope it — not just whoever happened to type it. Returns null when the id
+// is unknown OR out of reach, so the two are indistinguishable to a caller.
+function precedentForUser(id: string, user: User): SecurityPrecedent | null {
+  const p = db.find("securityPrecedents", (r) => r.id === id);
+  if (!p) return null;
+  const install = db.find("installations", (i) => i.id === p.installationId);
+  return install && userInInstall(install, user.id) ? p : null;
+}
 
 // Withdraw a ruling: it stops conditioning scans, and everything it muted comes
 // back. The escape hatch that keeps auto-suppression safe to ship.
@@ -1012,7 +1028,7 @@ api.post("/security/precedents/:id/revoke", (req, res) => {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   if (securityLocked(user)) return void res.status(403).json(UPGRADE_SECURITY);
-  const p = db.find("securityPrecedents", (r) => r.id === req.params.id && r.ownerUserId === user.id);
+  const p = precedentForUser(req.params.id, user);
   if (!p) return void res.status(404).json({ error: "precedent_not_found" });
   if (p.status === "revoked") return void res.status(409).json({ error: "already_revoked" });
   const restored = revokePrecedent(p, user.githubLogin, Date.now());
@@ -1030,7 +1046,7 @@ api.patch("/security/precedents/:id", (req, res) => {
   if (scope !== "repo" && scope !== "account") {
     return void res.status(400).json({ error: "invalid_scope" });
   }
-  const p = db.find("securityPrecedents", (r) => r.id === req.params.id && r.ownerUserId === user.id);
+  const p = precedentForUser(req.params.id, user);
   if (!p) return void res.status(404).json({ error: "precedent_not_found" });
   const updated = db.update("securityPrecedents", (r) => r.id === p.id, { scope });
   res.json({ ok: true, precedent: updated });

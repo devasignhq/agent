@@ -37,6 +37,7 @@ function ruling(over: Partial<Parameters<typeof precedentFromRuling>[0]> = {}) {
     code: "control_exists" as SecurityRulingCode,
     note: "auth is applied by requireAuth in server.ts before this router mounts",
     scope: "repo" as const,
+    installationId: "inst-1",
     ownerUserId: "u1",
     repoId: "r1",
     createdBy: "octocat",
@@ -50,6 +51,7 @@ function ruling(over: Partial<Parameters<typeof precedentFromRuling>[0]> = {}) {
 function precedent(over: Partial<SecurityPrecedent> = {}): SecurityPrecedent {
   return {
     id: "p1",
+    installationId: "inst-1",
     ownerUserId: "u1",
     repoId: "r1",
     scope: "repo",
@@ -187,6 +189,40 @@ test("anchorHolds: with no quoted evidence, falls back to the blob sha", () => {
   const p = precedent({ anchorEvidence: undefined });
   assert.equal(anchorHolds(p, { sha: "sha-a", content: FILE }), true);
   assert.equal(anchorHolds(p, { sha: "sha-b", content: FILE }), false);
+});
+
+// Regression: the gutter is model-authored prose, and a form we fail to strip
+// stays glued to the evidence, never matches the file, and expires the ruling
+// on the very next scan even though the code never moved.
+for (const [name, evidence] of [
+  ["bare number", "42: router.post('/payout', createPayout)"],
+  ["pipe gutter", "42 | router.post('/payout', createPayout)"],
+  ["line word", "line 42: router.post('/payout', createPayout)"],
+  ["capitalised line word", "Line 42 | router.post('/payout', createPayout)"],
+  ["backticked code", "line 42: `router.post('/payout', createPayout)`"],
+  ["no gutter at all", "router.post('/payout', createPayout)"],
+] as const) {
+  test(`anchorHolds: survives a "${name}" evidence gutter`, () => {
+    assert.equal(anchorHolds(precedent({ anchorEvidence: evidence }), { sha: "sha-b", content: FILE }), true);
+  });
+}
+
+test("anchorHolds: the LLM mock's own evidence format matches its file", () => {
+  // security/agent.ts's SECURITY_SAMPLE finding quotes exactly this shape, so a
+  // regression here would expire rulings in every offline verification run.
+  const p = precedent({ anchorEvidence: "line 42: `const accountId = req.body.accountId;`" });
+  const content = "export function payoutHandler(req, res) {\n  const accountId = req.body.accountId;\n}\n";
+  assert.equal(anchorHolds(p, { sha: "sha-b", content }), true);
+});
+
+test("anchorHolds: a source line that itself starts with a number still matches", () => {
+  // The gutter strip runs on the evidence only. Running it on file content too
+  // would shorten one side of the comparison and not the other.
+  const p = precedent({ anchorEvidence: "line 7: 1000 * multiplierForTenant(id)" });
+  assert.equal(
+    anchorHolds(p, { sha: "sha-b", content: "const cap =\n  1000 * multiplierForTenant(id)\n" }),
+    true
+  );
 });
 
 test("anchorHolds: trivial quoted lines don't keep a dead ruling alive", () => {

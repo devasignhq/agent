@@ -235,17 +235,18 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
       let resolved = 0;
       let suppressed = 0;
 
-      // The maintainer's learned corpus, read ONCE for the whole run: db.filter
+      // The maintainers' learned corpus, read ONCE for the whole run: db.filter
       // is a full linear scan with no indexes, so doing this per file would be
-      // O(files × findings). Account-wide, because an architectural ruling the
-      // owner promoted travels across their repos (prompt-only — see
-      // matchPrecedent, which refuses to auto-suppress on those).
-      const corpus = install.userId
-        ? db.filter(
-            "securityPrecedents",
-            (p) => p.ownerUserId === install.userId && p.status !== "revoked"
-          )
-        : [];
+      // O(files × findings). Keyed on the INSTALLATION, not the primary owner:
+      // on a shared org install every co-maintainer triages the same findings,
+      // and keying on install.userId would make the audit silently ignore
+      // everyone else's rulings. Install-wide, because an architectural ruling
+      // travels across the install's repos (prompt-only — see matchPrecedent,
+      // which refuses to auto-suppress on those).
+      const corpus = db.filter(
+        "securityPrecedents",
+        (p) => p.installationId === install.id && p.status !== "revoked"
+      );
       if (corpus.length) {
         logLine(run.id, `precedent: ${corpus.length} maintainer ruling(s) in scope`);
       }
