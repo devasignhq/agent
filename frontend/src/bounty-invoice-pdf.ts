@@ -54,7 +54,9 @@ function toBase64(buf: ArrayBuffer): Promise<string> {
   });
 }
 
-async function loadFonts() {
+// Exported for security-export-pdf.ts, which draws with the same face — both
+// are lazy chunks, so Vite hoists this (and the cache) into a shared one.
+export async function loadFonts() {
   if (!fontCache) {
     fontCache = (async () => {
       const [regular, bold] = await Promise.all(
@@ -85,7 +87,10 @@ async function loadFonts() {
 // reproduces them exactly as even-odd would; a future logo whose holes wind the
 // same direction as their outer contour would fill in solid and need the
 // low-level fillEvenOdd path instead.
-function drawPath(ctx: jsPDF["context2d"], d: string) {
+// Exported for security-export-pdf.ts, which reuses the logo lockup. Note the
+// coordinates come out pre-multiplied by this module's S — a caller placing the
+// artwork elsewhere should wrap the calls in a ctx translate, not rescale.
+export function drawPath(ctx: jsPDF["context2d"], d: string) {
   const tokens = d.match(/[MmLlHhVvCcSsQqTtAaZz]|-?\d*\.?\d+(?:[eE][-+]?\d+)?/g) || [];
   let i = 0;
   let cmd = "";

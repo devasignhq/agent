@@ -58,6 +58,8 @@ import {
   scanProgressLabel,
   summarizeRescan,
 } from "./security-rescan.ts";
+import { exportFilename, findingFileUrl, findingsCsv } from "./security-export.ts";
+import { downloadTextFile } from "./download.ts";
 
 // ─── tiny shared pieces ───────────────────────────────────────────────────────
 
@@ -753,6 +755,15 @@ const Dashboard = ({
   onOpen: (id: string) => void;
 }) => {
   const now = Date.now();
+
+  // Export selection, by finding id. Kept as the raw picked set; everything
+  // downstream uses its intersection with the visible rows, so a filter or
+  // repo switch silently narrows the export and an id resurfaces as selected
+  // if the filter brings its row back.
+  const [selected, setSelected] = React.useState<Set<string>>(new Set());
+  const [pdfBusy, setPdfBusy] = React.useState(false);
+  const [exportErr, setExportErr] = React.useState<string | null>(null);
+
   const scopedFindings = overview.findings.filter(
     (f) => repoFilter === "all" || f.repoId === repoFilter
   );
@@ -772,12 +783,70 @@ const Dashboard = ({
   // GitHub blob URL for a finding's file, resolving the repo's default branch
   // from the overview (falls back to HEAD, then to the repo root). Mirrors the
   // link the finding-detail view builds. Returns null when we have no repo slug.
-  const repoFileUrl = (f: SecurityFinding): string | null => {
-    if (!f.repo) return null;
-    const base = `https://github.com/${f.repo}`;
-    if (!f.path) return base;
-    const branch = overview.repos.find((r) => r.id === f.repoId)?.defaultBranch ?? "HEAD";
-    return `${base}/blob/${branch}/${f.path}${f.line ? `#L${f.line}` : ""}`;
+  // The builder lives in security-export.ts so the CSV/PDF carry this same URL.
+  const branchOf = (repoId: string) =>
+    overview.repos.find((r) => r.id === repoId)?.defaultBranch;
+  const repoFileUrl = (f: SecurityFinding): string | null => findingFileUrl(f, branchOf);
+
+  // ── export selection ──
+  const selectedShown = shown.filter((f) => selected.has(f.id));
+  const allPicked = shown.length > 0 && selectedShown.length === shown.length;
+
+  const toggle = (id: string) =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+
+  // Select-all touches only the visible rows — ids picked under another filter
+  // stay picked there rather than being cleared by a header click here.
+  const toggleAll = () =>
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const f of shown) {
+        if (allPicked) next.delete(f.id);
+        else next.add(f.id);
+      }
+      return next;
+    });
+
+  // Repo slug for the filename, only when the page is filtered to one repo.
+  const filteredRepo = repoFilter === "all" ? null : overview.repos.find((r) => r.id === repoFilter);
+  const repoSlug = filteredRepo ? `${filteredRepo.owner}/${filteredRepo.name}` : null;
+
+  // Synchronous on purpose: Safari only honours a download started inside the
+  // user gesture (same reasoning as the transactions CSV).
+  const exportCsv = () => {
+    if (selectedShown.length === 0 || overview.locked) return;
+    downloadTextFile(
+      exportFilename("csv", Date.now(), repoSlug),
+      "text/csv;charset=utf-8",
+      findingsCsv(selectedShown, branchOf),
+      { bom: true }
+    );
+  };
+
+  const exportPdf = async () => {
+    if (selectedShown.length === 0 || overview.locked || pdfBusy) return;
+    setPdfBusy(true);
+    setExportErr(null);
+    try {
+      // Dynamic import keeps jsPDF and the fonts out of the main bundle for
+      // everyone who never exports (same split as the invoice PDF).
+      const { downloadFindingsPdf } = await import("./security-export-pdf.ts");
+      await downloadFindingsPdf(
+        selectedShown,
+        branchOf,
+        exportFilename("pdf", Date.now(), repoSlug),
+        repoSlug ?? "all repositories"
+      );
+    } catch {
+      setExportErr("Couldn't build the PDF. Check your connection and try again.");
+    } finally {
+      setPdfBusy(false);
+    }
   };
 
   const latest = [...scopedScans].sort((a, b) => b.startedAt - a.startedAt)[0] ?? null;
@@ -1041,11 +1110,61 @@ const Dashboard = ({
               </button>
             ))}
           </div>
-          <div className="vln-pnl-s">
-            showing {shown.length} finding{shown.length === 1 ? "" : "s"}
-          </div>
+          {selectedShown.length > 0 ? (
+            <div className="vln-export-bar">
+              {exportErr && <span className="vln-export-err">{exportErr}</span>}
+              <span>
+                <b>{selectedShown.length}</b> selected
+              </span>
+              {overview.locked && <ProLock />}
+              <button
+                className="btn sm"
+                disabled={overview.locked}
+                onClick={exportCsv}
+                title={
+                  overview.locked
+                    ? "Exports are a Pro/Max feature"
+                    : "Download the selected findings as CSV"
+                }
+              >
+                <Icon name="download" size={12} /> CSV
+              </button>
+              <button
+                className="btn sm"
+                disabled={overview.locked || pdfBusy}
+                onClick={() => void exportPdf()}
+                title={
+                  overview.locked
+                    ? "Exports are a Pro/Max feature"
+                    : "Download the selected findings as a PDF report"
+                }
+              >
+                <Icon name="download" size={12} /> {pdfBusy ? "Preparing…" : "PDF"}
+              </button>
+              <button className="btn ghost sm" onClick={() => setSelected(new Set())}>
+                Clear
+              </button>
+            </div>
+          ) : (
+            <div className="vln-pnl-s">
+              showing {shown.length} finding{shown.length === 1 ? "" : "s"}
+            </div>
+          )}
         </div>
         <div className="vln-fx-head">
+          <span className="vln-fx-sel">
+            <input
+              type="checkbox"
+              aria-label="Select all shown findings"
+              checked={allPicked}
+              disabled={shown.length === 0}
+              ref={(el) => {
+                // Partial selection reads as neither on nor off.
+                if (el) el.indeterminate = !allPicked && selectedShown.length > 0;
+              }}
+              onChange={toggleAll}
+            />
+          </span>
           <span>severity</span>
           <span>id</span>
           <span>finding</span>
@@ -1063,6 +1182,16 @@ const Dashboard = ({
               className={`vln-fx-row ${f.severity} ${f.state === "new" ? "fresh" : ""}`}
               onClick={() => onOpen(f.id)}
             >
+              {/* The wrapper swallows the click so toggling never opens the
+                  detail view — same trick as the repo link below. */}
+              <span className="vln-fx-sel" onClick={(e) => e.stopPropagation()}>
+                <input
+                  type="checkbox"
+                  aria-label={`Select ${displayId(f)}`}
+                  checked={selected.has(f.id)}
+                  onChange={() => toggle(f.id)}
+                />
+              </span>
               <SevPill sev={f.severity} />
               <span className="vln-fx-id">{displayId(f)}</span>
               <span style={{ minWidth: 0 }}>
