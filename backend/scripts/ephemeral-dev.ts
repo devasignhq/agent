@@ -41,16 +41,16 @@ db.insert("users", {
 // EPHEMERAL_PLAN=pro (or max) seeds an active subscription so plan-gated
 // surfaces (security scans/triage/export, guidance) can be exercised unlocked.
 // Default stays Free — the locked treatment is the rarer thing to test blind.
-if (process.env.EPHEMERAL_PLAN === "pro" || process.env.EPHEMERAL_PLAN === "max") {
-  db.insert("subscriptions", {
-    id: "ephemeral-sub-1",
-    userId: "ephemeral-user-1",
-    plan: process.env.EPHEMERAL_PLAN,
-    status: "active",
-    reviewsUsed: 0,
-    usagePeriodStart: Date.now(),
-  } as never);
-  console.log(`[ephemeral] seeded ${process.env.EPHEMERAL_PLAN} subscription for ephemeral-user-1`);
+// The decision itself is pure and unit-tested (billing/ephemeral-plan.test.ts).
+const { ephemeralSubscriptionSeed } = await import("../src/billing/ephemeral-plan.js");
+const seededSub = ephemeralSubscriptionSeed(
+  process.env.EPHEMERAL_PLAN,
+  "ephemeral-user-1",
+  Date.now()
+);
+if (seededSub) {
+  db.insert("subscriptions", seededSub as never);
+  console.log(`[ephemeral] seeded ${seededSub.plan} subscription for ephemeral-user-1`);
 }
 // An installation row so the frontend routes past onboarding into the app shell.
 db.insert("installations", {
