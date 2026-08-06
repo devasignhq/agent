@@ -10,6 +10,17 @@ import { fingerprintFinding } from "./fingerprint.js";
 import { isActiveState } from "./policy.js";
 import type { AgentFinding } from "./agent.js";
 
+// A detection the audit annotated with the maintainer ruling that authorises
+// auto-suppressing it (security/precedent.ts). Carried alongside the finding
+// rather than baked into it so the matching rules stay in one pure module.
+export type DetectedFinding = AgentFinding & {
+  suppressedBy?: {
+    precedentId: string;
+    action: "false_positive" | "accepted";
+    note: string;
+  };
+};
+
 export type ReconcileCtx = {
   repoId: string;
   path: string;
@@ -22,8 +33,11 @@ export type ReconcileCtx = {
 export type ReconcileResult = {
   insert: SecurityFinding[];
   update: Array<{ id: string; patch: Partial<SecurityFinding> }>;
-  introduced: number; // rows inserted
+  introduced: number; // rows inserted (excluding auto-suppressed ones)
   resolved: number;   // active rows no longer detected
+  // Precedent ids that muted a fresh detection this pass, so the caller can
+  // bump their suppressedCount — the health metric behind the rulings ledger.
+  appliedPrecedentIds: string[];
 };
 
 const ACTIVITY_CAP = 50;
@@ -37,8 +51,8 @@ function pushEvent(
 }
 
 export function reconcileFile(args: {
-  existing: SecurityFinding[]; // stored findings for this repoId+path
-  detected: AgentFinding[];    // agent output for this file at ctx.sha
+  existing: SecurityFinding[];  // stored findings for this repoId+path
+  detected: DetectedFinding[];  // agent output for this file at ctx.sha
   ctx: ReconcileCtx;
 }): ReconcileResult {
   const { existing, detected, ctx } = args;
@@ -46,6 +60,7 @@ export function reconcileFile(args: {
   const update: ReconcileResult["update"] = [];
   let introduced = 0;
   let resolved = 0;
+  const appliedPrecedentIds: string[] = [];
 
   const byFingerprint = new Map(existing.map((f) => [f.fingerprint, f]));
   const seen = new Set<string>();
@@ -65,6 +80,12 @@ export function reconcileFile(args: {
 
     const prior = byFingerprint.get(fingerprint);
     if (!prior) {
+      // A maintainer already ruled on this exact issue in this repo, so the row
+      // is born suppressed: it goes straight to the rulings ledger instead of
+      // the active list, and — because neither state is in GATING_STATES — it
+      // can never flip a merge gate. The row still exists, so the suppression
+      // is visible and one revoke can bring it back.
+      const sup = d.suppressedBy;
       insert.push({
         id: uuid(),
         fingerprint,
@@ -86,7 +107,8 @@ export function reconcileFile(args: {
         ...(d.invariant ? { invariant: d.invariant } : {}),
         ...(d.remediation ? { remediation: d.remediation } : {}),
         ...(d.regressionTest ? { regressionTest: d.regressionTest } : {}),
-        state: "new",
+        state: sup ? sup.action : "new",
+        ...(sup ? { suppressedByPrecedentId: sup.precedentId, stateReason: sup.note } : {}),
         introducedByPr: ctx.origin.pr ?? null,
         introducedSha: ctx.origin.sha ?? null,
         introducedByAuthor: ctx.origin.author ?? null,
@@ -103,9 +125,20 @@ export function reconcileFile(args: {
               : "Detected by security audit",
             actor: "audit-agent",
           },
+          ...(sup
+            ? [
+                {
+                  at: ctx.now,
+                  kind: "state_change" as const,
+                  detail: `Auto-suppressed by your earlier ruling — ${sup.note}`,
+                  actor: "audit-agent",
+                },
+              ]
+            : []),
         ],
       });
-      introduced++;
+      if (sup) appliedPrecedentIds.push(sup.precedentId);
+      else introduced++;
       continue;
     }
 
@@ -189,5 +222,5 @@ export function reconcileFile(args: {
     resolved++;
   }
 
-  return { insert, update, introduced, resolved };
+  return { insert, update, introduced, resolved, appliedPrecedentIds };
 }

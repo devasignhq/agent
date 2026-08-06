@@ -3,11 +3,23 @@ import express, { Router } from "express";
 import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
-import type { RepoGuidanceItem, Repository, SecurityFinding, SecurityFindingEvent, SecurityScanRun, User } from "../types.js";
+import type {
+  RepoGuidanceItem,
+  Repository,
+  SecurityFinding,
+  SecurityFindingEvent,
+  SecurityPrecedent,
+  SecurityRulingCode,
+  SecurityScanRun,
+  User,
+} from "../types.js";
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
 import { effectiveSecurityPolicy, normalizeSecurityPolicy } from "../security/policy.js";
 import { computeGateForRepo, publishGateForRepo } from "../security/gate.js";
 import { createFindingIssue, IssueCreationError } from "../security/issue.js";
+import { RULING_CODES, codeFitsAction, precedentFromRuling } from "../security/precedent.js";
+import { contradictPrecedent, corpusForUser, revokePrecedent } from "../security/precedent-store.js";
+import { SECURITY_ENGINE } from "../security/audit.js";
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
 import { appJWT, gh, getOrgMembership } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
@@ -884,6 +896,12 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
 
   const action = req.body?.action;
   const reason = typeof req.body?.reason === "string" ? req.body.reason.trim().slice(0, 500) : "";
+  // Why the maintainer is suppressing this. One button covers several very
+  // different situations ("the agent is wrong" vs "it's right and we accept
+  // it"), and only some of them are a lesson — so the reason, not the click,
+  // decides whether anything is learned.
+  const code: SecurityRulingCode | null = RULING_CODES.has(req.body?.code) ? req.body.code : null;
+  const scope: "repo" | "account" = req.body?.scope === "account" ? "account" : "repo";
   const now = Date.now();
   const event = (kind: SecurityFindingEvent["kind"], detail: string): SecurityFindingEvent[] =>
     [...(finding.activity ?? []), { at: now, kind, detail, actor: ctx.user.githubLogin }].slice(-50);
@@ -894,18 +912,26 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
   switch (action) {
     case "false_positive": {
       if (TERMINAL.has(finding.state)) return void res.status(409).json({ error: "invalid_state" });
+      if (code && !codeFitsAction(code, "false_positive")) {
+        return void res.status(400).json({ error: "code_action_mismatch" });
+      }
       patch = {
         state: "false_positive",
         stateReason: reason || null,
+        rulingCode: code,
         activity: event("state_change", `Marked false positive${reason ? ` — ${reason}` : ""}`),
       };
       break;
     }
     case "accept": {
       if (TERMINAL.has(finding.state)) return void res.status(409).json({ error: "invalid_state" });
+      if (code && !codeFitsAction(code, "accepted")) {
+        return void res.status(400).json({ error: "code_action_mismatch" });
+      }
       patch = {
         state: "accepted",
         stateReason: reason || null,
+        rulingCode: code,
         activity: event("state_change", `Accepted as known risk${reason ? ` — ${reason}` : ""}`),
       };
       break;
@@ -916,9 +942,14 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
       if (!TERMINAL.has(finding.state) && finding.state !== "snoozed") {
         return void res.status(409).json({ error: "invalid_state" });
       }
+      // Reopening something a ruling had muted is a human overruling that
+      // ruling — retire it so it stops muting anything else.
+      contradictPrecedent(finding);
       patch = {
         state: finding.issueNumber != null ? "issue_created" : "open",
         stateReason: null,
+        rulingCode: null,
+        suppressedByPrecedentId: null,
         snoozeUntil: null,
         resolvedAt: null,
         activity: event("reopened", "Reopened for triage"),
@@ -929,10 +960,80 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
       return void res.status(400).json({ error: "invalid_action" });
   }
 
+  // Promote the ruling to precedent when it actually carries a lesson: a
+  // teachable code AND a written rationale. Everything else still suppresses
+  // this one finding — it just doesn't teach, because there is nothing to
+  // teach from.
+  let precedent: SecurityPrecedent | null = null;
+  if (code && reason && (action === "false_positive" || action === "accept")) {
+    precedent = precedentFromRuling({
+      code,
+      note: reason,
+      scope,
+      ownerUserId: ctx.user.id,
+      repoId: ctx.repo.id,
+      createdBy: ctx.user.githubLogin,
+      now,
+      engine: SECURITY_ENGINE,
+      finding: {
+        id: finding.id,
+        class: finding.class,
+        path: finding.path,
+        ...(finding.symbol ? { symbol: finding.symbol } : {}),
+        ...(finding.evidence ? { evidence: finding.evidence } : {}),
+        detectedSha: finding.detectedSha,
+        title: finding.title,
+      },
+    });
+    if (precedent) db.insert("securityPrecedents", precedent);
+  }
+
   const updated = db.update("securityFindings", (f) => f.id === finding.id, patch);
   // State changes can alter the blocking set — republish best-effort.
   void publishGateForRepo(ctx.repo).catch(() => {});
-  res.json({ ok: true, finding: updated });
+  res.json({ ok: true, finding: updated, precedent });
+});
+
+// The learned corpus for the signed-in account, newest first. Read-only, so it
+// follows the same convention as the security overview: readable on any plan,
+// with writes gated below.
+api.get("/security/precedents", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const rows = corpusForUser(user.id)
+    .filter((p) => p.status !== "revoked")
+    .sort((a, b) => b.createdAt - a.createdAt);
+  res.json({ precedents: rows, locked: securityLocked(user) });
+});
+
+// Withdraw a ruling: it stops conditioning scans, and everything it muted comes
+// back. The escape hatch that keeps auto-suppression safe to ship.
+api.post("/security/precedents/:id/revoke", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (securityLocked(user)) return void res.status(403).json(UPGRADE_SECURITY);
+  const p = db.find("securityPrecedents", (r) => r.id === req.params.id && r.ownerUserId === user.id);
+  if (!p) return void res.status(404).json({ error: "precedent_not_found" });
+  if (p.status === "revoked") return void res.status(409).json({ error: "already_revoked" });
+  const restored = revokePrecedent(p, user.githubLogin, Date.now());
+  res.json({ ok: true, restored });
+});
+
+// Promote a ruling to the whole account, or pull it back to one repo. Widening
+// only ever widens the PROMPT: matchPrecedent refuses to auto-suppress on an
+// account-scoped ruling, so this can't silently mute another repo.
+api.patch("/security/precedents/:id", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  if (securityLocked(user)) return void res.status(403).json(UPGRADE_SECURITY);
+  const scope = req.body?.scope;
+  if (scope !== "repo" && scope !== "account") {
+    return void res.status(400).json({ error: "invalid_scope" });
+  }
+  const p = db.find("securityPrecedents", (r) => r.id === req.params.id && r.ownerUserId === user.id);
+  if (!p) return void res.status(404).json({ error: "precedent_not_found" });
+  const updated = db.update("securityPrecedents", (r) => r.id === p.id, { scope });
+  res.json({ ok: true, precedent: updated });
 });
 
 // Scan policy (triggers / engines / severity gates).

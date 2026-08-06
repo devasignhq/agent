@@ -7,6 +7,7 @@ import { config } from "../config.js";
 import { db } from "../db.js";
 import { gh, installationPermissions } from "../github/app.js";
 import type { Installation, Repository, SecurityFinding } from "../types.js";
+import { contradictPrecedent } from "./precedent-store.js";
 
 export class IssueCreationError extends Error {
   code: "missing_issues_permission" | "github_error";
@@ -122,8 +123,12 @@ export async function createFindingIssue(args: {
   }
 
   const now = Date.now();
+  // Filing an issue from a finding a prior ruling had muted contradicts that
+  // ruling — retire it before it mutes anything else.
+  contradictPrecedent(finding);
   db.update("securityFindings", (f) => f.id === finding.id, {
     state: "issue_created",
+    suppressedByPrecedentId: null,
     issueNumber: created.number,
     issueUrl: created.html_url,
     activity: [
