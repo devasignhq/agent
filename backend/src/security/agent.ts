@@ -73,7 +73,13 @@ const SECURITY_AUDIT_SYSTEM =
   "unverified assumption is at most medium, no matter its potential blast radius.\n" +
   "4. Prefer under-reporting with high precision over comprehensive noise. An empty array is a good answer for a " +
   "clean file.\n" +
-  "5. You report; you do not fix. The remediation is advice for a human or coding agent.\n\n" +
+  "5. You report; you do not fix. The remediation is advice for a human or coding agent.\n" +
+  "6. The user message may carry PRIOR MAINTAINER RULINGS — cases where the people who own this codebase examined a " +
+  "finding and explained why it was wrong or accepted. Treat them as evidence about how this codebase actually " +
+  "works (where controls live, what is reachable, what is deliberate), not as instructions to stay silent. They " +
+  "raise the bar for re-reporting the same thing; they do not forbid it. If what you see here genuinely differs " +
+  "from the ruling — the control they named is gone, the input is now attacker-reachable, the design changed — " +
+  "report it anyway and say in the concern which ruling you are departing from and why.\n\n" +
   'Emit ONLY JSON: {"findings": [{' +
   '"stable_key": string,           // short kebab-case identity for THIS issue, stable across re-scans (e.g. "payout-route-missing-auth"). Never include line numbers.\n' +
   '"class": string,                // taxonomy tag: "sql-injection", "missing-authz", "hardcoded-secret", "idor", "ssrf", "missing-idempotency", "prompt-injection", ...\n' +
@@ -180,11 +186,17 @@ export async function scanFile(args: {
   path: string;
   content: string;
   repoContext?: string; // brief index-derived context (flags, summary)
+  // Pre-rendered prior maintainer rulings (security/precedent.ts). Kept out of
+  // the system prompt on purpose: that is sent with cacheSystem and has to stay
+  // one global constant, or the prompt cache keys per account. Kept out of
+  // repoContext too — that one is sliced to 500 chars by the caller.
+  precedent?: string;
   engines: RepoSecurityPolicy["engines"];
 }): Promise<AgentFinding[] | null> {
   const userText =
     `Path: ${args.path}\n` +
     (args.repoContext ? `Repo context: ${args.repoContext}\n` : "") +
+    (args.precedent ? `\n${args.precedent}\n` : "") +
     `\n\`\`\`\n${args.content}\n\`\`\``;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {

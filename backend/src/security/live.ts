@@ -63,7 +63,13 @@ let unsubscribe: (() => void) | null = null;
 export function startSecurityLiveSignals(): () => void {
   if (unsubscribe) return unsubscribe;
   const off = onRowChange(({ collection, row, prev }) => {
-    if (collection === "securityFindings" || collection === "securityScans") {
+    if (
+      collection === "securityFindings" ||
+      collection === "securityScans" ||
+      // A ruling written, revoked, or retired changes the rulings ledger and
+      // what the findings list shows as suppressed — both live on the same page.
+      collection === "securityPrecedents"
+    ) {
       if (!hasClients()) return;
       dirtyRepoIds.add((row as { repoId: string }).repoId);
       queueFlush();

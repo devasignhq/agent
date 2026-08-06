@@ -24,7 +24,8 @@ import type {
 import { AUDIT_MODEL, scanFile } from "./agent.js";
 import { classifySurface } from "./fingerprint.js";
 import { effectiveSecurityPolicy, isActiveState } from "./policy.js";
-import { reconcileFile, type ReconcileCtx } from "./reconcile.js";
+import { reconcileFile, type DetectedFinding, type ReconcileCtx } from "./reconcile.js";
+import { anchorHolds, matchPrecedent, renderPrecedentBlock, selectPrecedents } from "./precedent.js";
 import { publishGateForRepo } from "./gate.js";
 
 const CONCURRENCY = 4;
@@ -232,6 +233,23 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
       // Per-severity split of the run's new findings, for the dashboard chart.
       const introducedBySeverity: Partial<Record<SecuritySeverity, number>> = {};
       let resolved = 0;
+      let suppressed = 0;
+
+      // The maintainers' learned corpus, read ONCE for the whole run: db.filter
+      // is a full linear scan with no indexes, so doing this per file would be
+      // O(files × findings). Keyed on the INSTALLATION, not the primary owner:
+      // on a shared org install every co-maintainer triages the same findings,
+      // and keying on install.userId would make the audit silently ignore
+      // everyone else's rulings. Install-wide, because an architectural ruling
+      // travels across the install's repos (prompt-only — see matchPrecedent,
+      // which refuses to auto-suppress on those).
+      const corpus = db.filter(
+        "securityPrecedents",
+        (p) => p.installationId === install.id && p.status !== "revoked"
+      );
+      if (corpus.length) {
+        logLine(run.id, `precedent: ${corpus.length} maintainer ruling(s) in scope`);
+      }
 
       await runPool(capped, CONCURRENCY, async (entry) => {
         let content: string;
@@ -242,11 +260,30 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
           return;
         }
         if (!content) return;
+
+        // Expiry, checked against the file we just fetched: a ruling is only as
+        // true as the code it was made about. Once that code is gone the ruling
+        // stops auto-suppressing — but it is downgraded, not deleted, because
+        // the maintainer's reasoning is still worth showing the model and worth
+        // showing the human who has to re-confirm it.
+        for (const p of corpus) {
+          if (p.status !== "active" || p.repoId !== repo.id || p.path !== entry.path) continue;
+          if (anchorHolds(p, { sha: entry.sha, content })) continue;
+          p.status = "needs_reconfirm";
+          p.statusReason = "code_changed";
+          db.update("securityPrecedents", (r) => r.id === p.id, {
+            status: "needs_reconfirm",
+            statusReason: "code_changed",
+          });
+          logLine(run.id, `⟳ ruling needs re-confirming — code changed under it in ${entry.path}`);
+        }
+
         const detected = await scanFile({
           path: entry.path,
           content,
           repoContext:
             `flags: ${entry.securityFlags?.join(", ") || "(none)"} · ${entry.summary}`.slice(0, 500),
+          precedent: renderPrecedentBlock(selectPrecedents(corpus, { repoId: repo.id, path: entry.path })),
           engines: policy.engines,
         });
         if (detected === null) {
@@ -256,7 +293,16 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         }
         // The secrets engine gates finding-level output (a secret can hide in
         // any file, so it can't be a file-level gate).
-        const kept = policy.engines.secrets ? detected : detected.filter((d) => d.surface !== "secrets");
+        const engineKept = policy.engines.secrets ? detected : detected.filter((d) => d.surface !== "secrets");
+        // Annotate anything a repo-scoped ruling already covers. reconcileFile
+        // only honours the annotation when minting a NEW row: a finding that
+        // already has a row keeps whatever triage state it earned.
+        const kept: DetectedFinding[] = engineKept.map((d) => {
+          const p = matchPrecedent(d, corpus, { repoId: repo.id, path: entry.path });
+          return p
+            ? { ...d, suppressedBy: { precedentId: p.id, action: p.action, note: p.note } }
+            : d;
+        });
         const ctx: ReconcileCtx = {
           repoId: repo.id,
           path: entry.path,
@@ -272,23 +318,38 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         const result = reconcileFile({ existing, detected: kept, ctx });
         for (const row of result.insert) db.insert("securityFindings", row);
         for (const u of result.update) db.update("securityFindings", (f) => f.id === u.id, u.patch);
+        for (const id of result.appliedPrecedentIds) {
+          const p = corpus.find((r) => r.id === id);
+          if (!p) continue;
+          p.suppressedCount += 1;
+          db.update("securityPrecedents", (r) => r.id === id, {
+            suppressedCount: p.suppressedCount,
+            lastAppliedAt: ctx.now,
+          });
+        }
         db.update("repoIndex", (e) => e.id === entry.id, {
           securityScannedSha: entry.sha,
           securityEngine: SECURITY_ENGINE,
         });
         filesScanned++;
         introduced += result.introduced;
-        for (const row of result.insert) {
-          introducedBySeverity[row.severity] = (introducedBySeverity[row.severity] ?? 0) + 1;
-        }
+        suppressed += result.appliedPrecedentIds.length;
         resolved += result.resolved;
         for (const row of result.insert) {
+          if (row.suppressedByPrecedentId) {
+            logLine(run.id, `· muted by your ruling  ${row.path}${row.line ? `:${row.line}` : ""} — ${row.title}`);
+            continue;
+          }
+          introducedBySeverity[row.severity] = (introducedBySeverity[row.severity] ?? 0) + 1;
           logLine(run.id, `✗ ${row.severity.toUpperCase().padEnd(8)} ${row.path}${row.line ? `:${row.line}` : ""} — ${row.title}`);
         }
         if (result.resolved > 0) {
           logLine(run.id, `✓ ${result.resolved} finding(s) resolved in ${entry.path}`);
         }
       });
+      if (suppressed > 0) {
+        logLine(run.id, `${suppressed} finding(s) auto-suppressed by your earlier rulings`);
+      }
 
       // Findings in files that no longer exist. Differential runs resolve only
       // explicitly-removed paths; full runs resolve anything whose file left

@@ -560,6 +560,10 @@ export type SecurityFinding = {
   regressionTest?: string;
   state: SecurityFindingState;
   stateReason?: string | null;
+  rulingCode?: SecurityRulingCode | null;
+  // Set when the audit muted this on a prior maintainer ruling instead of a
+  // click — drives the "Suppressed by your rulings" section.
+  suppressedByPrecedentId?: string | null;
   assigneeLogin?: string | null;
   issueNumber?: number | null;
   issueUrl?: string | null;
@@ -643,6 +647,35 @@ export type SecurityScanBatch = {
   ok: true;
   queued: { repoId: string; scanRunId: string }[];
   skipped: { repoId: string; reason: "in_progress" }[];
+};
+
+export type SecurityRulingCode =
+  | "control_exists"
+  | "not_reachable"
+  | "misread_code"
+  | "out_of_scope"
+  | "duplicate"
+  | "by_design"
+  | "compensating_control"
+  | "accepted_cost";
+
+// A maintainer ruling the audit agent carries into later scans.
+export type SecurityPrecedent = {
+  id: string;
+  repoId: string;
+  scope: "repo" | "account";
+  code: SecurityRulingCode;
+  action: "false_positive" | "accepted";
+  note: string;
+  class: string;
+  path: string;
+  symbol?: string;
+  createdAt: number;
+  createdBy: string;
+  status: "active" | "needs_reconfirm" | "revoked";
+  statusReason?: "code_changed" | "contradicted" | "revoked" | null;
+  suppressedCount: number;
+  lastAppliedAt?: number | null;
 };
 
 export type SecurityOverview = {
@@ -741,12 +774,28 @@ export const api = {
     body: {
       action: "false_positive" | "accept" | "reopen";
       reason?: string;
+      // Which kind of "false positive" this is. A teachable code plus a written
+      // reason is what promotes the ruling into the agent's corpus.
+      code?: SecurityRulingCode;
+      scope?: "repo" | "account";
     }
   ) =>
-    request<{ ok: true; finding: SecurityFinding }>(
+    request<{ ok: true; finding: SecurityFinding; precedent: SecurityPrecedent | null }>(
       `/api/repositories/${repoId}/security/findings/${findingId}`,
       { method: "PATCH", body: JSON.stringify(body) }
     ),
+  securityPrecedents: () =>
+    request<{ precedents: SecurityPrecedent[]; locked: boolean }>("/api/security/precedents"),
+  revokePrecedent: (id: string) =>
+    request<{ ok: true; restored: number }>(`/api/security/precedents/${id}/revoke`, {
+      method: "POST",
+      body: "{}",
+    }),
+  setPrecedentScope: (id: string, scope: "repo" | "account") =>
+    request<{ ok: true; precedent: SecurityPrecedent }>(`/api/security/precedents/${id}`, {
+      method: "PATCH",
+      body: JSON.stringify({ scope }),
+    }),
   securityPolicy: (repoId: string) =>
     request<{ policy: RepoSecurityPolicy }>(`/api/repositories/${repoId}/security/policy`),
   setSecurityPolicy: (repoId: string, policy: RepoSecurityPolicy) =>

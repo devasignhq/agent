@@ -235,6 +235,23 @@ export type SecurityFindingState =
   | "false_positive" // suppressed, kept by fingerprint so it can't come back
   | "snoozed";
 
+// Why a human suppressed a finding. "False positive" and "accept risk" are one
+// button each in the UI, but a maintainer clicks them for very different
+// reasons, and only some of those reasons are a lesson the agent can learn.
+// Splitting them at the point of the click is what keeps the precedent corpus
+// from degenerating into "the agent was trained to stay quiet".
+export type SecurityRulingCode =
+  // false-positive family — the agent got it wrong
+  | "control_exists"        // the control is applied elsewhere (middleware, wrapper, layer)
+  | "not_reachable"         // real sink, but no untrusted input can reach it
+  | "misread_code"          // the claim is factually untrue about this code
+  | "out_of_scope"          // vendored / generated / sample / fixture code
+  | "duplicate"             // already tracked by another finding
+  // accepted-risk family — the agent is right, the team is living with it
+  | "by_design"             // intentional and reviewed
+  | "compensating_control"  // mitigated outside the code (WAF, network, IaC, process)
+  | "accepted_cost";        // real, consciously not fixed now
+
 export type SecurityFindingEvent = {
   at: number;
   kind:
@@ -274,6 +291,11 @@ export type SecurityFinding = {
   regressionTest?: string;   // a test that fails today, passes after the fix
   state: SecurityFindingState;
   stateReason?: string | null; // note on accepted / false_positive / snoozed
+  rulingCode?: SecurityRulingCode | null;   // why a human suppressed it, when they said
+  // Set when the audit auto-suppressed this on a maintainer's prior ruling
+  // rather than on a click. Drives the "Suppressed by your rulings" ledger and
+  // lets a revoke find everything it muted.
+  suppressedByPrecedentId?: string | null;
   assigneeLogin?: string | null;
   issueNumber?: number | null;
   issueUrl?: string | null;
@@ -289,6 +311,52 @@ export type SecurityFinding = {
   detectedSha: string;       // blob sha last detected on
   model: string;
   activity: SecurityFindingEvent[]; // capped at 50, newest last
+};
+
+// A maintainer's ruling, promoted to something the auditor carries forward.
+// Only the teachable ruling codes ever reach this table, and only with a
+// rationale attached — a lesson with no reasoning is not a lesson.
+//
+// Two channels, deliberately separated (see security/precedent.ts):
+//   - repo-scoped rulings ALSO auto-suppress a tight re-match in that repo;
+//   - account-scoped rulings only condition the scan prompt, never auto-hide.
+// We hard-mute solely in the repo where the maintainer actually looked.
+export type SecurityPrecedent = {
+  id: string;
+  // A ruling belongs to the INSTALLATION, not to whoever happened to type it.
+  // Any co-maintainer on an install triages the same findings, and the audit
+  // runs under the primary owner — key this on a person and a team member's
+  // rulings are invisible to the scan that should honour them, and to the
+  // ledger that should let anyone withdraw them.
+  installationId: string;
+  ownerUserId: string;         // who authored it — provenance, not access control
+  repoId: string;              // the repo the ruling was made in
+  scope: "repo" | "account";   // "account" is an explicit opt-in promotion
+  code: SecurityRulingCode;
+  action: "false_positive" | "accepted"; // the state a tight match should apply
+  note: string;                // the maintainer's rationale — the actual lesson
+  // Match key. Looser than a fingerprint on purpose: no repoId (so an account
+  // ruling can travel) and no line numbers or prose (both drift between runs).
+  class: string;
+  slug: string;
+  path: string;
+  symbol?: string;
+  // Expiry anchors. A ruling is only as true as the code it was made against,
+  // so we keep enough to notice when that code moves out from under it.
+  originFindingId: string;
+  anchorSha: string;           // blob sha the file had when the ruling was made
+  anchorEvidence?: string;     // the evidence line the agent had quoted
+  engineAtCreation: string;    // SECURITY_ENGINE, for revalidation on a bump
+  createdAt: number;
+  createdBy: string;           // github login
+  // "needs_reconfirm" still informs the prompt but stops auto-suppressing: the
+  // ground truth shifted, so the ruling needs a human to look again.
+  status: "active" | "needs_reconfirm" | "revoked";
+  statusReason?: "code_changed" | "contradicted" | "revoked" | null;
+  suppressedCount: number;     // how many findings it has muted — the health metric
+  lastAppliedAt?: number | null;
+  revokedAt?: number | null;
+  revokedBy?: string | null;
 };
 
 export type SecurityScanTrigger = "merge" | "manual" | "nightly";
@@ -879,4 +947,5 @@ export type DB = {
   escrowTransactions: EscrowTransaction[];
   securityFindings: SecurityFinding[];
   securityScans: SecurityScanRun[];
+  securityPrecedents: SecurityPrecedent[];
 };

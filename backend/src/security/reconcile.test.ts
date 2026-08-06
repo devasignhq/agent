@@ -148,3 +148,52 @@ test("two model findings collapsing to one fingerprint insert once", () => {
   });
   assert.equal(out.insert.length, 1);
 });
+
+// --- precedent-driven auto-suppression -------------------------------------
+
+const muted = { precedentId: "p1", action: "false_positive" as const, note: "auth is in requireAuth" };
+
+test("a detection annotated by a maintainer ruling is born suppressed, not active", () => {
+  const out = reconcileFile({ existing: [], detected: [{ ...detected(), suppressedBy: muted }], ctx: ctx() });
+  assert.equal(out.insert.length, 1);
+  const row = out.insert[0];
+  assert.equal(row.state, "false_positive");
+  assert.equal(row.suppressedByPrecedentId, "p1");
+  assert.equal(row.stateReason, "auth is in requireAuth");
+  // It must not count as introduced — the dashboard's "new findings" number
+  // would otherwise report work the maintainer already adjudicated.
+  assert.equal(out.introduced, 0);
+  assert.deepEqual(out.appliedPrecedentIds, ["p1"]);
+  // The suppression has to be legible in the row's own history.
+  assert.ok(row.activity.some((e) => /Auto-suppressed by your earlier ruling/.test(e.detail)));
+});
+
+test("an accepted-risk ruling suppresses as accepted, not as a false positive", () => {
+  const out = reconcileFile({
+    existing: [],
+    detected: [{ ...detected(), suppressedBy: { ...muted, action: "accepted" } }],
+    ctx: ctx(),
+  });
+  assert.equal(out.insert[0].state, "accepted");
+});
+
+test("a ruling never overrides the triage state a finding already earned", () => {
+  // The row exists and a human filed an issue from it. A precedent matching the
+  // same class must not quietly mute a finding that is already being worked.
+  const out = reconcileFile({
+    existing: [stored({ state: "issue_created", issueNumber: 12 })],
+    detected: [{ ...detected(), suppressedBy: muted }],
+    ctx: ctx(),
+  });
+  assert.equal(out.insert.length, 0);
+  assert.equal(out.appliedPrecedentIds.length, 0);
+  assert.ok(!("state" in out.update[0].patch), "existing triage state must survive");
+});
+
+test("an unannotated detection is unaffected by the suppression path", () => {
+  const out = reconcileFile({ existing: [], detected: [detected()], ctx: ctx() });
+  assert.equal(out.insert[0].state, "new");
+  assert.equal(out.insert[0].suppressedByPrecedentId, undefined);
+  assert.equal(out.introduced, 1);
+  assert.deepEqual(out.appliedPrecedentIds, []);
+});
