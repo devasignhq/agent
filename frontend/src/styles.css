@@ -5649,6 +5649,11 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .vln-pnl-head-wrap { flex-wrap: wrap; }
 .vln-pnl-t { font-family: var(--mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-dim); margin: 0; }
 .vln-pnl-s { font-family: var(--mono); font-size: 10.5px; color: var(--fg-faint); }
+/* Selection/export toolbar — replaces the "showing N" caption while rows are
+   selected. */
+.vln-export-bar { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); }
+.vln-export-bar b { color: var(--fg); font-weight: 500; }
+.vln-export-err { font-family: var(--mono); font-size: 10.5px; color: var(--danger); }
 .vln-pnl-body { padding: 14px; }
 /* The chart wants more breathing room than a plain panel body. */
 .vln-mg-body { padding: 20px 20px 16px; }
@@ -5825,9 +5830,13 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 /* findings table */
 .vln-fx-head, .vln-fx-row {
   display: grid;
-  grid-template-columns: 96px 96px minmax(0,1fr) 90px 140px 150px 48px 110px;
+  grid-template-columns: 24px 96px 96px minmax(0,1fr) 90px 140px 150px 48px 110px;
   align-items: center; gap: 12px; padding: 0 14px;
 }
+/* Selection cell: the wrapper carries the click-swallowing handler, so give it
+   the full cell as hit area rather than just the 13px box. */
+.vln-fx-sel { display: flex; align-items: center; align-self: stretch; }
+.vln-fx-sel input { accent-color: var(--accent); cursor: pointer; margin: 0; }
 .vln-fx-head { height: 30px; background: var(--bg); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
 .vln-fx-row { min-height: 54px; border-bottom: 1px solid var(--line); border-left: 2px solid transparent; cursor: pointer; }
 .vln-fx-row:last-child { border-bottom: 0; }
@@ -6042,10 +6051,10 @@ pre.vln-code, .vln-code {
    matters — is the flexible one, so it collapses to nothing. Drop the two
    lowest-value columns (id, origin) and give the title the room. */
 @media (max-width: 1300px) {
-  .vln-fx-head, .vln-fx-row { grid-template-columns: 96px minmax(0,1fr) 90px 48px 110px; }
-  .vln-fx-head > :nth-child(2),  /* id */
-  .vln-fx-head > :nth-child(5),  /* origin */
-  .vln-fx-head > :nth-child(6),  /* repo */
+  .vln-fx-head, .vln-fx-row { grid-template-columns: 24px 96px minmax(0,1fr) 90px 48px 110px; }
+  .vln-fx-head > :nth-child(3),  /* id */
+  .vln-fx-head > :nth-child(6),  /* origin */
+  .vln-fx-head > :nth-child(7),  /* repo */
   .vln-fx-row > .vln-fx-id,
   .vln-fx-row > .vln-fx-repo,
   .vln-fx-row > .vln-fx-o { display: none; }
@@ -6069,11 +6078,14 @@ pre.vln-code, .vln-code {
     padding: 10px 12px;
   }
   .vln-fx-row > .vln-sev { grid-area: sev; }
-  .vln-fx-row > :nth-child(2), /* id */
+  /* Selection and export are a desktop workflow — hidden with the columns. */
+  .vln-fx-row > .vln-fx-sel,
+  .vln-export-bar,
+  .vln-fx-row > :nth-child(3), /* id */
   .vln-fx-row > .vln-tag.surface,
   .vln-fx-row > .vln-fx-o,
   .vln-fx-row > .vln-fx-repo,
   .vln-fx-row > .vln-fx-a { display: none; }
-  .vln-fx-row > :nth-child(3) { grid-area: title; }
+  .vln-fx-row > :nth-child(4) { grid-area: title; }
   .vln-fx-row > .vln-tag:last-child { grid-area: state; }
 }
