@@ -42,10 +42,14 @@ export function findingFileUrl(f: SecurityFinding, branchOf: RepoBranchLookup): 
 // Mirrors the table's origin cell ("#487 @alice · ab12cd3", or "audit" for a
 // finding first seen by a full scan) so the export reads like the screen it
 // came from. The split PR/author/sha columns exist alongside it for machines.
+//
+// "audit" means the absence of PR provenance, so it only appears when there is
+// no PR reference — a PR with an unknown author is just "#487", never
+// "#487 audit".
 export function originLabel(f: SecurityFinding): string {
   const head = [
     f.introducedByPr ? `#${f.introducedByPr}` : "",
-    f.introducedByAuthor ? `@${f.introducedByAuthor}` : "audit",
+    f.introducedByAuthor ? `@${f.introducedByAuthor}` : f.introducedByPr ? "" : "audit",
   ]
     .filter(Boolean)
     .join(" ");

@@ -124,6 +124,13 @@ test("originLabel: PR provenance vs audit fallback", () => {
   );
   assert.equal(originLabel(finding()), "audit");
   assert.equal(originLabel(finding({ introducedSha: "ab12cd34ef" })), "audit · ab12cd3");
+  // A PR with an unknown author is PR provenance, not an audit finding — the
+  // fallback must not produce "#487 audit".
+  assert.equal(originLabel(finding({ introducedByPr: 487 })), "#487");
+  assert.equal(
+    originLabel(finding({ introducedByPr: 487, introducedSha: "ab12cd34ef" })),
+    "#487 · ab12cd3"
+  );
 });
 
 test("dataflowText / exploitText: numbered steps, empty when absent", () => {
