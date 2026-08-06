@@ -25,7 +25,9 @@ import {
   type SecurityConfidence,
   type SecurityFinding,
   type SecurityOverview,
+  type SecurityPrecedent,
   type SecurityRepoView,
+  type SecurityRulingCode,
   type SecurityScanSummary,
   type SecuritySeverity,
 } from "./api";
@@ -58,6 +60,21 @@ import {
   scanProgressLabel,
   summarizeRescan,
 } from "./security-rescan.ts";
+import {
+  canPromoteToAccount,
+  findOption,
+  NOTE_MAX,
+  optionsFor,
+  outcomeSummary,
+  precedentById,
+  reconfirmReason,
+  requiresNote,
+  sortPrecedents,
+  suppressedByRulings,
+  validateRuling,
+  type RulingAction,
+  type RulingDraft,
+} from "./security-triage.ts";
 import { exportFilename, findingFileUrl, findingsCsv } from "./security-export.ts";
 import { downloadTextFile } from "./download.ts";
 
@@ -149,7 +166,7 @@ const LockedEmpty = () => (
 
 // ─── main page ────────────────────────────────────────────────────────────────
 
-type ViewKey = "dashboard" | "detail" | "gate" | "policy";
+type ViewKey = "dashboard" | "detail" | "gate" | "policy" | "rulings";
 
 // One segment of the top-bar breadcrumb. A segment with a `path` is a link back;
 // the last (pathless) segment is the current page.
@@ -180,29 +197,39 @@ export const SecurityPage = ({
   // "owner/name" — resolved to an id once the overview arrives.
   const [repoFilter, setRepoFilter] = React.useState<string>("all");
   const [chip, setChip] = React.useState<FilterChip>("all");
+  // The maintainer's learned corpus. Fetched alongside the overview so the
+  // findings list can name the ruling behind each auto-suppression without a
+  // second round-trip per row.
+  const [precedents, setPrecedents] = React.useState<SecurityPrecedent[]>([]);
+
+  const fetchAll = React.useCallback(async () => {
+    const [ov, pr] = await Promise.all([api.securityOverview(), api.securityPrecedents()]);
+    setOverview(ov);
+    setPrecedents(pr.precedents);
+  }, []);
 
   const load = React.useCallback(async () => {
     setLoading(true);
     setError(null);
     try {
-      setOverview(await api.securityOverview());
+      await fetchAll();
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setLoading(false);
     }
-  }, []);
+  }, [fetchAll]);
 
   // Silent variant: a live refetch must never blank an already-painted page.
   const refresh = React.useCallback(async () => {
     try {
-      setOverview(await api.securityOverview());
+      await fetchAll();
     } catch (err) {
       if (!isTransientApiError(err)) {
         setError(err instanceof Error ? err.message : String(err));
       }
     }
-  }, []);
+  }, [fetchAll]);
 
   React.useEffect(() => {
     void load();
@@ -252,6 +279,7 @@ export const SecurityPage = ({
   const crumbs = React.useMemo<SecurityCrumb[]>(() => {
     const root: SecurityCrumb = { label: "Security", path: "/security" };
     if (view === "gate") return [root, { label: "Merge gate" }];
+    if (view === "rulings") return [root, { label: "Rulings" }];
     if (view === "policy") return [root, { label: "Scan policy" }];
     if (view === "detail") {
       const leaf: SecurityCrumb = { label: detailLabel };
@@ -275,6 +303,7 @@ export const SecurityPage = ({
       {[
         { key: "dashboard", label: "Findings", path: "/security" },
         { key: "gate", label: "Merge gate", path: "/security/gate" },
+        { key: "rulings", label: "Rulings", path: "/security/rulings" },
         { key: "policy", label: "Scan policy", path: "/security/policy" },
       ].map((t) => (
         <button
@@ -354,12 +383,33 @@ export const SecurityPage = ({
         (overview.locked && overview.findings.length === 0 ? (
           <LockedEmpty />
         ) : (
-          <Dashboard
-            overview={overview}
-            repoFilter={repoFilter}
-            chip={chip}
-            setChip={setChip}
-            onOpen={(id) => navigate(`/security/findings/${id}`)}
+          <>
+            <Dashboard
+              overview={overview}
+              repoFilter={repoFilter}
+              chip={chip}
+              setChip={setChip}
+              onOpen={(id) => navigate(`/security/findings/${id}`)}
+            />
+            <SuppressedSection
+              findings={overview.findings}
+              precedents={precedents}
+              repoFilter={repoFilter}
+              onOpen={(id) => navigate(`/security/findings/${id}`)}
+              onManage={() => navigate("/security/rulings")}
+            />
+          </>
+        ))}
+      {view === "rulings" &&
+        (overview.locked && overview.findings.length === 0 ? (
+          <LockedEmpty />
+        ) : (
+          <RulingsView
+            precedents={precedents}
+            findings={overview.findings}
+            repos={overview.repos}
+            refresh={refresh}
+            locked={overview.locked}
           />
         ))}
       {(view === "gate" || view === "policy") && overview.locked && overview.findings.length === 0 && (
@@ -1598,17 +1648,6 @@ const FindingDetail = ({
               Reopen
             </button>
           </>
-        ) : confirm ? (
-          <span className="vln-confirm">
-            {confirm === "false_positive" ? "Mark false positive?" : "Accept this risk?"}
-            <button className="vln-confirm-yes" onClick={() => void patch({ action: confirm })}>
-              Confirm
-            </button>
-            /
-            <button className="vln-confirm-no" onClick={() => setConfirm(null)}>
-              Cancel
-            </button>
-          </span>
         ) : (
           <>
             <button className="btn ghost" onClick={() => setConfirm("false_positive")}>
@@ -1620,6 +1659,374 @@ const FindingDetail = ({
           </>
         )}
       </div>
+
+      {confirm && (
+        <RulingModal
+          action={confirm}
+          finding={f}
+          onClose={() => setConfirm(null)}
+          // Deliberately not routed through patch(): that swallows the error
+          // into the footer, and the dialog needs it to stay open and show why.
+          onSubmit={async (body) => {
+            const res = await api.patchFinding(f.repoId, f.id, { action: confirm, ...body });
+            applyFinding(res.finding);
+            void refresh();
+          }}
+        />
+      )}
+    </div>
+  );
+};
+
+// ─── triage ruling dialog ─────────────────────────────────────────────────────
+
+// "False positive" is one button covering several unrelated situations, so the
+// click opens a picker instead of suppressing straight away. The reason is what
+// decides whether the agent learns anything: a correction with a written
+// rationale becomes precedent it carries into later scans; a scope note or a
+// business decision just suppresses this one finding.
+const RulingModal = ({
+  action,
+  finding,
+  onClose,
+  onSubmit,
+}: {
+  action: RulingAction;
+  finding: SecurityFinding;
+  onClose: () => void;
+  onSubmit: (body: { reason: string; code: SecurityRulingCode; scope: "repo" | "account" }) => Promise<void>;
+}) => {
+  const [draft, setDraft] = React.useState<RulingDraft>({
+    code: null,
+    note: "",
+    applyToAllRepos: false,
+  });
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+
+  React.useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "Escape") return;
+      // FindingDetail also binds Escape (to navigate back), so this has to stop
+      // here or one keypress would both close the dialog and leave the page.
+      e.stopPropagation();
+      onClose();
+    };
+    window.addEventListener("keydown", onKey, true);
+    return () => window.removeEventListener("keydown", onKey, true);
+  }, [onClose]);
+
+  const options = optionsFor(action);
+  const promotable = canPromoteToAccount(draft.code);
+
+  const submit = async () => {
+    const v = validateRuling(draft);
+    if (v.ok !== true) {
+      setErr(v.error);
+      return;
+    }
+    setBusy(true);
+    setErr(null);
+    try {
+      await onSubmit(v.body);
+      onClose();
+    } catch (e) {
+      setErr(
+        e instanceof ApiError && e.status === 403
+          ? "Security audits are a Pro/Max feature."
+          : e instanceof Error
+          ? e.message
+          : String(e)
+      );
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="modal-scrim" onClick={onClose}>
+      <div className="modal cb-modal" onClick={(e) => e.stopPropagation()}>
+        <button className="modal-close" onClick={onClose} aria-label="Close">
+          <Icon name="x" size={13} />
+        </button>
+        <div className="cb-modal-head">
+          <div className="cb-eyebrow">Security</div>
+          <h2 className="cb-modal-title">
+            {action === "accept" ? "Accept this risk" : "Mark as a false positive"}
+          </h2>
+          <div className="cb-modal-sub">
+            {action === "accept"
+              ? "The agent is right and you're choosing to live with it. Which is it?"
+              : "Tell the agent what it got wrong. What you pick here is what it learns from."}
+          </div>
+        </div>
+
+        <div className="vln-pick-list">
+          {options.map((o) => (
+            <button
+              key={o.code}
+              className={`vln-pick-row vln-ruling-opt${draft.code === o.code ? " on" : ""}`}
+              onClick={() => setDraft((d) => ({ ...d, code: o.code }))}
+            >
+              <span className="vln-eng-n">
+                {o.label}
+                {o.teaches && <span className="vln-tag">teaches the agent</span>}
+              </span>
+              <span className="vln-eng-d">{o.description}</span>
+            </button>
+          ))}
+        </div>
+
+        {draft.code && (
+          <>
+            <label className="vln-ruling-note">
+              <span className="vln-eng-n">
+                {requiresNote(draft.code) ? "Why? (required)" : "Note (optional)"}
+              </span>
+              <textarea
+                className="textarea wf-textarea"
+                autoFocus
+                placeholder={
+                  action === "accept"
+                    ? "e.g. this endpoint is public by design; it returns no tenant data"
+                    : "e.g. auth is applied by requireAuth in server.ts before this router mounts"
+                }
+                value={draft.note}
+                onChange={(e) =>
+                  setDraft((d) => ({ ...d, note: e.target.value.slice(0, NOTE_MAX) }))
+                }
+              />
+              <span className="mono mute" style={{ fontSize: 11, alignSelf: "flex-end" }}>
+                {draft.note.length}/{NOTE_MAX}
+              </span>
+            </label>
+
+            {promotable && (
+              <label className="vln-pick-row">
+                <input
+                  type="checkbox"
+                  checked={draft.applyToAllRepos}
+                  onChange={(e) => setDraft((d) => ({ ...d, applyToAllRepos: e.target.checked }))}
+                />
+                <span className="vln-pick-name">Apply this reasoning to all my repositories</span>
+              </label>
+            )}
+
+            <div className="mono mute" style={{ fontSize: 11, padding: "6px 0 0" }}>
+              {outcomeSummary(draft)}
+            </div>
+          </>
+        )}
+
+        {err && (
+          <div className="mono" style={{ fontSize: 12, color: "var(--danger)", padding: "4px 0 0" }}>
+            {err}
+          </div>
+        )}
+
+        <div className="cb-modal-foot">
+          <button className="btn ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="btn primary" disabled={!draft.code || busy} onClick={() => void submit()}>
+            {busy ? "Saving…" : action === "accept" ? "Accept risk" : "Mark false positive"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ─── suppressed-by-rulings ledger ─────────────────────────────────────────────
+
+// Findings the agent muted on its own, on the strength of an earlier ruling.
+// They never enter the active list and never gate a merge — so this section is
+// the only place they surface, and that visibility is exactly what makes
+// auto-suppression safe to ship. Silent suppression on a security tool is the
+// worst outcome available.
+const SuppressedSection = ({
+  findings,
+  precedents,
+  repoFilter,
+  onOpen,
+  onManage,
+}: {
+  findings: SecurityFinding[];
+  precedents: SecurityPrecedent[];
+  repoFilter: string;
+  onOpen: (id: string) => void;
+  onManage: () => void;
+}) => {
+  const [open, setOpen] = React.useState(false);
+  const scoped = repoFilter === "all" ? findings : findings.filter((f) => f.repoId === repoFilter);
+  const rows = suppressedByRulings(scoped);
+  const byId = precedentById(precedents);
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="vln-suppressed">
+      <button className="vln-suppressed-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name={open ? "chevron-d" : "chevron-r"} size={12} />
+        Suppressed by your rulings ({rows.length})
+        <span className="mono mute" style={{ fontSize: 11, marginLeft: 8 }}>
+          hidden from the list above and from the merge gate
+        </span>
+      </button>
+      {open && (
+        <div className="vln-suppressed-list">
+          {rows.map((f) => {
+            const p = f.suppressedByPrecedentId ? byId.get(f.suppressedByPrecedentId) : null;
+            return (
+              <div key={f.id} className="vln-suppressed-row">
+                <button className="vln-suppressed-title" onClick={() => onOpen(f.id)}>
+                  <SevPill sev={f.severity} />
+                  <span className="mono">{f.path}{f.line ? `:${f.line}` : ""}</span>
+                  <span>{f.title}</span>
+                </button>
+                <div className="vln-suppressed-why mono mute">
+                  ↳ your ruling: “{p?.note ?? f.stateReason ?? "—"}”
+                  {p && <> · {findOption(p.code)?.label ?? p.code}</>}
+                </div>
+              </div>
+            );
+          })}
+          <button className="btn ghost sm" onClick={onManage}>
+            Manage rulings
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─── rulings view ─────────────────────────────────────────────────────────────
+
+// The corpus itself: what the agent has been taught, how much each ruling is
+// muting, and which ones need another look. Every ruling is revocable here —
+// without that, teaching the agent would be a one-way door.
+const RulingsView = ({
+  precedents,
+  findings,
+  repos,
+  refresh,
+  locked,
+}: {
+  precedents: SecurityPrecedent[];
+  findings: SecurityFinding[];
+  repos: SecurityRepoView[];
+  refresh: () => Promise<void>;
+  locked: boolean;
+}) => {
+  const [busy, setBusy] = React.useState<string | null>(null);
+  const [err, setErr] = React.useState<string | null>(null);
+  const rows = sortPrecedents(precedents);
+
+  const act = async (id: string, fn: () => Promise<void>) => {
+    setBusy(id);
+    setErr(null);
+    try {
+      await fn();
+      await refresh();
+    } catch (e) {
+      setErr(
+        e instanceof ApiError && e.status === 403
+          ? "Security audits are a Pro/Max feature."
+          : e instanceof Error
+          ? e.message
+          : String(e)
+      );
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  if (rows.length === 0) {
+    return (
+      <div className="vln-blank">
+        <div className="vln-blank-t">No rulings yet</div>
+        <div className="vln-blank-s">
+          When you mark a finding a false positive and explain why, the reasoning lands here and the
+          audit agent carries it into later scans. Everything it teaches stays visible and revocable.
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="vln-rulings">
+      {err && <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>{err}</div>}
+      {rows.map((p) => {
+        const repo = repos.find((r) => r.id === p.repoId);
+        const needs = reconfirmReason(p);
+        const muted = findings.filter((f) => f.suppressedByPrecedentId === p.id).length;
+        return (
+          <div key={p.id} className={`vln-ruling${needs ? " warn" : ""}`}>
+            <div className="vln-ruling-head">
+              <span className="vln-tag">{findOption(p.code)?.label ?? p.code}</span>
+              <span className="mono mute" style={{ fontSize: 11 }}>
+                {repo ? `${repo.owner}/${repo.name}` : "—"} · {p.class}
+              </span>
+              <span className={`vln-tag${p.scope === "account" ? " new" : ""}`}>
+                {p.scope === "account" ? "all repositories" : "this repository"}
+              </span>
+              <div style={{ flex: 1 }} />
+              <span className="mono mute" style={{ fontSize: 11 }}>
+                suppressed {p.suppressedCount} · {muted} active
+              </span>
+            </div>
+
+            <div className="vln-ruling-note-text">“{p.note}”</div>
+            <div className="mono mute" style={{ fontSize: 11 }}>
+              {p.createdBy} · {ageLabel(p.createdAt, Date.now())} ago · {p.path}
+            </div>
+
+            {needs && (
+              <div className="tu-notice" style={{ marginTop: 8 }}>
+                Needs another look — {needs} It has stopped suppressing anything until you re-confirm it.
+              </div>
+            )}
+
+            <div className="vln-ruling-foot">
+              {locked ? (
+                <span className="mono mute" style={{ fontSize: 11 }}>
+                  rulings paused <ProLock />
+                </span>
+              ) : (
+                <>
+                  <button
+                    className="btn ghost sm"
+                    disabled={busy === p.id}
+                    onClick={() =>
+                      void act(p.id, async () => {
+                        await api.setPrecedentScope(p.id, p.scope === "account" ? "repo" : "account");
+                      })
+                    }
+                    title={
+                      p.scope === "account"
+                        ? "Limit this reasoning to the repository it was made in"
+                        : "Let the agent weigh this reasoning on every repository. It still won't auto-hide findings outside this repo."
+                    }
+                  >
+                    {p.scope === "account" ? "Limit to this repo" : "Apply to all repos"}
+                  </button>
+                  <button
+                    className="btn ghost sm"
+                    disabled={busy === p.id}
+                    onClick={() =>
+                      void act(p.id, async () => {
+                        await api.revokePrecedent(p.id);
+                      })
+                    }
+                    title="Withdraw this ruling and bring back everything it suppressed"
+                  >
+                    Revoke
+                  </button>
+                </>
+              )}
+            </div>
+          </div>
+        );
+      })}
     </div>
   );
 };

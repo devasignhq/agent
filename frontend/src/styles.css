@@ -6089,3 +6089,49 @@ pre.vln-code, .vln-code {
   .vln-fx-row > :nth-child(4) { grid-area: title; }
   .vln-fx-row > .vln-tag:last-child { grid-area: state; }
 }
+
+/* ── triage rulings ────────────────────────────────────────────────────────
+   The false-positive dialog's reason picker, the suppressed-findings ledger,
+   and the corpus view. The picker rows reuse .vln-pick-row's gutter so they
+   line up with the modal title and footer, but stack label over description
+   the way .vln-eng does instead of sitting on one line. */
+.vln-ruling-opt {
+  display: block; width: 100%; text-align: left;
+  background: transparent; border: 0; border-bottom: 1px solid var(--line);
+  padding: 11px 24px;
+}
+.vln-ruling-opt.on { background: rgba(255,122,61,.07); box-shadow: inset 2px 0 0 var(--accent); }
+.vln-ruling-opt.on .vln-eng-n { color: var(--accent); }
+/* .vln-eng-n/-d are inline spans in the engines list; here they are the two
+   lines of a stacked option row, so they have to break. */
+.vln-ruling-opt .vln-eng-n { display: flex; align-items: center; gap: 8px; }
+.vln-ruling-opt .vln-eng-d { display: block; }
+.vln-ruling-note { display: flex; flex-direction: column; gap: 6px; padding: 12px 24px 0; }
+.vln-ruling-note .wf-textarea { min-height: 74px; }
+
+/* Collapsed by default: the point is that these are OUT of the way, but never
+   invisible — a security tool that quietly stops reporting is the failure mode
+   this whole feature is built to avoid. */
+.vln-suppressed { margin-top: 18px; border-top: 1px solid var(--line); }
+.vln-suppressed-head {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  background: transparent; border: 0; cursor: pointer;
+  padding: 11px 0; font-family: var(--mono); font-size: 12px; color: var(--fg-dim);
+}
+.vln-suppressed-head:hover { color: var(--fg); }
+.vln-suppressed-list { padding-bottom: 12px; display: flex; flex-direction: column; gap: 10px; }
+.vln-suppressed-row { border-left: 2px solid var(--line-2); padding-left: 12px; }
+.vln-suppressed-title {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: transparent; border: 0; cursor: pointer; padding: 0;
+  font-size: 12.5px; color: var(--fg-dim); text-align: left;
+}
+.vln-suppressed-title:hover { color: var(--fg); }
+.vln-suppressed-why { font-size: 11px; margin-top: 4px; }
+
+.vln-rulings { display: flex; flex-direction: column; gap: 12px; }
+.vln-ruling { border: 1px solid var(--line); padding: 14px 16px; background: var(--bg-1); }
+.vln-ruling.warn { border-color: rgba(255,122,61,.45); }
+.vln-ruling-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.vln-ruling-note-text { font-size: 13px; color: var(--fg); margin-bottom: 6px; }
+.vln-ruling-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }

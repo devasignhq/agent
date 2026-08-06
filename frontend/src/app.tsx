@@ -892,6 +892,7 @@ const AppContent = () => {
             <Route path="/security" element={<SecurityPage view="dashboard" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path="/security/findings/:findingId" element={<SecurityPage view="detail" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path="/security/gate" element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path="/security/rulings" element={<SecurityPage view="rulings" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path="/security/policy" element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
             <Route path="/settings/:section" element={<SettingsPage />} />
