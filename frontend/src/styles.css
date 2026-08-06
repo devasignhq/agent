@@ -1766,6 +1766,9 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .tu-notice svg { color: var(--warn); flex-shrink: 0; margin-top: 1px; }
 .tu-notice b { color: var(--fg); }
+/* The side margins above are the modal gutter this callout was written for. In
+   page flow the banner has to line up with the widgets around it instead. */
+.tu-notice.page-notice { margin-left: 0; margin-right: 0; }
 
 /* Shared success panel — reused by the Fund / Cancel bounty modals. */
 .wd-success { text-align: center; padding: 22px 0 14px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
@@ -5979,12 +5982,9 @@ pre.vln-code, .vln-code {
   .vln-pick-row { padding-left: 16px; padding-right: 16px; }
 }
 
-.vln-scanning { display: flex; align-items: center; gap: 7px; margin-top: 3px; color: var(--accent); }
-.vln-scanning-dot {
-  width: 6px; height: 6px; border-radius: 50%; background: var(--accent);
-  animation: vlnPulse 1.4s ease-in-out infinite;
-}
-@keyframes vlnPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.25; } }
+/* Scan progress is a clause inside .page-sub, so it inherits that line's size
+   and family — only weight and color set it apart. */
+.vln-scanning { color: var(--accent); font-weight: 600; }
 
 /* merge gate */
 .vln-verdict { display: flex; align-items: center; gap: 14px; padding: 14px 16px; border: 1px solid var(--line); }
