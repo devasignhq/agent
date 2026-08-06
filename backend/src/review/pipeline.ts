@@ -241,7 +241,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
   return withModel(reviewModel, () => withUsage(async () => {
   setStatus(review.id, { status: "reviewing" });
-  log(review.id, "review", "Pipeline started");
+  // Name the model tier up front: "why was this review shallow?" is
+  // undiagnosable when the model choice is invisible. plan=null means the
+  // install has no linked user yet (frontier default, not a Haiku downgrade).
+  log(review.id, "review", "Pipeline started", {
+    detail: `Review model: ${reviewModel}${plan ? ` (plan: ${plan})` : " (no linked user — frontier default)"}`,
+    meta: { model: reviewModel, plan: plan ?? null },
+  });
 
   // Surface the "review in progress" placeholder comment the moment a run starts —
   // after the private-repo gate above, so a blocked review posts nothing. One
@@ -548,6 +554,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // security backstop in c.1a below keeps security covered.
     let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
     const holisticRan = wf.stages.holistic && (holistic.entries.length > 0 || holistic.manifest.length > 0);
+    if (!holisticRan && wf.stages.holistic) {
+      // The workflow-disabled case already logs at gather time; this covers the
+      // other silent gap — a silently-missing stage reads as "the agent found
+      // nothing repo-wide" when it never actually looked.
+      log(review.id, "holistic", "Whole-repo review skipped", {
+        detail:
+          "The repo index has no entries yet (initial walk not finished) — the security backstop still runs on the diff.",
+        meta: { reason: "index_not_built" },
+      });
+    }
     if (holisticRan) {
       holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic, extraInstructions: wf.prompts?.holistic });
       const holisticBlocked = [
