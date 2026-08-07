@@ -5694,6 +5694,27 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .vln-export-bar { display: flex; align-items: center; gap: 8px; font-family: var(--mono); font-size: 10.5px; color: var(--fg-mute); }
 .vln-export-bar b { color: var(--fg); font-weight: 500; }
 .vln-export-err { font-family: var(--mono); font-size: 10.5px; color: var(--danger); }
+/* Search box + whichever caption is showing, kept together on the right of the
+   findings panel head so the chips can wrap away from them. */
+.vln-head-right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-left: auto; }
+.vln-search {
+  display: flex; align-items: center; gap: 7px; padding: 0 9px; height: 28px;
+  border: 1px solid var(--line); background: var(--bg); min-width: 240px;
+}
+.vln-search:focus-within { border-color: var(--line-2); }
+.vln-search > svg { color: var(--fg-mute); flex-shrink: 0; }
+.vln-search .input.bare {
+  border: none; background: transparent; height: 100%; padding: 0;
+  font-family: var(--mono); font-size: 11.5px; min-width: 0; flex: 1;
+}
+/* Kill the browser's own clear affordance — we draw our own. */
+.vln-search .input.bare::-webkit-search-cancel-button { display: none; }
+.vln-search-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent; color: var(--fg-faint);
+  padding: 0; cursor: pointer; flex-shrink: 0;
+}
+.vln-search-x:hover { color: var(--fg-dim); }
 .vln-pnl-body { padding: 14px; }
 /* The chart wants more breathing room than a plain panel body. */
 .vln-mg-body { padding: 20px 20px 16px; }
@@ -6128,6 +6149,10 @@ pre.vln-code, .vln-code {
   .vln-fx-row > .vln-fx-a { display: none; }
   .vln-fx-row > :nth-child(4) { grid-area: title; }
   .vln-fx-row > .vln-tag:last-child { grid-area: state; }
+  /* Search stays — it's the only way to reach a row once the columns collapse
+     — but takes the full width rather than holding a 240px floor. */
+  .vln-head-right { width: 100%; margin-left: 0; }
+  .vln-search { min-width: 0; flex: 1; }
 }
 
 /* ── triage rulings ────────────────────────────────────────────────────────

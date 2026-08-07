@@ -197,6 +197,10 @@ export const SecurityPage = ({
   // "owner/name" — resolved to an id once the overview arrives.
   const [repoFilter, setRepoFilter] = React.useState<string>("all");
   const [chip, setChip] = React.useState<FilterChip>("all");
+  // Free-text search over the findings table. Lifted here (like `chip`) so it
+  // survives opening a finding and coming back — Dashboard unmounts for the
+  // detail view.
+  const [query, setQuery] = React.useState("");
   // The maintainer's learned corpus. Fetched alongside the overview so the
   // findings list can name the ruling behind each auto-suppression without a
   // second round-trip per row.
@@ -389,6 +393,8 @@ export const SecurityPage = ({
               repoFilter={repoFilter}
               chip={chip}
               setChip={setChip}
+              query={query}
+              setQuery={setQuery}
               onOpen={(id) => navigate(`/security/findings/${id}`)}
             />
             <SuppressedSection
@@ -796,12 +802,16 @@ const Dashboard = ({
   repoFilter,
   chip,
   setChip,
+  query,
+  setQuery,
   onOpen,
 }: {
   overview: SecurityOverview;
   repoFilter: string;
   chip: FilterChip;
   setChip: (c: FilterChip) => void;
+  query: string;
+  setQuery: (q: string) => void;
   onOpen: (id: string) => void;
 }) => {
   const now = Date.now();
@@ -821,8 +831,10 @@ const Dashboard = ({
     (s) => repoFilter === "all" || s.repoId === repoFilter
   );
   const stats = computeStats(scopedFindings, scopedScans, now);
-  const counts = chipCounts(overview.findings, repoFilter);
-  const shown = sortFindings(filterFindings(overview.findings, { chip, repoId: repoFilter }));
+  const counts = chipCounts(overview.findings, repoFilter, query);
+  const shown = sortFindings(
+    filterFindings(overview.findings, { chip, repoId: repoFilter, query })
+  );
   const series = mergeDeltaSeries(overview.scans, repoFilter, 12);
   const surfaces = surfaceBreakdown(overview.findings, repoFilter);
   const repoName = (repoId: string) =>
@@ -1160,46 +1172,69 @@ const Dashboard = ({
               </button>
             ))}
           </div>
-          {selectedShown.length > 0 ? (
-            <div className="vln-export-bar">
-              {exportErr && <span className="vln-export-err">{exportErr}</span>}
-              <span>
-                <b>{selectedShown.length}</b> selected
-              </span>
-              {overview.locked && <ProLock />}
-              <button
-                className="btn sm"
-                disabled={overview.locked}
-                onClick={exportCsv}
-                title={
-                  overview.locked
-                    ? "Exports are a Pro/Max feature"
-                    : "Download the selected findings as CSV"
-                }
-              >
-                <Icon name="download" size={12} /> CSV
-              </button>
-              <button
-                className="btn sm"
-                disabled={overview.locked || pdfBusy}
-                onClick={() => void exportPdf()}
-                title={
-                  overview.locked
-                    ? "Exports are a Pro/Max feature"
-                    : "Download the selected findings as a PDF report"
-                }
-              >
-                <Icon name="download" size={12} /> {pdfBusy ? "Preparing…" : "PDF"}
-              </button>
-              <button className="btn ghost sm" onClick={() => setSelected(new Set())}>
-                Clear
-              </button>
+          <div className="vln-head-right">
+            <div className="vln-search">
+              <Icon name="search" size={13} />
+              <input
+                className="input bare"
+                type="search"
+                placeholder="Search by ID, finding, repo…"
+                aria-label="Search findings"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+              />
+              {query !== "" && (
+                <button
+                  className="vln-search-x"
+                  aria-label="Clear search"
+                  title="Clear search"
+                  onClick={() => setQuery("")}
+                >
+                  <Icon name="x" size={11} />
+                </button>
+              )}
             </div>
-          ) : (
-            <div className="vln-pnl-s">
-              showing {shown.length} finding{shown.length === 1 ? "" : "s"}
-            </div>
-          )}
+            {selectedShown.length > 0 ? (
+              <div className="vln-export-bar">
+                {exportErr && <span className="vln-export-err">{exportErr}</span>}
+                <span>
+                  <b>{selectedShown.length}</b> selected
+                </span>
+                {overview.locked && <ProLock />}
+                <button
+                  className="btn sm"
+                  disabled={overview.locked}
+                  onClick={exportCsv}
+                  title={
+                    overview.locked
+                      ? "Exports are a Pro/Max feature"
+                      : "Download the selected findings as CSV"
+                  }
+                >
+                  <Icon name="download" size={12} /> CSV
+                </button>
+                <button
+                  className="btn sm"
+                  disabled={overview.locked || pdfBusy}
+                  onClick={() => void exportPdf()}
+                  title={
+                    overview.locked
+                      ? "Exports are a Pro/Max feature"
+                      : "Download the selected findings as a PDF report"
+                  }
+                >
+                  <Icon name="download" size={12} /> {pdfBusy ? "Preparing…" : "PDF"}
+                </button>
+                <button className="btn ghost sm" onClick={() => setSelected(new Set())}>
+                  Clear
+                </button>
+              </div>
+            ) : (
+              <div className="vln-pnl-s">
+                showing {shown.length} finding{shown.length === 1 ? "" : "s"}
+              </div>
+            )}
+          </div>
         </div>
         <div className="vln-fx-head">
           <span className="vln-fx-sel">
@@ -1284,9 +1319,18 @@ const Dashboard = ({
         })}
         {shown.length === 0 && (
           <div className="vln-empty">
-            {overview.findings.length === 0
-              ? "No findings yet. The audit runs automatically when a PR merges — or hit Re-scan."
-              : "No findings match this filter."}
+            {overview.findings.length === 0 ? (
+              "No findings yet. The audit runs automatically when a PR merges — or hit Re-scan."
+            ) : query.trim() !== "" ? (
+              <>
+                No findings match “{query.trim()}”.{" "}
+                <button className="btn ghost sm" onClick={() => setQuery("")}>
+                  Clear search
+                </button>
+              </>
+            ) : (
+              "No findings match this filter."
+            )}
           </div>
         )}
       </div>
