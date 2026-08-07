@@ -3440,6 +3440,46 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .ac-row.regressed .ac-check { color: var(--warn); border-color: rgba(245,165,36,0.4); }
 .ac-row.regressed { background: rgba(245,165,36,0.05); }
 
+/* Criterion reasoning note — one line collapsed, full text expanded. The whole
+   note is the toggle so the click target isn't just the 11px chevron. */
+.ac-note {
+  display: grid;
+  grid-template-columns: 14px 1fr;
+  gap: 6px;
+  align-items: start;
+  width: 100%;
+  margin-top: 3px;
+  padding: 0;
+  background: none;
+  border: 0;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+  color: inherit;
+}
+.ac-note-chev {
+  display: grid;
+  place-items: center;
+  height: 16px;
+  color: var(--fg-mute);
+  transition: color 0.12s ease;
+}
+.ac-note:hover .ac-note-chev { color: var(--fg); }
+.ac-note-text {
+  font-size: 12px;
+  min-width: 0;
+  line-height: 16px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.ac-note.open .ac-note-text {
+  white-space: normal;
+  overflow: visible;
+  text-overflow: clip;
+  word-break: break-word;
+}
+
 .constraint-list {
   list-style: none;
   padding: 0;
