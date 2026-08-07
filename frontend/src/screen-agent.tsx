@@ -597,6 +597,38 @@ const TerminalFor = ({ pr, lines }) =>
   </div>;
 
 
+// One acceptance-criterion row. The agent's reasoning note can run to a dozen
+// lines, which pushes the rest of the criteria off-screen — so it collapses to
+// a single line by default and expands in place on click.
+const AcceptanceRow = ({ a }) => {
+  const [open, setOpen] = React.useState(false);
+  const hasNote = Boolean(a.note);
+  return (
+    <div className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"}`}>
+      <div className="ac-check">
+        {a.met ? <Icon name="check" size={11} /> : a.regressed ? <Icon name="warn" size={11} /> : <span className="mono">!</span>}
+      </div>
+      <div style={{ minWidth: 0 }}>
+        <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
+        {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
+        {hasNote && (
+          <button
+            type="button"
+            className={`ac-note ${open ? "open" : ""}`}
+            aria-expanded={open}
+            title={open ? "Collapse" : "Show the full reasoning"}
+            onClick={() => setOpen((v) => !v)}
+          >
+            <span className="ac-note-chev"><Icon name={open ? "chevron-d" : "chevron-r"} size={11} /></span>
+            <span className="mute mono ac-note-text">{a.note}</span>
+          </button>
+        )}
+      </div>
+      <span className="mono mute" style={{ fontSize: 10, justifySelf: "end" }}>AC-{a.id}</span>
+    </div>
+  );
+};
+
 // ────────────────────────────────────────────────────────────────────────────
 // Goal panel (right column) — same layout as the previous pop-up
 // ────────────────────────────────────────────────────────────────────────────
@@ -809,19 +841,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                 </div>
               </div>
             }
-            {sortedAcceptance.map((a) =>
-            <div key={a.id} className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"}`}>
-                <div className="ac-check">
-                  {a.met ? <Icon name="check" size={11} /> : a.regressed ? <Icon name="warn" size={11} /> : <span className="mono">!</span>}
-                </div>
-                <div>
-                  <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
-                  {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
-                  {a.note && <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>{a.note}</div>}
-                </div>
-                <span className="mono mute" style={{ fontSize: 10, justifySelf: "end" }}>AC-{a.id}</span>
-              </div>
-            )}
+            {sortedAcceptance.map((a) => <AcceptanceRow key={a.id} a={a} />)}
           </div>
         </div>
 
