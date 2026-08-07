@@ -31,5 +31,5 @@ export function taskIdForBounty(bountyId: string): string {
 }
 
 export function isValidTaskId(taskId: string): boolean {
-  return typeof taskId === "string" && taskId.length === TASK_ID_LENGTH;
+  return typeof taskId === "string" && /^[A-Z2-7]{25}$/.test(taskId);
 }
