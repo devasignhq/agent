@@ -754,11 +754,17 @@ export async function summarizeVideo(input: {
     });
 
     const endpoint =
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent` +
-      `?key=${encodeURIComponent(config.gemini.apiKey)}`;
+      `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent`;
     const res = await fetch(endpoint, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      // The key goes in a header, never the URL: request URLs are what proxy
+      // access logs, APM spans and error trackers capture by default, and this
+      // is a long-lived credential on the org's billing account. Google accepts
+      // the same key as ?key=, but that form leaks it into every log sink.
+      headers: {
+        "Content-Type": "application/json",
+        "x-goog-api-key": config.gemini.apiKey,
+      },
       body: JSON.stringify({
         systemInstruction: { parts: [{ text: VIDEO_SYSTEM }] },
         contents: [{ role: "user", parts }],
