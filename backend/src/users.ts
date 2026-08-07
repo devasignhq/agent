@@ -9,7 +9,8 @@
 //
 // Legacy tolerance: rows written before `accountKind` existed load without it and
 // are treated as "maintainer" (existing prod accounts are the sponsor side; the
-// boot backfill stamps them explicitly — see backfillAccountKinds).
+// boot backfill stamps them explicitly, and preserves that same default unless a
+// row shows positive contributor evidence — see backfillAccountKinds).
 import { db } from "./db.js";
 import type { User } from "./types.js";
 
@@ -47,14 +48,37 @@ export function contributorNotifyTarget(githubId: number): User | null {
   return contributorByGithubId(githubId) ?? maintainerByGithubId(githubId);
 }
 
-// One-time, idempotent boot backfill: stamp any un-stamped `users` row by
-// installation presence — a row that owns/joined an installation is a maintainer
-// account, everything else is a contributor account. Safe to run on every boot
-// (only touches rows missing `accountKind`). Returns the number of rows stamped.
-export function backfillAccountKinds(installCount: (userId: string) => number): number {
+// One-time, idempotent boot backfill: stamp any un-stamped `users` row. A row
+// that owns/joined an installation is a maintainer account. Everything else needs
+// POSITIVE contributor evidence — a registered payout wallet, or bounty activity
+// under its githubId — to be stamped "contributor"; with no evidence either way it
+// keeps the legacy default this file documents, "maintainer".
+//
+// Missing installations is NOT contributor evidence: a pre-split sponsor who
+// removed the App (or whose row predates install linking) has none. Getting that
+// wrong fails SILENTLY on the money path — contributorByGithubId is the strict
+// payout-wallet resolver, so a mis-stamped sponsor row becomes the resolution
+// target for that githubId's wallet, and maintainerByGithubId stops finding the
+// sponsor's own account (their next sign-in mints a new row, orphaning installs
+// and billing). The maintainer default fails LOUDLY instead: a real contributor
+// gets a contributor row on first contributor-app sign-in, and the wallet path
+// returns no_contributor_wallet rather than substituting another account.
+//
+// Both signals are injected (like installCount) to keep this file free of install
+// and bounty shape. Safe to run on every boot — only touches rows missing
+// `accountKind`. Returns the number of rows stamped.
+export function backfillAccountKinds(
+  installCount: (userId: string) => number,
+  hasBountyActivity: (githubId: number) => boolean,
+): number {
   let stamped = 0;
   for (const u of db.filter("users", (row) => row.accountKind == null)) {
-    const kind: AccountKind = installCount(u.id) > 0 ? "maintainer" : "contributor";
+    // Checked here, not left to the caller's predicate, so the "no evidence →
+    // maintainer" invariant holds whatever a call site passes in.
+    const isContributor =
+      installCount(u.id) === 0 &&
+      (!!u.stellarPayoutAddress || (u.githubId != null && hasBountyActivity(u.githubId)));
+    const kind: AccountKind = isContributor ? "contributor" : "maintainer";
     db.update("users", (row) => row.id === u.id, { accountKind: kind });
     stamped++;
   }

@@ -35,6 +35,7 @@ import { closeAllStreams } from "./notifications-stream.js";
 import { dedupePRReviews } from "./review/dedupe.js";
 import { backfillAccountKinds } from "./users.js";
 import { installationsForUser } from "./github/installations.js";
+import { hasContributorBountyActivity } from "./bounties/service.js";
 import { startWorker } from "./worker.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
@@ -264,13 +265,18 @@ if (mergedReviews > 0) {
 }
 
 // One-time split of the single-account world into the two-account model: stamp
-// every un-classified `users` row by installation presence (owns/joined an
-// install → maintainer account; otherwise → contributor account). Idempotent —
-// only touches rows still missing `accountKind`, so it's a no-op after the first
-// boot. Must run after initDb() (reads the loaded snapshot) and before we serve.
-const stampedAccounts = backfillAccountKinds((userId) => installationsForUser(userId).length);
+// every un-classified `users` row. Owns/joined an install → maintainer account;
+// otherwise it takes positive contributor evidence (payout wallet, or bounty
+// activity under that githubId) to be stamped a contributor — no evidence keeps
+// the legacy maintainer default. Idempotent — only touches rows still missing
+// `accountKind`, so it's a no-op after the first boot. Must run after initDb()
+// (reads the loaded snapshot) and before we serve.
+const stampedAccounts = backfillAccountKinds(
+  (userId) => installationsForUser(userId).length,
+  hasContributorBountyActivity
+);
 if (stampedAccounts > 0) {
-  console.log(`[server] classified ${stampedAccounts} account${stampedAccounts === 1 ? "" : "s"} by installation (two-account migration)`);
+  console.log(`[server] classified ${stampedAccounts} account${stampedAccounts === 1 ? "" : "s"} (two-account migration)`);
 }
 
 // Analytics. Non-fatal by design: initStatsig() swallows its own errors, so a

@@ -22,6 +22,9 @@ function mkUser(id: string, kind: "maintainer" | "contributor" | undefined, extr
   } as any);
 }
 
+const NO_INSTALLS = () => 0;
+const NO_BOUNTY_ACTIVITY = () => false;
+
 beforeEach(() => {
   db.remove("users", () => true);
   db.remove("installations", () => true);
@@ -55,15 +58,36 @@ test("contributorNotifyTarget prefers the contributor, falls back to the maintai
   assert.equal(contributorNotifyTarget(GH), null, "nobody → null");
 });
 
-test("backfill stamps only un-stamped rows, by installation presence, idempotently", () => {
+test("backfill stamps only un-stamped rows, on positive evidence, idempotently", () => {
   mkUser("has-install", undefined);
-  mkUser("no-install", undefined);
+  mkUser("bare", undefined); // no install, no wallet, no bounty activity
+  mkUser("has-wallet", undefined, { githubId: 77, stellarPayoutAddress: "G" + "A".repeat(55) });
+  mkUser("applicant", undefined, { githubId: 88 });
   mkUser("already", "contributor");
   const installed = new Set(["has-install"]);
-  const stamped = backfillAccountKinds((userId) => (installed.has(userId) ? 1 : 0));
-  assert.equal(stamped, 2, "only the two un-stamped rows are touched");
+  const stamped = backfillAccountKinds(
+    (userId) => (installed.has(userId) ? 1 : 0),
+    (githubId) => githubId === 88, // "applicant" applied to / was delegated a bounty
+  );
+  assert.equal(stamped, 4, "only the un-stamped rows are touched");
   assert.equal(db.find("users", (u) => u.id === "has-install")!.accountKind, "maintainer");
-  assert.equal(db.find("users", (u) => u.id === "no-install")!.accountKind, "contributor");
+  assert.equal(db.find("users", (u) => u.id === "has-wallet")!.accountKind, "contributor", "a payout wallet is contributor evidence");
+  assert.equal(db.find("users", (u) => u.id === "applicant")!.accountKind, "contributor", "bounty activity is contributor evidence");
   assert.equal(db.find("users", (u) => u.id === "already")!.accountKind, "contributor", "pre-stamped untouched");
-  assert.equal(backfillAccountKinds(() => 1), 0, "second run is a no-op");
+  // The one that matters: no install is NOT evidence of anything, so the row keeps
+  // the legacy default rather than being converted into a contributor.
+  assert.equal(db.find("users", (u) => u.id === "bare")!.accountKind, "maintainer");
+  assert.equal(backfillAccountKinds(() => 1, () => true), 0, "second run is a no-op");
+});
+
+test("backfill never turns an install-less legacy row into a money-path contributor", () => {
+  // A pre-split sponsor with no current installation — the App was removed, or the
+  // row predates install linking. Stamping it "contributor" would make it the
+  // resolution target for this githubId's payout wallet (contributorByGithubId is
+  // the strict money-path resolver) and would hide the sponsor from their own
+  // account on next sign-in. Absence of installs is not contributor evidence.
+  mkUser("legacy-sponsor", undefined);
+  assert.equal(backfillAccountKinds(NO_INSTALLS, NO_BOUNTY_ACTIVITY), 1);
+  assert.equal(contributorByGithubId(GH), null, "must NOT become a contributor");
+  assert.equal(maintainerByGithubId(GH)!.id, "legacy-sponsor", "stays the sponsor account");
 });
