@@ -12,6 +12,7 @@ import {
   computeStats,
   displayId,
   filterFindings,
+  matchesQuery,
   mergeDeltaAllZero,
   mergeDeltaPeak,
   mergeDeltaSeries,
@@ -82,6 +83,67 @@ test("filterFindings: chips select the right states, repo filter scopes", () => 
   assert.equal(filterFindings(rows, { chip: "accepted", repoId: "all" }).length, 1);
   const counts = chipCounts(rows, "all");
   assert.equal(counts.all, 4);
+  assert.equal(counts.accepted, 1);
+});
+
+test("matchesQuery: id, title, description, and row keywords; case-insensitive", () => {
+  const f = finding({
+    fingerprint: "a1b2c3d4e5",
+    title: "Unauthenticated payout endpoint",
+    concern: "Anyone can drain the escrow without a session cookie.",
+    path: "api/payout.ts",
+    line: 42,
+    cwe: "CWE-306",
+    repo: "acme/pay",
+    introducedByPr: 487,
+  });
+  assert.equal(displayId(f), "VLN-A1B2C3");
+
+  // id — full display form, bare hex, either case
+  assert.ok(matchesQuery(f, "VLN-A1B2C3"));
+  assert.ok(matchesQuery(f, "vln-a1b2c3"));
+  assert.ok(matchesQuery(f, "a1b2c3"));
+  // title and description
+  assert.ok(matchesQuery(f, "payout"));
+  assert.ok(matchesQuery(f, "drain the escrow"));
+  // other things the row shows
+  assert.ok(matchesQuery(f, "acme/pay"));
+  assert.ok(matchesQuery(f, "api/payout.ts"));
+  // The row prints "path:line" with no space — pasting that back must match.
+  assert.ok(matchesQuery(f, "api/payout.ts:42"));
+  assert.ok(matchesQuery(f, "cwe-306"));
+  assert.ok(matchesQuery(f, "#487"));
+  assert.ok(matchesQuery(f, "critical"));
+
+  assert.ok(!matchesQuery(f, "sql injection"));
+  // blank / whitespace-only matches everything
+  assert.ok(matchesQuery(f, ""));
+  assert.ok(matchesQuery(f, "   "));
+  // multiple terms are AND, in any order
+  assert.ok(matchesQuery(f, "payout escrow"));
+  assert.ok(matchesQuery(f, "escrow payout"));
+  assert.ok(!matchesQuery(f, "payout sqli"));
+});
+
+test("filterFindings/chipCounts: query narrows rows and the chip counts with them", () => {
+  const rows = [
+    finding({ state: "open", title: "Unauthenticated payout endpoint" }),
+    finding({ state: "open", title: "Reflected XSS in the search box" }),
+    finding({ state: "accepted", title: "Verbose payout error" }),
+  ];
+  assert.equal(filterFindings(rows, { chip: "all", repoId: "all" }).length, 2);
+  assert.equal(
+    filterFindings(rows, { chip: "all", repoId: "all", query: "payout" }).length,
+    1
+  );
+  assert.equal(filterFindings(rows, { chip: "all", repoId: "all", query: "nope" }).length, 0);
+  // repo scope still applies on top of the query
+  assert.equal(
+    filterFindings(rows, { chip: "all", repoId: "r2", query: "payout" }).length,
+    0
+  );
+  const counts = chipCounts(rows, "all", "payout");
+  assert.equal(counts.all, 1);
   assert.equal(counts.accepted, 1);
 });
 

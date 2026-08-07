@@ -68,20 +68,71 @@ export function chipMatches(chip: FilterChip, f: SecurityFinding): boolean {
   }
 }
 
+// ── free-text search ────────────────────────────────────────────────────────
+
+// Everything the row puts on screen (plus the fingerprint the display id is cut
+// from), flattened into one lowercase blob. Keeps the matcher honest: if a
+// column is visible, typing what's in it finds the row.
+export function findingHaystack(f: SecurityFinding): string {
+  return [
+    displayId(f),
+    f.fingerprint,
+    f.title,
+    f.concern,
+    // One element, not two — the row renders "path:line" with no space, so
+    // pasting exactly what's on screen has to match.
+    `${f.path}${f.line == null ? "" : `:${f.line}`}`,
+    f.symbol ?? "",
+    f.class,
+    f.cwe ?? "",
+    f.repo,
+    f.surface,
+    f.severity,
+    f.state,
+    STATE_LABEL[f.state]?.label ?? "",
+    f.introducedByPr == null ? "" : `#${f.introducedByPr}`,
+    f.introducedByAuthor ? `@${f.introducedByAuthor}` : "",
+    f.issueNumber == null ? "" : `#${f.issueNumber}`,
+    f.assigneeLogin ? `@${f.assigneeLogin}` : "",
+    f.bounty?.code ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
+// Whitespace-separated terms, ALL of which must appear somewhere in the row —
+// so "critical pay" narrows instead of widening. A blank query matches
+// everything, which is what lets the search box start empty.
+export function matchesQuery(f: SecurityFinding, query: string): boolean {
+  const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (terms.length === 0) return true;
+  const hay = findingHaystack(f);
+  return terms.every((t) => hay.includes(t));
+}
+
 export function filterFindings(
   findings: SecurityFinding[],
-  opts: { chip: FilterChip; repoId: string | "all" }
+  opts: { chip: FilterChip; repoId: string | "all"; query?: string }
 ): SecurityFinding[] {
+  const query = opts.query ?? "";
   return findings.filter(
-    (f) => (opts.repoId === "all" || f.repoId === opts.repoId) && chipMatches(opts.chip, f)
+    (f) =>
+      (opts.repoId === "all" || f.repoId === opts.repoId) &&
+      chipMatches(opts.chip, f) &&
+      matchesQuery(f, query)
   );
 }
 
+// Counts respect the search too — otherwise a chip promising 12 opens a list of
+// 2 and the search looks broken.
 export function chipCounts(
   findings: SecurityFinding[],
-  repoId: string | "all"
+  repoId: string | "all",
+  query = ""
 ): Record<FilterChip, number> {
-  const scoped = findings.filter((f) => repoId === "all" || f.repoId === repoId);
+  const scoped = findings.filter(
+    (f) => (repoId === "all" || f.repoId === repoId) && matchesQuery(f, query)
+  );
   const counts = { new: 0, all: 0, critical: 0, bounty: 0, accepted: 0 } as Record<FilterChip, number>;
   for (const chip of ["new", "all", "critical", "bounty", "accepted"] as FilterChip[]) {
     counts[chip] = scoped.filter((f) => chipMatches(chip, f)).length;
