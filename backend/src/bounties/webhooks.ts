@@ -133,6 +133,15 @@ export function maybeHandleBountyComment(event: any): boolean {
 export function maybeHandleBountyLinearComment(event: any, integration: Integration): boolean {
   const body: string = event?.data?.body || "";
   if (!looksLikeBountyCommand(body)) return false;
+  const isAuthorized =
+    event?.data?.user?.admin === true ||
+    event?.actor?.admin === true ||
+    event?.data?.user?.id === integration.userId ||
+    event?.actor?.id === integration.userId;
+  if (!isAuthorized) {
+    console.warn(`[bounty] Linear bounty command rejected: unauthorized actor`);
+    return false;
+  }
   const cmd = parseBountyCommand(body);
   if (!cmd) return false;
   if (!isStellarConfigured()) {
