@@ -78,6 +78,23 @@ export function assigneeUser(b: Bounty) {
   return contributorNotifyTarget(b.assigneeGithubId);
 }
 
+/**
+ * Has this GitHub identity ever acted as a CONTRIBUTOR on a bounty — applied to
+ * one, or been delegated one? Both signals are githubId-keyed, which is what makes
+ * them usable on a pre-split row (one `users` row per identity back then). Feeds
+ * the two-account boot backfill (backfillAccountKinds in users.ts), which needs
+ * positive contributor evidence before it stamps a legacy row "contributor".
+ * `applications` is optional-chained: rows written before it existed must not
+ * throw here, since this runs over every user at boot.
+ */
+export function hasContributorBountyActivity(githubId: number): boolean {
+  return !!db.find(
+    "bounties",
+    (b) =>
+      b.assigneeGithubId === githubId || !!b.applications?.some((a) => a.githubId === githubId)
+  );
+}
+
 function nextSeq(): number {
   let max = 0;
   for (const b of db.table("bounties")) if (b.seq > max) max = b.seq;

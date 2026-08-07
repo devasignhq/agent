@@ -31,6 +31,7 @@ import {
   requestExtension,
   respondToExtension,
   withdrawApplication,
+  hasContributorBountyActivity,
   type EscrowChain,
 } from "./service.js";
 
@@ -1006,4 +1007,27 @@ test("bountiesNearingDeadline covers submitted work, excludes held/warned/out-of
 test("respondToExtension with nothing pending fails", async () => {
   const { b } = await delegated();
   assert.equal(respondToExtension(b.id, "approve", "sponsor").reason, "no_pending_extension");
+});
+
+// This predicate is the contributor evidence the two-account boot backfill
+// (backfillAccountKinds, users.ts) needs before it stamps a legacy row
+// "contributor". A false negative is safe (the row stays a maintainer); a stray
+// true would convert a sponsor into a payout-wallet target, so it must answer
+// only for identities that really acted on a bounty.
+test("hasContributorBountyActivity sees applicants and assignees, nobody else", async () => {
+  const { chain } = fakeChain();
+  const { b } = await delegated(); // githubId 999 applied, then was delegated
+  assert.equal(hasContributorBountyActivity(999), true, "the assignee counts");
+  assert.equal(hasContributorBountyActivity(1234), false, "an unrelated identity does not");
+
+  // An applicant who was never delegated still counts.
+  const open = mkBounty();
+  fundAndConfirm(open.id);
+  await applyToBounty(open.id, { githubId: 555, githubLogin: "other", address: ADDR() }, chain);
+  assert.equal(hasContributorBountyActivity(555), true, "a pending applicant counts");
+
+  // A row written before `applications` existed must not throw — this runs over
+  // every user at boot, so one legacy bounty would otherwise take the server down.
+  db.update("bounties", (x) => x.id === b.id, { applications: undefined } as any);
+  assert.equal(hasContributorBountyActivity(4242), false);
 });

@@ -15,7 +15,8 @@ export type User = {
   // find-or-create on (githubId, accountKind); the session cookie is chosen per
   // app so each side resolves its own account. Optional so legacy rows load
   // unchanged — a missing value is treated as "maintainer" (see accountKindOf in
-  // users.ts and the boot backfill that stamps existing rows by installation).
+  // users.ts, and the boot backfill that stamps existing rows: install presence,
+  // else positive contributor evidence, else that same maintainer default).
   accountKind?: "maintainer" | "contributor";
   // Bounty payout wallet. A contributor authenticates with GitHub, then MANUALLY
   // enters the Stellar address (G…) their bounty payouts should go to — so their
