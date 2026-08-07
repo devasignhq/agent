@@ -79,8 +79,9 @@ export function findingHaystack(f: SecurityFinding): string {
     f.fingerprint,
     f.title,
     f.concern,
-    f.path,
-    f.line == null ? "" : `:${f.line}`,
+    // One element, not two — the row renders "path:line" with no space, so
+    // pasting exactly what's on screen has to match.
+    `${f.path}${f.line == null ? "" : `:${f.line}`}`,
     f.symbol ?? "",
     f.class,
     f.cwe ?? "",

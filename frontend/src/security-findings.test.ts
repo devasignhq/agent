@@ -109,6 +109,8 @@ test("matchesQuery: id, title, description, and row keywords; case-insensitive",
   // other things the row shows
   assert.ok(matchesQuery(f, "acme/pay"));
   assert.ok(matchesQuery(f, "api/payout.ts"));
+  // The row prints "path:line" with no space — pasting that back must match.
+  assert.ok(matchesQuery(f, "api/payout.ts:42"));
   assert.ok(matchesQuery(f, "cwe-306"));
   assert.ok(matchesQuery(f, "#487"));
   assert.ok(matchesQuery(f, "critical"));
