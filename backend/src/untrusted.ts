@@ -31,7 +31,11 @@ const end = (kind: string) => `<<<END_UNTRUSTED_${kind}>>>`;
 // pair delimits data, so a FILE_CONTENT block carrying a REPO_CONTEXT marker
 // would still read as a delimiter — stripping only the matching kind leaves the
 // break-out open under a different name.
-const SENTINELS = /<<<(?:BEGIN|END)_UNTRUSTED_[A-Z_]*>>>/g;
+//
+// The kind is matched by shape rather than against the kinds this file defines,
+// so a new call site can't quietly fall outside the strip — but it must be a
+// real kind: `+`, not `*`, so the pattern says a marker and not a prefix.
+const SENTINELS = /<<<(?:BEGIN|END)_UNTRUSTED_[A-Z_]+>>>/g;
 
 /**
  * Fence `text` as untrusted data of some `kind` (e.g. "FILE_CONTENT").
