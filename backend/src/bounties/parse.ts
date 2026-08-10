@@ -7,8 +7,10 @@
 //   "bounty $100 2 days"        "Bounties 100 USDC 2 dys"     "bouny $ 100 in 2 days"
 //   "$100 bounty for 2 days"    "bounty 100 dollars 2d"       "bunty $100 2 days"
 //
-// The leniency is safe: only repo maintainers can trigger it
-// (webhooks.ts:MAINTAINER_ASSOCIATIONS), and the amount/window it reads are shown
+// The leniency is safe: only an authorized sponsor can trigger it — a repo owner,
+// member or collaborator on GitHub (webhooks.ts:MAINTAINER_ASSOCIATIONS), a
+// workspace admin or the connector on Linear
+// (webhooks.ts:authorizeLinearBountyAuthor) — and the amount/window it reads are shown
 // back in the Fund/Cancel confirm comment (botcomment.ts:renderConfirmBody) before
 // a cent of USDC is escrowed — so a misread is one maintainer edit away, never a
 // lost payment.

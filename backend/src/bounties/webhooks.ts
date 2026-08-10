@@ -8,7 +8,7 @@ import { isStellarConfigured } from "../config.js";
 import { installationPermissions } from "../github/app.js";
 import { ensurePRReview } from "../github/webhooks.js";
 import type { Bounty, Integration } from "../types.js";
-import { createLinearComment } from "../linear/client.js";
+import { createLinearComment, fetchLinearUserRole, fetchLinearViewerId } from "../linear/client.js";
 import { looksLikeBountyCommand, parseBountyCommand } from "./parse.js";
 import { createBounty, markInReview, releaseByMerge } from "./service.js";
 import { postConfirmComment, renderConfirmBody, updateStatusComment } from "./botcomment.js";
@@ -123,12 +123,93 @@ export function maybeHandleBountyComment(event: any): boolean {
   return true;
 }
 
+/** The Linear credentials to act as this workspace, and how to present them. */
+function linearAuth(integration: Integration): { token: string; bearer: boolean } {
+  const token = integration.tokens.accessToken || integration.tokens.apiKey || "";
+  return { token, bearer: Boolean(integration.tokens.accessToken) };
+}
+
+/**
+ * May this comment's author spend the connected workspace's money? A Linear bounty
+ * is charged to the connector (sponsorUserId = integration.userId), so the answer
+ * is yes for exactly two people: the connector themself, and a workspace admin.
+ *
+ * This is the Linear counterpart of the GitHub MAINTAINER_ASSOCIATIONS gate above.
+ * It costs a lookup because the webhook payload carries no role at all — only the
+ * author's id — so the check can't be made from the event alone.
+ *
+ * Fails CLOSED: a missing author id, a non-human actor, an unknown user, or any
+ * failed lookup means no bounty. Rejections are logged, not answered in-thread —
+ * same as the GitHub path, which silently ignores a non-maintainer's command.
+ */
+export async function authorizeLinearBountyAuthor(
+  event: any,
+  integration: Integration
+): Promise<boolean> {
+  const issueId: string = event?.data?.issueId || event?.data?.issue?.id || "";
+  const deny = (why: string) => {
+    console.warn(`[bounty] Linear command on issue ${issueId || "?"} refused: ${why}`);
+    return false;
+  };
+
+  // Linear marks app/integration-authored comments with a non-"user" actor type.
+  // Rejecting them mirrors the GitHub `sender.type === "Bot"` check, and keeps our
+  // OWN confirm comment from ever re-triggering: renderConfirmBody says "your
+  // bounty of $500 USDC with a 7-day delivery window", which the (deliberately
+  // lenient) parser reads as a command. The active-bounty dedupe already breaks
+  // that loop; this is the second belt.
+  const actorType: string = event?.actor?.type || "";
+  if (actorType && actorType !== "user") return deny(`actor is a ${actorType}, not a person`);
+
+  const authorId: string =
+    event?.data?.user?.id || event?.data?.userId || event?.actor?.id || "";
+  if (!authorId) return deny("the payload carries no comment author");
+
+  const { token, bearer } = linearAuth(integration);
+  if (!token) return deny("the integration has no usable Linear token");
+
+  try {
+    // The connector is the account being charged, so their own command always
+    // stands — even if they are a plain member rather than an admin. Their id
+    // isn't captured at connect time (linear/oauth.ts stores workspace identity
+    // only), so resolve it once on demand and cache it onto the integration.
+    let connectorId = integration.workspaceMeta?.connectorUserId || "";
+    if (!connectorId) {
+      connectorId = (await fetchLinearViewerId(token, { bearer })) || "";
+      if (connectorId) {
+        const workspaceMeta = { ...integration.workspaceMeta, connectorUserId: connectorId };
+        db.update("integrations", (i) => i.id === integration.id, { workspaceMeta });
+      }
+    }
+    if (connectorId && authorId === connectorId) return true;
+
+    const role = await fetchLinearUserRole(token, authorId, { bearer });
+    if (!role) return deny(`author ${authorId} is not a member of this workspace`);
+    if (!role.active) return deny(`author ${authorId} is deactivated`);
+    if (role.guest) return deny(`author ${authorId} is a workspace guest`);
+    if (!role.admin) return deny(`author ${authorId} is not a workspace admin or the connector`);
+    return true;
+  } catch (err) {
+    console.warn(
+      `[bounty] Linear authority lookup failed for author ${authorId} on issue ${issueId}:`,
+      err
+    );
+    return false;
+  }
+}
+
 /**
  * Handle a `bounty $X $Nd` comment on a Linear ISSUE. The workspace connector is
  * the sponsor (bounties scope to them by sponsorUserId, since there's no GitHub
  * installation). Posts the Fund/Cancel confirm comment back to Linear. Payout for
  * a Linear bounty is the sponsor's in-app "Approve payment" (the merge trigger is
  * GitHub-specific). Returns true if this was a bounty command.
+ *
+ * Claiming the event says only "this comment was a bounty command", NOT "a bounty
+ * was created" — authority (see authorizeLinearBountyAuthor) needs a Linear lookup
+ * and can't be settled on this thread, so an unauthorized command is claimed here
+ * and dropped there. The cost is one skipped criteria re-ingest, on a comment that
+ * was trying to spend someone else's money.
  */
 export function maybeHandleBountyLinearComment(event: any, integration: Integration): boolean {
   const body: string = event?.data?.body || "";
@@ -147,6 +228,34 @@ export function maybeHandleBountyLinearComment(event: any, integration: Integrat
   );
   if (existing) return true;
 
+  void handleLinearBountyCommand(event, integration);
+  return true;
+}
+
+/**
+ * Authorize, then create the Linear bounty and post its confirm comment. Split out
+ * of maybeHandleBountyLinearComment so the receiver keeps its synchronous routing
+ * answer while the authority check gets to await. Returns the bounty, or null when
+ * the command was refused or already served.
+ */
+export async function handleLinearBountyCommand(
+  event: any,
+  integration: Integration
+): Promise<Bounty | null> {
+  const cmd = parseBountyCommand(event?.data?.body || "");
+  if (!cmd) return null;
+  const issueId: string = event?.data?.issueId || event?.data?.issue?.id || "";
+  if (!issueId) return null;
+  if (!(await authorizeLinearBountyAuthor(event, integration))) return null;
+
+  // Re-check after the await: the authority lookup is a yield point, so a second
+  // command on the same issue could have created the bounty while we waited.
+  const existing = db.find(
+    "bounties",
+    (b) => b.source === "linear" && b.externalKey === issueId && ACTIVE.has(b.status)
+  );
+  if (existing) return null;
+
   const issueUrl: string =
     event?.data?.issue?.url || event?.url || `https://linear.app/issue/${issueId}`;
   const title: string = event?.data?.issue?.title || `Linear bounty ${issueId}`;
@@ -163,17 +272,14 @@ export function maybeHandleBountyLinearComment(event: any, integration: Integrat
     sponsorUserId: integration.userId,
   });
   console.log(`[bounty] created ${bounty.code} from Linear issue ${issueId}`);
-  const token = integration.tokens.accessToken || integration.tokens.apiKey || "";
-  const bearer = Boolean(integration.tokens.accessToken);
-  void (async () => {
-    try {
-      if (token) await createLinearComment(token, issueId, renderConfirmBody(bounty), { bearer });
-      await flushPending();
-    } catch (err) {
-      console.warn(`[bounty] Linear confirm comment failed for ${bounty.code}:`, err);
-    }
-  })();
-  return true;
+  const { token, bearer } = linearAuth(integration);
+  try {
+    if (token) await createLinearComment(token, issueId, renderConfirmBody(bounty), { bearer });
+    await flushPending();
+  } catch (err) {
+    console.warn(`[bounty] Linear confirm comment failed for ${bounty.code}:`, err);
+  }
+  return bounty;
 }
 
 /** A merged PR delivering a delegated bounty → release the escrow (admin-signed). */

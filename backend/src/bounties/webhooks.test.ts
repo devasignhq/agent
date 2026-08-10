@@ -4,7 +4,7 @@
 // is gated the same way. Runs against the in-memory store with the chain stubbed
 // (no network). Run:
 //   node --import tsx/esm --test src/bounties/webhooks.test.ts
-import { test, beforeEach } from "node:test";
+import { test, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { Keypair } from "@stellar/stellar-sdk";
 import { config } from "../config.js";
@@ -23,6 +23,8 @@ import {
   handleBountyPRMerge,
   handleBountyPROpened,
   maybeHandleBountyComment,
+  maybeHandleBountyLinearComment,
+  handleLinearBountyCommand,
 } from "./webhooks.js";
 
 // handleBountyPRMerge no-ops unless the escrow is "configured", so make it so —
@@ -249,4 +251,149 @@ test("second bounty command on the same issue is a no-op while one is active", a
   const all = db.filter("bounties", (b) => b.repo === "acme/app" && b.issueNumber === 5);
   assert.equal(all.length, 1, "only the first bounty exists");
   assert.equal(all[0].amountUsdc, 100);
+});
+
+// ── Linear command authority ─────────────────────────────────────────────────
+// A Linear bounty is charged to whoever connected the workspace, so the comment
+// that mints it must come from someone entitled to spend that money: the
+// connector, or a workspace admin. Linear's payload carries only an author id, so
+// the gate makes a GraphQL lookup — stubbed here on globalThis.fetch, which is
+// what linearGraphQL uses.
+
+const CONNECTOR = "lin_connector";
+const ORG = "org_test";
+const realFetch = globalThis.fetch;
+let roles: Record<string, { admin: boolean; guest: boolean; active: boolean }> = {};
+let graphqlCalls: string[] = [];
+let roleLookupFails = false;
+
+function seedIntegration(workspaceMeta: Record<string, string> = { organizationId: ORG }) {
+  db.insert("integrations", {
+    id: "int_lin", userId: "u_sponsor", type: "linear",
+    tokens: { accessToken: "tok" }, workspaceMeta, createdAt: Date.now(),
+  } as any);
+}
+
+// A Comment.create webhook. `authorId` null omits the author entirely, which is
+// the "who sent this?" case the gate must refuse rather than guess at.
+const linearEvent = (authorId: string | null, body = "bounty $500 7d") => ({
+  type: "Comment",
+  action: "create",
+  organizationId: ORG,
+  ...(authorId ? { actor: { id: authorId, type: "user" } } : {}),
+  data: {
+    id: "cmt_1",
+    body,
+    issueId: "issue_lin",
+    ...(authorId ? { user: { id: authorId } } : {}),
+    issue: { id: "issue_lin", identifier: "ENG-1", title: "Ticket", url: "https://linear.app/i/ENG-1" },
+  },
+});
+
+const linearIntegration = () => db.find("integrations", (i) => i.id === "int_lin")!;
+const linearBounty = () => db.find("bounties", (b) => b.source === "linear" && b.externalKey === "issue_lin");
+
+beforeEach(() => {
+  db.remove("integrations", () => true);
+  roles = {};
+  graphqlCalls = [];
+  roleLookupFails = false;
+  globalThis.fetch = (async (_url: string, init: any) => {
+    const payload = JSON.parse(String(init?.body || "{}"));
+    const query: string = payload.query || "";
+    graphqlCalls.push(query.includes("viewer") ? "viewer" : query.includes("user(id:") ? "user" : "other");
+    const ok = (data: unknown) => ({ ok: true, status: 200, async json() { return { data }; }, async text() { return ""; } });
+    if (query.includes("viewer")) return ok({ viewer: { id: CONNECTOR } });
+    if (query.includes("user(id:")) {
+      if (roleLookupFails) return { ok: false, status: 500, async text() { return "linear is down"; } };
+      const role = roles[payload.variables?.id];
+      return ok({ user: role ? { id: payload.variables.id, ...role } : null });
+    }
+    return ok({ commentCreate: { success: true } });
+  }) as unknown as typeof fetch;
+});
+afterEach(() => {
+  globalThis.fetch = realFetch;
+});
+
+test("Linear bounty refused from a guest, a plain member, and a deactivated user", async () => {
+  seedIntegration();
+  roles = {
+    lin_guest: { admin: false, guest: true, active: true },
+    lin_member: { admin: false, guest: false, active: true },
+    lin_gone: { admin: true, guest: false, active: false },
+    lin_stranger: undefined as any, // not in the workspace at all
+  };
+  for (const author of ["lin_guest", "lin_member", "lin_gone", "lin_stranger"]) {
+    assert.equal(await handleLinearBountyCommand(linearEvent(author), linearIntegration()), null, author);
+    assert.equal(linearBounty(), null, `${author} must not create a bounty`);
+  }
+});
+
+test("Linear bounty allowed for a workspace admin, sponsored by the connector's account", async () => {
+  seedIntegration();
+  roles = { lin_admin: { admin: true, guest: false, active: true } };
+  const bounty = await handleLinearBountyCommand(linearEvent("lin_admin"), linearIntegration());
+  assert.ok(bounty, "admin's command creates the bounty");
+  assert.equal(bounty!.sponsorUserId, "u_sponsor");
+  assert.equal(bounty!.amountUsdc, 500);
+  assert.equal(bounty!.deliveryDays, 7);
+  assert.equal(bounty!.status, "PENDING_FUNDING");
+});
+
+test("the connector's own command stands without an admin role, and the id is cached", async () => {
+  seedIntegration();
+  roles = {}; // no role would authorize; identity as the connector is the whole basis
+  assert.ok(await handleLinearBountyCommand(linearEvent(CONNECTOR), linearIntegration()));
+  assert.equal(
+    linearIntegration().workspaceMeta.connectorUserId,
+    CONNECTOR,
+    "resolved once and cached onto the integration"
+  );
+  assert.deepEqual(graphqlCalls.filter((c) => c === "user"), [], "no per-author lookup needed");
+
+  // Second command on a fresh issue: the cached id means no viewer lookup either.
+  db.remove("bounties", () => true);
+  graphqlCalls = [];
+  assert.ok(await handleLinearBountyCommand(linearEvent(CONNECTOR), linearIntegration()));
+  assert.deepEqual(graphqlCalls.filter((c) => c === "viewer"), [], "connector id came from the cache");
+});
+
+test("Linear bounty refused when the payload names no author — without any lookup", async () => {
+  seedIntegration();
+  assert.equal(await handleLinearBountyCommand(linearEvent(null), linearIntegration()), null);
+  assert.equal(linearBounty(), null);
+  assert.deepEqual(graphqlCalls, [], "an unattributable command is refused before we ask Linear anything");
+});
+
+test("Linear bounty refused when the authority lookup fails (fails closed)", async () => {
+  seedIntegration();
+  roleLookupFails = true;
+  assert.equal(await handleLinearBountyCommand(linearEvent("lin_admin"), linearIntegration()), null);
+  assert.equal(linearBounty(), null, "a Linear outage must not open the money path");
+});
+
+test("a non-human actor is refused, so our own confirm comment can't re-trigger", async () => {
+  seedIntegration();
+  roles = { lin_app: { admin: true, guest: false, active: true } };
+  const echo = { ...linearEvent("lin_app"), actor: { id: "lin_app", type: "integration" } };
+  assert.equal(await handleLinearBountyCommand(echo, linearIntegration()), null);
+  assert.equal(linearBounty(), null);
+});
+
+test("the receiver's sync answer claims commands only, and creation still needs authority", async () => {
+  seedIntegration();
+  roles = { lin_member: { admin: false, guest: false, active: true } };
+  assert.equal(
+    maybeHandleBountyLinearComment({ ...linearEvent("lin_member"), data: { ...linearEvent("lin_member").data, body: "looks good to me" } }, linearIntegration()),
+    false,
+    "an ordinary comment is not claimed"
+  );
+  assert.equal(
+    maybeHandleBountyLinearComment(linearEvent("lin_member"), linearIntegration()),
+    true,
+    "a command is claimed even though the author turns out to be unauthorized"
+  );
+  await flush();
+  assert.equal(linearBounty(), null, "…and no bounty is created for them");
 });

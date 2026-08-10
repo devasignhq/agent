@@ -208,6 +208,42 @@ export async function fetchLinearWorkspace(
   return { organizationId: org.id, workspaceName: org.name || "", urlKey: org.urlKey || "" };
 }
 
+// Who this token belongs to — the workspace member who connected DevAsign. Used
+// to authorize inbound bounty commands: the connector is the account a Linear
+// bounty is charged to, so their own comments are trusted (bounties/webhooks.ts).
+// Cached onto the integration by the caller; this is one call per workspace.
+export async function fetchLinearViewerId(
+  token: string,
+  opts?: { bearer?: boolean }
+): Promise<string | null> {
+  const query = `query { viewer { id } }`;
+  const data = await linearGraphQL<{ viewer: { id?: string } }>(token, query, {}, opts);
+  return data?.viewer?.id || null;
+}
+
+export type LinearUserRole = { admin: boolean; guest: boolean; active: boolean };
+
+// A workspace member's standing, for authority checks. `admin` is the closest
+// Linear equivalent of GitHub's OWNER/MEMBER association; `guest` marks a limited
+// external collaborator and `active` excludes deactivated accounts — both must be
+// consulted, since a guest or a suspended member can still hold a user row.
+export async function fetchLinearUserRole(
+  token: string,
+  userId: string,
+  opts?: { bearer?: boolean }
+): Promise<LinearUserRole | null> {
+  const query = `query User($id: String!) { user(id: $id) { id admin active guest } }`;
+  const data = await linearGraphQL<{ user: { admin?: boolean; active?: boolean; guest?: boolean } | null }>(
+    token,
+    query,
+    { id: userId },
+    opts
+  );
+  const user = data?.user;
+  if (!user) return null;
+  return { admin: !!user.admin, guest: !!user.guest, active: !!user.active };
+}
+
 // Confirm whether an OAuth access token still works. Used to detect when a user
 // has revoked DevAsign from their Linear workspace — Linear sends no webhook for
 // that, so we probe on demand (after the user visits "Manage Access"). Returns
