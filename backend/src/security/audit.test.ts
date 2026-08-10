@@ -81,6 +81,43 @@ test("a disabled engine drops its surface", () => {
   assert.equal(out.candidates.length, 0);
 });
 
+// ── the gate's non-LLM half ──────────────────────────────────────────────────
+// securityFlags come out of a model that read the file's own content, so a file
+// can ask to be summarised as harmless — and if the gate believed only that, it
+// would never be scanned again. These are the signals it can't talk down.
+
+test("a file whose model flags were suppressed is still selected on its static flags", () => {
+  // What the attacker achieved: securityFlags: []. What they did not: the bytes
+  // still contain raw SQL, so the indexer's computed flags still say so.
+  const out = select([
+    entry({ path: "backend/src/lib/user-lookup.ts", securityFlags: [], staticFlags: ["raw-sql", "handles-auth"] }),
+  ]);
+  assert.equal(out.candidates.length, 1, "suppressing the model's flags must not hide the file");
+});
+
+test("a sensitive path is selected even with no flags at all (rows indexed before staticFlags)", () => {
+  const out = select([entry({ path: "backend/src/routes/pay.ts", securityFlags: [], staticFlags: undefined })]);
+  assert.equal(out.candidates.length, 1);
+});
+
+test("static flags don't override the cache or a disabled engine", () => {
+  const warm = entry({
+    securityFlags: [],
+    staticFlags: ["raw-sql"],
+    securityScannedSha: "blob1",
+    securityEngine: SECURITY_ENGINE,
+  });
+  assert.equal(select([warm]).candidates.length, 0, "an already-scanned blob is still a cache hit");
+  assert.equal(select([warm]).cacheHits, 1);
+  const off = selectCandidates({
+    entries: [entry({ securityFlags: [], staticFlags: ["raw-sql"] })],
+    policy: { ...policy, engines: { ...policy.engines, api: false } },
+    scopePaths: null,
+    full: true,
+  });
+  assert.equal(off.candidates.length, 0, "an operator's disabled engine still wins");
+});
+
 test("differential scope keeps a run to the paths the merge touched", () => {
   const out = selectCandidates({
     entries: [entry(), entry({ id: "e2", path: "backend/src/routes/auth.ts" })],
