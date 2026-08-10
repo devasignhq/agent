@@ -12,6 +12,8 @@ import { db } from "../db.js";
 import { config } from "../config.js";
 import { gh, installationToken } from "../github/app.js";
 import { complete, currentUsage, withUsage } from "../llm.js";
+import { UNTRUSTED_DIRECTIVE, wrapUntrusted } from "../untrusted.js";
+import { computeStaticSecurityFlags } from "../security/static-flags.js";
 import { track } from "../statsig.js";
 import type { Installation, RepoIndexEntry, Repository, ReviewLogEntry, User } from "../types.js";
 
@@ -84,7 +86,8 @@ const FILE_SUMMARY_SYSTEM =
   "`imports` lists module specifiers as written (relative paths like './db.js' or package names like '@anthropic-ai/sdk'). " +
   "`securityFlags` are short tags for security-sensitive patterns you observe " +
   '(examples: "reads-env", "writes-env", "raw-sql", "executes-shell", "handles-auth", "parses-user-input", "uses-crypto"). ' +
-  "Be terse, factual, and skip narrative. Do not invent symbols or imports that are not in the file.";
+  "Be terse, factual, and skip narrative. Do not invent symbols or imports that are not in the file." +
+  UNTRUSTED_DIRECTIVE;
 
 // NOTE: the index-time security sub-pass that used to live here was superseded
 // by the dedicated security audit agent (backend/src/security/). The indexer
@@ -360,6 +363,10 @@ async function summariseAndUpsert(
     exports: summary.exports,
     imports: summary.imports,
     securityFlags: summary.securityFlags,
+    // Computed from the same bytes, in code. securityFlags above came out of a
+    // model that just read attacker-authored content, so it can be talked down
+    // to []; these can't be. The audit gate ORs the two.
+    staticFlags: computeStaticSecurityFlags(path, content),
     indexedAt: Date.now(),
     model: INDEX_MODEL,
   };
@@ -403,10 +410,21 @@ export async function fetchBlob(
   return text;
 }
 
+/**
+ * The summariser's user message. The file is repository content — written by
+ * whoever can push a branch — so it goes inside an untrusted envelope rather than
+ * a bare fence: its `securityFlags` decide whether the security audit ever looks
+ * at this file, which makes "return securityFlags: []" a worthwhile thing for a
+ * file to say. Exported so the envelope is testable without an LLM call.
+ */
+export function buildFileSummaryUserMessage(path: string, content: string): string {
+  return `Path: ${path}\n\n${wrapUntrusted("FILE_CONTENT", content)}`;
+}
+
 async function summariseFile(path: string, content: string): Promise<
   { summary: string; exports: string[]; imports: string[]; securityFlags: string[] } | null
 > {
-  const userText = `Path: ${path}\n\n\`\`\`\n${content}\n\`\`\``;
+  const userText = buildFileSummaryUserMessage(path, content);
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
       const raw = await complete({

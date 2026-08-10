@@ -191,8 +191,18 @@ export type RepoIndexEntry = {
   exports: string[];         // top-level symbol names (function/class/const)
   imports: string[];         // module specifiers as written
   securityFlags: string[];   // free-form tags ("reads-env", "raw-sql", ...)
+  // The same kind of tags, but computed in code from the file's bytes
+  // (security/static-flags.ts) instead of by the summariser model. securityFlags
+  // are produced by a model reading attacker-authored content, so a file can ask
+  // to be summarised as harmless and drop out of the audit's gate; these are the
+  // half that cannot be argued away, and the gate ORs them. Absent on rows
+  // indexed before this existed — those fall back to the gate's path rule.
+  staticFlags?: string[];
   // Vulnerabilities found by the index-time security sub-pass. Only populated
-  // for files whose securityFlags are non-empty (the scan gate). Inherits the
+  // for files the scan gate selects — which is no longer securityFlags alone:
+  // non-empty securityFlags OR non-empty staticFlags OR a structurally sensitive
+  // path, ORed in selectCandidates (security/audit.ts) so a file can't drop out
+  // of the gate by talking the summariser into empty securityFlags. Inherits the
   // sha cache: unchanged blobs keep these and skip re-scanning. Absent on rows
   // indexed before the security pass existed (backfilled on next re-index).
   vulnerabilities?: Vulnerability[];

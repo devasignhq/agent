@@ -9,6 +9,7 @@ import { complete } from "../llm.js";
 import type { AttackSurface, RepoSecurityPolicy, SecurityConfidence, SecuritySeverity } from "../types.js";
 import { capSeverityByConfidence, normalizeConfidence, normalizeSeverity } from "./severity.js";
 import { classifySurfaceFor } from "./fingerprint.js";
+import { UNTRUSTED_DIRECTIVE, wrapUntrusted } from "../untrusted.js";
 
 export const AUDIT_MODEL = config.llm.model;
 const MAX_LLM_RETRIES = 3;
@@ -97,7 +98,8 @@ const SECURITY_AUDIT_SYSTEM =
   '"invariant": string,            // the rule that should hold\n' +
   '"remediation": string,          // code-level fix a human or coding agent can apply; name files/symbols, not "use best practices"\n' +
   '"regression_test": string       // a test that fails today and passes after the fix\n' +
-  "}]}";
+  "}]}" +
+  UNTRUSTED_DIRECTIVE;
 
 // Coerce the model's output into hardened AgentFinding rows: drop items without
 // a concern/title or without the mandatory 3-step exploit narrative, clamp
@@ -193,11 +195,16 @@ export async function scanFile(args: {
   precedent?: string;
   engines: RepoSecurityPolicy["engines"];
 }): Promise<AgentFinding[] | null> {
+  // The file is repo content and the repo context is a model's summary OF that
+  // content, so both are fenced as untrusted: this agent's output opens issues
+  // and funds bounties, and the file it is reading can be written by anyone who
+  // can push a branch. The precedent block stays outside the fence — those are
+  // maintainer-authored rulings, and system-prompt rule 6 says how to weigh them.
   const userText =
     `Path: ${args.path}\n` +
-    (args.repoContext ? `Repo context: ${args.repoContext}\n` : "") +
+    (args.repoContext ? `Repo context:\n${wrapUntrusted("REPO_CONTEXT", args.repoContext)}\n` : "") +
     (args.precedent ? `\n${args.precedent}\n` : "") +
-    `\n\`\`\`\n${args.content}\n\`\`\``;
+    `\n${wrapUntrusted("FILE_CONTENT", args.content)}`;
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
       const raw = await complete({
