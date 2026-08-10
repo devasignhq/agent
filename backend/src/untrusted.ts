@@ -34,8 +34,11 @@ const end = (kind: string) => `<<<END_UNTRUSTED_${kind}>>>`;
 //
 // The kind is matched by shape rather than against the kinds this file defines,
 // so a new call site can't quietly fall outside the strip — but it must be a
-// real kind: `+`, not `*`, so the pattern says a marker and not a prefix.
-const SENTINELS = /<<<(?:BEGIN|END)_UNTRUSTED_[A-Z_]+>>>/g;
+// real kind: `+`, not `*`, so the pattern says a marker and not a prefix. Keep
+// the class a superset of anything begin()/end() can emit; a kind this misses
+// (a digit, say, in a future SHA256_BLOB) issues markers the strip walks past,
+// which is the break-out the envelope exists to prevent.
+const SENTINELS = /<<<(?:BEGIN|END)_UNTRUSTED_[A-Z0-9_]+>>>/g;
 
 /**
  * Fence `text` as untrusted data of some `kind` (e.g. "FILE_CONTENT").
