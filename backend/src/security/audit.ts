@@ -293,9 +293,10 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         const detected = await scanFile({
           path: entry.path,
           content,
-          repoContext:
+          repoContext: (
             `flags: ${entry.securityFlags?.join(", ") || "(none)"} · ` +
-            `static: ${entry.staticFlags?.join(", ") || "(none)"} · ${entry.summary}`.slice(0, 500),
+            `static: ${entry.staticFlags?.join(", ") || "(none)"} · ${entry.summary}`
+          ).slice(0, 500),
           precedent: renderPrecedentBlock(selectPrecedents(corpus, { repoId: repo.id, path: entry.path })),
           engines: policy.engines,
         });

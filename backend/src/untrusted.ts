@@ -26,11 +26,18 @@ export const UNTRUSTED_DIRECTIVE =
 const begin = (kind: string) => `<<<BEGIN_UNTRUSTED_${kind}>>>`;
 const end = (kind: string) => `<<<END_UNTRUSTED_${kind}>>>`;
 
+// Every marker in the family, not just the kind being wrapped. The directive
+// above tells the model that ANY <<<BEGIN_UNTRUSTED_*>>>/<<<END_UNTRUSTED_*>>>
+// pair delimits data, so a FILE_CONTENT block carrying a REPO_CONTEXT marker
+// would still read as a delimiter — stripping only the matching kind leaves the
+// break-out open under a different name.
+const SENTINELS = /<<<(?:BEGIN|END)_UNTRUSTED_[A-Z_]*>>>/g;
+
 /**
  * Fence `text` as untrusted data of some `kind` (e.g. "FILE_CONTENT").
  *
- * The markers are stripped from `text` first. Without that, content containing
- * its own `<<<END_UNTRUSTED_FILE_CONTENT>>>` would close the envelope early and
+ * Markers are stripped from `text` first. Without that, content containing an
+ * `<<<END_UNTRUSTED_…>>>` of its own would close the envelope early and
  * everything after it would read as trusted prompt — the whole envelope defeated
  * by one line of the very content it is supposed to contain.
  *
@@ -38,7 +45,6 @@ const end = (kind: string) => `<<<END_UNTRUSTED_${kind}>>>`;
  * is testable.
  */
 export function wrapUntrusted(kind: string, text: string): string {
-  const sentinels = new RegExp(`<<<(?:BEGIN|END)_UNTRUSTED_${kind}>>>`, "g");
-  const safe = String(text ?? "").replace(sentinels, "[removed marker]");
+  const safe = String(text ?? "").replace(SENTINELS, "[removed marker]");
   return `${begin(kind)}\n${safe}\n${end(kind)}`;
 }
