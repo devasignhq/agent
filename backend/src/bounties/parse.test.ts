@@ -104,17 +104,52 @@ test("looksLikeBountyCommand is a cheap keyword gate", () => {
 // 15 seconds were the whole API, and on Linear this parse runs before the authority
 // check (bounties/webhooks.ts:217 vs :249).
 //
-// Meaning: bounding the run without NUM's (?![\d,]) would TRUNCATE it instead of
-// rejecting it — the first 30 digits read as 1.1e29 and this junk body parsed as a
-// real command, which then threw in usdcToStroops rather than being ignored. Null
-// is the answer both before the speed fix and after; only the time changed.
+// Meaning: bounding the run TRUNCATES it rather than rejecting it, and NUM's
+// (?![\d,]) only prevents that at the head of a run. A match can still start inside
+// one — AMOUNT_ANCHORED[1] has no lookbehind, AMOUNT_BARE's omits "," — and read an
+// absurd tail. All three shapes below exercised that; the amount range check in
+// parseBountyCommand is what rejects them. Null is the answer both before the speed
+// fix and after; only the time changed.
 test("an oversized digit run is rejected, in linear time", () => {
-  const body = "bounty 2 days " + "1".repeat(64_980); // GitHub's ~65k comment ceiling
-  const started = process.hrtime.bigint();
-  const parsed = parseBountyCommand(body);
-  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.equal(parsed, null, "a 65k digit run is not an amount");
-  assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the scan is quadratic again`);
+  const bodies = [
+    "bounty 2 days " + "1".repeat(64_980), // bare run; GitHub's ~65k comment ceiling
+    "bounty 2 days " + "1".repeat(64_980) + " usdc", // a currency anchor follows the run
+    "bounty 2 days " + "1,".repeat(32_000), // comma-interleaved: every comma is a legal start
+  ];
+  for (const body of bodies) {
+    const started = process.hrtime.bigint();
+    const parsed = parseBountyCommand(body);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.equal(parsed, null, `a 65k run is not an amount: ${body.slice(0, 20)}…`);
+    assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the scan is quadratic again`);
+  }
+});
+
+// The same truncation at a size where nothing is slow — proof the range check, not
+// the timing, is what rejects it. AMOUNT_ANCHORED[1] starts 10 chars into the run
+// and reads the last 30 digits as 1.1e29.
+test("a run just over the bound is rejected even when it is cheap to scan", () => {
+  assert.equal(parseBountyCommand("bounty " + "1".repeat(40) + " usdc 2 days"), null);
+});
+
+// Guards a tempting "fix": adding a leading (?<![\d,.]) to NUM would close the
+// interior-start holes described above, but it would also stop this parsing, since
+// the amount sits immediately after a comma. The range check covers those holes
+// without costing this.
+test("an amount directly after a comma still parses", () => {
+  assert.deepEqual(parseBountyCommand("bounty,100 usdc 2 days"), {
+    amountUsdc: 100,
+    deliveryDays: 2,
+  });
+});
+
+// The escrow contract's bounds (MIN/MAX_BOUNTY_STROOPS in stellar/amount.ts). An
+// out-of-range amount used to parse and then throw inside createBounty; now the
+// parser declines it, so the comment is simply ignored.
+test("an amount outside the escrowable range is not a command", () => {
+  assert.equal(parseBountyCommand("bounty 2,000,000,000 usdc 2 days"), null, "above the max");
+  assert.equal(parseBountyCommand("bounty $0.005 2 days"), null, "below the 0.01 minimum");
+  assert.deepEqual(parseBountyCommand("bounty $0.01 2 days"), { amountUsdc: 0.01, deliveryDays: 2 });
 });
 
 // The other payload from the same report: ~65k of b-prefixed 6-letter tokens, aimed
