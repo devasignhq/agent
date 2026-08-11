@@ -1,7 +1,7 @@
 // Offline tests for the Linear integration. Run in mock mode (no network):
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= \
 //     node --import tsx/esm --test src/linear/linear.test.ts
-import { test } from "node:test";
+import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import {
@@ -9,7 +9,7 @@ import {
   linearSourcesFromIssue,
   synthesizeCriteriaCore,
 } from "../review/pipeline.js";
-import { handleLinearWebhook } from "./webhooks.js";
+import { handleLinearWebhook, __resetSeenDeliveriesForTests } from "./webhooks.js";
 import type { LinearIssueContext } from "./client.js";
 import { config } from "../config.js";
 import { db } from "../db.js";
@@ -76,6 +76,13 @@ test("synthesizeCriteriaCore (mock LLM) yields criteria from a Linear ticket", a
 });
 
 // ── Webhook handler ──────────────────────────────────────────────────────────
+
+// The receiver's replay map is module-level and the whole suite runs in one
+// process, so clear it between tests rather than relying on bodies differing.
+// Between tests only — the replay test's two deliveries share a test and still
+// exercise the duplicate path.
+beforeEach(__resetSeenDeliveriesForTests);
+
 function fakeRes() {
   const res: any = { statusCode: 200, body: undefined };
   res.status = (n: number) => { res.statusCode = n; return res; };
@@ -139,6 +146,55 @@ test("handleLinearWebhook: IssueAttachment re-ingests; ProjectUpdate stores (no 
 
   db.remove("integrations", (i) => i.id === "int_pa");
   db.remove("linearProjectUpdates", (u) => u.id === "pu_x");
+});
+
+// The skew check used to be `if (ts && ...)`, so a delivery with no usable
+// webhookTimestamp skipped it entirely — a captured, still-validly-signed body
+// with the field stripped was accepted forever.
+test("handleLinearWebhook: missing/zero/non-numeric timestamp rejected", () => {
+  const orgId = "org_no_ts";
+  db.insert("integrations", {
+    id: "int_no_ts", userId: "u", type: "linear",
+    tokens: { accessToken: "tok" }, workspaceMeta: { organizationId: orgId },
+    createdAt: Date.now(),
+  } as any);
+
+  const before = queueSnapshot().reviews;
+  const base = { type: "Issue", action: "create", organizationId: orgId, data: { id: "issue_nots" } };
+  assert.equal(deliver(base).statusCode, 401, "absent webhookTimestamp");
+  assert.equal(deliver({ ...base, webhookTimestamp: 0 }).statusCode, 401, "zero");
+  assert.equal(deliver({ ...base, webhookTimestamp: "abc" }).statusCode, 401, "non-numeric");
+  assert.equal(queueSnapshot().reviews, before, "no ingest enqueued for any of them");
+
+  db.remove("integrations", (i) => i.id === "int_no_ts");
+});
+
+// The signature is an HMAC over the body alone, so resending captured bytes
+// reproduces a valid signature. Only the dedupe stops the repeat.
+test("handleLinearWebhook: replayed delivery dropped", () => {
+  const orgId = "org_replay";
+  db.insert("integrations", {
+    id: "int_replay", userId: "u", type: "linear",
+    tokens: { accessToken: "tok" }, workspaceMeta: { organizationId: orgId },
+    createdAt: Date.now(),
+  } as any);
+
+  const before = queueSnapshot().reviews;
+  const event = {
+    type: "Issue", action: "create", organizationId: orgId,
+    webhookTimestamp: Date.now(), data: { id: "issue_replay" },
+  };
+
+  const first = deliver(event);
+  assert.equal(first.statusCode, 200);
+  assert.equal(queueSnapshot().reviews, before + 1, "first delivery enqueues");
+
+  const replay = deliver(event); // byte-identical body → same valid signature
+  assert.equal(replay.statusCode, 200);
+  assert.deepEqual(replay.body, { ok: true, duplicate: true });
+  assert.equal(queueSnapshot().reviews, before + 1, "replay does not re-enqueue");
+
+  db.remove("integrations", (i) => i.id === "int_replay");
 });
 
 test("handleLinearWebhook: stale timestamp rejected", () => {
