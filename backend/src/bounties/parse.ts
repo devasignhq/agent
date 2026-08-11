@@ -23,12 +23,36 @@
 // Word order is flexible; anything without a clear amount AND window returns null,
 // so casual mentions ("we should bounty this someday") stay ignored.
 
+import { isValidBountyAmount, usdcToStroops } from "../stellar/amount.js";
+
 export type BountyCommand = { amountUsdc: number; deliveryDays: number };
 
 const MAX_DELIVERY_DAYS = 365;
 
 // A number with optional thousands commas and up to USDC's 7 decimals.
-const NUM = String.raw`\d[\d,]*(?:\.\d{1,7})?`;
+//
+// The {0,29} bound is load-bearing, not cosmetic. AMOUNT_ANCHORED[1] puts NUM in
+// front of a suffix that usually fails, so an unbounded [\d,]* made the engine
+// walk to the end of the body and back at every digit position — quadratic. A
+// 65k-char comment (GitHub's ceiling) blocked the event loop for ~16 seconds;
+// bounded, the per-position work is constant and the whole scan is linear.
+// 30 characters is far above any real amount: the most this system will escrow
+// is 1,000,000,000 USDC (MAX_BOUNTY_STROOPS in stellar/amount.ts) — 13 with commas.
+//
+// (?![\d,]) stops the bound truncating a run at its HEAD: without it, a 65k-digit
+// run matched its first 30 digits and read as 1.1e29. It costs at most 30 attempts
+// per position, sits before the decimal group, and "." isn't in [\d,] — so "12.50"
+// and "1,000" still parse.
+//
+// It does NOT make an over-long run unmatchable, and don't let this comment imply
+// otherwise. A match can still begin INSIDE a run and take its last ≤30 characters:
+// AMOUNT_ANCHORED[1] has no leading lookbehind at all, and AMOUNT_BARE's omits ","
+// so any position after a comma is a legal start. What actually keeps a truncated
+// run from parsing is the amount range check in parseBountyCommand — meaning is
+// enforced there, deliberately, not in this regex. Tightening NUM with a leading
+// (?<![\d,.]) would close those two holes but also stop "bounty,100 usdc 2 days"
+// parsing, which is why it isn't here.
+const NUM = String.raw`\d[\d,]{0,29}(?![\d,])(?:\.\d{1,7})?`;
 
 // "<n> <word>" pairs (e.g. "2 days", "3d"); the word is classified as a time unit
 // afterwards. The lookbehind stops us latching onto the fractional tail of a
@@ -135,6 +159,21 @@ export function parseBountyCommand(body: string): BountyCommand | null {
 
   const amountUsdc = findAmount(s.slice(0, dur.start) + " " + s.slice(dur.end));
   if (amountUsdc == null || !Number.isFinite(amountUsdc) || amountUsdc <= 0) return null;
+
+  // An amount the escrow cannot hold was never a bounty command — the counterpart
+  // to the MAX_DELIVERY_DAYS check above. This, not the regex, is what keeps a
+  // truncated digit run from parsing (see NUM): a match that starts inside a long
+  // run reads an absurd tail, and it gets rejected here whichever regex found it.
+  // Deciding it in the parser also keeps a junk comment ignorable instead of
+  // letting createBounty throw on the webhook thread — maybeHandleBountyComment is
+  // called unguarded from github/webhooks.ts:182.
+  let stroops: bigint;
+  try {
+    stroops = usdcToStroops(amountUsdc);
+  } catch {
+    return null; // not representable as USDC (a truncated run lands in exponent form)
+  }
+  if (!isValidBountyAmount(stroops)) return null;
 
   return { amountUsdc, deliveryDays };
 }

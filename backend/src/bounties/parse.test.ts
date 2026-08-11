@@ -93,3 +93,85 @@ test("looksLikeBountyCommand is a cheap keyword gate", () => {
   assert.equal(looksLikeBountyCommand("bounty $100 2 days"), true);
   assert.equal(looksLikeBountyCommand("nothing here"), false);
 });
+
+// Two things at once, and they pull in opposite directions.
+//
+// Speed: NUM used to end in an unbounded [\d,]*, and AMOUNT_ANCHORED[1] puts it
+// before a suffix that fails — so a long digit run made the engine rescan from
+// every digit position. This exact body took 15,740ms; it now takes ~16ms. The 1s
+// budget sits ~60x above the fixed cost and ~15x below the broken one, so it stays
+// decisive without turning flaky on a loaded CI box. Node is single-threaded: those
+// 15 seconds were the whole API, and on Linear this parse runs before the authority
+// check (bounties/webhooks.ts:217 vs :249).
+//
+// Meaning: bounding the run TRUNCATES it rather than rejecting it, and NUM's
+// (?![\d,]) only prevents that at the head of a run. A match can still start inside
+// one — AMOUNT_ANCHORED[1] has no lookbehind, AMOUNT_BARE's omits "," — and read an
+// absurd tail. All three shapes below exercised that; the amount range check in
+// parseBountyCommand is what rejects them. Null is the answer both before the speed
+// fix and after; only the time changed.
+test("an oversized digit run is rejected, in linear time", () => {
+  const bodies = [
+    "bounty 2 days " + "1".repeat(64_980), // bare run; GitHub's ~65k comment ceiling
+    "bounty 2 days " + "1".repeat(64_980) + " usdc", // a currency anchor follows the run
+    "bounty 2 days " + "1,".repeat(32_000), // comma-interleaved: every comma is a legal start
+  ];
+  for (const body of bodies) {
+    const started = process.hrtime.bigint();
+    const parsed = parseBountyCommand(body);
+    const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+    assert.equal(parsed, null, `a 65k run is not an amount: ${body.slice(0, 20)}…`);
+    assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the scan is quadratic again`);
+  }
+});
+
+// The same truncation at a size where nothing is slow — proof the range check, not
+// the timing, is what rejects it. AMOUNT_ANCHORED[1] starts 10 chars into the run
+// and reads the last 30 digits as 1.1e29.
+test("a run just over the bound is rejected even when it is cheap to scan", () => {
+  assert.equal(parseBountyCommand("bounty " + "1".repeat(40) + " usdc 2 days"), null);
+});
+
+// Guards a tempting "fix": adding a leading (?<![\d,.]) to NUM would close the
+// interior-start holes described above, but it would also stop this parsing, since
+// the amount sits immediately after a comma. The range check covers those holes
+// without costing this.
+test("an amount directly after a comma still parses", () => {
+  assert.deepEqual(parseBountyCommand("bounty,100 usdc 2 days"), {
+    amountUsdc: 100,
+    deliveryDays: 2,
+  });
+});
+
+// The escrow contract's bounds (MIN/MAX_BOUNTY_STROOPS in stellar/amount.ts). An
+// out-of-range amount used to parse and then throw inside createBounty; now the
+// parser declines it, so the comment is simply ignored.
+test("an amount outside the escrowable range is not a command", () => {
+  assert.equal(parseBountyCommand("bounty 2,000,000,000 usdc 2 days"), null, "above the max");
+  assert.equal(parseBountyCommand("bounty $0.005 2 days"), null, "below the 0.01 minimum");
+  assert.deepEqual(parseBountyCommand("bounty $0.01 2 days"), { amountUsdc: 0.01, deliveryDays: 2 });
+});
+
+// The other payload from the same report: ~65k of b-prefixed 6-letter tokens, aimed
+// at hasBountyKeyword/levenshtein. That path is already linear — the distance call is
+// gated to 5-8 char tokens — so this pins it rather than fixing it. Widening the gate
+// in isBountyWord, or adding a second distance target, would show up here.
+test("a body of near-keyword tokens is rejected, in linear time", () => {
+  const body = "bbbbbb ".repeat(9_285); // levenshtein("bbbbbb", "bounty") === 5, over the 2 budget
+  const started = process.hrtime.bigint();
+  const looks = looksLikeBountyCommand(body);
+  const parsed = parseBountyCommand(body);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.equal(looks, false, "the keyword gate does not fire");
+  assert.equal(parsed, null);
+  assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the keyword scan is no longer linear`);
+});
+
+// The bound must not narrow what the parser accepts: the largest escrowable
+// amount (MAX_BOUNTY_STROOPS in stellar/amount.ts) is 13 characters with commas.
+test("the bounded number still covers the largest escrowable amount", () => {
+  assert.deepEqual(parseBountyCommand("bounty 1,000,000,000 usdc 2 days"), {
+    amountUsdc: 1_000_000_000,
+    deliveryDays: 2,
+  });
+});
