@@ -64,24 +64,52 @@ export async function sendEmail(
 
 // ─── Templates ──────────────────────────────────────────────────────────────
 
+/**
+ * Escape every character that can terminate a tag or an attribute. Deliberately
+ * the same entity set as escapeHtml in frontend/src/sanitize.ts (single quote
+ * included) so the two don't drift; kept local rather than shared because this
+ * is the only module on the backend that builds markup. The `&` replace must
+ * stay first, or the later replacements' own ampersands get double-encoded.
+ */
+export const escapeHtml = (s: string): string =>
+  String(s)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+
 // Minimal, client-safe inline-styled shell shared by every transactional mail.
+//
+// The two parameters are NOT symmetric. `heading` is text and is escaped here,
+// so a caller can't introduce an injection by passing a value instead of a
+// literal. `bodyHtml` is pre-built markup and must stay raw — escaping anything
+// interpolated INTO it is the caller's job (see accountPurgedHtml).
 function layout(heading: string, bodyHtml: string): string {
   return `<div style="font-family:-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif;max-width:480px;margin:0 auto;padding:24px;color:#1a1a1a;line-height:1.5">
-  <h1 style="font-size:18px;margin:0 0 16px">${heading}</h1>
+  <h1 style="font-size:18px;margin:0 0 16px">${escapeHtml(heading)}</h1>
   ${bodyHtml}
   <p style="font-size:12px;color:#888;margin-top:24px">— The ${BRAND} team</p>
 </div>`;
+}
+
+// Body of the purge notice, split from the send so a test can inspect the markup
+// without stubbing fetch. githubLogin is the one interpolated value: GitHub only
+// issues [A-Za-z0-9-] logins, so nothing reaching this today needs escaping — but
+// that constraint lives in GitHub's API contract, not in this file, and the
+// output renders in someone else's mail client.
+export function accountPurgedHtml(user: User): string {
+  return layout("Your account has been deleted", `
+    <p>Hi ${escapeHtml(user.githubLogin)},</p>
+    <p>Your ${BRAND} account and all associated data have been permanently deleted, and any active subscription was canceled.</p>
+    <p><strong>One last step:</strong> to fully revoke ${BRAND}'s access, open GitHub → <em>Settings → Applications → Authorized GitHub Apps</em> and remove ${BRAND}.</p>
+    <p>Thanks for giving us a try — you're always welcome back.</p>
+  `);
 }
 
 // Sent right after the account is permanently wiped. We can't revoke the user's
 // OAuth grant ourselves (we never store their token), so the mail tells them to
 // remove DevAsign from their authorized apps.
 export function sendAccountPurgedEmail(user: User): Promise<boolean> {
-  const html = layout("Your account has been deleted", `
-    <p>Hi ${user.githubLogin},</p>
-    <p>Your ${BRAND} account and all associated data have been permanently deleted, and any active subscription was canceled.</p>
-    <p><strong>One last step:</strong> to fully revoke ${BRAND}'s access, open GitHub → <em>Settings → Applications → Authorized GitHub Apps</em> and remove ${BRAND}.</p>
-    <p>Thanks for giving us a try — you're always welcome back.</p>
-  `);
-  return sendEmail(user.email, `Your ${BRAND} account has been deleted`, html);
+  return sendEmail(user.email, `Your ${BRAND} account has been deleted`, accountPurgedHtml(user));
 }
