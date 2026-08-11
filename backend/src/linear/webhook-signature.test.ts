@@ -9,7 +9,7 @@ import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import crypto from "node:crypto";
 import { config } from "../config.js";
-import { handleLinearWebhook } from "./webhooks.js";
+import { handleLinearWebhook, __resetSeenDeliveriesForTests } from "./webhooks.js";
 
 const SECRET = "test-linear-secret";
 // Fresh timestamp and id per call: the receiver rejects a delivery with no
@@ -41,6 +41,9 @@ function deliver(sig: string | undefined, raw = body()) {
 
 beforeEach(() => {
   config.linear.webhookSigningSecret = SECRET;
+  // The receiver's replay map is module-level and the whole suite runs in one
+  // process, so clear it between tests rather than relying on bodies differing.
+  __resetSeenDeliveriesForTests();
 });
 
 test("valid signature is accepted (unknown org → acknowledged, no action)", () => {

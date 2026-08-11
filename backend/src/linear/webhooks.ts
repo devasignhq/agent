@@ -48,6 +48,13 @@ function isReplay(signature: string): boolean {
   return false;
 }
 
+// The map lives for the process lifetime and `node --test 'src/**/*.test.ts'` loads
+// many test files into one process, so let tests clear it — otherwise two identical
+// signed bodies in unrelated files would read as a replay.
+export function __resetSeenDeliveriesForTests(): void {
+  seenDeliveries.clear();
+}
+
 // A Linear webhook signature: lowercase hex HMAC-SHA256 of the raw body.
 // Validating the shape up front means timingSafeEqual always compares
 // equal-length buffers (it throws otherwise) and malformed headers are
