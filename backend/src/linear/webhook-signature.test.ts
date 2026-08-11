@@ -12,8 +12,20 @@ import { config } from "../config.js";
 import { handleLinearWebhook } from "./webhooks.js";
 
 const SECRET = "test-linear-secret";
+// Fresh timestamp and id per call: the receiver rejects a delivery with no
+// webhookTimestamp and dedupes byte-identical repeats, so a fixed body would
+// trip the replay guard instead of exercising the HMAC gate. Mirrors the
+// per-request GUID in github/webhook-signature.test.ts.
 const body = () =>
-  Buffer.from(JSON.stringify({ type: "Issue", action: "update", organizationId: "org-unknown" }));
+  Buffer.from(
+    JSON.stringify({
+      type: "Issue",
+      action: "update",
+      organizationId: "org-unknown",
+      webhookTimestamp: Date.now(),
+      webhookId: crypto.randomUUID(),
+    })
+  );
 const sign = (raw: Buffer, secret: string) =>
   crypto.createHmac("sha256", secret).update(raw).digest("hex");
 
