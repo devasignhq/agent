@@ -28,7 +28,15 @@ export type BountyCommand = { amountUsdc: number; deliveryDays: number };
 const MAX_DELIVERY_DAYS = 365;
 
 // A number with optional thousands commas and up to USDC's 7 decimals.
-const NUM = String.raw`\d[\d,]*(?:\.\d{1,7})?`;
+//
+// The {0,29} bound is load-bearing, not cosmetic. AMOUNT_ANCHORED[1] puts NUM in
+// front of a suffix that usually fails, so an unbounded [\d,]* made the engine
+// walk to the end of the body and back at every digit position — quadratic. A
+// 65k-char comment (GitHub's ceiling) blocked the event loop for ~16 seconds;
+// bounded, the per-position work is constant and the whole scan is linear.
+// 30 characters is far above any real amount: the most this system will escrow
+// is 1,000,000,000 USDC (MAX_BOUNTY_STROOPS in stellar/amount.ts) — 13 with commas.
+const NUM = String.raw`\d[\d,]{0,29}(?:\.\d{1,7})?`;
 
 // "<n> <word>" pairs (e.g. "2 days", "3d"); the word is classified as a time unit
 // afterwards. The lookbehind stops us latching onto the fractional tail of a

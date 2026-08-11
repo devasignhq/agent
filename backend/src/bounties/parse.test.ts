@@ -93,3 +93,28 @@ test("looksLikeBountyCommand is a cheap keyword gate", () => {
   assert.equal(looksLikeBountyCommand("bounty $100 2 days"), true);
   assert.equal(looksLikeBountyCommand("nothing here"), false);
 });
+
+// NUM used to end in an unbounded [\d,]*, and AMOUNT_ANCHORED[1] puts it before a
+// suffix that fails — so a long digit run made the engine rescan from every digit
+// position. This exact body took 15,740ms; it now takes ~16ms. The 1s budget sits
+// ~60x above the fixed cost and ~15x below the broken one, so it stays decisive
+// without turning flaky on a loaded CI box. Node is single-threaded: those 15
+// seconds were the whole API, and on Linear this parse runs before the authority
+// check (bounties/webhooks.ts:217 vs :249).
+test("a maximum-size comment parses in linear time", () => {
+  const body = "bounty 2 days " + "1".repeat(64_980); // GitHub's ~65k comment ceiling
+  const started = process.hrtime.bigint();
+  const parsed = parseBountyCommand(body);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.ok(parsed, "the command still parses");
+  assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the scan is quadratic again`);
+});
+
+// The bound must not narrow what the parser accepts: the largest escrowable
+// amount (MAX_BOUNTY_STROOPS in stellar/amount.ts) is 13 characters with commas.
+test("the bounded number still covers the largest escrowable amount", () => {
+  assert.deepEqual(parseBountyCommand("bounty 1,000,000,000 usdc 2 days"), {
+    amountUsdc: 1_000_000_000,
+    deliveryDays: 2,
+  });
+});
