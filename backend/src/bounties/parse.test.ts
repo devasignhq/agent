@@ -94,20 +94,42 @@ test("looksLikeBountyCommand is a cheap keyword gate", () => {
   assert.equal(looksLikeBountyCommand("nothing here"), false);
 });
 
-// NUM used to end in an unbounded [\d,]*, and AMOUNT_ANCHORED[1] puts it before a
-// suffix that fails — so a long digit run made the engine rescan from every digit
-// position. This exact body took 15,740ms; it now takes ~16ms. The 1s budget sits
-// ~60x above the fixed cost and ~15x below the broken one, so it stays decisive
-// without turning flaky on a loaded CI box. Node is single-threaded: those 15
-// seconds were the whole API, and on Linear this parse runs before the authority
+// Two things at once, and they pull in opposite directions.
+//
+// Speed: NUM used to end in an unbounded [\d,]*, and AMOUNT_ANCHORED[1] puts it
+// before a suffix that fails — so a long digit run made the engine rescan from
+// every digit position. This exact body took 15,740ms; it now takes ~16ms. The 1s
+// budget sits ~60x above the fixed cost and ~15x below the broken one, so it stays
+// decisive without turning flaky on a loaded CI box. Node is single-threaded: those
+// 15 seconds were the whole API, and on Linear this parse runs before the authority
 // check (bounties/webhooks.ts:217 vs :249).
-test("a maximum-size comment parses in linear time", () => {
+//
+// Meaning: bounding the run without NUM's (?![\d,]) would TRUNCATE it instead of
+// rejecting it — the first 30 digits read as 1.1e29 and this junk body parsed as a
+// real command, which then threw in usdcToStroops rather than being ignored. Null
+// is the answer both before the speed fix and after; only the time changed.
+test("an oversized digit run is rejected, in linear time", () => {
   const body = "bounty 2 days " + "1".repeat(64_980); // GitHub's ~65k comment ceiling
   const started = process.hrtime.bigint();
   const parsed = parseBountyCommand(body);
   const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
-  assert.ok(parsed, "the command still parses");
+  assert.equal(parsed, null, "a 65k digit run is not an amount");
   assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the scan is quadratic again`);
+});
+
+// The other payload from the same report: ~65k of b-prefixed 6-letter tokens, aimed
+// at hasBountyKeyword/levenshtein. That path is already linear — the distance call is
+// gated to 5-8 char tokens — so this pins it rather than fixing it. Widening the gate
+// in isBountyWord, or adding a second distance target, would show up here.
+test("a body of near-keyword tokens is rejected, in linear time", () => {
+  const body = "bbbbbb ".repeat(9_285); // levenshtein("bbbbbb", "bounty") === 5, over the 2 budget
+  const started = process.hrtime.bigint();
+  const looks = looksLikeBountyCommand(body);
+  const parsed = parseBountyCommand(body);
+  const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6;
+  assert.equal(looks, false, "the keyword gate does not fire");
+  assert.equal(parsed, null);
+  assert.ok(elapsedMs < 1000, `parsing took ${elapsedMs.toFixed(0)}ms — the keyword scan is no longer linear`);
 });
 
 // The bound must not narrow what the parser accepts: the largest escrowable

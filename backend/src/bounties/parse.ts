@@ -36,7 +36,14 @@ const MAX_DELIVERY_DAYS = 365;
 // bounded, the per-position work is constant and the whole scan is linear.
 // 30 characters is far above any real amount: the most this system will escrow
 // is 1,000,000,000 USDC (MAX_BOUNTY_STROOPS in stellar/amount.ts) — 13 with commas.
-const NUM = String.raw`\d[\d,]{0,29}(?:\.\d{1,7})?`;
+//
+// (?![\d,]) is what keeps the bound from changing MEANING. Without it the bound
+// silently truncates: a 65k-digit run matched its first 30 digits and read as
+// 1.1e29, so a junk comment parsed as a command instead of being ignored. The
+// lookahead makes an over-long run fail to match at all — the pre-bound outcome —
+// while still costing at most 30 attempts per position. It sits before the
+// decimal group, and "." isn't in [\d,], so "12.50" and "1,000" still parse.
+const NUM = String.raw`\d[\d,]{0,29}(?![\d,])(?:\.\d{1,7})?`;
 
 // "<n> <word>" pairs (e.g. "2 days", "3d"); the word is classified as a time unit
 // afterwards. The lookbehind stops us latching onto the fractional tail of a
