@@ -4,13 +4,21 @@
 // DOMPurify wiring that consumes SANITIZE_ALLOWED_* lives in screen-agent.tsx,
 // since DOMPurify needs a browser DOM and its methods don't exist under bare node.
 
-/** Escape the HTML-significant characters for safe interpolation into markup. */
+/**
+ * Escape the HTML-significant characters for safe interpolation into markup —
+ * every character that can terminate a tag or an attribute, in either quoting
+ * style. The single quote matters even though today's call sites all use
+ * double-quoted attributes: this is a general-purpose helper, and a future
+ * `title='…'` shouldn't have to know that only one quote character is covered.
+ * `&#39;` rather than `&apos;`, which isn't an HTML4 entity.
+ */
 export const escapeHtml = (s) =>
   String(s)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
 // Accept a raw user-supplied string only if it is a well-formed http(s) URL.
 // Returns the normalized URL, or "" for anything else — javascript:, data:,

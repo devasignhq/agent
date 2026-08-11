@@ -109,13 +109,20 @@ test("sourceLink handles a missing url (text attachments carry none)", () => {
 
 // ── escapeHtml ───────────────────────────────────────────────────────────────
 
-test("escapeHtml escapes &, <, >, and \"", () => {
-  assert.equal(escapeHtml(`<b>"x"&y</b>`), "&lt;b&gt;&quot;x&quot;&amp;y&lt;/b&gt;");
+test("escapeHtml escapes &, <, >, \" and '", () => {
+  assert.equal(escapeHtml(`<b>"x"&y'z</b>`), "&lt;b&gt;&quot;x&quot;&amp;y&#39;z&lt;/b&gt;");
   assert.equal(escapeHtml("plain text"), "plain text");
 });
 
 test("escapeHtml neutralizes a <script> payload", () => {
   assert.equal(escapeHtml("<script>alert(1)</script>"), "&lt;script&gt;alert(1)&lt;/script&gt;");
+});
+
+// Today's call sites all interpolate into double-quoted attributes or into text,
+// so this isn't reachable — but escapeHtml is contracted for any markup context,
+// and a value must not be able to close a single-quoted attribute either.
+test("escapeHtml neutralizes a single-quoted attribute breakout", () => {
+  assert.equal(escapeHtml("x' onmouseover='alert(1)"), "x&#39; onmouseover=&#39;alert(1)");
 });
 
 // ── sanitize allow-list (the config DOMPurify strips against) ─────────────────
