@@ -179,10 +179,17 @@ export async function completeWithMeta(opts: {
   return { text, stopReason: resp.stop_reason ?? null };
 }
 
+// What the mock was last handed. Offline tests use it to assert on the prompt a
+// caller actually sent, not just on what its prompt builder returns in isolation.
+// Only ever written on the mock path (no API key), so it costs live runs nothing.
+export const lastMockPrompt: { system?: string; user?: string } = {};
+
 // Deterministic, structurally-correct mock so the rest of the pipeline can run
 // without an API key. Returns JSON shaped like the live model would produce.
 function mockComplete({ system, messages }: { system?: string; messages: LLMMessage[] }): string {
   const last = messages[messages.length - 1]?.content || "";
+  lastMockPrompt.system = system;
+  lastMockPrompt.user = last;
 
   // MUST stay ahead of the criteria-synthesis branch below: the judge's user
   // message quotes the drafted list, so it contains the literal phrase
