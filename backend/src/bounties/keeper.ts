@@ -30,6 +30,7 @@ import {
   unfundedPendingBounties,
   type EscrowChain,
 } from "./service.js";
+import { taskIdMatchesBounty } from "./taskid.js";
 import { updateStatusComment } from "./botcomment.js";
 import { sponsorAudience } from "./live.js";
 import { pushNotification } from "../notifications.js";
@@ -215,6 +216,12 @@ async function recoverOrphanedFunding(deps: KeeperDeps): Promise<void> {
     const now = deps.now();
     if (now - b.createdAt < ORPHAN_MIN_AGE_MS) continue;
     if (now - (lastOrphanCheck.get(b.id) ?? 0) < ORPHAN_RECHECK_MS) continue;
+    // A row whose taskId isn't the one its id derives would query — and adopt —
+    // some OTHER bounty's escrow. Never guess; leave it for a human.
+    if (!taskIdMatchesBounty(b.id, b.taskId)) {
+      console.warn(`[bounty-keeper] ${b.code}: taskId "${b.taskId}" is not derived from its id — skipped`);
+      continue;
+    }
     lastOrphanCheck.set(b.id, now);
     checkedThisTick++;
     let escrow: unknown;

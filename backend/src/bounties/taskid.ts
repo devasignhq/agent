@@ -7,6 +7,7 @@ import crypto from "node:crypto";
 
 const BASE32 = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 export const TASK_ID_LENGTH = 25;
+const TASK_ID_RE = /^[A-Z2-7]{25}$/;
 
 function base32(buf: Buffer): string {
   let bits = 0;
@@ -31,5 +32,11 @@ export function taskIdForBounty(bountyId: string): string {
 }
 
 export function isValidTaskId(taskId: string): boolean {
-  return typeof taskId === "string" && taskId.length === TASK_ID_LENGTH;
+  return typeof taskId === "string" && TASK_ID_RE.test(taskId);
+}
+
+/** True when `taskId` is the one this bounty id derives — catches a corrupt row.
+ * Plain `===`: the id is a public unsalted hash of a public id, nothing to leak. */
+export function taskIdMatchesBounty(bountyId: string, taskId: string): boolean {
+  return isValidTaskId(taskId) && taskIdForBounty(bountyId) === taskId;
 }
