@@ -181,6 +181,26 @@ function tryParseJSON(text: string): any | null {
   }
 }
 
+// The scan prompt's user message. The file is repo content and the repo context
+// is a model's summary OF that content, so both are fenced as untrusted: this
+// agent's output opens issues and funds bounties, and the file it is reading can
+// be written by anyone who can push a branch. The precedent block stays outside
+// the fence — those are maintainer-authored rulings, and system-prompt rule 6
+// says how to weigh them. Exported so the envelope is testable without an LLM.
+export function buildScanUserMessage(args: {
+  path: string;
+  content: string;
+  repoContext?: string;
+  precedent?: string;
+}): string {
+  return (
+    `Path: ${args.path}\n` +
+    (args.repoContext ? `Repo context:\n${wrapUntrusted("REPO_CONTEXT", args.repoContext)}\n` : "") +
+    (args.precedent ? `\n${args.precedent}\n` : "") +
+    `\n${wrapUntrusted("FILE_CONTENT", args.content)}`
+  );
+}
+
 // Scan one file. Mirrors the indexer's retry/429-backoff shape; returns [] on
 // persistent failure so one flaky file never sinks the run (the audit job logs
 // the miss and the file stays owed — securityScannedSha isn't advanced).
@@ -195,16 +215,7 @@ export async function scanFile(args: {
   precedent?: string;
   engines: RepoSecurityPolicy["engines"];
 }): Promise<AgentFinding[] | null> {
-  // The file is repo content and the repo context is a model's summary OF that
-  // content, so both are fenced as untrusted: this agent's output opens issues
-  // and funds bounties, and the file it is reading can be written by anyone who
-  // can push a branch. The precedent block stays outside the fence — those are
-  // maintainer-authored rulings, and system-prompt rule 6 says how to weigh them.
-  const userText =
-    `Path: ${args.path}\n` +
-    (args.repoContext ? `Repo context:\n${wrapUntrusted("REPO_CONTEXT", args.repoContext)}\n` : "") +
-    (args.precedent ? `\n${args.precedent}\n` : "") +
-    `\n${wrapUntrusted("FILE_CONTENT", args.content)}`;
+  const userText = buildScanUserMessage(args);
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
       const raw = await complete({
