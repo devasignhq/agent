@@ -19,7 +19,7 @@ import { adminAddress, server } from "../src/stellar/client.js";
 import { buildEscrowInvoke } from "../src/stellar/build.js";
 import { getEscrow } from "../src/stellar/escrow.js";
 import { addressScVal, taskIdScVal } from "../src/stellar/scval.js";
-import { isValidTaskId } from "../src/bounties/taskid.js";
+import { isValidTaskId, taskIdMatchesBounty } from "../src/bounties/taskid.js";
 
 function detail(err: unknown): string {
   if (err instanceof Error) {
@@ -66,7 +66,13 @@ async function main() {
   console.log(`status       ${b.status}`);
   console.log(`pendingOp    ${b.pendingOp ?? "(none)"}`);
   const taskOk = isValidTaskId(b.taskId);
-  console.log(`taskId       ${b.taskId} ${taskOk ? "(valid)" : "*** INVALID — must be exactly 25 chars ***"}`);
+  const derived = taskIdMatchesBounty(b.id, b.taskId);
+  const taskNote = !taskOk
+    ? "*** INVALID — must be 25 base32 [A-Z2-7] chars ***"
+    : derived
+      ? "(valid)"
+      : "*** NOT DERIVED FROM THIS BOUNTY ID — row is corrupt ***";
+  console.log(`taskId       ${b.taskId} ${taskNote}`);
   console.log(`amount       ${b.amountStroops} stroops`);
   console.log(`sponsorAddr  ${b.sponsorAddress ?? "(none)"}`);
   console.log(`assigneeAddr ${b.assigneeAddress ?? "(none)"}`);
@@ -141,7 +147,7 @@ async function main() {
     console.log("    • 'Account not found'                → admin account missing on this network (wrong STELLAR_NETWORK / rotated key)");
     console.log("    • 'MissingValue' / unknown function  → deployed contract has no admin_refund — redeploy the contract");
     console.log("    • 'Error(Contract, #N)'              → contract rejected it: wrong admin, already settled, or bad status");
-    console.log("    • 'task_id must be exactly 25 chars' → the bounty row's taskId is corrupt");
+    console.log("    • 'task_id must be exactly 25 base32'→ the bounty row's taskId is corrupt");
   }
 
   await shutdownDb();

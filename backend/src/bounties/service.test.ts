@@ -8,7 +8,10 @@ import assert from "node:assert/strict";
 import { Keypair } from "@stellar/stellar-sdk";
 import { db, onRowChange } from "../db.js";
 import type { EscrowTransaction } from "../types.js";
+import { taskIdForBounty } from "./taskid.js";
 import {
+  buildFundingTx,
+  buildSponsorReleaseTx,
   createBounty,
   recordFunding,
   cancelPending,
@@ -1030,4 +1033,39 @@ test("hasContributorBountyActivity sees applicants and assignees, nobody else", 
   // every user at boot, so one legacy bounty would otherwise take the server down.
   db.update("bounties", (x) => x.id === b.id, { applications: undefined } as any);
   assert.equal(hasContributorBountyActivity(4242), false);
+});
+
+// A row whose taskId is not the one its id derives addresses SOMEONE ELSE'S
+// escrow on-chain. Every path that spends or reads escrow must refuse it rather
+// than sign against the crafted key.
+test("a corrupt taskId is refused by every escrow path, nothing is signed", async () => {
+  const { chain, calls } = fakeChain();
+  const b = mkBounty();
+  const crafted = "T".repeat(25); // right length, right charset, wrong bounty
+  db.update("bounties", (x) => x.id === b.id, { taskId: crafted });
+
+  const funding = await buildFundingTx(b.id, ADDR(), chain);
+  assert.deepEqual([funding.ok, funding.reason], [false, "corrupt_task_id"]);
+  assert.equal(calls.build, 0);
+
+  fundAndConfirm(b.id);
+  await delegate(b.id, chain);
+  const release = await releaseByMerge(b.id, chain);
+  assert.deepEqual([release.ok, release.reason], [false, "chain_error"]);
+  assert.equal(calls.adminRelease, 0);
+
+  const sponsorTx = await buildSponsorReleaseTx(b.id, chain);
+  assert.deepEqual([sponsorTx.ok, sponsorTx.reason], [false, "corrupt_task_id"]);
+  assert.equal(calls.build, 0);
+
+  const refund = await refundBounty(b.id, "expired", chain);
+  assert.deepEqual([refund.ok, refund.reason], [false, "chain_error"]);
+  assert.equal(calls.adminRefund, 0);
+
+  // Repaired, the same bounty goes through — the guard gates on derivation, not
+  // on some sticky failure flag.
+  db.update("bounties", (x) => x.id === b.id, { taskId: taskIdForBounty(b.id) });
+  const ok = await refundBounty(b.id, "expired", chain);
+  assert.equal(ok.ok, true, ok.reason);
+  assert.equal(calls.adminRefund, 1);
 });

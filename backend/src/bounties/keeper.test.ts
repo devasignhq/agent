@@ -252,6 +252,37 @@ test("a genuinely unfunded bounty stays PENDING_FUNDING", async () => {
   assert.equal(txnByKey(`escrow:${b.taskId}`), null);
 });
 
+test("a bounty whose taskId isn't derived from its id is never queried on-chain", async () => {
+  const b = mkBounty();
+  // A corrupt row: get_escrow on this key would adopt SOMEONE ELSE'S escrow.
+  db.update("bounties", (x) => x.id === b.id, { taskId: "T".repeat(25) });
+  let escrowReads = 0;
+  const deps = keeperDeps({}, PAST_MIN_AGE, {
+    async getEscrow() {
+      escrowReads++;
+      return { creator: ADDR() };
+    },
+  });
+
+  await runTick(deps);
+
+  assert.equal(escrowReads, 0);
+  assert.equal(getBounty(b.id)!.status, "PENDING_FUNDING");
+
+  // The skip stamps the recheck throttle, so a corrupt row doesn't re-warn on
+  // every 12s tick until a human repairs it.
+  const warn = console.warn;
+  let warns = 0;
+  console.warn = () => { warns++; };
+  try {
+    await runTick(deps);
+    await runTick(deps);
+  } finally {
+    console.warn = warn;
+  }
+  assert.equal(warns, 0);
+});
+
 test("per-tick read cap counts actual chain reads, not skipped candidates", async () => {
   // 10 fresh bounties (inside the grace window) iterate FIRST, then 5 aged past
   // it — the skips must neither consume read budget nor break the loop early.

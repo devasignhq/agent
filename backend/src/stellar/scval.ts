@@ -8,7 +8,9 @@ import { isValidTaskId } from "../bounties/taskid.js";
 const { nativeToScVal, scValToNative, Address, StrKey, xdr } = Stellar;
 
 export function taskIdScVal(taskId: string): Stellar.xdr.ScVal {
-  if (!isValidTaskId(taskId)) throw new Error(`task_id must be exactly 25 chars, got "${taskId}"`);
+  if (!isValidTaskId(taskId)) {
+    throw new Error(`task_id must be exactly 25 base32 [A-Z2-7] chars, got "${taskId}"`);
+  }
   return nativeToScVal(taskId, { type: "string" });
 }
 
