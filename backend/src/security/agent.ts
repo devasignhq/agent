@@ -9,7 +9,7 @@ import { complete } from "../llm.js";
 import type { AttackSurface, RepoSecurityPolicy, SecurityConfidence, SecuritySeverity } from "../types.js";
 import { capSeverityByConfidence, normalizeConfidence, normalizeSeverity } from "./severity.js";
 import { classifySurfaceFor } from "./fingerprint.js";
-import { UNTRUSTED_DIRECTIVE, wrapUntrusted } from "../untrusted.js";
+import { UNTRUSTED_DIRECTIVE, boundaryNotice, newBoundaryToken, wrapUntrusted } from "../untrusted.js";
 
 export const AUDIT_MODEL = config.llm.model;
 const MAX_LLM_RETRIES = 3;
@@ -181,6 +181,31 @@ function tryParseJSON(text: string): any | null {
   }
 }
 
+// The scan prompt's user message. The file is repo content and the repo context
+// is a model's summary OF that content, so both are fenced as untrusted: this
+// agent's output opens issues and funds bounties, and the file it is reading can
+// be written by anyone who can push a branch. A fresh boundary token per scan
+// means the file cannot name the marker that would close its own envelope. The
+// precedent block stays outside the fence — those are maintainer-authored
+// rulings, and system-prompt rule 6 says how to weigh them. Exported (with the
+// token injectable) so the envelope is testable without an LLM.
+export function buildScanUserMessage(args: {
+  path: string;
+  content: string;
+  repoContext?: string;
+  precedent?: string;
+  token?: string;
+}): string {
+  const token = args.token || newBoundaryToken();
+  return (
+    `Path: ${args.path}\n` +
+    `${boundaryNotice(token)}\n` +
+    (args.repoContext ? `Repo context:\n${wrapUntrusted("REPO_CONTEXT", args.repoContext, token)}\n` : "") +
+    (args.precedent ? `\n${args.precedent}\n` : "") +
+    `\n${wrapUntrusted("FILE_CONTENT", args.content, token)}`
+  );
+}
+
 // Scan one file. Mirrors the indexer's retry/429-backoff shape; returns [] on
 // persistent failure so one flaky file never sinks the run (the audit job logs
 // the miss and the file stays owed — securityScannedSha isn't advanced).
@@ -195,16 +220,7 @@ export async function scanFile(args: {
   precedent?: string;
   engines: RepoSecurityPolicy["engines"];
 }): Promise<AgentFinding[] | null> {
-  // The file is repo content and the repo context is a model's summary OF that
-  // content, so both are fenced as untrusted: this agent's output opens issues
-  // and funds bounties, and the file it is reading can be written by anyone who
-  // can push a branch. The precedent block stays outside the fence — those are
-  // maintainer-authored rulings, and system-prompt rule 6 says how to weigh them.
-  const userText =
-    `Path: ${args.path}\n` +
-    (args.repoContext ? `Repo context:\n${wrapUntrusted("REPO_CONTEXT", args.repoContext)}\n` : "") +
-    (args.precedent ? `\n${args.precedent}\n` : "") +
-    `\n${wrapUntrusted("FILE_CONTENT", args.content)}`;
+  const userText = buildScanUserMessage(args);
   for (let attempt = 0; attempt < MAX_LLM_RETRIES; attempt++) {
     try {
       const raw = await complete({
