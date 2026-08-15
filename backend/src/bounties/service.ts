@@ -19,7 +19,7 @@ import type {
   BountyExtension,
   EscrowTransaction,
 } from "../types.js";
-import { taskIdForBounty } from "./taskid.js";
+import { taskIdForBounty, taskIdMatchesBounty } from "./taskid.js";
 import { assertBountyAmount, stroopsToUsdcNumber, usdcToStroops } from "../stellar/amount.js";
 import { assertValidAddress } from "../stellar/scval.js";
 import {
@@ -179,6 +179,19 @@ export function acceptanceLocked(b: Bounty): boolean {
   );
 }
 
+/**
+ * The bounty's on-chain key, refusing a row whose taskId is not the one its id
+ * derives — such a key would address SOME OTHER bounty's escrow. This is the
+ * gate for every escrow call; taskIdScVal can only check the character set,
+ * since it is handed a bare task id with no bounty to derive from.
+ */
+function chainTaskId(b: Bounty): string {
+  if (!taskIdMatchesBounty(b.id, b.taskId)) {
+    throw new Error(`bounty ${b.code}: taskId "${b.taskId}" is not derived from its id`);
+  }
+  return b.taskId;
+}
+
 // ── creation + funding ───────────────────────────────────────────────────────
 
 export type CreateBountyInput = {
@@ -280,6 +293,7 @@ export async function buildFundingTx(
   if (!b) return { ok: false, reason: "not_found" };
   if (b.status !== "PENDING_FUNDING") return { ok: false, reason: `already_${b.status.toLowerCase()}` };
   assertValidAddress(sponsorAddress);
+  if (!taskIdMatchesBounty(b.id, b.taskId)) return { ok: false, reason: "corrupt_task_id" };
   const xdr = await chain.buildCreateEscrowXdr(
     sponsorAddress,
     b.taskId,
@@ -883,7 +897,7 @@ export async function releaseByMerge(
   if (!acquire(bountyId, "releasing")) return { ok: false, reason: "in_flight" };
   let send: SendResult;
   try {
-    send = await chain.adminRelease(b.taskId, b.assigneeAddress, b.assigneeMemo ?? "");
+    send = await chain.adminRelease(chainTaskId(b), b.assigneeAddress, b.assigneeMemo ?? "");
   } catch (err) {
     // Same blind spot as refundBounty's throw path — see the note there.
     console.warn(`[bounty] admin_release for ${b.code} (task ${b.taskId}) threw:`, err);
@@ -934,6 +948,7 @@ export async function buildSponsorReleaseTx(
   if (!b.assigneeAddress) return { ok: false, reason: "no_payout_address" };
   if (!b.sponsorAddress) return { ok: false, reason: "no_sponsor_address" };
   if (b.pendingOp) return { ok: false, reason: "in_flight" };
+  if (!taskIdMatchesBounty(b.id, b.taskId)) return { ok: false, reason: "corrupt_task_id" };
   const xdr = await chain.buildReleaseXdr(b.sponsorAddress, b.taskId, b.assigneeAddress, b.assigneeMemo ?? "");
   return { ok: true, reason: "built", xdr };
 }
@@ -1011,7 +1026,7 @@ export async function refundBounty(
   if (!acquire(bountyId, "refunding")) return { ok: false, reason: "in_flight" };
   let send: SendResult;
   try {
-    send = await chain.adminRefund(b.taskId);
+    send = await chain.adminRefund(chainTaskId(b));
   } catch (err) {
     // Log it: a build/simulate throw is almost always DETERMINISTIC (missing
     // admin account, contract revert, corrupt taskId), so the keeper retries it
@@ -1082,7 +1097,7 @@ export async function cancelBounty(
   if (chain !== defaultChain || isStellarConfigured()) {
     let escrow: unknown;
     try {
-      escrow = await chain.getEscrow(b.taskId);
+      escrow = await chain.getEscrow(chainTaskId(b));
     } catch {
       return { ok: false, reason: "chain_error" };
     }
@@ -1421,9 +1436,9 @@ export async function resubmitAdminTxn(
   let send: SendResult;
   try {
     if (txn.kind === "refund") {
-      send = await chain.adminRefund(b.taskId);
+      send = await chain.adminRefund(chainTaskId(b));
     } else if (txn.kind === "payout" && b.assigneeAddress) {
-      send = await chain.adminRelease(b.taskId, b.assigneeAddress);
+      send = await chain.adminRelease(chainTaskId(b), b.assigneeAddress);
     } else {
       return { ok: false, reason: "not_resubmittable" };
     }

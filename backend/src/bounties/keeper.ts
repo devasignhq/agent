@@ -217,8 +217,10 @@ async function recoverOrphanedFunding(deps: KeeperDeps): Promise<void> {
     if (now - b.createdAt < ORPHAN_MIN_AGE_MS) continue;
     if (now - (lastOrphanCheck.get(b.id) ?? 0) < ORPHAN_RECHECK_MS) continue;
     // A row whose taskId isn't the one its id derives would query — and adopt —
-    // some OTHER bounty's escrow. Never guess; leave it for a human.
+    // some OTHER bounty's escrow. Never guess; leave it for a human. Stamped
+    // before the skip so the warning is throttled, not re-logged every tick.
     if (!taskIdMatchesBounty(b.id, b.taskId)) {
+      lastOrphanCheck.set(b.id, now);
       console.warn(`[bounty-keeper] ${b.code}: taskId "${b.taskId}" is not derived from its id — skipped`);
       continue;
     }
