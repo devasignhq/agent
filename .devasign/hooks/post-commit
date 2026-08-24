@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+# DevAsign post-commit hook — reviews every local commit in the background.
+# Non-blocking by design: post-commit cannot stop a commit. The blocking gate is pre-push.
+# Opt out of one commit with: DEVASIGN_SKIP=1 git commit ...
+set -u
+command -v claude >/dev/null 2>&1 || exit 0
+[ "${DEVASIGN_SKIP:-0}" = "1" ] && exit 0
+ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+SHA=$(git rev-parse HEAD)
+SHORT=$(git rev-parse --short HEAD)
+# Cheap skips here; review-lead re-checks the full .devasign.yml commit.* rules.
+git rev-parse -q --verify HEAD^2 >/dev/null 2>&1 && exit 0   # merge commit
+case "$(git log -1 --pretty=%s)" in
+  fixup!*|squash!*|wip*|WIP*) exit 0 ;;
+esac
+RUN="$ROOT/.devasign"; OUT="$RUN/reviews"
+QDIR="$RUN/queue"; LOCK="$RUN/.review.lock"
+mkdir -p "$QDIR" "$OUT"
+touch "$QDIR/$(date +%s)-$SHA"
+# One runner at a time; extra commits queue up and are processed in order.
+if mkdir "$LOCK" 2>/dev/null; then
+  (
+    trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+    cd "$ROOT" || exit 0
+    while :; do
+      qfile=$(ls -1 "$QDIR" 2>/dev/null | head -n 1)
+      [ -n "${qfile:-}" ] || break
+      s="${qfile#*-}"
+      rm -f "$QDIR/$qfile"
+      short=$(git rev-parse --short "$s" 2>/dev/null || echo "$s")
+      # Prompt must precede --allowedTools: it is variadic and would eat the prompt.
+      claude -p "Review commit $s" \
+        --agent review-lead \
+        --allowedTools "Agent,Read,Grep,Glob,Bash,Write" \
+        < /dev/null > "$OUT/$short.log" 2>&1
+    done
+  ) >/dev/null 2>&1 &
+  echo "devasign: reviewing $SHORT in the background -> .devasign/reviews/$SHORT.log"
+else
+  echo "devasign: $SHORT queued for review"
+fi
+exit 0
