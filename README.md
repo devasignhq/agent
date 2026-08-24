@@ -1,11 +1,31 @@
 # DevAsign
 
-Multimodal AI agent that reviews PRs against the actual ticket — pulling context from GitHub, Linear, Slack/Discord, Figma, Loom, screenshots, PDFs — then posts a verdict back as a GitHub Check Run + PR review and broadcasts to your chat tool.
+Multimodal AI agent that reviews PRs against the actual ticket — not just the
+diff. It pulls context from GitHub, Linear, Slack/Discord, Figma, Loom,
+screenshots and PDFs, synthesizes an **End goal** (the acceptance criteria the
+PR must meet), reviews the change against it, and posts a verdict back as a
+GitHub Check Run + PR review while broadcasting to your chat tool.
 
-This repo has two halves:
+On top of review, DevAsign turns issues into **funded bounties**: maintainers
+escrow USDC on Stellar (Soroban), contributors apply and submit work, and the
+same review engine gates the payout.
 
-- [`frontend/`](frontend) — Vite + React + TypeScript dashboard, ported pixel-for-pixel from the Claude Design handoff (terminal/CLI dark theme, Geist + Geist Mono, orange accent `#ff7a3d`).
-- [`backend/`](backend) — Node + Express API that implements the spine described in [`devasign.md`](devasign.md): GitHub OAuth + GitHub App, webhook receiver, in-memory job queue, review worker, Anthropic LLM client, Postgres-backed store (Neon).
+## Repository layout
+
+This repo holds three apps that share one backend:
+
+- [`backend/`](backend) — Node + Express API: GitHub OAuth + GitHub App,
+  webhook receiver, in-memory job queue, review worker, Anthropic + Gemini LLM
+  clients, Stellar/Soroban escrow, Stripe billing, and a Postgres-backed store
+  (Neon). Implements the spine described in [`design.md`](design.md).
+- [`frontend/`](frontend) — the **maintainer** dashboard (Vite + React + TS).
+  Terminal/CLI dark theme, Geist + Geist Mono, orange accent `#ff7a3d`.
+- [`contributor/`](contributor) — the standalone **contributor** app (Vite +
+  React + TS): bounty discovery, apply, dashboard, and wallet.
+
+The two frontends are separate apps with separate accounts (a maintainer
+account and a contributor account are distinct even for the same GitHub
+identity); the backend scopes its session cookie by `Origin`.
 
 ## Quickstart
 
@@ -21,56 +41,143 @@ npm run dev                # http://localhost:8787
 What works out of the box:
 
 - `GET  /api/health` — sanity check
-- `POST /api/webhooks/github` — receives PR / installation events, enqueues review jobs
-- `GET  /api/reviews` — list of PR reviews
-- `GET  /api/reviews/:id` — review + log timeline + linked task
-- `POST /api/reviews/:id/rerun` — re-queue
+- `POST /api/webhooks/github` — receives PR / installation / comment events,
+  enqueues review jobs (also mounted at `/`)
+- `GET  /api/reviews`, `GET /api/reviews/:id`, `POST /api/reviews/:id/rerun`
+- `GET  /api/repositories`, `POST /api/repositories/:id/reindex`,
+  `GET/PUT /api/repositories/:id/workflow` (per-repo review config)
 - `POST /api/tasks/:id/attachments` — Loom / Figma / image / PDF added by the user
-- `GET  /api/me`, `GET /api/integrations`, `GET /api/billing/subscription`, …
+- `GET  /api/bounties`, `POST /api/bounties`, and the funding / apply / submit /
+  payout lifecycle (see **Bounties** below)
+- `GET  /api/security/overview`, `POST /api/security/scan` (see **Security** below)
+- `GET  /api/me`, `GET /api/integrations`, `GET /api/billing/subscription`,
+  `GET /api/notifications/stream` (SSE), …
 
 Without an `ANTHROPIC_API_KEY` the LLM step uses a deterministic mock that emits
 properly-shaped JSON, so the rest of the pipeline (ingest → criteria → review →
-output → log) still runs end-to-end. Drop in a key to flip to live Claude.
+output → log) still runs end-to-end. Drop in a key to flip to live Claude. Video
+understanding (Loom / screen recordings) runs on Gemini when `GEMINI_API_KEY` is
+set, and is skipped otherwise.
 
-### Frontend
+### Frontend (maintainer dashboard)
 
 ```bash
 cd frontend
 npm install
-npm run dev                # http://localhost:5173, proxies /api → 8787
+npm run dev                # http://localhost:3001, proxies /api → 8787
 ```
 
-The dashboard ships the full design from the handoff bundle:
+Screens:
 
 - Auth (GitHub OAuth gate)
-- Onboarding (4 steps: GitHub install → integrations → IDE/CLI → wallet)
+- Onboarding (GitHub install → integrations → IDE/CLI → wallet)
 - Agents (PR queue + review log timeline + end-goal panel + multimodal composer)
-- Bounties (list + drawer + applications inbox + create-bounty modal)
-- Wallet (Stellar balance + withdraw with 2FA gate)
-- Settings (Account, Installation, Review Models per repo, Usage, Plans, Security, Integrations)
-- ⌘K command center
-- Tweaks panel (accent / density / sidebar / mono font)
+- Bounties (list + drawer + create/fund modal + applications inbox + invoice PDF)
+- Security (repo scans, findings by severity, one-click issue → bounty)
+- Workflow (per-repo review models and stage toggles)
+- Wallet (Stellar balance + payout address)
+- Settings (Account, Installation, Review Models per repo, Usage, Plans,
+  Security, Integrations)
+- ⌘K command center and a Tweaks panel (accent / density / sidebar / mono font)
+
+### Contributor app
+
+```bash
+cd contributor
+npm install
+npm run dev                # http://localhost:3002, proxies /api → 8787
+```
+
+Screens: public **Discovery** → GitHub auth gate → **Dashboard**, **Bounties**
+(apply, submit, request extension/payout), **Wallet** (Stellar payout address),
+and **Settings**.
+
+## Bounties & escrow
+
+Bounties are backed by a **non-custodial** USDC escrow on Stellar (Soroban).
+The backend never holds contributor funds:
+
+- **Fund** — the sponsor signs `create_escrow` with Freighter; the backend only
+  builds the unsigned XDR and submits the signed transaction.
+- **Release** — the sponsor can release in-app (Freighter-signed), and the
+  backend releases with an admin/arbiter key when a linked PR merges.
+- **Refund** — the admin key refunds on cancel/expiry.
+
+Lifecycle: create → fund → apply → accept (assign) → submit → review → payout or
+refund, with **timeline extensions** (contributor requests, sponsor approves)
+and a **rejection/dispute** path. When a bounty is funded its acceptance
+criteria are locked and seeded into the review engine, so the same End-goal
+review that gates a normal PR also gates the payout.
+
+Stellar config lives under `STELLAR_*` in `backend/.env.example`
+(`STELLAR_NETWORK`, `STELLAR_RPC_URL`, `STELLAR_ESCROW_CONTRACT_ID`,
+`STELLAR_USDC_*`, `STELLAR_ADMIN_SECRET`, …).
+
+## Security audit
+
+The agent scans a repository for vulnerabilities and tracks findings over time
+(`backend/src/security/`). Findings are **fingerprinted** so they survive
+re-scans, ranked into four severity tiers, and confidence caps severity
+(unconfirmed findings can't exceed medium). A `devasign/security` Check Run
+reports the gate, precedents/policy let a repo suppress or accept classes of
+findings, and a maintainer can turn any finding into a GitHub issue — and from
+there a funded bounty — in one click. Findings can be exported (CSV/PDF) on paid
+plans.
+
+## The review pipeline
+
+Per [`design.md`](design.md), the worker drains a job per PR and runs, in order:
+
+1. **Ingest** — gather PR + repo context, linked Linear issue, and attachments;
+   summarize any videos via Gemini.
+2. **Holistic** — retrieve the whole-repo index (when built) for cross-file context.
+3. **Criteria / End goal** — synthesize acceptance criteria, seeded from a
+   linked bounty (locked at funding) or Linear ticket, refined by video.
+4. **New-commit intent review** — on re-review, judge new commits against their
+   own commit-message intent and the incremental delta.
+5. **Defect review** — a correctness pass ("is this code right?") independent of
+   the spec, so it still runs when no index/spec exists.
+6. **Output & log** — post the Check Run + PR review and record a timeline.
+
+Maintainer feedback can **re-score** existing verdicts (clear false positives,
+re-open passed criteria), not just add criteria.
 
 ## What's implemented vs. stubbed
-
-Per [`devasign.md`](devasign.md):
 
 | Layer | Status |
 |---|---|
 | Identity (GitHub OAuth) | ✅ real OAuth flow; falls back to error if creds missing |
 | GitHub App install + JWT + installation tokens | ✅ signing, token caching, REST helper |
-| Webhook receiver (HMAC) | ✅ verifies sha256, routes `installation`, `installation_repositories`, `pull_request` |
-| Review pipeline | ✅ ingest → criteria → review → output → log; multimodal context shape is in place |
+| Webhook receiver (HMAC) | ✅ verifies sha256; routes `installation`, `installation_repositories`, `pull_request`, `issue_comment` |
+| Review pipeline | ✅ ingest → holistic → criteria → new-commit → defect → output → log |
 | LLM (Claude) | ✅ live when key set, deterministic mock otherwise |
+| Video understanding (Gemini) | ✅ live when `GEMINI_API_KEY` set, skipped otherwise |
 | Job queue | ✅ in-memory (stand-in for Cloud Tasks); one worker drains it |
-| Persistence | ✅ Postgres (Neon); in-memory snapshot loaded at boot, write-through on mutation |
-| Integrations | Slack & Discord broadcast wired; Linear ingestion helper present |
-| Billing (Stripe) | Subscription row + credit grant endpoint; no real Stripe wiring yet |
-| Eval harness | Spec'd in `devasign.md` §5.e but out-of-band — not in the request path |
+| Persistence | ✅ Postgres (Neon); in-memory snapshot at boot, resilient write-through on mutation |
+| Bounties + Stellar/Soroban escrow | ✅ non-custodial (Freighter-signed create/release, admin-signed release/refund); contract deploy is environment config |
+| Security audit | ✅ fingerprinted findings, severity tiers, precedents/policy, issue → bounty |
+| Integrations | ✅ Slack & Discord broadcast; Linear OAuth + ingestion + webhooks |
+| Billing (Stripe) | ✅ live when `STRIPE_SECRET_KEY` set: checkout, portal, plan changes, credits |
+| Notifications | ✅ per-user SSE stream + live row-change fan-out |
+| Eval harness | out-of-band (see the `evals` repo) — not in the request path |
+
+## Environment
+
+Keys are grouped in [`backend/.env.example`](backend/.env.example); both
+frontends only need `VITE_API_BASE`. Notable groups:
+
+- **GitHub** — `GITHUB_OAUTH_*`, `GITHUB_APP_*` (id, name, webhook secret, private key)
+- **LLM** — `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `GEMINI_API_KEY` / `GEMINI_MODEL`
+- **Data & sessions** — `DATABASE_URL`, `SESSION_SECRET`, `INTEGRATION_ENCRYPTION_KEY`
+- **Origins** — `WEB_ORIGIN` (maintainer app), `CONTRIBUTOR_ORIGIN` (contributor app)
+- **Stellar** — `STELLAR_*` (network, RPC/Horizon, escrow contract, USDC, admin key)
+- **Billing** — `STRIPE_*` (secret, price ids, webhook secret)
+- **Integrations** — `SLACK_*`, `DISCORD_*`, `LINEAR_*`
+- **Ops** — `RESEND_API_KEY` / `EMAIL_FROM`, `STATSIG_*`
 
 ## End-to-end smoke test
 
-Once both servers are running:
+Once the backend is running:
 
 ```bash
 curl -s -X POST http://localhost:8787/api/webhooks/github \
@@ -80,9 +187,9 @@ curl -s -X POST http://localhost:8787/api/webhooks/github \
 ```
 
 You should see the job hit the queue, the worker run ingest → criteria → review,
-and the resulting record persist to Postgres (Neon) along with five log
-entries on the timeline (`Pipeline started`, `Context ingested`, `End goal
-synthesized`, `Changes requested`, `Posted Check Run and PR review`).
+and the resulting record persist to Postgres (Neon) along with the log entries on
+the timeline (`Pipeline started`, `Context ingested`, `End goal synthesized`,
+`Changes requested`, `Posted Check Run and PR review`).
 
 ## Guiding the review with `DEVASIGN.md`
 
