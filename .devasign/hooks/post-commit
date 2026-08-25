@@ -28,13 +28,14 @@ mkdir -p "$QDIR" "$OUT"
 touch "$QDIR/$(date +%s)-$SHA"
 # A lock whose runner was killed (SIGKILL, reboot) would otherwise stop reviews forever.
 lock_is_stale() {
+  # No progress for STALE_MINUTES means hung, whatever the pid claims: a hung runner
+  # keeps its pid alive forever, and a recycled pid can belong to anything. The runner
+  # touches the lock before each review, so this measures progress, not age.
+  [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$STALE_MINUTES" 2>/dev/null)" ] && return 0
   lockpid=$(cat "$LOCKPID" 2>/dev/null) || lockpid=""
-  if [ -n "$lockpid" ]; then
-    kill -0 "$lockpid" 2>/dev/null && return 1   # a live runner holds it
-    return 0
-  fi
-  # No pid recorded yet: a runner that just started is not stale, an old lock is.
-  [ -n "$(find "$LOCK" -maxdepth 0 -mmin +"$STALE_MINUTES" 2>/dev/null)" ]
+  [ -n "$lockpid" ] || return 1                 # no pid recorded yet: a fresh lock
+  kill -0 "$lockpid" 2>/dev/null && return 1    # a live runner holds it
+  return 0
 }
 # One runner at a time; extra commits queue up and are processed in order.
 claimed=no
@@ -66,6 +67,7 @@ if [ "$claimed" = yes ]; then
       s="${qfile#*-}"
       rm -f "$QDIR/$qfile"
       short=$(git rev-parse --short "$s" 2>/dev/null || echo "$s")
+      touch "$LOCK" 2>/dev/null   # heartbeat: the drain is progressing, do not reclaim
       # Prompt must precede --allowedTools: it is variadic and would eat the prompt.
       claude -p "Review commit $s" \
         --agent review-lead \

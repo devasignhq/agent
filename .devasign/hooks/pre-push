@@ -46,7 +46,9 @@ while read -r local_ref local_sha remote_ref remote_sha; do
     status=1
   elif [ "$rc" -ne 0 ] || ! grep -q '^DEVASIGN_VERDICT=' "$log"; then
     # Never let a failed review read as a clean one.
-    echo "devasign: WARNING — no verdict for $range (claude exited $rc); this push was NOT reviewed."
+    echo "devasign: push blocked — no verdict for $range (claude exited $rc), so it was NOT reviewed."
+    echo "devasign: bypass once with --no-verify, or DEVASIGN_SKIP=1 git push."
+    status=1
   fi
   rm -f "$log"
 done
