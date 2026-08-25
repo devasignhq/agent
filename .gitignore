@@ -46,6 +46,13 @@ desktop.ini
 
 # Claude Code local tooling (settings, launch config, installed skills) — any level
 .claude/
+# ...except the review agents and skills at the repo root: .devasign.yml's
+# review.tiers/review.models configure them, so the config and its consumer
+# version together. Settings and worktrees under .claude/ stay local.
+!/.claude/
+/.claude/*
+!/.claude/agents/
+!/.claude/skills/
 
 # Project memory (local-only working doc)
 memory.md
