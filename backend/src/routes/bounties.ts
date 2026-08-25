@@ -239,12 +239,9 @@ bounties.post("/bounties", (req, res) => {
 // exists today, and adding one would invite future callers to patch fields that
 // must never be client-writable (amountStroops, status, taskId).
 //
-// Auth here is SESSION + sponsor, deliberately stricter than the funding routes
-// below, which accept the signed link token alone. The two are not comparable:
-// funding costs the actor their own USDC, while editing is free and rewrites
-// what a contributor is paid for — and that link sits in a PUBLIC GitHub
-// comment. Requiring a session costs nothing either, since the funding page
-// already loads the bounty through the session-authed GET above.
+// Auth is SESSION + sponsor, the same as the token-scoped funding and cancel
+// routes below: a link token names a bounty, it never authorizes the actor.
+// That link sits in a PUBLIC GitHub comment.
 bounties.patch("/bounties/:id/acceptance", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
