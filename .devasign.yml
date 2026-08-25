@@ -5,6 +5,16 @@ review:
   blocking_severities: [blocker, high]   # what makes the verdict FIX_BEFORE_PUSH (high must be verified)
   max_report_findings: 25                # findings shown in the markdown report; everything ships in the JSON
   max_nits: 5
+  max_verifiers: 3                       # parallel verifiers for unverified blocker/high findings;
+                                         # lifted to 8 when the change is tagged money, auth or data
+  tiers:                                 # how many agents a change earns — see review-lead Phase 1
+    fast_max_lines: 40                   # tier 1 = intent + correctness + docs; 0 disables the fast tier
+    standard_max_lines: 400              # tier 2 ceiling; anything larger is always tier 3
+    escalating_tags: [money, auth, data, public-api, deps, infra]   # any of these forces tier 3
+  models:                                # model override by tier; tier 3 always runs as declared
+    fast: sonnet                         # tier 1 — every agent
+    standard: sonnet                     # tier 2 — every agent except standard_deep below
+    standard_deep: [review-security]     # tier 2 agents that keep full depth (no override)
   run_tests: auto                        # auto | always | never — auto runs the suite when a runner is detected
   ignore_paths:                          # excluded from review and from line counts
     - "**/node_modules/**"
@@ -19,12 +29,10 @@ review:
     disable: []                          # e.g. [review-frontend]
     force: []                            # always run, regardless of risk tags — e.g. [review-money]
   language: en                           # language of the written review
-commit:                                  # rules for the every-commit flow
+commit:                                  # skip rules, applied to the pushed range at pre-push
   skip_merge_commits: true
   skip_patterns: ["wip", "WIP", "fixup!", "squash!"]   # commit-subject prefixes that skip review
   min_changed_lines: 1                   # skip commits smaller than this (0 reviews even empty commits)
-  fast_path_max_lines: 40                # small commits with no money/auth/data/public-api/deps/infra tag
-                                         # run intent + correctness + docs only; 0 disables the fast path
   already_reviewed: skip                 # skip | rerun — what to do when .devasign/reviews/<sha>.json exists
 family:                                  # explicit sister-repo declaration; wins over heuristics
   name: devasign-escrow                  # this service plus the Soroban contracts it invokes

@@ -239,12 +239,9 @@ bounties.post("/bounties", (req, res) => {
 // exists today, and adding one would invite future callers to patch fields that
 // must never be client-writable (amountStroops, status, taskId).
 //
-// Auth here is SESSION + sponsor, deliberately stricter than the funding routes
-// below, which accept the signed link token alone. The two are not comparable:
-// funding costs the actor their own USDC, while editing is free and rewrites
-// what a contributor is paid for — and that link sits in a PUBLIC GitHub
-// comment. Requiring a session costs nothing either, since the funding page
-// already loads the bounty through the session-authed GET above.
+// Auth is SESSION + sponsor, the same as the token-scoped funding and cancel
+// routes below: a link token names a bounty, it never authorizes the actor.
+// That link sits in a PUBLIC GitHub comment.
 bounties.patch("/bounties/:id/acceptance", (req, res) => {
   const user = requireUser(req, res);
   if (!user) return;
@@ -268,12 +265,19 @@ bounties.patch("/bounties/:id/acceptance", (req, res) => {
   res.json({ bounty: withSponsorLinks(bounty) });
 });
 
-// --- funding (token-scoped; sponsor need not have a session) ---
+// --- funding (sponsor session + token) ---
+// The fund/cancel tokens ride in a PUBLIC issue comment, so they only scope an
+// action to one bounty; they never stand in for the sponsor's own session.
 
 bounties.get("/bounties/:id/funding-tx", async (req, res) => {
-  if (!requireStellar(res)) return;
+  const user = requireUser(req, res);
+  if (!user) return;
   const bountyId = verifyBountyLinkToken(String(req.query.token || ""), "fund");
   if (bountyId !== req.params.id) return void res.status(403).json({ error: "invalid_token" });
+  const fundBounty = getBounty(bountyId);
+  if (!fundBounty) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(fundBounty, user.id)) return void res.status(403).json({ error: "forbidden" });
+  if (!requireStellar(res)) return;
   const address = String(req.query.address || "");
   try {
     const r = await buildFundingTx(bountyId, address);
@@ -288,9 +292,14 @@ bounties.get("/bounties/:id/funding-tx", async (req, res) => {
 });
 
 bounties.post("/bounties/:id/funding-submit", async (req, res) => {
-  if (!requireStellar(res)) return;
+  const user = requireUser(req, res);
+  if (!user) return;
   const bountyId = verifyBountyLinkToken(String(req.body?.token || ""), "fund");
   if (bountyId !== req.params.id) return void res.status(403).json({ error: "invalid_token" });
+  const submitBounty = getBounty(bountyId);
+  if (!submitBounty) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(submitBounty, user.id)) return void res.status(403).json({ error: "forbidden" });
+  if (!requireStellar(res)) return;
   const signedXdr = String(req.body?.signedXdr || "");
   if (!signedXdr) return void res.status(400).json({ error: "missing_signed_xdr" });
   const r = await submitFunding(bountyId, signedXdr);
@@ -299,10 +308,13 @@ bounties.post("/bounties/:id/funding-submit", async (req, res) => {
 });
 
 bounties.post("/bounties/:id/cancel", async (req, res) => {
+  const user = requireUser(req, res);
+  if (!user) return;
   const bountyId = verifyBountyLinkToken(String(req.body?.token || ""), "cancel");
   if (bountyId !== req.params.id) return void res.status(403).json({ error: "invalid_token" });
   const b = getBounty(bountyId);
   if (!b) return void res.status(404).json({ error: "not_found" });
+  if (!isSponsor(b, user.id)) return void res.status(403).json({ error: "forbidden" });
   // Refund needs the chain unless it's an unfunded PENDING_FUNDING discard.
   if (b.status !== "PENDING_FUNDING" && !requireStellar(res)) return;
   const r = await cancelBounty(bountyId, "deleted");
