@@ -68,3 +68,6 @@ coverage/
 .nuxt/
 .turbo/
 .vite/
+# Motion
+.motion/
+motion/
