@@ -2,7 +2,13 @@
 # DevAsign pre-push gate — reviews the exact commits about to leave this machine
 # and blocks the push when the verdict is FIX_BEFORE_PUSH.
 # Bypass once with: git push --no-verify   (or DEVASIGN_SKIP=1 git push)
+#
+# SECURITY: like post-commit, this runs an agent over commit content that may not
+# be yours. It keeps full Bash because you are at the terminal watching its output
+# and can interrupt it; the unattended post-commit path does not. Narrow it with
+# DEVASIGN_ALLOWED_TOOLS if you would rather not make that trade.
 set -u
+TOOLS="${DEVASIGN_ALLOWED_TOOLS:-Agent,Read,Grep,Glob,Bash,Write}"
 command -v claude >/dev/null 2>&1 || exit 0
 [ "${DEVASIGN_SKIP:-0}" = "1" ] && exit 0
 git rev-parse --show-toplevel >/dev/null 2>&1 || exit 0
@@ -32,11 +38,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # Prompt must precede --allowedTools: it is variadic and would eat the prompt.
   claude -p "Review the commit range $range" \
     --agent review-lead \
-    --allowedTools "Agent,Read,Grep,Glob,Bash,Write" \
+    --allowedTools "$TOOLS" \
     < /dev/null 2>&1 | tee "$log"
+  rc=${PIPESTATUS[0]}
   if grep -q '^DEVASIGN_VERDICT=FIX_BEFORE_PUSH' "$log"; then
     echo "devasign: push blocked — fix the blocking findings, or bypass once with --no-verify."
     status=1
+  elif [ "$rc" -ne 0 ] || ! grep -q '^DEVASIGN_VERDICT=' "$log"; then
+    # Never let a failed review read as a clean one.
+    echo "devasign: WARNING — no verdict for $range (claude exited $rc); this push was NOT reviewed."
   fi
   rm -f "$log"
 done

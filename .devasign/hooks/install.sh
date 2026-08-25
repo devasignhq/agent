@@ -12,6 +12,11 @@ for h in post-commit pre-push; do
     printf '#!/usr/bin/env bash\n"$(git rev-parse --show-toplevel)/.devasign/hooks/%s" "$@"\n' "$h" > "$target"
   elif ! grep -q "devasign/hooks/$h" "$target"; then
     printf '\n# devasign review\n"$(git rev-parse --show-toplevel)/.devasign/hooks/%s" "$@" || exit $?\n' "$h" >> "$target"
+    # Appending is only useful if control reaches the end of the existing hook.
+    if grep -qE '^[[:space:]]*exit([[:space:]]|$)' "$target"; then
+      echo "devasign: WARNING - $target has a top-level 'exit'; the line just appended may never run."
+      echo "devasign:          Move that line above the exit, or reviews will silently not happen."
+    fi
   fi
   chmod +x "$target"
 done
