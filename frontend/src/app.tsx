@@ -2,6 +2,7 @@
 // Main App shell + sidebar + routing
 import React from "react";
 import { useLocation, useNavigate, Routes, Route, Navigate } from "react-router-dom";
+import { ROUTE_PATHS, DEFAULT_ROUTE, DEFAULT_SETTINGS_PATH } from "./routes";
 import { StatsigProvider, useClientAsyncInit } from "@statsig/react-bindings";
 import { StatsigAutoCapturePlugin } from "@statsig/web-analytics";
 import { StatsigSessionReplayPlugin } from "@statsig/session-replay";
@@ -884,20 +885,20 @@ const AppContent = () => {
         />
         <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           <Routes>
-            <Route path="/agent"    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
-            <Route path="/workflow" element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
-            <Route path="/bounty"   element={<BountiesPage isMobile={isMobile} />} />
-            <Route path="/bounties/:id/fund" element={<FundBountyPage />} />
-            <Route path="/bounties/:id/cancel" element={<BountiesPage isMobile={isMobile} isCancelling />} />
-            <Route path="/security" element={<SecurityPage view="dashboard" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path="/security/findings/:findingId" element={<SecurityPage view="detail" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path="/security/gate" element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path="/security/rulings" element={<SecurityPage view="rulings" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path="/security/policy" element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path="/settings" element={<Navigate to="/settings/account" replace />} />
-            <Route path="/settings/:section" element={<SettingsPage />} />
-            <Route path="/" element={<Navigate to="/agent" replace />} />
-            <Route path="*" element={<Navigate to="/agent" replace />} />
+            <Route path={ROUTE_PATHS.agent}    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
+            <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
+            <Route path={ROUTE_PATHS.bounty}   element={<BountiesPage isMobile={isMobile} />} />
+            <Route path={ROUTE_PATHS.fundBounty} element={<FundBountyPage />} />
+            <Route path={ROUTE_PATHS.cancelBounty} element={<BountiesPage isMobile={isMobile} isCancelling />} />
+            <Route path={ROUTE_PATHS.security} element={<SecurityPage view="dashboard" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityFinding} element={<SecurityPage view="detail" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityGate} element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityRulings} element={<SecurityPage view="rulings" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityPolicy} element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.settings} element={<Navigate to={DEFAULT_SETTINGS_PATH} replace />} />
+            <Route path={ROUTE_PATHS.settingsSection} element={<SettingsPage />} />
+            <Route path={ROUTE_PATHS.root} element={<Navigate to={DEFAULT_ROUTE} replace />} />
+            <Route path={ROUTE_PATHS.catchAll} element={<Navigate to={DEFAULT_ROUTE} replace />} />
           </Routes>
         </div>
       </div>

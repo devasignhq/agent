@@ -5255,6 +5255,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 
 /* Controls inside the panel */
 .wf-ctl-group { display: flex; flex-direction: column; gap: 14px; }
+/* Status pills in the column flex would stretch full-width; hug their text. */
+.wf-ctl-group > .pill { align-self: flex-start; }
 /* Labeled field (e.g. the GitHub Action workflow picker / run-when select). */
 .wf-field { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
 .wf-field .input { font-family: var(--mono); }
