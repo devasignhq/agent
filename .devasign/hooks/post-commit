@@ -24,7 +24,16 @@ if mkdir "$LOCK" 2>/dev/null; then
     cd "$ROOT" || exit 0
     while :; do
       qfile=$(ls -1 "$QDIR" 2>/dev/null | head -n 1)
-      [ -n "${qfile:-}" ] || break
+      if [ -z "${qfile:-}" ]; then
+        # Release, then look again: a commit queued while we still held the lock
+        # would otherwise sit there until some later commit started a new runner.
+        rmdir "$LOCK" 2>/dev/null
+        qfile=$(ls -1 "$QDIR" 2>/dev/null | head -n 1)
+        if [ -z "${qfile:-}" ] || ! mkdir "$LOCK" 2>/dev/null; then
+          trap - EXIT   # the lock is gone or another runner's now; never remove theirs
+          break
+        fi
+      fi
       s="${qfile#*-}"
       rm -f "$QDIR/$qfile"
       short=$(git rev-parse --short "$s" 2>/dev/null || echo "$s")
