@@ -37,6 +37,7 @@ import { backfillAccountKinds } from "./users.js";
 import { installationsForUser } from "./github/installations.js";
 import { hasContributorBountyActivity } from "./bounties/service.js";
 import { startWorker } from "./worker.js";
+import { startTopologyRefresh } from "./review/cross-repo/job.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
 import { startSecurityLiveSignals } from "./security/live.js";
@@ -335,6 +336,7 @@ backfillLegacyVulnerabilities();
 backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
+startTopologyRefresh();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no

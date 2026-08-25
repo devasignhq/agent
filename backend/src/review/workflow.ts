@@ -10,7 +10,7 @@ import type { Repository, RepoWorkflow } from "../types.js";
 
 // The stages that make an LLM call and can therefore carry maintainer
 // instructions. Shared by normalize/effective/advancedChanged and the pipeline.
-export const PROMPT_KEYS = ["criteria", "review", "holistic", "security", "defects", "deferrals", "docs"] as const;
+export const PROMPT_KEYS = ["criteria", "review", "holistic", "security", "defects", "deferrals", "docs", "crossRepo"] as const;
 // Cap a single stage prompt so a pasted essay can't blow up the system prompt.
 const PROMPT_CAP = 2000;
 // Cap the stored workflow file name for the "Run GitHub Action" step.
@@ -24,10 +24,12 @@ const WORKFLOW_NAME_CAP = 200;
 // review lets a PR that satisfies every requirement ship a real bug — shipping
 // it default-off would leave that gap open for every repo that never visits the
 // Workflow screen. Maintainers can turn it off there.
+// crossRepo is the mirror case: advisory-only, so leaving it off closes no gap,
+// and it costs GitHub calls plus tokens on every PR. Opt in on the Workflow screen.
 export const WORKFLOW_DEFAULTS: RepoWorkflow = {
   version: 1,
   trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-  stages: { holistic: true, defects: true, docs: true, deferrals: true },
+  stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: false },
   verdict: { blocking: true },
   prompts: {},
   actions: { enabled: false, workflow: "", runWhen: "passed" },
@@ -87,6 +89,7 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
       defects: b(s.defects, WORKFLOW_DEFAULTS.stages.defects),
       docs: b(s.docs, WORKFLOW_DEFAULTS.stages.docs),
       deferrals: b(s.deferrals, WORKFLOW_DEFAULTS.stages.deferrals),
+      crossRepo: b(s.crossRepo, WORKFLOW_DEFAULTS.stages.crossRepo),
     },
     verdict: { blocking: b(v.blocking, WORKFLOW_DEFAULTS.verdict.blocking) },
     prompts,

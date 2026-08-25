@@ -8,7 +8,13 @@ import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
 import { maintainerByGithubId } from "../users.js";
-import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
+import {
+  enqueueCrossRepoTopology,
+  enqueueIndex,
+  enqueueMaintainerFeedback,
+  enqueueReview,
+  enqueueSecurityAudit,
+} from "../queue.js";
 import { effectiveSecurityPolicy } from "../security/policy.js";
 import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
@@ -737,6 +743,9 @@ function handleInstallationRepos(event: any) {
       db.remove("repositories", (x) => x.owner === owner && x.name === name);
     }
   }
+  // The connected repo set just moved, so the cross-repo map is stale by
+  // definition — rebuild it now rather than waiting for the hourly sweep.
+  enqueueCrossRepoTopology({ installationId: install.id, trigger: "webhook" });
 }
 
 // Insert a Repository row for `repo` if we don't already have one. Pulls the

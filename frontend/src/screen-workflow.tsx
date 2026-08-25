@@ -28,12 +28,12 @@ import { api, type Repository, type RepoWorkflow, type StagePromptKey, type Acti
 import { runSave } from "./optimistic-save";
 import { useAuth } from "./auth-context";
 
-type StageKey = "holistic" | "defects" | "deferrals" | "docs";
+type StageKey = "holistic" | "defects" | "deferrals" | "docs" | "crossRepo";
 type NodeId =
   // Main PR-review lane
   | "trigger" | "ingest" | "criteria" | "newcommit" | "review"
   | "holistic" | "backstop" | "secgate" | "preexisting"
-  | "defects" | "deferrals" | "docs" | "verdict" | "actions"
+  | "defects" | "deferrals" | "docs" | "crossrepo" | "verdict" | "actions"
   // Maintainer-feedback lane (second entry path + loop back)
   | "mtrigger" | "manalyze" | "mrescore" | "mguide";
 
@@ -127,12 +127,16 @@ const NODE_DEFS: NodeDef[] = [
     pos: { x: X_MAIN, y: ROW * 9 },
     short: "Conventions & doc drift",
     desc: "Enforce your repo conventions & flag docs the change makes outdated." },
-  { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", color: "var(--lemon)", mandatory: true, advanced: true, lane: "pr",
+  { id: "crossrepo", name: "Cross-repo impact", tag: "Agent", icon: "git", color: "var(--info)", mandatory: false, advanced: true, badge: "advisory", stageKey: "crossRepo", promptKey: "crossRepo", lane: "pr",
     pos: { x: X_MAIN, y: ROW * 10 },
+    short: "Breakage & parity across sibling repos",
+    desc: "Check whether this PR breaks a consumer in another repository in your org, and flag capabilities it adds that sibling repos don't have yet. Reads the org map DevAsign builds in the background. Advisory — it never blocks the merge." },
+  { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", color: "var(--lemon)", mandatory: true, advanced: true, lane: "pr",
+    pos: { x: X_MAIN, y: ROW * 11 },
     short: "Check Run + PR review + notify",
     desc: "Post the Check Run + PR review and notify your connected integrations." },
   { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", color: "var(--danger)", mandatory: false, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 11 },
+    pos: { x: X_MAIN, y: ROW * 12 },
     short: "Dispatch a workflow on finish",
     desc: "Dispatch a chosen GitHub Actions workflow after the review (workflow_dispatch)." },
 
@@ -177,7 +181,8 @@ const EDGES: EdgeDef[] = [
   { from: "preexisting", to: "defects" },
   { from: "defects", to: "deferrals" },
   { from: "deferrals", to: "docs" },
-  { from: "docs", to: "verdict" },
+  { from: "docs", to: "crossrepo" },
+  { from: "crossrepo", to: "verdict" },
   { from: "verdict", to: "actions" },
   // Maintainer-feedback lane + loop back into the PR trigger
   { from: "mtrigger", to: "manalyze" },
@@ -192,12 +197,12 @@ const EDGES: EdgeDef[] = [
 const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdict">> = {
   strict: {
     trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-    stages: { holistic: true, defects: true, docs: true, deferrals: true },
+    stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: true },
     verdict: { blocking: true },
   },
   balanced: {
     trigger: { onSynchronize: true, skipDrafts: true, skipBots: true },
-    stages: { holistic: true, defects: true, docs: true, deferrals: true },
+    stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: true },
     verdict: { blocking: true },
   },
   light: {
@@ -205,7 +210,7 @@ const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdi
     // Bug detection stays on even in Light: it's the one pass that catches a
     // wrong-but-criteria-satisfying diff. Light's verdict.blocking:false already
     // keeps it from stopping a merge.
-    stages: { holistic: false, defects: true, docs: true, deferrals: false },
+    stages: { holistic: false, defects: true, docs: true, deferrals: false, crossRepo: false },
     verdict: { blocking: false },
   },
 };

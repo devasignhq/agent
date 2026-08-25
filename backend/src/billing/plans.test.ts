@@ -21,6 +21,7 @@ import {
   privateRepoBlocked,
   rollAndCheckUsage,
   securityScanBlocked,
+  crossRepoBlocked,
 } from "./plans.js";
 import type { Subscription, SubscriptionStatus } from "../types.js";
 
@@ -55,6 +56,9 @@ test("PLAN_LIMITS encode the tier matrix", () => {
   assert.equal(PLAN_LIMITS.free.linear, false);
   assert.equal(PLAN_LIMITS.pro.linear, true);
   assert.equal(PLAN_LIMITS.max.linear, true);
+  assert.equal(PLAN_LIMITS.free.crossRepo, false);
+  assert.equal(PLAN_LIMITS.pro.crossRepo, true);
+  assert.equal(PLAN_LIMITS.max.crossRepo, true);
 });
 
 test("modelForPlan: Free → Haiku, Pro/Max → frontier", () => {
@@ -209,6 +213,28 @@ test("securityScanBlocked: audits are Pro/Max, and stop when the sub lapses", ()
   assert.equal(securityScanBlocked(""), false);
   assert.equal(securityScanBlocked(null), false);
   assert.equal(securityScanBlocked(undefined), false);
+});
+
+test("crossRepoBlocked: cross-repo review is Pro/Max, and stops when the sub lapses", () => {
+  const free = uuid();
+  db.insert("subscriptions", sub({ userId: free, plan: "free" }));
+  const pro = uuid();
+  db.insert("subscriptions", sub({ userId: pro, plan: "pro", status: "active" }));
+  const max = uuid();
+  db.insert("subscriptions", sub({ userId: max, plan: "max", status: "trialing" }));
+  const lapsed = uuid();
+  db.insert("subscriptions", sub({ userId: lapsed, plan: "pro", status: "canceled" }));
+  const noSub = uuid();
+
+  assert.equal(crossRepoBlocked(free), true);
+  assert.equal(crossRepoBlocked(pro), false);
+  assert.equal(crossRepoBlocked(max), false); // trialing counts as paying
+  assert.equal(crossRepoBlocked(lapsed), true); // effectivePlan downgrades it
+  assert.equal(crossRepoBlocked(noSub), true); // no row → Free
+  // Unlinked install (no userId yet) → onboarding grace, never blocked.
+  assert.equal(crossRepoBlocked(""), false);
+  assert.equal(crossRepoBlocked(null), false);
+  assert.equal(crossRepoBlocked(undefined), false);
 });
 
 test("chargeForNewPRReview: charges a new under-cap PR exactly once", () => {

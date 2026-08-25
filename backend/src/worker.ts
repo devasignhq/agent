@@ -6,6 +6,7 @@ import { buildRepoIndex } from "./review/indexer.js";
 import { runGuidanceIngestJob } from "./review/guidance.js";
 import { runBountyCriteriaJob } from "./bounties/criteria-job.js";
 import { runSecurityAudit } from "./security/audit.js";
+import { runCrossRepoTopologyJob } from "./review/cross-repo/job.js";
 
 // Run one job to completion. A job mutates the store (a finished review writes
 // its prReviews/reviewLogs rows and charges the monthly count) but there is no
@@ -47,6 +48,12 @@ async function runJob(job: Job): Promise<void> {
         `[worker] security_audit ${job.payload.repoId} (${job.payload.trigger}${job.payload.full ? ", full" : ""})`
       );
       await runSecurityAudit(job.payload);
+      return;
+    case "cross_repo_topology":
+      console.log(
+        `[worker] cross_repo_topology ${job.payload.installationId} (${job.payload.trigger})`
+      );
+      await runCrossRepoTopologyJob(job.payload);
       return;
   }
 }

@@ -10,16 +10,21 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { DEFECT_STAGE_DISABLED, runReviewJob } from "./pipeline.js";
+import {
+  CROSS_REPO_NO_INSTALL,
+  CROSS_REPO_PLAN_LOCKED,
+  CROSS_REPO_STAGE_DISABLED,
+} from "./cross-repo/run.js";
 
 const HOLISTIC_DISABLED = "Whole-repo review disabled by workflow";
 
 // Seed a PUBLIC repo (no private-repo gate) carrying `workflow`, plus a queued
 // review, and deliberately NO matching install row so ingestContext skips every
 // GitHub call. Returns the review id.
-function seedReview(workflow: any): string {
+function seedReview(workflow: any, opts: { installId?: string } = {}): string {
   const repo = db.insert("repositories", {
     id: uuid(),
-    installationId: uuid(), // no install row has this id → ingest skips GitHub
+    installationId: opts.installId ?? uuid(), // unmatched id → ingest skips GitHub
     owner: "acme",
     name: "widgets",
     private: false,
@@ -102,4 +107,89 @@ test("stages.defects=true → pipeline does not log the stage disabled", async (
   await runReviewJob(id);
   const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
   assert.ok(!logs.some((l) => l.action === DEFECT_STAGE_DISABLED));
+});
+
+// ─── Cross-repo stage ───────────────────────────────────────────────────────
+// Advisory and Pro/Max-only. `stages` is a free-editable field, so the plan gate
+// has to live in the pipeline — the UI lock alone is not enforcement.
+
+// An install row + a subscription, with the repo still pointing at a DANGLING
+// installation id so ingest stays offline. That separation is what lets the plan
+// branch be exercised without any GitHub call.
+function seedOwner(plan: "free" | "pro"): { installId: string; userId: string } {
+  const userId = uuid();
+  const installId = uuid();
+  db.insert("installations", {
+    id: installId,
+    userId,
+    userIds: [userId],
+    accountId: 1,
+    accountLogin: "acme",
+    accountType: "Organization",
+    installationId: 4242,
+    repoIds: [],
+  } as any);
+  db.insert("subscriptions", {
+    id: uuid(),
+    userId,
+    plan,
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    status: plan === "free" ? null : "active",
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    reviewsUsed: 0,
+    usagePeriodStart: Date.now(),
+    pendingPlan: null,
+    scheduleId: null,
+  } as any);
+  return { installId, userId };
+}
+
+test("cross-repo is OFF for a repo with no stored workflow at all", async () => {
+  const id = seedReview(undefined);
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(
+    logs.some((l) => l.action === CROSS_REPO_STAGE_DISABLED),
+    "an un-customised repo must NOT run the cross-repo stage — it is opt-in"
+  );
+});
+
+test("stages.crossRepo=false → pipeline skips the cross-repo stage", async () => {
+  const id = seedReview({ version: 1, stages: { crossRepo: false } });
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(logs.some((l) => l.action === CROSS_REPO_STAGE_DISABLED));
+});
+
+test("stages.crossRepo=true on a Free plan → the pipeline refuses, not just the UI", async () => {
+  const { installId } = seedOwner("free");
+  const id = seedReview({ version: 1, stages: { crossRepo: true } }, { installId });
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(
+    logs.some((l) => l.action === CROSS_REPO_PLAN_LOCKED),
+    "a free user flipping stages.crossRepo through the API must still be gated"
+  );
+  assert.ok(!logs.some((l) => l.action === CROSS_REPO_STAGE_DISABLED));
+});
+
+test("stages.crossRepo=true on Pro but no install token → skipped, never thrown", async () => {
+  const id = seedReview({ version: 1, stages: { crossRepo: true } });
+  await runReviewJob(id);
+  const logs = db.filter("reviewLogs", (l) => l.reviewId === id);
+  assert.ok(logs.some((l) => l.action === CROSS_REPO_NO_INSTALL));
+});
+
+test("the cross-repo stage never changes the verdict", async () => {
+  const off = seedReview({ version: 1, stages: { crossRepo: false } });
+  await runReviewJob(off);
+  const { installId } = seedOwner("pro");
+  const on = seedReview({ version: 1, stages: { crossRepo: true } }, { installId });
+  await runReviewJob(on);
+  assert.equal(
+    db.find("prReviews", (r) => r.id === on)!.status,
+    db.find("prReviews", (r) => r.id === off)!.status
+  );
 });

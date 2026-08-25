@@ -381,8 +381,10 @@ async function summariseAndUpsert(
 // Exported for reuse by the DEVASIGN.md guidance pass (see devasign.ts), which
 // fetches doc blobs by sha from the PR head tree the same way the indexer does.
 export async function fetchBlob(
-  repo: Repository,
-  install: Installation,
+  // Widened from Repository so cross-repo callers can read a sibling's blob
+  // without a local row; every existing caller still satisfies it structurally.
+  repo: Pick<Repository, "owner" | "name">,
+  install: Pick<Installation, "installationId">,
   path: string,
   sha: string
 ): Promise<string> {
