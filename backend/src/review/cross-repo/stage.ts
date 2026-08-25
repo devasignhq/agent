@@ -17,6 +17,7 @@ export const MAX_IMPACT_FINDINGS = 5;
 export const MAX_PARITY_NOTES = 3;
 export const CROSS_REPO_BUDGET_MS = 45_000;
 const CONTRACT_DIFF_CAP = 60_000;
+export const CONTRACT_DELTA_MODEL = "claude-haiku-4-5";
 
 export type ContractSurface =
   | "ts-export" | "go-export" | "py-export" | "rust-export" | "http" | "graphql" | "proto"
@@ -142,6 +143,10 @@ export async function extractContractDelta(args: {
     cacheSystem: true,
     messages: [{ role: "user", content: userText }],
     maxTokens: 3072,
+    // Pinned: runReviewJob wraps the job in withModel(frontier) for Pro/Max — the
+    // only tiers that reach this stage — so without it every pre-scan hit would
+    // pay an Opus call to do extraction from a diff already in front of it.
+    model: CONTRACT_DELTA_MODEL,
   });
   const parsed = tryParse<{ entries?: unknown }>(raw);
   return normaliseContractDelta(parsed.entries);
@@ -179,10 +184,31 @@ function qualify(where: string): string {
   return where.replace(/\s+/g, "");
 }
 
-export function normaliseImpacts(raw: unknown, knownRepos: Set<string>): HolisticFinding[] {
+// Indentation and wrapping differ between what the model echoes and the file it
+// read; content does not. Compared squashed so reformatting is not a drop, while
+// composed text still fails.
+function squash(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
+}
+
+// Takes the snippets themselves rather than a set of repo names, so the "is this
+// repo known" and "is this line real" checks cannot drift apart: both are decided
+// from the same byte-confirmed excerpts. There is no default — a caller that
+// passes nothing gets nothing through, never a silently skipped check.
+export function normaliseImpacts(
+  raw: unknown,
+  snippets: CandidateSnippet[]
+): HolisticFinding[] {
   const list = Array.isArray(raw) ? raw : [];
   const out: HolisticFinding[] = [];
   const seen = new Set<string>();
+  const bySquashedRepo = new Map<string, string[]>();
+  for (const s of snippets) {
+    bySquashedRepo.set(s.repoFullName, [
+      ...(bySquashedRepo.get(s.repoFullName) || []),
+      squash(s.excerpt),
+    ]);
+  }
   for (const item of list) {
     if (!item || typeof item !== "object") continue;
     const o = item as Record<string, unknown>;
@@ -192,11 +218,14 @@ export function normaliseImpacts(raw: unknown, knownRepos: Set<string>): Holisti
     const failureScenario = typeof o.failureScenario === "string" ? o.failureScenario.trim() : "";
     // The drop rule: no quoted consuming line means the model is speculating.
     if (!where || !concern || !evidence) continue;
-    // Unconditional: with no sibling bytes read there is no evidence for ANY
-    // breakage claim, so an empty set must drop every impact rather than wave
-    // them all through. The parity-only path reaches here with zero snippets.
+    // The quoted line must OCCUR in bytes we actually read from that sibling.
+    // Checking only that the repo was read let a real repo carry a composed
+    // line — which is the claim this whole stage rests on not being possible.
     const repoPart = where.split(":")[0];
-    if (!knownRepos.has(repoPart)) continue;
+    const excerpts = bySquashedRepo.get(repoPart);
+    if (!excerpts) continue;
+    const needle = squash(evidence);
+    if (!needle || !excerpts.some((e) => e.includes(needle))) continue;
     if (seen.has(where + concern.slice(0, 60))) continue;
     seen.add(where + concern.slice(0, 60));
     out.push({
@@ -291,10 +320,9 @@ export async function assessCrossRepoImpact(args: {
     maxTokens: 3072,
   });
   const parsed = tryParse<{ impacts?: unknown; parityNotes?: unknown; summary?: unknown }>(raw);
-  const knownRepos = new Set(args.snippets.map((s) => s.repoFullName));
   const parity = normaliseParityNotes(parsed.parityNotes, args.parityProbes);
   return {
-    impacts: normaliseImpacts(parsed.impacts, knownRepos),
+    impacts: normaliseImpacts(parsed.impacts, args.snippets),
     parityNotes: parity.notes,
     parityFeatures: parity.features,
     summary: String(parsed.summary || ""),

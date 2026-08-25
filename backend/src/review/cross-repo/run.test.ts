@@ -9,10 +9,12 @@ import {
   CROSS_REPO_NO_SIBLINGS,
   CROSS_REPO_NO_SURFACE,
   CROSS_REPO_VISIBILITY_FILTERED,
+  __setVisibilityCheckForTests,
   runCrossRepoStage,
   visibleSiblings,
 } from "./run.js";
-import { installationWantsCrossRepo } from "./job.js";
+import { installationWantsCrossRepo, sweepStaleTopologies } from "./job.js";
+import { __setBlobReaderForTests } from "./discovery.js";
 import { parityFeatureFor, recordParityFeatures } from "./parity.js";
 import type { Installation, PRReview, Repository } from "../../types.js";
 
@@ -193,12 +195,13 @@ function seedSibling(installId: string, name: string, isPrivate: boolean) {
   } as any) as Repository;
 }
 
-test("a public repo may not quote a private sibling", () => {
+test("a public repo may not quote a private sibling", async () => {
   const { install } = seed({ sibling: false });
   const pub = seedSibling(install.id, `pub-${uuid().slice(0, 6)}`, false);
   const priv = seedSibling(install.id, `priv-${uuid().slice(0, 6)}`, true);
-  const out = visibleSiblings({
+  const out = await visibleSiblings({
     installId: install.id,
+    installationId: install.installationId,
     selfPrivate: false,
     names: [`acme/${pub.name}`, `acme/${priv.name}`],
     topology: null,
@@ -206,11 +209,12 @@ test("a public repo may not quote a private sibling", () => {
   assert.deepEqual(out, [`acme/${pub.name}`]);
 });
 
-test("a private repo may see its private siblings", () => {
+test("a private repo may see its private siblings", async () => {
   const { install } = seed({ sibling: false });
   const priv = seedSibling(install.id, `priv2-${uuid().slice(0, 6)}`, true);
-  const out = visibleSiblings({
+  const out = await visibleSiblings({
     installId: install.id,
+    installationId: install.installationId,
     selfPrivate: true,
     names: [`acme/${priv.name}`],
     topology: null,
@@ -218,23 +222,88 @@ test("a private repo may see its private siblings", () => {
   assert.deepEqual(out, [`acme/${priv.name}`]);
 });
 
-test("unknown visibility is treated as private, not as public", () => {
-  // A topology row written before `private` was carried has no flag. Failing
-  // open there would leak exactly what this guard exists to prevent.
+test("a topology repo with no visibility flag is treated as private", async () => {
   const { install } = seed({ sibling: false });
   const topology: any = {
-    repos: [
-      { fullName: "acme/no-flag", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main" },
-      { fullName: "acme/known-public", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main", private: false },
-    ],
+    repos: [{ fullName: "acme/no-flag", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main" }],
   };
-  const out = visibleSiblings({
+  const out = await visibleSiblings({
     installId: install.id,
+    installationId: install.installationId,
     selfPrivate: false,
-    names: ["acme/no-flag", "acme/known-public"],
+    names: ["acme/no-flag"],
     topology,
   });
-  assert.deepEqual(out, ["acme/known-public"]);
+  assert.deepEqual(out, []);
+});
+
+test("a topology repo flagged public is re-confirmed live before being quoted", async (t) => {
+  // The snapshot is up to 7 days old and no webhook keeps it honest, so a repo
+  // flipped public->private would read public for a week without this check.
+  const { install } = seed({ sibling: false });
+  const asked: string[] = [];
+  t.after(() => __setVisibilityCheckForTests(null));
+  const topology: any = {
+    repos: [
+      { fullName: "acme/still-public", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main", private: false },
+      { fullName: "acme/went-private", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main", private: false },
+    ],
+  };
+
+  __setVisibilityCheckForTests(async (_id, _owner, name) => {
+    asked.push(name);
+    return name === "still-public";
+  });
+  const out = await visibleSiblings({
+    installId: install.id,
+    installationId: install.installationId,
+    selfPrivate: false,
+    names: ["acme/still-public", "acme/went-private"],
+    topology,
+  });
+  assert.deepEqual(out, ["acme/still-public"]);
+  assert.deepEqual(asked.sort(), ["still-public", "went-private"]);
+});
+
+test("a failed live visibility check excludes the repo", async (t) => {
+  const { install } = seed({ sibling: false });
+  t.after(() => __setVisibilityCheckForTests(null));
+  __setVisibilityCheckForTests(async () => {
+    throw new Error("network down");
+  });
+  const topology: any = {
+    repos: [{ fullName: "acme/unconfirmable", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main", private: false }],
+  };
+  await assert.doesNotReject(async () => {
+    const out = await visibleSiblings({
+      installId: install.id,
+      installationId: install.installationId,
+      selfPrivate: false,
+      names: ["acme/unconfirmable"],
+      topology,
+    }).catch(() => []);
+    assert.deepEqual(out, []);
+  });
+});
+
+test("an onboarded public sibling needs no live check at all", async (t) => {
+  const { install } = seed({ sibling: false });
+  let called = false;
+  t.after(() => __setVisibilityCheckForTests(null));
+  __setVisibilityCheckForTests(async () => {
+    called = true;
+    return true;
+  });
+  const pub = seedSibling(install.id, `local-${uuid().slice(0, 6)}`, false);
+  const out = await visibleSiblings({
+    installId: install.id,
+    installationId: install.installationId,
+    selfPrivate: false,
+    names: [`acme/${pub.name}`],
+    topology: null,
+  });
+  assert.deepEqual(out, [`acme/${pub.name}`]);
+  assert.equal(called, false, "the stored flag is kept current by the repository webhook");
 });
 
 test("the stage logs when it withholds a private sibling and never reaches it", async (t) => {
@@ -263,4 +332,126 @@ test("installationWantsCrossRepo is false until a repo opts in", () => {
     workflow: { version: 1, stages: { crossRepo: true } } as any,
   });
   assert.equal(installationWantsCrossRepo(install.id), true);
+});
+
+// ─── The discovery → impact seam ────────────────────────────────────────────
+// loadSiblingIndexes → rankCandidates → snippetFor → excerptAround is where the
+// "the index never becomes evidence" guarantee is actually enforced: the index
+// only nominates a file, and the fetched bytes decide whether it survives.
+
+function seedIndexedSibling(installId: string, name: string, _exportsList: string[]) {
+  const repo = db.insert("repositories", {
+    id: uuid(),
+    installationId: installId,
+    owner: "acme",
+    name,
+    defaultBranch: "main",
+    private: false,
+    defaultModel: "claude-opus-4-7",
+    modelOverrides: {},
+    reviewsEnabled: true,
+    indexState: "ready",
+  } as any) as Repository;
+  db.insert("repoIndex", {
+    id: uuid(),
+    repoId: repo.id,
+    path: "src/consumer.ts",
+    sha: "blobsha",
+    size: 100,
+    language: "ts",
+    summary: "Creates bounties for the web app.",
+    exports: ["submitBountyForm"],
+    imports: ["@acme/sdk/createBounty"],
+    securityFlags: [],
+    indexedAt: 1,
+    model: "m",
+  } as any);
+  return repo;
+}
+
+test("an impact survives when the fetched bytes really contain the line", async (t) => {
+  const priorSample = process.env.CROSS_REPO_SAMPLE;
+  process.env.CROSS_REPO_SAMPLE = "1";
+  t.after(() => {
+    if (priorSample === undefined) delete process.env.CROSS_REPO_SAMPLE;
+    else process.env.CROSS_REPO_SAMPLE = priorSample;
+    __setBlobReaderForTests(null);
+  });
+
+  const { install, repo, review } = seed({ sibling: false });
+  seedIndexedSibling(install.id, "acme-web", ["listPayouts"]);
+  // The mock impact quotes exactly this line, and it is really in the bytes.
+  __setBlobReaderForTests(async () => "const b = await createBounty(title, amount);\nexport {};");
+
+  const { result } = await run({ install, repo, review, diff: SURFACE_DIFF });
+  assert.equal(result.impacts.length, 1);
+  assert.match(result.impacts[0].path!, /^acme\/acme-web:/);
+  assert.match(result.impacts[0].concern, /createBounty\(title, amount\)/);
+});
+
+test("the same impact is dropped when the needle is absent from the bytes", async (t) => {
+  const priorSample = process.env.CROSS_REPO_SAMPLE;
+  process.env.CROSS_REPO_SAMPLE = "1";
+  t.after(() => {
+    if (priorSample === undefined) delete process.env.CROSS_REPO_SAMPLE;
+    else process.env.CROSS_REPO_SAMPLE = priorSample;
+    __setBlobReaderForTests(null);
+  });
+
+  const { install, repo, review } = seed({ sibling: false });
+  seedIndexedSibling(install.id, "acme-web2", ["listPayouts"]);
+  // The index nominated this file, but the bytes mention nothing we searched
+  // for — so excerptAround yields no snippet and the impact has no evidence.
+  __setBlobReaderForTests(async () => "export const unrelated = 1;\n");
+
+  const { result } = await run({ install, repo, review, diff: SURFACE_DIFF });
+  assert.deepEqual(result.impacts, [], "an index hit alone must never become a finding");
+});
+
+// ─── Topology sweep ─────────────────────────────────────────────────────────
+// The hourly tick was the one path in this module no test executed, so a mistake
+// in it would first appear an hour into production.
+
+test("the sweep enqueues only once a repo has enabled the stage", () => {
+  // Measured as a delta: the sweep is global and earlier tests in this file have
+  // already put opted-in installs in the store.
+  const { install, userId } = seed();
+  // Pro: the sweep skips Free installs, so without this the gate under test is
+  // never the one doing the skipping.
+  db.insert("subscriptions", {
+    id: uuid(),
+    userId,
+    plan: "pro",
+    stripeCustomerId: null,
+    stripeSubscriptionId: null,
+    status: "active",
+    currentPeriodEnd: null,
+    cancelAtPeriodEnd: false,
+    reviewsUsed: 0,
+    usagePeriodStart: Date.now(),
+    pendingPlan: null,
+    scheduleId: null,
+  } as any);
+  const baseline = sweepStaleTopologies();
+  db.update("repositories", (r) => r.installationId === install.id, {
+    workflow: { version: 1, stages: { crossRepo: true } } as any,
+  });
+  assert.ok(
+    sweepStaleTopologies() > baseline,
+    "enabling the stage on a repo should make its installation sweepable"
+  );
+});
+
+test("the sweep does not throw on an installation with no linked user", () => {
+  db.insert("installations", {
+    id: uuid(),
+    userId: "",
+    userIds: [],
+    accountId: 2,
+    accountLogin: "unlinked",
+    accountType: "Organization",
+    installationId: 7777,
+    repoIds: [],
+  } as any);
+  assert.doesNotThrow(() => sweepStaleTopologies());
 });

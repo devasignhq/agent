@@ -38,17 +38,30 @@ export async function runCrossRepoTopologyJob(payload: CrossRepoTopologyJobPaylo
 
 // The retry for a dropped in-memory job, and the only rebuild trigger that needs
 // no webhook. Cheap: staleness is decided from rows already in memory.
+// Exported so the sweep's decision logic is reachable from a test; startTopologyRefresh
+// only wires it to a timer. Returns how many builds it enqueued.
+export function sweepStaleTopologies(now = Date.now()): number {
+  let enqueued = 0;
+  for (const install of db.table("installations")) {
+    if (!install.userId) continue;
+    if (crossRepoBlocked(install.userId)) continue;
+    if (!installationWantsCrossRepo(install.id)) continue;
+    if (!topologyStale(topologyFor(install.id), install, now)) continue;
+    enqueueCrossRepoTopology({ installationId: install.id, trigger: "stale" });
+    enqueued += 1;
+  }
+  return enqueued;
+}
+
 export function startTopologyRefresh(): void {
   const HOUR = 60 * 60 * 1000;
-  const tick = () => {
-    const now = Date.now();
-    for (const install of db.table("installations")) {
-      if (!install.userId) continue;
-      if (crossRepoBlocked(install.userId)) continue;
-      if (!installationWantsCrossRepo(install.id)) continue;
-      if (!topologyStale(topologyFor(install.id), install, now)) continue;
-      enqueueCrossRepoTopology({ installationId: install.id, trigger: "stale" });
+  // Wrapped: a throw inside a setInterval callback is an uncaught exception that
+  // takes the process down, and this one would first fire an hour into production.
+  setInterval(() => {
+    try {
+      sweepStaleTopologies();
+    } catch (err) {
+      console.warn(`[cross-repo] topology sweep failed: ${err}`);
     }
-  };
-  setInterval(tick, HOUR);
+  }, HOUR);
 }

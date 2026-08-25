@@ -4,6 +4,7 @@
 // verdict change. The stage is last in the pipeline precisely so that an abort
 // costs nothing already computed.
 import { db } from "../../db.js";
+import { gh } from "../../github/app.js";
 import { enqueueCrossRepoTopology } from "../../queue.js";
 import { discoverCandidates, probeParity, type ParityProbe } from "./discovery.js";
 import { familyOf, rankSiblings, topologyFor } from "./topology.js";
@@ -39,23 +40,71 @@ export const MAX_SIBLING_REPOS = 12;
 // installation token can read the private ones. Unknown visibility counts as
 // private: a topology row written before this existed carries no flag, and
 // failing open there would leak exactly what this guard exists to prevent.
-export function visibleSiblings(args: {
+export async function visibleSiblings(args: {
   installId: string;
+  installationId: number;
   selfPrivate: boolean;
   names: string[];
   topology: RepoTopology | null;
-}): string[] {
+}): Promise<string[]> {
   if (args.selfPrivate) return args.names;
   const topoByName = new Map((args.topology?.repos ?? []).map((r) => [r.fullName, r]));
-  return args.names.filter((fullName) => {
+  const out: string[] = [];
+  for (const fullName of args.names) {
     const owner = ownerOf(fullName);
     const name = repoNameOf(fullName);
-    const row = db.find("repositories", (r) => r.owner === owner && r.name === name);
-    if (row) return !row.private;
+    // Scoped to this installation: a row from somewhere else must never decide
+    // what this review may quote.
+    const row = db.find(
+      "repositories",
+      (r) => r.installationId === args.installId && r.owner === owner && r.name === name
+    );
+    // An onboarded repo's flag is kept current by the repository webhook, so the
+    // stored value is authoritative.
+    if (row) {
+      if (!row.private) out.push(fullName);
+      continue;
+    }
+    // No local row means the only cached answer is the topology snapshot, which
+    // is up to TOPOLOGY_MAX_AGE_MS old and has no webhook keeping it honest — a
+    // repo flipped public->private would read public for a week. Re-confirm live
+    // before quoting it, and treat any failure as private.
     const topo = topoByName.get(fullName);
-    return topo?.private === false;
-  });
+    if (topo?.private !== false) continue;
+    if (await liveVisibilityCheck(args.installationId, owner, name)) out.push(fullName);
+  }
+  return out;
 }
+
+// Test seam: the live check is the one part of the gate that needs the network.
+let liveVisibilityCheck: (installationId: number, owner: string, name: string) => Promise<boolean>;
+
+export function __setVisibilityCheckForTests(
+  fn: ((installationId: number, owner: string, name: string) => Promise<boolean>) | null
+): void {
+  liveVisibilityCheck = fn ?? isPubliclyVisible;
+}
+
+// Live visibility check. Fails closed: a repo we cannot confirm public is not
+// quoted into a world-readable comment.
+async function isPubliclyVisible(
+  installationId: number,
+  owner: string,
+  name: string
+): Promise<boolean> {
+  try {
+    const repo = await gh<{ private?: boolean; visibility?: string }>(
+      installationId,
+      `/repos/${owner}/${name}`
+    );
+    if (typeof repo?.private === "boolean") return !repo.private;
+    return repo?.visibility === "public";
+  } catch {
+    return false;
+  }
+}
+
+liveVisibilityCheck = isPubliclyVisible;
 
 type LogFn = (action: string, extra?: { detail?: string; meta?: Record<string, unknown> }) => void;
 
@@ -90,8 +139,9 @@ export async function runCrossRepoStage(args: {
     : db
         .filter("repositories", (r) => r.installationId === install.id)
         .map((r) => `${r.owner}/${r.name}`);
-  const visible = visibleSiblings({
+  const visible = await visibleSiblings({
     installId: install.id,
+    installationId: install.installationId,
     selfPrivate: Boolean(repo.private),
     names: allNames,
     topology,

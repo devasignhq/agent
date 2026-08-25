@@ -2768,7 +2768,12 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   // parityNotes is deliberately absent, like preexistingVulns above: this prompt
   // is pasted into an agent pointed at THIS checkout, and a parity fix belongs in
   // a different repository entirely.
-  { key: "crossRepoImpacts", label: "Cross-repo" },
+  //
+  // Impacts DO stay, because there is usually a fix on this side (keep the old
+  // signature, make the parameter optional, ship a deprecation) — but the broken
+  // caller is in the named sibling, so the label has to say so or an agent
+  // pointed here will go hunting for files that do not exist in this checkout.
+  { key: "crossRepoImpacts", label: "Cross-repo — the consumer is in the named repo" },
 ];
 
 function collectConsolidatedFindings(

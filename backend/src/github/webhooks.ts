@@ -121,6 +121,9 @@ export function handleWebhook(req: Request, res: Response) {
     case "installation":
       handleInstallation(event);
       break;
+    case "repository":
+      handleRepositoryVisibility(event);
+      break;
     case "installation_repositories":
       handleInstallationRepos(event);
       break;
@@ -703,6 +706,26 @@ function handleInstallation(event: any) {
       (i) => i.installationId === event.installation.id
     );
   }
+}
+
+// A repo flipping public<->private changes what a cross-repo review may quote
+// into a world-readable PR comment, and the cached flag is otherwise only
+// refreshed on a full topology rebuild (up to 7 days). Keep it current here, and
+// drop the topology's copy so its snapshot cannot outvote this.
+function handleRepositoryVisibility(event: any) {
+  if (event?.action !== "privatized" && event?.action !== "publicized") return;
+  const fullName = String(event?.repository?.full_name || "");
+  const [owner, name] = fullName.split("/");
+  if (!owner || !name) return;
+  const isPrivate = event.action === "privatized";
+  db.update("repositories", (r) => r.owner === owner && r.name === name, { private: isPrivate });
+  const install = db.find("installations", (i) => i.installationId === event?.installation?.id);
+  if (!install) return;
+  const topology = db.find("repoTopologies", (t) => t.installationId === install.id);
+  if (!topology) return;
+  db.update("repoTopologies", (t) => t.id === topology.id, {
+    repos: topology.repos.map((r) => (r.fullName === fullName ? { ...r, private: isPrivate } : r)),
+  });
 }
 
 function handleInstallationRepos(event: any) {

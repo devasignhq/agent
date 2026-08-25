@@ -507,7 +507,10 @@ test("cross-repo findings render at advisory severity, never as blockers", () =>
 test("the impact reaches the consolidated fix prompt but the parity note does not", () => {
   const body = crossRepoBody();
   const details = body.slice(body.lastIndexOf("<details>"));
-  assert.match(details, /Cross-repo/);
+  // The entry has to say the broken caller lives elsewhere, or an agent pointed
+  // at this checkout will look for acme-web's files here.
+  assert.match(details, /Cross-repo — the consumer is in the named repo/);
+  assert.match(details, /acme\/acme-web:src\/api\/bounties\.ts/);
   assert.match(details, /add the currency argument in acme-web/);
   // A parity fix belongs in a different repository, so pasting it into an agent
   // pointed at this checkout would send it editing files that do not exist here.

@@ -113,9 +113,10 @@ test("stages.defects=true → pipeline does not log the stage disabled", async (
 // Advisory and Pro/Max-only. `stages` is a free-editable field, so the plan gate
 // has to live in the pipeline — the UI lock alone is not enforcement.
 
-// An install row + a subscription, with the repo still pointing at a DANGLING
-// installation id so ingest stays offline. That separation is what lets the plan
-// branch be exercised without any GitHub call.
+// An install row + a subscription, and seedReview points the repo AT it — that is
+// the point: `install` has to resolve for crossRepoBlocked(install.userId) to be
+// reachable at all. Restoring a dangling id here would silently move these tests
+// onto the !install branch and stop them proving anything about the plan gate.
 function seedOwner(plan: "free" | "pro"): { installId: string; userId: string } {
   const userId = uuid();
   const installId = uuid();

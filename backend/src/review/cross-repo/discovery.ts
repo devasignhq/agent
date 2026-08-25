@@ -156,6 +156,19 @@ export function rankCandidates(
     .slice(0, limit);
 }
 
+// Test seam: reading a sibling's bytes is the only part of discovery that needs
+// the network, and it is the step the "index never becomes evidence" rule turns on.
+type BlobReader = (fullName: string, install: Installation, path: string, sha: string) => Promise<string>;
+
+const defaultBlobReader: BlobReader = (fullName, install, path, sha) =>
+  fetchBlob({ owner: ownerOf(fullName), name: repoNameOf(fullName) }, install, path, sha);
+
+let blobReader: BlobReader = defaultBlobReader;
+
+export function __setBlobReaderForTests(fn: BlobReader | null): void {
+  blobReader = fn ?? defaultBlobReader;
+}
+
 async function snippetFor(
   install: Installation,
   fullName: string,
@@ -165,7 +178,7 @@ async function snippetFor(
   lane: "index" | "search"
 ): Promise<CandidateSnippet | null> {
   try {
-    const text = await fetchBlob({ owner: ownerOf(fullName), name: repoNameOf(fullName) }, install, path, sha);
+    const text = await blobReader(fullName, install, path, sha);
     const found = excerptAround(text, variants);
     if (!found) return null;
     return { repoFullName: fullName, path, sha, lane, ...found };

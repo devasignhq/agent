@@ -12,7 +12,7 @@ import {
   scanContractCandidates,
   type ContractDeltaEntry,
 } from "./stage.js";
-import type { ParityProbe } from "./discovery.js";
+import type { CandidateSnippet, ParityProbe } from "./discovery.js";
 
 function diffFor(path: string, body: string): string {
   return `diff --git a/${path} b/${path}\n--- a/${path}\n+++ b/${path}\n@@ -1,3 +1,4 @@\n${body}\n`;
@@ -81,7 +81,15 @@ test("needlesForDelta skips compatible entries and routes route-surfaces", () =>
   assert.ok(needles[1].variants.includes("/v1/payouts"));
 });
 
-const KNOWN = new Set(["acme/web"]);
+// Byte-confirmed excerpts, as excerptAround would have produced them.
+function snip(repoFullName: string, path: string, excerpt: string): CandidateSnippet {
+  return { repoFullName, path, sha: "s", line: 1, excerpt, matchedOn: "x", lane: "index" };
+}
+
+const READ = [
+  snip("acme/web", "src/a.ts", "const b = await createBounty(a, b);\nreturn b;"),
+  snip("acme/web", "src/f.ts", "call0()\ncall1()\ncall2()\ncall3()\ncall4()\ncall5()"),
+];
 
 test("normaliseImpacts drops any finding with no quoted consuming line", () => {
   const out = normaliseImpacts(
@@ -90,42 +98,66 @@ test("normaliseImpacts drops any finding with no quoted consuming line", () => {
       { where: "acme/web:src/b.ts", concern: "breaks too", evidence: "" },
       { where: "acme/web:src/c.ts", concern: "breaks as well" },
     ],
-    KNOWN
+    READ
   );
   assert.equal(out.length, 1);
   assert.equal(out[0].path, "acme/web:src/a.ts");
 });
 
+test("normaliseImpacts drops a line the sibling's bytes do not contain", () => {
+  // A real repo we really read, with a consuming line the model composed. This
+  // is the case a repo-name-only check waved through.
+  const out = normaliseImpacts(
+    [{ where: "acme/web:src/a.ts", concern: "breaks", evidence: "await refundEscrow(id);" }],
+    READ
+  );
+  assert.deepEqual(out, []);
+});
+
+test("normaliseImpacts tolerates reformatting but not invention", () => {
+  const readIt = [snip("acme/web", "src/a.ts", "  const b =\n    await createBounty(a, b);")];
+  const reflowed = normaliseImpacts(
+    [{ where: "acme/web:src/a.ts", concern: "c", evidence: "const b = await createBounty(a, b);" }],
+    readIt
+  );
+  assert.equal(reflowed.length, 1, "whitespace differences must not drop a real line");
+  const invented = normaliseImpacts(
+    [{ where: "acme/web:src/a.ts", concern: "c", evidence: "const b = await createBounty(a, b, c);" }],
+    readIt
+  );
+  assert.deepEqual(invented, [], "an extra argument is a different line");
+});
+
 test("normaliseImpacts drops every impact when no sibling code was read", () => {
-  // The parity-only path reaches the model with "(no sibling code found)". A
-  // conditional known-repo check let anything it invented through unverified.
+  // The parity-only path reaches the model with "(no sibling code found)".
   const out = normaliseImpacts(
     [{ where: "acme/web:src/a.ts", concern: "breaks", evidence: "createBounty(a, b)" }],
-    new Set()
+    []
   );
   assert.deepEqual(out, []);
 });
 
 test("normaliseImpacts forces warn severity whatever the model says", () => {
   const out = normaliseImpacts(
-    [{ where: "acme/web:src/a.ts", concern: "c", evidence: "e", severity: "blocker" }],
-    KNOWN
+    [{ where: "acme/web:src/a.ts", concern: "c", evidence: "createBounty(a, b)", severity: "blocker" }],
+    READ
   );
   assert.equal(out[0].severity, "warn");
 });
 
 test("normaliseImpacts refuses a repo it never actually read", () => {
   const out = normaliseImpacts(
-    [{ where: "acme/hallucinated:src/a.ts", concern: "c", evidence: "e" }],
-    KNOWN
+    [{ where: "acme/hallucinated:src/a.ts", concern: "c", evidence: "createBounty(a, b)" }],
+    READ
   );
   assert.deepEqual(out, []);
 });
 
 test("normaliseImpacts keeps the consuming line in the rendered concern", () => {
+  const read = [snip("acme/web", "src/a.ts", "x\nawait createBounty(t, a);\ny")];
   const out = normaliseImpacts(
     [{ where: "acme/web:src/a.ts", line: 88, concern: "It breaks.", evidence: "await createBounty(t, a);" }],
-    KNOWN
+    read
   );
   assert.match(out[0].concern, /Consuming line: `await createBounty\(t, a\);`/);
   assert.equal(out[0].line, 88);
@@ -133,11 +165,11 @@ test("normaliseImpacts keeps the consuming line in the rendered concern", () => 
 
 test("normaliseImpacts caps the finding count", () => {
   const many = Array.from({ length: 20 }, (_, i) => ({
-    where: `acme/web:src/f${i}.ts`,
+    where: `acme/web:src/f.ts`,
     concern: `breaks ${i}`,
-    evidence: `call${i}()`,
+    evidence: `call${i % 6}()`,
   }));
-  assert.equal(normaliseImpacts(many, KNOWN).length, MAX_IMPACT_FINDINGS);
+  assert.equal(normaliseImpacts(many, READ).length, MAX_IMPACT_FINDINGS);
 });
 
 function probes(entries: Array<[string, ParityProbe["status"]]>): ParityProbe[] {
