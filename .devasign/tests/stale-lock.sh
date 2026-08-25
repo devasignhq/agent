@@ -26,6 +26,7 @@ setup() {   # $1 = seconds the stub review takes
   mkdir -p "$ROOT/.devasign"
 }
 teardown() { [ -n "$HUNG" ] && { kill "$HUNG" 2>/dev/null; wait "$HUNG" 2>/dev/null; }; HUNG=""; rm -rf "$T"; }
+mtime_of() { stat -c %Y "$1" 2>/dev/null || stat -f %m "$1" 2>/dev/null || echo none; }
 run_hook() { ( cd "$T/repo" && PATH="$T/bin:$PATH" bash .devasign/hooks/post-commit 2>&1 ); }
 expect() {  # label, wanted substring, actual
   case "$3" in
@@ -67,10 +68,11 @@ mkdir -p "$ROOT/.devasign/queue"
 for n in 1 2 3; do : > "$ROOT/.devasign/queue/100$n-$head"; done
 run_hook >/dev/null 2>&1
 sleep 1
-m1=$(stat -f %m "$ROOT/.devasign/.review.lock" 2>/dev/null || echo none)
+# GNU spells mtime `-c %Y`; BSD spells it `-f %m`, and on GNU `-f` means --file-system.
+m1=$(mtime_of "$ROOT/.devasign/.review.lock")
 sleep 5
 if [ -d "$ROOT/.devasign/.review.lock" ]; then
-  m2=$(stat -f %m "$ROOT/.devasign/.review.lock" 2>/dev/null || echo none)
+  m2=$(mtime_of "$ROOT/.devasign/.review.lock")
   if [ "$m1" != "$m2" ]; then echo "  ok    heartbeat advances while the queue drains"
   else echo "  FAIL  heartbeat never advanced ($m1 == $m2)"; fails=$((fails + 1)); fi
 else
