@@ -122,6 +122,54 @@ export async function gh<T>(
   return (await res.json()) as T;
 }
 
+// Same auth as gh(), but hands back the Link header's rel="next" so a caller can
+// paginate. gh() parses and discards the response, which loses it.
+export async function ghPaged<T>(
+  installationId: number,
+  pathOrUrl: string
+): Promise<{ body: T; nextUrl: string | null }> {
+  const url = pathOrUrl.startsWith("http") ? pathOrUrl : `https://api.github.com${pathOrUrl}`;
+  // Checked BEFORE minting a token: this helper follows Link headers, so it is
+  // the one place a URL from a response could steer the installation token
+  // off-site. A bad target must not even cause a token to be issued.
+  assertGitHubApiUrl(url);
+  const token = await installationToken(installationId);
+  const res = await fetch(url, {
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "devasign-app",
+    },
+  });
+  if (!res.ok) {
+    throw new Error(`GitHub ${res.status} on ${url}: ${await res.text()}`);
+  }
+  const body = (await res.json()) as T;
+  return { body, nextUrl: parseNextLink(res.headers.get("link")) };
+}
+
+export function assertGitHubApiUrl(url: string): void {
+  let host: string;
+  try {
+    host = new URL(url).hostname;
+  } catch {
+    throw new Error(`Invalid GitHub API URL: ${url}`);
+  }
+  if (host !== "api.github.com") {
+    throw new Error(`Refusing to send an installation token to ${host}`);
+  }
+}
+
+export function parseNextLink(link: string | null | undefined): string | null {
+  if (!link) return null;
+  for (const part of link.split(",")) {
+    const m = part.match(/<([^>]+)>;\s*rel="next"/);
+    if (m) return m[1];
+  }
+  return null;
+}
+
 // Look up a user's membership in an org via the installation token. Returns the
 // role + state + the member's GitHub id, or null when the user isn't a member
 // (404) or we can't see membership (403 — usually the App lacks the "Members"

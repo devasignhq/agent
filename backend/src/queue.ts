@@ -108,6 +108,21 @@ export type SecurityAuditJob = {
   attempts: number;
 };
 
+// Org repository map for the cross-repo review stage. Drains in the index bucket:
+// it is a latency-tolerant org walk and must never starve a PR review.
+export type CrossRepoTopologyJobPayload = {
+  installationId: string; // Installation.id (DB uuid)
+  trigger: "cold" | "stale" | "webhook" | "manual";
+};
+
+export type CrossRepoTopologyJob = {
+  id: string;
+  type: "cross_repo_topology";
+  payload: CrossRepoTopologyJobPayload;
+  enqueuedAt: number;
+  attempts: number;
+};
+
 export type Job =
   | ReviewJob
   | MaintainerFeedbackJob
@@ -115,7 +130,8 @@ export type Job =
   | LinearIngestJob
   | GuidanceIngestJob
   | BountyCriteriaJob
-  | SecurityAuditJob;
+  | SecurityAuditJob
+  | CrossRepoTopologyJob;
 
 const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
@@ -228,6 +244,28 @@ export function enqueueSecurityAudit(payload: SecurityAuditJobPayload): Security
   const job: SecurityAuditJob = {
     id: uuid(),
     type: "security_audit",
+    payload,
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.index.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueCrossRepoTopology(
+  payload: CrossRepoTopologyJobPayload
+): CrossRepoTopologyJob {
+  // Idempotent per installation: the hourly sweep, a webhook and a cold-cache
+  // review can all ask at once, and one org walk serves all three.
+  const waiting = pending.index.find(
+    (j): j is CrossRepoTopologyJob =>
+      j.type === "cross_repo_topology" && j.payload.installationId === payload.installationId
+  );
+  if (waiting) return waiting;
+  const job: CrossRepoTopologyJob = {
+    id: uuid(),
+    type: "cross_repo_topology",
     payload,
     enqueuedAt: Date.now(),
     attempts: 0,

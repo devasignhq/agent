@@ -249,11 +249,12 @@ export type Repository = {
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
 // `stages` is BASIC (free); `trigger`, `verdict`, `prompts` + `actions` are
 // ADVANCED (Pro/Max).
-export type StagePromptKey = "criteria" | "review" | "holistic" | "security" | "defects" | "deferrals" | "docs";
+export type StagePromptKey =
+  | "criteria" | "review" | "holistic" | "security" | "defects" | "deferrals" | "docs" | "crossRepo";
 export type RepoWorkflow = {
   version: 1;
   trigger: { onSynchronize: boolean; skipDrafts: boolean; skipBots: boolean };
-  stages: { holistic: boolean; defects: boolean; docs: boolean; deferrals: boolean };
+  stages: { holistic: boolean; defects: boolean; docs: boolean; deferrals: boolean; crossRepo: boolean };
   verdict: { blocking: boolean };
   // Per-stage maintainer instructions (the stages that make an LLM call).
   prompts?: Partial<Record<StagePromptKey, string>>;

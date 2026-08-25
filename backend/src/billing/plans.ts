@@ -19,6 +19,7 @@ export type PlanLimits = {
   privateRepos: boolean; // may review private repos
   linear: boolean; // Linear integration + acceptance-criteria sync
   securityScans: boolean; // repo-wide security audits + merge gate (Security page)
+  crossRepo: boolean; // cross-repo impact + parity stage on PR reviews
   priceKey: "pricePro" | "priceMax" | null; // which config.stripe price funds it
 };
 
@@ -26,9 +27,9 @@ export type PlanLimits = {
 // (ANTHROPIC_MODEL — opus). Reading config.llm.model means a prod model bump
 // (e.g. opus-4-8) automatically applies to Pro/Max with no code change here.
 export const PLAN_LIMITS: Record<Plan, PlanLimits> = {
-  free: { model: "claude-haiku-4-5", monthlyReviews: 10, privateRepos: false, linear: false, securityScans: false, priceKey: null },
-  pro: { model: config.llm.model, monthlyReviews: 50, privateRepos: true, linear: true, securityScans: true, priceKey: "pricePro" },
-  max: { model: config.llm.model, monthlyReviews: Infinity, privateRepos: true, linear: true, securityScans: true, priceKey: "priceMax" },
+  free: { model: "claude-haiku-4-5", monthlyReviews: 10, privateRepos: false, linear: false, securityScans: false, crossRepo: false, priceKey: null },
+  pro: { model: config.llm.model, monthlyReviews: 50, privateRepos: true, linear: true, securityScans: true, crossRepo: true, priceKey: "pricePro" },
+  max: { model: config.llm.model, monthlyReviews: Infinity, privateRepos: true, linear: true, securityScans: true, crossRepo: true, priceKey: "priceMax" },
 };
 
 // Tier ordering for upgrade/downgrade comparisons (free < pro < max).
@@ -166,6 +167,15 @@ export function privateRepoBlocked(
 export function securityScanBlocked(ownerUserId: string | null | undefined): boolean {
   if (!ownerUserId) return false;
   return !PLAN_LIMITS[planForUser(ownerUserId)].securityScans;
+}
+
+// Single source of truth for the cross-repo rule: the PR review's cross-repo
+// impact + parity stage is Pro/Max. Same unlinked-install grace as the others —
+// and the pipeline enforces it directly, because `stages` is free-editable so a
+// free user can flip the toggle on through the API.
+export function crossRepoBlocked(ownerUserId: string | null | undefined): boolean {
+  if (!ownerUserId) return false;
+  return !PLAN_LIMITS[planForUser(ownerUserId)].crossRepo;
 }
 
 // Monthly-cap enforcement for a *new* PR review, charged once per unique PR.

@@ -37,6 +37,7 @@ import { backfillAccountKinds } from "./users.js";
 import { installationsForUser } from "./github/installations.js";
 import { hasContributorBountyActivity } from "./bounties/service.js";
 import { startWorker } from "./worker.js";
+import { startTopologyRefresh } from "./review/cross-repo/job.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
 import { startSecurityLiveSignals } from "./security/live.js";
@@ -311,7 +312,7 @@ const server = app.listen(port, () => {
   // first thing to verify is that the matching event here is also subscribed
   // in the GitHub App's settings on github.com → Permissions & events.
   console.log(
-    `  · Webhooks:   accepting installation, installation_repositories, pull_request, issue_comment, pull_request_review, pull_request_review_comment, github_app_authorization, ping`
+    `  · Webhooks:   accepting installation, installation_repositories, repository, pull_request, issue_comment, pull_request_review, pull_request_review_comment, github_app_authorization, ping`
   );
   // Self-diagnose: ask GitHub which events the App is actually configured to
   // deliver. A common failure mode is the handler being ready while the App
@@ -335,6 +336,7 @@ backfillLegacyVulnerabilities();
 backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
+startTopologyRefresh();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no

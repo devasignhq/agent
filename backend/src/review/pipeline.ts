@@ -37,7 +37,14 @@ import { ACTIVE_STATES as SECURITY_ACTIVE_STATES } from "../security/policy.js";
 import { publishGateForPR } from "../security/gate.js";
 import { resolveBountyForPR } from "../bounties/prlink.js";
 import { recordBountyEvent } from "../bounties/service.js";
-import { modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
+import { crossRepoBlocked, modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
+import {
+  CROSS_REPO_NO_INSTALL,
+  CROSS_REPO_PLAN_LOCKED,
+  CROSS_REPO_STAGE_DISABLED,
+  runCrossRepoStage,
+} from "./cross-repo/run.js";
+import { recordParityFeatures } from "./cross-repo/parity.js";
 import {
   appendAddedCriteria,
   buildCriteriaSection,
@@ -113,6 +120,10 @@ type FindingCategory =
   // DEVASIGN.md statement the diff makes outdated (docs need updating).
   | "convention"
   | "docDrift"
+  // Cross-repo stage: a sibling repository that this change breaks, and a
+  // capability a sibling now lacks. Both advisory — forced "warn"/"nit".
+  | "crossRepo"
+  | "parity"
   | "suggestion";
 
 function emitFindingLog(
@@ -141,6 +152,8 @@ function emitFindingLog(
     deferral: "Deferred / incomplete work",
     convention: "DEVASIGN.md violation",
     docDrift: "DEVASIGN.md needs updating",
+    crossRepo: "Cross-repo impact",
+    parity: "Feature parity gap",
   };
   log(reviewId, "finding", titleByCategory[category], {
     detail: finding.concern,
@@ -861,6 +874,52 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         }
       } catch (err) {
         log(review.id, "holistic", "DEVASIGN.md guidance skipped", {
+          detail: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
+
+    // Cross-repo impact + feature parity. Runs AFTER hasBlocker (:768) is already
+    // decided, so it is structurally incapable of gating the merge — same reason
+    // the deferred-work and DEVASIGN.md stages live down here.
+    //
+    // if/else-if with exported log strings rather than the docs stage's
+    // `if (install && ...)`: the offline harness seeds a dangling installationId,
+    // so an install-guarded shape would make every branch but "disabled"
+    // untestable. Plan is enforced here and not only in the UI, because
+    // `stages` is a free-editable field.
+    if (!wf.stages.crossRepo) {
+      log(review.id, "holistic", CROSS_REPO_STAGE_DISABLED);
+    } else if (crossRepoBlocked(install?.userId)) {
+      log(review.id, "holistic", CROSS_REPO_PLAN_LOCKED);
+    } else if (!install) {
+      log(review.id, "holistic", CROSS_REPO_NO_INSTALL);
+    } else {
+      try {
+        const cross = await runCrossRepoStage({
+          review,
+          repo,
+          install,
+          diff: context.diff,
+          extraInstructions: wf.prompts?.crossRepo,
+          log: (action, extra) => log(review.id, "holistic", action, extra),
+        });
+        holisticVerdict = {
+          ...holisticVerdict,
+          crossRepoImpacts: cross.impacts,
+          parityNotes: cross.parityNotes,
+        };
+        for (const f of cross.impacts) emitFindingLog(review.id, "crossRepo", f);
+        for (const f of cross.parityNotes) emitFindingLog(review.id, "parity", f);
+        recordParityFeatures({
+          install,
+          repo,
+          review,
+          features: cross.parityFeatures,
+          family: cross.family,
+        });
+      } catch (err) {
+        log(review.id, "holistic", "Cross-repo impact skipped", {
           detail: err instanceof Error ? err.message : String(err),
         });
       }
@@ -2612,6 +2671,21 @@ export function formatReviewBody(
     lines.push("");
   }
 
+  // Cross-repo impact (advisory). Sits last of the finding sections because it is
+  // the only one not about code in this diff — it is about other repositories.
+  const crossRepoItems = holistic.crossRepoImpacts.length + holistic.parityNotes.length;
+  if (crossRepoItems) {
+    lines.push("### Cross-repo impact");
+    lines.push(
+      "Checked other repositories in your organization for code that consumes what this " +
+        "PR changes. Advisory — none of this blocks the merge:",
+      ""
+    );
+    appendHolisticGroup(lines, "Breaks a sibling repo", holistic.crossRepoImpacts);
+    appendHolisticGroup(lines, "Feature parity", holistic.parityNotes);
+    lines.push("");
+  }
+
   // Consolidated "fix everything in one paste" prompt for an external AI
   // coding agent (Claude Code, Cursor, Aider, Codex). Only included when
   // there's anything to fix — at least one unmet criterion or one review
@@ -2674,7 +2748,8 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
     | "consistencyFindings"
     | "deferrals"
     | "conventionFindings"
-    | "docDriftFindings";
+    | "docDriftFindings"
+    | "crossRepoImpacts";
   label: string;
 }> = [
   { key: "regressions", label: "Regression" },
@@ -2690,6 +2765,15 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   { key: "deferrals", label: "Deferred work" },
   { key: "conventionFindings", label: "Convention" },
   { key: "docDriftFindings", label: "Docs" },
+  // parityNotes is deliberately absent, like preexistingVulns above: this prompt
+  // is pasted into an agent pointed at THIS checkout, and a parity fix belongs in
+  // a different repository entirely.
+  //
+  // Impacts DO stay, because there is usually a fix on this side (keep the old
+  // signature, make the parameter optional, ship a deprecation) — but the broken
+  // caller is in the named sibling, so the label has to say so or an agent
+  // pointed here will go hunting for files that do not exist in this checkout.
+  { key: "crossRepoImpacts", label: "Cross-repo — the consumer is in the named repo" },
 ];
 
 function collectConsolidatedFindings(
@@ -4375,6 +4459,12 @@ type HolisticVerdict = {
   // changed and no findings surfaced. Empty/"" on first reviews and same-sha reruns.
   commitIntentFindings: HolisticFinding[];
   commitIntentSummary: string;
+  // Cross-repo stage (Pro/Max, off by default). `crossRepoImpacts` are sibling
+  // repositories this change breaks; `parityNotes` are capabilities it adds that
+  // siblings lack. Both advisory — severity is forced at normalisation, and
+  // neither feeds hasBlocker.
+  crossRepoImpacts: HolisticFinding[];
+  parityNotes: HolisticFinding[];
   summary: string;
 };
 
@@ -4391,6 +4481,8 @@ export const EMPTY_HOLISTIC: HolisticVerdict = {
   resolvedPreexisting: [],
   commitIntentFindings: [],
   commitIntentSummary: "",
+  crossRepoImpacts: [],
+  parityNotes: [],
   summary: "",
 };
 

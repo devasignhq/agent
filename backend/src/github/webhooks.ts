@@ -8,10 +8,17 @@ import { db } from "../db.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
 import { maintainerByGithubId } from "../users.js";
-import { enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
+import {
+  enqueueCrossRepoTopology,
+  enqueueIndex,
+  enqueueMaintainerFeedback,
+  enqueueReview,
+  enqueueSecurityAudit,
+} from "../queue.js";
 import { effectiveSecurityPolicy } from "../security/policy.js";
 import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
+import { installationWantsCrossRepo } from "../review/cross-repo/job.js";
 import { triggerOutcome } from "../review/decisions.js";
 import { notifyForReview } from "../notifications.js";
 import {
@@ -113,6 +120,9 @@ export function handleWebhook(req: Request, res: Response) {
   switch (type) {
     case "installation":
       handleInstallation(event);
+      break;
+    case "repository":
+      handleRepositoryVisibility(event);
       break;
     case "installation_repositories":
       handleInstallationRepos(event);
@@ -698,6 +708,36 @@ function handleInstallation(event: any) {
   }
 }
 
+// A repo flipping public<->private changes what a cross-repo review may quote
+// into a world-readable PR comment, and the cached flag is otherwise only
+// refreshed on a full topology rebuild (up to 7 days). Keep it current here, and
+// drop the topology's copy so its snapshot cannot outvote this.
+function handleRepositoryVisibility(event: any) {
+  if (event?.action !== "privatized" && event?.action !== "publicized") return;
+  const fullName = String(event?.repository?.full_name || "");
+  const [owner, name] = fullName.split("/");
+  if (!owner || !name) return;
+  // Resolved before anything is written: an event we cannot attribute to a known
+  // installation identifies no row we have any business touching.
+  const install = db.find("installations", (i) => i.installationId === event?.installation?.id);
+  if (!install) return;
+  const isPrivate = event.action === "privatized";
+  // Scoped by installation to match how visibleSiblings READS it — an unscoped
+  // write can update a row the scoped read will never find.
+  db.update(
+    "repositories",
+    (r) => r.installationId === install.id && r.owner === owner && r.name === name,
+    { private: isPrivate }
+  );
+  const topology = db.find("repoTopologies", (t) => t.installationId === install.id);
+  if (!topology) return;
+  db.update("repoTopologies", (t) => t.id === topology.id, {
+    repos: (topology.repos || []).map((r) =>
+      r.fullName === fullName ? { ...r, private: isPrivate } : r
+    ),
+  });
+}
+
 function handleInstallationRepos(event: any) {
   const install = db.find(
     "installations",
@@ -736,6 +776,11 @@ function handleInstallationRepos(event: any) {
     if (owner && name) {
       db.remove("repositories", (x) => x.owner === owner && x.name === name);
     }
+  }
+  // The connected repo set just moved, so the cross-repo map is stale by
+  // definition — rebuild it, but only for an installation that actually uses it.
+  if (installationWantsCrossRepo(install.id)) {
+    enqueueCrossRepoTopology({ installationId: install.id, trigger: "webhook" });
   }
 }
 

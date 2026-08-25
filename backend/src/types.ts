@@ -74,6 +74,7 @@ export type RepoWorkflow = {
     defects: boolean;   // general correctness/robustness bug hunt on the diff
     docs: boolean;      // DEVASIGN.md conventions + doc-drift check
     deferrals: boolean; // self-admitted deferred/incomplete-work scan
+    crossRepo: boolean; // sibling-repo breakage + feature-parity pass (Pro/Max)
   };
   verdict: {
     blocking: boolean; // false = post advisory COMMENT, never REQUEST_CHANGES
@@ -88,6 +89,7 @@ export type RepoWorkflow = {
     defects?: string;   // general defect review
     deferrals?: string; // deferred-work scan
     docs?: string;      // DEVASIGN.md guidance
+    crossRepo?: string; // cross-repo impact + parity
   };
   // Optional "Run GitHub Action" step (ADVANCED): when enabled, dispatch a
   // chosen GitHub Actions workflow after a review. `runWhen` gates dispatch on
@@ -941,6 +943,96 @@ export type EscrowTransaction = {
   destMemo?: string | null;
 };
 
+// Cross-repo topology: the map of every repository an installation can see,
+// with the families and consumer edges the PR review's cross-repo stage reads.
+export type TopoRepoKind =
+  | "sdk" | "service" | "frontend" | "cli" | "infra"
+  | "contract" | "docs" | "mobile" | "library" | "unknown";
+
+export type TopoRepo = {
+  fullName: string;
+  repoId?: string;             // Repository.id when DevAsign has this repo onboarded
+  description?: string;
+  language?: string;
+  kind: TopoRepoKind;
+  publishedName?: string;      // npm name, Go module path, PyPI name, crate
+  declaredDeps: string[];
+  // Undefined on rows built before visibility was carried. Consumers must treat
+  // unknown as private: a review of a public repo must never quote a private
+  // sibling's source into a comment anyone can read.
+  private?: boolean;
+  archived: boolean;
+  pushedAt: number;
+  defaultBranch: string;
+};
+
+export type TopoFamilyKind = "sdk-family" | "service-client" | "monorepo-split" | "shared-contract";
+export type TopoConfidence = "high" | "medium" | "low";
+
+export type TopoFamily = {
+  name: string;
+  kind: TopoFamilyKind;
+  members: string[];           // fullNames
+  confidence: TopoConfidence;
+  evidence: string[];
+};
+
+export type TopoEdgeVia =
+  | "package-dep" | "http-contract" | "event-schema"
+  | "db-schema" | "submodule" | "env-config" | "docs-link";
+
+export type TopoEdge = {
+  consumer: string;
+  provider: string;
+  via: TopoEdgeVia;
+  evidence: string;
+  confidence: TopoConfidence;
+};
+
+export type CodeSearchStatus = "ok" | "forbidden" | "unavailable" | "unknown";
+
+export type RepoTopology = {
+  id: string;
+  installationId: string;      // Installation.id (DB uuid), NOT the numeric GitHub id
+  owner: string;
+  isOrg: boolean;
+  generatedAt: number;
+  buildMs: number;
+  repoCount: number;           // repos actually enumerated
+  // install.repoIds.length observed at build time. Compared against the live
+  // value to detect a changed repo set for free; must NOT be repoCount, which
+  // diverges under truncation and would rebuild forever.
+  repoIdsAtBuild: number;
+  totalCount: number | null;   // total_count GitHub reported; null when unknown
+  // Enumeration hit the page cap. A repo we never saw must never be reported
+  // "absent", so this suppresses parity notes while leaving breakage findings.
+  truncated: boolean;
+  repos: TopoRepo[];
+  families: TopoFamily[];
+  edges: TopoEdge[];
+  codeSearch: { status: CodeSearchStatus; probedAt: number; note?: string };
+  error?: string | null;
+};
+
+export type ParityStatus = "present" | "absent" | "partial" | "n/a";
+
+export type ParityFeature = {
+  id: string;
+  installationId: string;
+  family: string;
+  featureId: string;           // "<family>/<slug>"
+  title: string;
+  summary: string;
+  origin: { repoId: string; repoFullName: string; sha: string; prNumber: number | null; at: number };
+  statusByRepo: Record<string, ParityStatus>;
+  evidence: Record<string, string>;  // what was searched per repo; required for "absent"
+  openedAt: number;
+  closedAt: number | null;
+  closedBy: { repoFullName: string; sha: string; prNumber: number | null } | null;
+  notifiedRepos: string[];     // per-feature-per-repo notification dedupe, durable
+  lastSeenReviewId: string;
+};
+
 export type DB = {
   users: User[];
   installations: Installation[];
@@ -959,4 +1051,6 @@ export type DB = {
   securityFindings: SecurityFinding[];
   securityScans: SecurityScanRun[];
   securityPrecedents: SecurityPrecedent[];
+  repoTopologies: RepoTopology[];
+  parityFeatures: ParityFeature[];
 };

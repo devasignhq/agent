@@ -447,3 +447,83 @@ test("patch with backtick runs still fences safely", () => {
   // The wrapping fence must be longer than the longest inner run (4) — 5+.
   assert.match(body, /`{5,}diff/);
 });
+
+// ─── Cross-repo impact section ──────────────────────────────────────────────
+// Advisory: it renders, it names the sibling repo, and it stays out of the
+// consolidated fix prompt where a parity note would point an agent at the wrong
+// checkout entirely.
+
+const IMPACT = {
+  path: "acme/acme-web:src/api/bounties.ts",
+  line: 88,
+  concern:
+    "acme-web calls createBounty with two arguments.\n\nConsuming line: `const b = await createBounty(t, a);`",
+  severity: "warn" as const,
+  failureScenario: "acme-web's next build fails with a missing-argument error.",
+  fixPrompt: "Fix: add the currency argument in acme-web",
+};
+
+const PARITY = {
+  path: "acme/acme-sdk-go",
+  concern:
+    "listPayouts has no equivalent in acme/acme-sdk-go\n\nMissing in: acme/acme-sdk-go.\nSearched: ListPayouts, list_payouts",
+  severity: "nit" as const,
+};
+
+function crossRepoBody() {
+  return formatReviewBody(
+    "Add currency support.",
+    [crit({ met: true, evidence: "done" })],
+    [],
+    { ...EMPTY_HOLISTIC, crossRepoImpacts: [IMPACT], parityNotes: [PARITY] },
+    { prTitle: "Add currency", repoFullName: "acme/acme-sdk-ts" }
+  );
+}
+
+test("cross-repo section renders both groups and names the sibling repo", () => {
+  const body = crossRepoBody();
+  assert.match(body, /### Cross-repo impact/);
+  assert.match(body, /Advisory — none of this blocks the merge/);
+  assert.match(body, /#### Breaks a sibling repo/);
+  assert.match(body, /#### Feature parity/);
+  // Qualified as owner/repo:path — findingWhere renders the path bare, so an
+  // unqualified path would read as a file in THIS repo.
+  assert.match(body, /`acme\/acme-web:src\/api\/bounties\.ts:88`/);
+  assert.match(body, /acme\/acme-sdk-go/);
+  assert.doesNotMatch(body, EMOJI);
+});
+
+test("cross-repo findings render at advisory severity, never as blockers", () => {
+  const body = crossRepoBody();
+  // Only Blocker is bolded by appendHolisticGroup; warn/nit render plain.
+  assert.match(body, /- Warn — `acme\/acme-web:src\/api\/bounties\.ts:88`/);
+  assert.match(body, /- Nit — `acme\/acme-sdk-go`/);
+  // Scoped to the section: the consolidated prompt's own boilerplate mentions
+  // **Blocker** to explain the tag, which is not a finding severity.
+  const section = body.slice(body.indexOf("### Cross-repo impact"), body.indexOf("---"));
+  assert.doesNotMatch(section, /Blocker/);
+});
+
+test("the impact reaches the consolidated fix prompt but the parity note does not", () => {
+  const body = crossRepoBody();
+  const details = body.slice(body.lastIndexOf("<details>"));
+  // The entry has to say the broken caller lives elsewhere, or an agent pointed
+  // at this checkout will look for acme-web's files here.
+  assert.match(details, /Cross-repo — the consumer is in the named repo/);
+  assert.match(details, /acme\/acme-web:src\/api\/bounties\.ts/);
+  assert.match(details, /add the currency argument in acme-web/);
+  // A parity fix belongs in a different repository, so pasting it into an agent
+  // pointed at this checkout would send it editing files that do not exist here.
+  assert.doesNotMatch(details, /list_payouts/);
+});
+
+test("a clean cross-repo run adds no section at all", () => {
+  const body = formatReviewBody(
+    "Add currency support.",
+    [crit({ met: true, evidence: "done" })],
+    [],
+    EMPTY_HOLISTIC,
+    { prTitle: "Add currency", repoFullName: "acme/acme-sdk-ts" }
+  );
+  assert.doesNotMatch(body, /### Cross-repo impact/);
+});

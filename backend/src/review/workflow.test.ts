@@ -15,8 +15,15 @@ test("effectiveWorkflow with no stored workflow reproduces prior behavior", () =
   // pipeline did before workflows existed. `defects` is the deliberate exception
   // to "reproduces prior behavior": bug detection ships on by default, because
   // default-off would leave the criteria-only blind spot open for every repo
-  // that never opens the Workflow screen.
-  assert.deepEqual(wf.stages, { holistic: true, defects: true, docs: true, deferrals: true });
+  // that never opens the Workflow screen. `crossRepo` is the mirror case — it is
+  // advisory-only, so default-off leaves no blind spot and costs nobody tokens.
+  assert.deepEqual(wf.stages, {
+    holistic: true,
+    defects: true,
+    docs: true,
+    deferrals: true,
+    crossRepo: false,
+  });
   assert.deepEqual(wf.trigger, { onSynchronize: true, skipDrafts: false, skipBots: false });
   assert.equal(wf.verdict.blocking, true);
   assert.deepEqual(wf, WORKFLOW_DEFAULTS);

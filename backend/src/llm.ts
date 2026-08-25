@@ -232,6 +232,77 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ id: null });
   }
 
+  // Cross-repo stages. Checked BEFORE the "PR review" branch above: that branch
+  // is the broadest matcher in this mock, so anything whose prompt could ever
+  // pick up the substring must be resolved ahead of it.
+  //
+  // Both default to a CLEAN result. The stage is advisory, but a sample finding
+  // by default would still change every offline pipeline test's comment body.
+  // CROSS_REPO_SAMPLE=1 emits one impact + one parity note to exercise the
+  // report section, the timeline cards, and the consolidated-prompt split.
+  if (system?.includes("contract-delta extraction")) {
+    if (process.env.CROSS_REPO_SAMPLE !== "1") return JSON.stringify({ entries: [] });
+    return JSON.stringify({
+      entries: [
+        {
+          surface: "ts-export",
+          name: "createBounty",
+          change: "signature_changed",
+          detail: "[mock] added a required `currency` parameter",
+          compat: "breaking",
+          path: "src/bounties.ts",
+          line: 42,
+        },
+        {
+          surface: "ts-export",
+          name: "listPayouts",
+          change: "added",
+          detail: "[mock] new exported helper",
+          compat: "compatible",
+          path: "src/payouts.ts",
+          line: 10,
+        },
+      ],
+    });
+  }
+
+  if (system?.includes("cross-repo impact step")) {
+    if (process.env.CROSS_REPO_SAMPLE !== "1") {
+      return JSON.stringify({
+        impacts: [],
+        parityNotes: [],
+        summary: "[mock] No cross-repo impact found.",
+      });
+    }
+    return JSON.stringify({
+      impacts: [
+        {
+          where: "acme/acme-web:src/api/bounties.ts",
+          line: 88,
+          concern:
+            "[mock] acme-web calls createBounty with two arguments. This change makes `currency` required, " +
+            "so the call no longer type-checks and the web build fails on the next deploy.",
+          evidence: "const b = await createBounty(title, amount);",
+          failureScenario:
+            "acme-web's next build fails at src/api/bounties.ts:88 with a missing-argument error; if it is " +
+            "deployed from a cached build, every bounty creation rejects at runtime.",
+        },
+      ],
+      parityNotes: [
+        {
+          featureSlug: "list-payouts",
+          title: "[mock] listPayouts has no equivalent in acme-sdk-go",
+          missingIn: ["acme/acme-sdk-go"],
+          searched: "ListPayouts, list_payouts in payouts.go, README, CHANGELOG",
+          concern:
+            "[mock] This change adds listPayouts to the TypeScript SDK. The Go SDK exposes no equivalent, so " +
+            "the two SDKs now differ in what they can do.",
+        },
+      ],
+      summary: "[mock] 1 downstream break, 1 parity gap.",
+    });
+  }
+
   if (system?.includes("PR review") || last.includes("Review this PR")) {
     // Echo the criterion ids from the prompt's leading `# Criteria` section
     // (buildCriteriaSection renders `- ${id}: ${text}`) so seeded ids like
