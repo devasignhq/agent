@@ -1,4 +1,5 @@
-// The app's URL surface in one place, so app.tsx and routing.test.ts cannot drift.
+// The <Route> table app.tsx renders and routing.test.ts exercises. Other call sites
+// still hardcode these URLs, so this is not yet the app's only copy of them.
 // Param names are a contract: the screens read them straight off useParams().
 export const ROUTE_PATHS = {
   agent: "/agent",
@@ -17,8 +18,6 @@ export const ROUTE_PATHS = {
   catchAll: "*",
 } as const;
 
-export type RouteKey = keyof typeof ROUTE_PATHS;
-
 // Where the redirect-only routes send the browser.
 export const DEFAULT_ROUTE = ROUTE_PATHS.agent;
-export const DEFAULT_SETTINGS_SECTION = "/settings/account";
+export const DEFAULT_SETTINGS_PATH = "/settings/account";

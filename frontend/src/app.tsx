@@ -2,7 +2,7 @@
 // Main App shell + sidebar + routing
 import React from "react";
 import { useLocation, useNavigate, Routes, Route, Navigate } from "react-router-dom";
-import { ROUTE_PATHS, DEFAULT_ROUTE, DEFAULT_SETTINGS_SECTION } from "./routes";
+import { ROUTE_PATHS, DEFAULT_ROUTE, DEFAULT_SETTINGS_PATH } from "./routes";
 import { StatsigProvider, useClientAsyncInit } from "@statsig/react-bindings";
 import { StatsigAutoCapturePlugin } from "@statsig/web-analytics";
 import { StatsigSessionReplayPlugin } from "@statsig/session-replay";
@@ -895,7 +895,7 @@ const AppContent = () => {
             <Route path={ROUTE_PATHS.securityGate} element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path={ROUTE_PATHS.securityRulings} element={<SecurityPage view="rulings" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path={ROUTE_PATHS.securityPolicy} element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path={ROUTE_PATHS.settings} element={<Navigate to={DEFAULT_SETTINGS_SECTION} replace />} />
+            <Route path={ROUTE_PATHS.settings} element={<Navigate to={DEFAULT_SETTINGS_PATH} replace />} />
             <Route path={ROUTE_PATHS.settingsSection} element={<SettingsPage />} />
             <Route path={ROUTE_PATHS.root} element={<Navigate to={DEFAULT_ROUTE} replace />} />
             <Route path={ROUTE_PATHS.catchAll} element={<Navigate to={DEFAULT_ROUTE} replace />} />
