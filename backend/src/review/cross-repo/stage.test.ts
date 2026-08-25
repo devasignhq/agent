@@ -96,6 +96,16 @@ test("normaliseImpacts drops any finding with no quoted consuming line", () => {
   assert.equal(out[0].path, "acme/web:src/a.ts");
 });
 
+test("normaliseImpacts drops every impact when no sibling code was read", () => {
+  // The parity-only path reaches the model with "(no sibling code found)". A
+  // conditional known-repo check let anything it invented through unverified.
+  const out = normaliseImpacts(
+    [{ where: "acme/web:src/a.ts", concern: "breaks", evidence: "createBounty(a, b)" }],
+    new Set()
+  );
+  assert.deepEqual(out, []);
+});
+
 test("normaliseImpacts forces warn severity whatever the model says", () => {
   const out = normaliseImpacts(
     [{ where: "acme/web:src/a.ts", concern: "c", evidence: "e", severity: "blocker" }],
@@ -143,6 +153,20 @@ test("normaliseParityNotes confirms absence against the probes, not the model", 
   assert.equal(out.notes.length, 1);
   assert.equal(out.notes[0].severity, "nit");
   assert.deepEqual(out.features[0].missingIn, ["acme/sdk-go"]);
+});
+
+test("normaliseParityNotes persists the canonical slug, not the model's spelling", () => {
+  // parity.ts keys the stored row on `${family}/${slug}`. Persisting the raw
+  // spelling made "listPayouts" and "list-payouts" two rows for one gap, which
+  // re-notified every install member on the next review.
+  const map = new Map([["list-payouts", probes([["acme/sdk-go", "absent"]])]]);
+  for (const spelling of ["listPayouts", "List_Payouts", "list-payouts"]) {
+    const out = normaliseParityNotes(
+      [{ featureSlug: spelling, title: "t", searched: "s", missingIn: ["acme/sdk-go"], concern: "c" }],
+      map
+    );
+    assert.equal(out.features[0].slug, "list-payouts", `"${spelling}" must canonicalise`);
+  }
 });
 
 test("normaliseParityNotes will not claim absence for an unread repo", () => {

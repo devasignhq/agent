@@ -192,8 +192,11 @@ export function normaliseImpacts(raw: unknown, knownRepos: Set<string>): Holisti
     const failureScenario = typeof o.failureScenario === "string" ? o.failureScenario.trim() : "";
     // The drop rule: no quoted consuming line means the model is speculating.
     if (!where || !concern || !evidence) continue;
+    // Unconditional: with no sibling bytes read there is no evidence for ANY
+    // breakage claim, so an empty set must drop every impact rather than wave
+    // them all through. The parity-only path reaches here with zero snippets.
     const repoPart = where.split(":")[0];
-    if (knownRepos.size && !knownRepos.has(repoPart)) continue;
+    if (!knownRepos.has(repoPart)) continue;
     if (seen.has(where + concern.slice(0, 60))) continue;
     seen.add(where + concern.slice(0, 60));
     out.push({
@@ -234,7 +237,7 @@ export function normaliseParityNotes(
       (repo) => forFeature.find((p) => p.repoFullName === repo)?.status === "absent"
     );
     if (!confirmed.length) continue;
-    features.push({ slug, title, missingIn: confirmed, searched });
+    features.push({ slug: key, title, missingIn: confirmed, searched });
     notes.push({
       path: confirmed[0],
       concern:

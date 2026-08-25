@@ -3,11 +3,23 @@ import { db } from "../../db.js";
 import { crossRepoBlocked } from "../../billing/plans.js";
 import { enqueueCrossRepoTopology, type CrossRepoTopologyJobPayload } from "../../queue.js";
 import { buildTopology, topologyFor, topologyStale } from "./topology.js";
+import { effectiveWorkflow } from "../workflow.js";
+
+// The stage is opt-in and off by default, so an unguarded build spends ~3 GitHub
+// calls per repo (plus a search probe) drawing a map nobody will read. Every
+// trigger checks this; a repo turning the stage on gets its map from the cold
+// enqueue on that repo's first review.
+export function installationWantsCrossRepo(installationId: string): boolean {
+  return db
+    .filter("repositories", (r) => r.installationId === installationId)
+    .some((r) => effectiveWorkflow(r).stages.crossRepo);
+}
 
 export async function runCrossRepoTopologyJob(payload: CrossRepoTopologyJobPayload): Promise<void> {
   const install = db.find("installations", (i) => i.id === payload.installationId);
   if (!install) return;
   if (crossRepoBlocked(install.userId)) return;
+  if (!installationWantsCrossRepo(install.id)) return;
   try {
     const row = await buildTopology(install);
     console.log(
@@ -33,6 +45,7 @@ export function startTopologyRefresh(): void {
     for (const install of db.table("installations")) {
       if (!install.userId) continue;
       if (crossRepoBlocked(install.userId)) continue;
+      if (!installationWantsCrossRepo(install.id)) continue;
       if (!topologyStale(topologyFor(install.id), install, now)) continue;
       enqueueCrossRepoTopology({ installationId: install.id, trigger: "stale" });
     }

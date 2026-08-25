@@ -957,6 +957,10 @@ export type TopoRepo = {
   kind: TopoRepoKind;
   publishedName?: string;      // npm name, Go module path, PyPI name, crate
   declaredDeps: string[];
+  // Undefined on rows built before visibility was carried. Consumers must treat
+  // unknown as private: a review of a public repo must never quote a private
+  // sibling's source into a comment anyone can read.
+  private?: boolean;
   archived: boolean;
   pushedAt: number;
   defaultBranch: string;

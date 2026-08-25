@@ -18,6 +18,7 @@ import {
 import { effectiveSecurityPolicy } from "../security/policy.js";
 import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
+import { installationWantsCrossRepo } from "../review/cross-repo/job.js";
 import { triggerOutcome } from "../review/decisions.js";
 import { notifyForReview } from "../notifications.js";
 import {
@@ -744,8 +745,10 @@ function handleInstallationRepos(event: any) {
     }
   }
   // The connected repo set just moved, so the cross-repo map is stale by
-  // definition — rebuild it now rather than waiting for the hourly sweep.
-  enqueueCrossRepoTopology({ installationId: install.id, trigger: "webhook" });
+  // definition — rebuild it, but only for an installation that actually uses it.
+  if (installationWantsCrossRepo(install.id)) {
+    enqueueCrossRepoTopology({ installationId: install.id, trigger: "webhook" });
+  }
 }
 
 // Insert a Repository row for `repo` if we don't already have one. Pulls the

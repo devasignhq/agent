@@ -257,6 +257,7 @@ export function rankSiblings(
 type RawRepo = {
   id: number;
   full_name: string;
+  private?: boolean;
   description?: string | null;
   language?: string | null;
   archived?: boolean;
@@ -356,6 +357,7 @@ async function classify(installationId: number, raw: RawRepo): Promise<TopoRepo>
     kind: "unknown",
     declaredDeps: [],
     archived: Boolean(raw.archived),
+    private: raw.private === undefined ? undefined : Boolean(raw.private),
     pushedAt: raw.pushed_at ? Date.parse(raw.pushed_at) : 0,
     defaultBranch: raw.default_branch || "main",
   };

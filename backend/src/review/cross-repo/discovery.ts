@@ -181,6 +181,10 @@ export async function discoverCandidates(args: {
   needles: Needle[];
   publishedName?: string;
   selfFullName: string;
+  // Repos this review is allowed to quote. Code search answers across the whole
+  // installation, private repos included, so its hits must be filtered against
+  // this rather than trusted.
+  allowedRepos: Set<string>;
   deadline: number;
 }): Promise<{ snippets: CandidateSnippet[]; searchesRun: number; indexedSiblings: string[] }> {
   const { install, needles, siblingNames, selfFullName } = args;
@@ -217,6 +221,7 @@ export async function discoverCandidates(args: {
       for (const hit of hits.slice(0, 3)) {
         if (snippets.length >= MAX_CANDIDATE_FILES) break;
         if (hit.fullName === selfFullName) continue;
+        if (!args.allowedRepos.has(hit.fullName)) continue;
         if (already.has(`${hit.fullName}:${hit.path}`)) continue;
         already.add(`${hit.fullName}:${hit.path}`);
         const s = await snippetFor(install, hit.fullName, hit.path, hit.sha, allVariants, "search");

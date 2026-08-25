@@ -7,6 +7,7 @@ import { db } from "../../db.js";
 import { enqueueCrossRepoTopology } from "../../queue.js";
 import { discoverCandidates, probeParity, type ParityProbe } from "./discovery.js";
 import { familyOf, rankSiblings, topologyFor } from "./topology.js";
+import { ownerOf, repoNameOf } from "./naming.js";
 import { slugify } from "./naming.js";
 import { closeParityGapsFor } from "./parity.js";
 import {
@@ -18,7 +19,7 @@ import {
   scanContractCandidates,
   type CrossRepoResult,
 } from "./stage.js";
-import type { Installation, PRReview, RepoIndexEntry, Repository } from "../../types.js";
+import type { Installation, PRReview, RepoTopology, Repository } from "../../types.js";
 
 export const CROSS_REPO_STAGE_DISABLED = "Cross-repo impact disabled by workflow";
 export const CROSS_REPO_PLAN_LOCKED = "Cross-repo impact is a Pro/Max feature";
@@ -26,8 +27,35 @@ export const CROSS_REPO_NO_INSTALL = "Cross-repo impact skipped — no installat
 export const CROSS_REPO_NO_TOPOLOGY = "Cross-repo impact — org map not built yet";
 export const CROSS_REPO_NO_SURFACE = "Cross-repo impact — this change has no external surface";
 export const CROSS_REPO_NO_SIBLINGS = "Cross-repo impact — no sibling repositories to check";
+export const CROSS_REPO_VISIBILITY_FILTERED = "Cross-repo impact — private siblings withheld";
 
 export const MAX_SIBLING_REPOS = 12;
+
+// Visibility gate for everything this stage can publish.
+//
+// A finding names a sibling repo, a path and a verbatim source line, and it is
+// rendered into a PR comment. When the reviewed repo is PUBLIC that comment is
+// readable by anyone, so only PUBLIC siblings may be quoted — even though the
+// installation token can read the private ones. Unknown visibility counts as
+// private: a topology row written before this existed carries no flag, and
+// failing open there would leak exactly what this guard exists to prevent.
+export function visibleSiblings(args: {
+  installId: string;
+  selfPrivate: boolean;
+  names: string[];
+  topology: RepoTopology | null;
+}): string[] {
+  if (args.selfPrivate) return args.names;
+  const topoByName = new Map((args.topology?.repos ?? []).map((r) => [r.fullName, r]));
+  return args.names.filter((fullName) => {
+    const owner = ownerOf(fullName);
+    const name = repoNameOf(fullName);
+    const row = db.find("repositories", (r) => r.owner === owner && r.name === name);
+    if (row) return !row.private;
+    const topo = topoByName.get(fullName);
+    return topo?.private === false;
+  });
+}
 
 type LogFn = (action: string, extra?: { detail?: string; meta?: Record<string, unknown> }) => void;
 
@@ -62,11 +90,26 @@ export async function runCrossRepoStage(args: {
     : db
         .filter("repositories", (r) => r.installationId === install.id)
         .map((r) => `${r.owner}/${r.name}`);
-  const siblingNames = rankSiblings(topology, selfFullName, allNames, MAX_SIBLING_REPOS);
+  const visible = visibleSiblings({
+    installId: install.id,
+    selfPrivate: Boolean(repo.private),
+    names: allNames,
+    topology,
+  });
+  if (visible.length < allNames.length) {
+    log(CROSS_REPO_VISIBILITY_FILTERED, {
+      detail:
+        `${allNames.length - visible.length} sibling repo(s) withheld: this PR is public, so a ` +
+        "private sibling's path and source cannot be quoted into the review.",
+      meta: { considered: allNames.length, visible: visible.length },
+    });
+  }
+  const siblingNames = rankSiblings(topology, selfFullName, visible, MAX_SIBLING_REPOS);
   if (!siblingNames.length) {
     log(CROSS_REPO_NO_SIBLINGS);
     return EMPTY_CROSS_REPO;
   }
+  const allowedRepos = new Set(siblingNames);
 
   const delta = await extractContractDelta({ diff: args.diff, candidates });
   if (!delta.length) {
@@ -106,6 +149,7 @@ export async function runCrossRepoStage(args: {
       needles,
       publishedName,
       selfFullName,
+      allowedRepos,
       deadline,
     });
     snippets = found.snippets;
@@ -116,7 +160,7 @@ export async function runCrossRepoStage(args: {
     delta,
     topology,
     selfFullName,
-    siblingNames,
+    allowedRepos,
   });
 
   if (!snippets.length && !parityProbes.size) {
@@ -134,7 +178,10 @@ export async function runCrossRepoStage(args: {
     delta,
     snippets,
     parityProbes,
-    familyMembers: family?.members.filter((m) => m !== selfFullName) ?? [],
+    // Filtered too: a repo we may not quote should not be named to the model at
+    // all, or it can surface in the summary even though findings about it drop.
+    familyMembers:
+      family?.members.filter((m) => m !== selfFullName && allowedRepos.has(m)) ?? [],
     selfFullName,
     extraInstructions: args.extraInstructions,
   });
@@ -168,12 +215,17 @@ function collectParityProbes(args: {
   delta: Awaited<ReturnType<typeof extractContractDelta>>;
   topology: ReturnType<typeof topologyFor>;
   selfFullName: string;
-  siblingNames: string[];
+  allowedRepos: Set<string>;
 }): Map<string, ParityProbe[]> {
   const out = new Map<string, ParityProbe[]>();
   if (args.topology?.truncated) return out;
+  // Family membership comes from the topology, not from the filtered list, so it
+  // has to be intersected here too — a "Missing in: <private repo>" note leaks
+  // the same name a breakage finding would.
   const family = familyOf(args.topology, args.selfFullName);
-  const members = (family?.members ?? []).filter((m) => m !== args.selfFullName);
+  const members = (family?.members ?? []).filter(
+    (m) => m !== args.selfFullName && args.allowedRepos.has(m)
+  );
   if (members.length < 1) return out;
 
   const added = args.delta.filter((e) => e.change === "added").slice(0, 3);
@@ -186,4 +238,3 @@ function collectParityProbes(args: {
   return out;
 }
 
-export type { RepoIndexEntry };

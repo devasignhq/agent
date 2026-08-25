@@ -5,7 +5,14 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../../db.js";
-import { CROSS_REPO_NO_SIBLINGS, CROSS_REPO_NO_SURFACE, runCrossRepoStage } from "./run.js";
+import {
+  CROSS_REPO_NO_SIBLINGS,
+  CROSS_REPO_NO_SURFACE,
+  CROSS_REPO_VISIBILITY_FILTERED,
+  runCrossRepoStage,
+  visibleSiblings,
+} from "./run.js";
+import { installationWantsCrossRepo } from "./job.js";
 import { parityFeatureFor, recordParityFeatures } from "./parity.js";
 import type { Installation, PRReview, Repository } from "../../types.js";
 
@@ -165,4 +172,95 @@ test("an unrelated open gap is left alone", async (t) => {
   const after = parityFeatureFor(install.id, "acme-sdk/refund-escrow")!;
   assert.equal(after.statusByRepo[selfFullName], "absent");
   assert.equal(after.closedAt, null);
+});
+
+// ─── Visibility ─────────────────────────────────────────────────────────────
+// A finding names a sibling repo, a path and a verbatim source line, and it is
+// rendered into a PR comment. On a public repo that comment is world-readable.
+
+function seedSibling(installId: string, name: string, isPrivate: boolean) {
+  return db.insert("repositories", {
+    id: uuid(),
+    installationId: installId,
+    owner: "acme",
+    name,
+    defaultBranch: "main",
+    private: isPrivate,
+    defaultModel: "claude-opus-4-7",
+    modelOverrides: {},
+    reviewsEnabled: true,
+    indexState: "ready",
+  } as any) as Repository;
+}
+
+test("a public repo may not quote a private sibling", () => {
+  const { install } = seed({ sibling: false });
+  const pub = seedSibling(install.id, `pub-${uuid().slice(0, 6)}`, false);
+  const priv = seedSibling(install.id, `priv-${uuid().slice(0, 6)}`, true);
+  const out = visibleSiblings({
+    installId: install.id,
+    selfPrivate: false,
+    names: [`acme/${pub.name}`, `acme/${priv.name}`],
+    topology: null,
+  });
+  assert.deepEqual(out, [`acme/${pub.name}`]);
+});
+
+test("a private repo may see its private siblings", () => {
+  const { install } = seed({ sibling: false });
+  const priv = seedSibling(install.id, `priv2-${uuid().slice(0, 6)}`, true);
+  const out = visibleSiblings({
+    installId: install.id,
+    selfPrivate: true,
+    names: [`acme/${priv.name}`],
+    topology: null,
+  });
+  assert.deepEqual(out, [`acme/${priv.name}`]);
+});
+
+test("unknown visibility is treated as private, not as public", () => {
+  // A topology row written before `private` was carried has no flag. Failing
+  // open there would leak exactly what this guard exists to prevent.
+  const { install } = seed({ sibling: false });
+  const topology: any = {
+    repos: [
+      { fullName: "acme/no-flag", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main" },
+      { fullName: "acme/known-public", kind: "unknown", declaredDeps: [], archived: false, pushedAt: 0, defaultBranch: "main", private: false },
+    ],
+  };
+  const out = visibleSiblings({
+    installId: install.id,
+    selfPrivate: false,
+    names: ["acme/no-flag", "acme/known-public"],
+    topology,
+  });
+  assert.deepEqual(out, ["acme/known-public"]);
+});
+
+test("the stage logs when it withholds a private sibling and never reaches it", async (t) => {
+  const prior = process.env.CROSS_REPO_SAMPLE;
+  process.env.CROSS_REPO_SAMPLE = "1";
+  t.after(() => {
+    if (prior === undefined) delete process.env.CROSS_REPO_SAMPLE;
+    else process.env.CROSS_REPO_SAMPLE = prior;
+  });
+  const { install, repo, review } = seed({ sibling: false });
+  seedSibling(install.id, `secret-${uuid().slice(0, 6)}`, true);
+  const { result, logs } = await run({ install, repo, review, diff: SURFACE_DIFF });
+  assert.ok(logs.includes(CROSS_REPO_VISIBILITY_FILTERED));
+  // Only the private sibling existed, so there is nothing left to check.
+  assert.ok(logs.includes(CROSS_REPO_NO_SIBLINGS));
+  assert.deepEqual(result.impacts, []);
+  assert.deepEqual(result.parityNotes, []);
+});
+
+// ─── Topology opt-in ────────────────────────────────────────────────────────
+
+test("installationWantsCrossRepo is false until a repo opts in", () => {
+  const { install, repo } = seed();
+  assert.equal(installationWantsCrossRepo(install.id), false);
+  db.update("repositories", (r) => r.id === repo.id, {
+    workflow: { version: 1, stages: { crossRepo: true } } as any,
+  });
+  assert.equal(installationWantsCrossRepo(install.id), true);
 });
