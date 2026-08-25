@@ -1,11 +1,21 @@
 #!/usr/bin/env bash
-# Installs the DevAsign git hooks, chaining onto any hooks you already have
+# Installs the DevAsign pre-push hook, chaining onto any hooks you already have
 # (husky, lefthook, hand-written) instead of replacing them.
 set -eu
 ROOT=$(git rev-parse --show-toplevel)
 DST=$(git rev-parse --git-path hooks)
 mkdir -p "$DST"
-for h in post-commit pre-push; do
+# Reviews moved to pre-push only; retire the per-commit hook an older install left.
+if [ -e "$DST/post-commit" ] && grep -q "devasign/hooks/post-commit" "$DST/post-commit" 2>/dev/null; then
+  if [ "$(wc -l < "$DST/post-commit")" -le 2 ]; then
+    rm -f "$DST/post-commit"
+    echo "devasign: removed the old post-commit review hook (reviews now run at pre-push)."
+  else
+    echo "devasign: WARNING - $DST/post-commit still calls the removed devasign post-commit hook."
+    echo "devasign:          Delete that line by hand; every commit will otherwise print an error."
+  fi
+fi
+for h in pre-push; do
   chmod +x "$ROOT/.devasign/hooks/$h"
   target="$DST/$h"
   if [ ! -e "$target" ]; then
@@ -21,5 +31,5 @@ for h in post-commit pre-push; do
   fi
   chmod +x "$target"
 done
-echo "devasign hooks installed: post-commit (background review) + pre-push (blocking gate)."
-echo "Bypass a single commit or push with DEVASIGN_SKIP=1, or 'git push --no-verify'."
+echo "devasign hook installed: pre-push (blocking review gate)."
+echo "Bypass a single push with DEVASIGN_SKIP=1, or 'git push --no-verify'."

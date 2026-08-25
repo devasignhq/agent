@@ -3,15 +3,20 @@
 # and blocks the push when the verdict is FIX_BEFORE_PUSH.
 # Bypass once with: git push --no-verify   (or DEVASIGN_SKIP=1 git push)
 #
-# SECURITY: like post-commit, this runs an agent over commit content that may not
-# be yours. It keeps full Bash because you are at the terminal watching its output
-# and can interrupt it; the unattended post-commit path does not. Narrow it with
-# DEVASIGN_ALLOWED_TOOLS if you would rather not make that trade.
+# SECURITY: this runs an agent over commit content that may not be yours, and
+# instruction-shaped text in it can try to steer that agent. Full Bash is kept
+# because you are at the terminal and can interrupt; narrow via DEVASIGN_ALLOWED_TOOLS.
 set -u
 TOOLS="${DEVASIGN_ALLOWED_TOOLS:-Agent,Read,Grep,Glob,Bash,Write}"
 command -v claude >/dev/null 2>&1 || exit 0
 [ "${DEVASIGN_SKIP:-0}" = "1" ] && exit 0
 git rev-parse --show-toplevel >/dev/null 2>&1 || exit 0
+# A review killed mid-flight leaves its worktree mounted; reap stale ones, never a live one.
+git worktree prune 2>/dev/null
+git worktree list --porcelain 2>/dev/null | awk '$1=="worktree" && $2 ~ /\/tmp\/review\//{print $2}' |
+  while read -r w; do
+    [ -n "$(find "$w" -maxdepth 0 -mmin +60 2>/dev/null)" ] && git worktree remove --force "$w" 2>/dev/null
+  done
 Z40=0000000000000000000000000000000000000000
 status=0
 while read -r local_ref local_sha remote_ref remote_sha; do
