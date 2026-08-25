@@ -717,14 +717,24 @@ function handleRepositoryVisibility(event: any) {
   const fullName = String(event?.repository?.full_name || "");
   const [owner, name] = fullName.split("/");
   if (!owner || !name) return;
-  const isPrivate = event.action === "privatized";
-  db.update("repositories", (r) => r.owner === owner && r.name === name, { private: isPrivate });
+  // Resolved before anything is written: an event we cannot attribute to a known
+  // installation identifies no row we have any business touching.
   const install = db.find("installations", (i) => i.installationId === event?.installation?.id);
   if (!install) return;
+  const isPrivate = event.action === "privatized";
+  // Scoped by installation to match how visibleSiblings READS it — an unscoped
+  // write can update a row the scoped read will never find.
+  db.update(
+    "repositories",
+    (r) => r.installationId === install.id && r.owner === owner && r.name === name,
+    { private: isPrivate }
+  );
   const topology = db.find("repoTopologies", (t) => t.installationId === install.id);
   if (!topology) return;
   db.update("repoTopologies", (t) => t.id === topology.id, {
-    repos: topology.repos.map((r) => (r.fullName === fullName ? { ...r, private: isPrivate } : r)),
+    repos: (topology.repos || []).map((r) =>
+      r.fullName === fullName ? { ...r, private: isPrivate } : r
+    ),
   });
 }
 
