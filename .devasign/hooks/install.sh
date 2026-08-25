@@ -13,7 +13,8 @@ for h in post-commit pre-push; do
   elif ! grep -q "devasign/hooks/$h" "$target"; then
     printf '\n# devasign review\n"$(git rev-parse --show-toplevel)/.devasign/hooks/%s" "$@" || exit $?\n' "$h" >> "$target"
     # Appending is only useful if control reaches the end of the existing hook.
-    if grep -qE '^[[:space:]]*exit([[:space:]]|$)' "$target"; then
+    # Unindented only: an exit nested in an if or case is not the end of the script.
+    if grep -qE '^exit([[:space:]]|$)' "$target"; then
       echo "devasign: WARNING - $target has a top-level 'exit'; the line just appended may never run."
       echo "devasign:          Move that line above the exit, or reviews will silently not happen."
     fi

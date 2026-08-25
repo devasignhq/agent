@@ -16,6 +16,10 @@ set -u
 HOOKS=$(cd "$(dirname "$0")/../hooks" && pwd)
 RACE_SHA=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 fails=0
+# Resolved before the stub joins PATH, so the stub can reach the real ls without
+# recursing into itself and without assuming it sits at /bin/ls.
+REAL_LS=$(command -v ls || true)
+[ -n "$REAL_LS" ] || { echo "no ls on PATH; cannot run"; exit 1; }
 
 run_case() {
   hook="$1"; want="$2"; label="$3"
@@ -32,7 +36,9 @@ done
 STUB
   cat > "$T/bin/ls" <<'STUB'
 #!/usr/bin/env bash
-out=$(/bin/ls "$@" 2>/dev/null)
+real="${DEVASIGN_TEST_REAL_LS:-}"
+if [ -n "$real" ]; then out=$("$real" "$@" 2>/dev/null)
+else out=$(command -p ls "$@" 2>/dev/null); fi
 case " $* " in
   *"$DEVASIGN_TEST_QDIR"*)
     # First empty listing of the queue: a commit lands in the drain window.
@@ -57,6 +63,7 @@ STUB
     export DEVASIGN_TEST_QDIR="$root/.devasign/queue"
     export DEVASIGN_TEST_FIRED="$T/fired"
     export DEVASIGN_TEST_RACE_SHA="$RACE_SHA"
+    export DEVASIGN_TEST_REAL_LS="$REAL_LS"
     : > "$DEVASIGN_TEST_REVIEWED"
     PATH="$T/bin:$PATH" bash .devasign/hooks/post-commit >/dev/null 2>&1
     for i in $(seq 1 60); do [ -d "$root/.devasign/.review.lock" ] || break; sleep 0.2; done
@@ -70,7 +77,7 @@ STUB
     echo "  FAIL  $label (race commit reviewed=$got, wanted $want)"
     fails=$((fails + 1))
   fi
-  leftover=$(/bin/ls -1 "$T/repo/.devasign/queue" 2>/dev/null | wc -l | tr -d ' ')
+  leftover=$("$REAL_LS" -1 "$T/repo/.devasign/queue" 2>/dev/null | wc -l | tr -d ' ')
   if [ "$want" = yes ]; then
     [ "$leftover" = "0" ] || { echo "  FAIL  $label left $leftover file(s) queued"; fails=$((fails + 1)); }
     [ -d "$T/repo/.devasign/.review.lock" ] && { echo "  FAIL  $label left a stale lock"; fails=$((fails + 1)); }
