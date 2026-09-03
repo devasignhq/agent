@@ -7,7 +7,11 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { contributorNotifyTarget } from "../users.js";
-import { dismissPRReview, dispatchWorkflow, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { dismissPRReview, dispatchWorkflow, gh, ghText, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { joinVerifyBranch, startVerifyBranch, type VerifyBranch } from "../verify/branch.js";
+import { blastRadiusCriteria } from "../verify/blast-radius.js";
+import { formatVerificationSection, postVerifyCheckRun, type VerificationView } from "../verify/report.js";
+import { updateRun as updateVerifyRun } from "../verify/runs.js";
 import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
 import { complete, completeWithMeta, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
 import { track } from "../statsig.js";
@@ -527,7 +531,38 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
     }
 
+    // Blast-radius criteria: consumers of a changed route/export inside this
+    // repo must keep working. Deterministic (diff + index), shared by both
+    // branches below because the criteria are synthesized exactly once.
+    if (repo.indexState === "ready" || repo.indexState === "stale") {
+      const blast = blastRadiusCriteria({
+        diff: context.diff,
+        entries: db.filter("repoIndex", (e) => e.repoId === repo.id),
+        existing: criteria,
+      });
+      if (blast.length) {
+        criteria = [...criteria, ...blast];
+        log(review.id, "criteria", `Added ${blast.length} blast-radius criteria`, {
+          detail: blast.map((c) => c.text).join("\n"),
+          meta: { count: blast.length, source: "blast_radius" },
+        });
+      }
+    }
     setStatus(review.id, { taskId: task.id, criteria });
+    const criteriaFinishedAt = Date.now();
+
+    // FORK: the verify branch plans its tests now and runs in parallel with
+    // every review stage below; joinVerifyBranch (before the verdict) reads it
+    // back with a bounded wait so verification never delays the review.
+    const verifyBranch: VerifyBranch = startVerifyBranch({
+      review,
+      repo,
+      install: install ?? null,
+      wf,
+      criteria,
+      criteriaFinishedAt,
+      log: (action, extra) => log(review.id, "verify", action, extra),
+    });
 
     // c. Review the diff against the criteria. priorVerdicts anchors criteria an
     // earlier commit already satisfied so a follow-up commit doesn't re-fail them.
@@ -925,6 +960,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
     }
 
+    // JOIN: bounded wait for the verify branch; a pending verification reports
+    // as pending and is updated in place when results land (verify/report.ts).
+    // Verification never gates `status` in this build.
+    const verification = await joinVerifyBranch(verifyBranch, {
+      review,
+      repo,
+      criteria: filledCriteria,
+      log: (action, extra) => log(review.id, "verify", action, extra),
+    });
+
     const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
     setStatus(review.id, {
       criteria: filledCriteria,
@@ -1047,6 +1092,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       endGoalCTA: includeEndGoalCTA,
       progressCommentId,
       prior: priorVerdicts,
+      verification,
     });
     // The verdict comment is now written. Clear the local id so a later
     // non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit the
@@ -1326,6 +1372,21 @@ async function ingestContext(
         ref: `${repo.owner}/${repo.name}#${review.prNumber}`,
         text: `${pr.title}\n\n${prBody}`,
       });
+      // A coding agent's own statement of intent, if the PR carries one.
+      const intent = extractAgentIntent(prBody);
+      if (intent) sources.push({ kind: "agent_intent", ref: `${repo.owner}/${repo.name}#${review.prNumber}`, text: intent });
+      try {
+        const file = await gh<{ content?: string; encoding?: string }>(
+          install.installationId,
+          `/repos/${repo.owner}/${repo.name}/contents/.devasign/intent.md?ref=${review.headSha}`
+        );
+        if (file && typeof file.content === "string" && file.content) {
+          const text = Buffer.from(file.content, (file.encoding as BufferEncoding) || "base64").toString("utf8").trim();
+          if (text) sources.push({ kind: "agent_intent", ref: ".devasign/intent.md", text: text.slice(0, 20_000) });
+        }
+      } catch {
+        // Absent on most PRs.
+      }
       // Persist real diff stats from the full PR object so the queue card
       // shows accurate counts instead of zeros.
       const nextAdditions = typeof pr.additions === "number" ? pr.additions : review.additions;
@@ -1728,14 +1789,12 @@ async function fetchIssueSafe(
   }
 }
 
-async function ghText(installationId: number, path: string, headers: Record<string, string>) {
-  const { installationToken } = await import("../github/app.js");
-  const token = await installationToken(installationId);
-  const res = await fetch(`https://api.github.com${path}`, {
-    headers: { ...headers, Authorization: `token ${token}`, "User-Agent": "devasign-app" },
-  });
-  if (!res.ok) throw new Error(`gh text ${res.status} on ${path}`);
-  return res.text();
+// `<!-- devasign:intent -->…<!-- /devasign:intent -->` in a PR body: a coding
+// agent's own account of what it built.
+export function extractAgentIntent(body: string | null | undefined): string | null {
+  const m = /<!--\s*devasign:intent\s*-->([\s\S]*?)<!--\s*\/devasign:intent\s*-->/i.exec(body || "");
+  const text = m?.[1]?.trim() || "";
+  return text ? text.slice(0, 20_000) : null;
 }
 
 // --- Criteria synthesis ---
@@ -1827,6 +1886,17 @@ export async function synthesizeCriteriaCore(args: {
     text: String(c.text || ""),
     met: null,
     evidence: null,
+    kind: c.kind === "ui" || c.kind === "unverifiable" ? c.kind : "code",
+    implied: c.implied === true,
+    ...(c.source && typeof c.source === "object" && typeof c.source.input === "string"
+      ? {
+          source: {
+            input: c.source.input,
+            ...(typeof c.source.ref === "string" ? { ref: String(c.source.ref).slice(0, 200) } : {}),
+            ...(typeof c.source.excerpt === "string" ? { excerpt: String(c.source.excerpt).slice(0, 300) } : {}),
+          },
+        }
+      : {}),
   }));
   return { endGoal: String(parsed.endGoal || ""), criteria };
 }
@@ -2373,7 +2443,8 @@ export function formatReviewBody(
   holistic: HolisticVerdict = EMPTY_HOLISTIC,
   context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
   prior: Map<string, PriorVerdict> = new Map(),
-  lineNotes: Array<{ path: string; line: number; body: string }> = []
+  lineNotes: Array<{ path: string; line: number; body: string }> = [],
+  verification: VerificationView | null = null
 ): string {
   const lines: string[] = [];
   const specless = filledCriteria.length === 0;
@@ -2698,6 +2769,13 @@ export function formatReviewBody(
   // button, so the user gets one-click copy of the whole prompt. A blank line
   // separates the </summary> from the fence so GitHub renders the markdown
   // inside <details> instead of treating it as raw HTML.
+  // Verification: per-criterion verdicts from tests that actually ran (or the
+  // pending/setup state). Marker-delimited so a later result update can splice
+  // this block without re-rendering the rest of the comment.
+  if (verification) {
+    lines.push(...formatVerificationSection(verification).split("\n"), "");
+  }
+
   const findings = collectConsolidatedFindings(holistic);
   if (context && (unmet.length > 0 || findings.length > 0)) {
     const prompt = buildConsolidatedFixPrompt({
@@ -3078,6 +3156,9 @@ async function postGithubOutput(
     // criterion that's still-open from one an earlier commit met but a later
     // commit broke (a regression). Empty on a first review.
     prior: Map<string, PriorVerdict>;
+    // The verify branch's state at the join — rendered as the "Verification"
+    // section and the "DevAsign · Verify" check run.
+    verification?: VerificationView | null;
   }
 ): Promise<{ verdictPosted: boolean }> {
   if (!install) return { verdictPosted: false }; // dev: nothing to post to
@@ -3105,7 +3186,8 @@ async function postGithubOutput(
     args.holistic,
     { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
     args.prior,
-    lineNotes
+    lineNotes,
+    args.verification ?? null
   );
   const commentBody = verdictCommentBody({ status, specless, reviewBody: fullBody });
   // Write the verdict into the conversation comment; returns whether it landed.
@@ -3115,7 +3197,12 @@ async function postGithubOutput(
   // the review.
   const writeVerdictComment = async (editOnly = false): Promise<boolean> => {
     if (args.progressCommentId !== null) {
-      return updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
+      const ok = await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
+      if (ok && args.verification?.runId) {
+        const run = db.find("verifyRuns", (r) => r.id === args.verification!.runId);
+        if (run) updateVerifyRun(run.id, { report: { ...(run.report || {}), commentId: args.progressCommentId! } });
+      }
+      return ok;
     }
     if (editOnly) return false;
     const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
@@ -3151,6 +3238,9 @@ async function postGithubOutput(
     });
   } catch (err) {
     console.warn("[review] failed to post check run:", err);
+  }
+  if (args.verification) {
+    await postVerifyCheckRun(install, repo, review, args.verification);
   }
 
   // Already asked for an end goal on a prior pass: refresh only the Check Run and

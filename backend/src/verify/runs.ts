@@ -6,6 +6,7 @@ import { config } from "../config.js";
 import { planForUser, type Plan } from "../billing/plans.js";
 import type {
   Criterion,
+  CriteriaRevision,
   Installation,
   PRReview,
   Repository,
@@ -75,6 +76,33 @@ export function createVerifyRun(input: {
     createdAt: now,
     updatedAt: now,
   });
+}
+
+function revisionKey(criteria: Criterion[]): string {
+  return JSON.stringify(criteria.map((c) => [c.id, c.text, c.kind ?? "code", !!c.notApplicable, c.supersededBy ?? null]));
+}
+
+/** Record the criteria as a revision; a snapshot identical to the latest one is reused, not duplicated. */
+export function snapshotCriteriaRevision(reviewId: string, criteria: Criterion[], causedByCommentId: number | null, diff: CriteriaRevision["diff"] = []): CriteriaRevision {
+  const rows = db.filter("criteriaRevisions", (c) => c.reviewId === reviewId).sort((a, b) => b.revision - a.revision);
+  const latest = rows[0] ?? null;
+  if (latest && revisionKey(latest.criteria) === revisionKey(criteria)) return latest;
+  return db.insert("criteriaRevisions", {
+    id: uuid(),
+    schemaVersion: 1,
+    reviewId,
+    revision: (latest?.revision ?? 0) + 1,
+    causedByCommentId,
+    criteria: criteria.map((c) => ({ ...c })),
+    diff,
+    createdAt: Date.now(),
+  });
+}
+
+/** Has a runner ever talked to us about this repo? Drives the "Setup pending" state. */
+export function hasRunnerEvidence(repo: Pick<Repository, "id" | "verify">): boolean {
+  if (repo.verify?.detected || repo.verify?.onboarding?.firstSuccessfulRunId) return true;
+  return !!db.find("verifyRuns", (r) => r.repoId === repo.id && r.timings.resolvedAt != null);
 }
 
 export function updateRun(id: string, patch: Partial<VerifyRun>): VerifyRun | null {

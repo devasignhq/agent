@@ -44,6 +44,8 @@ import { addClient, removeClient } from "../notifications-stream.js";
 import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
+import { buildRunView } from "../verify/runs.js";
+import { repoFlakeRate } from "../verify/flake.js";
 
 export const api = Router();
 
@@ -1230,6 +1232,25 @@ export function getReviewHandler(req: Request, res: Response) {
   res.json({ review, logs, task });
 }
 api.get("/reviews/:id", getReviewHandler);
+
+// Latest verify run for a review (same owner gate as the review read).
+api.get("/reviews/:id/verify", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const runs = db.filter("verifyRuns", (r) => r.reviewId === review.id).sort((a, b) => b.createdAt - a.createdAt);
+  const latest = runs[0] ? await buildRunView(runs[0], { includeUsage: true }) : null;
+  res.json({
+    latest,
+    runs: runs.map((r) => ({ id: r.id, sha: r.sha, attempt: r.attempt, status: r.status, createdAt: r.createdAt, verdicts: r.verdicts.length })),
+    flakeRate: repoFlakeRate(repo.id),
+  });
+});
 
 // Re-run a review (e.g. after the user attached a Loom and updated the task).
 // Same owner-scoped gate as the read above — this re-queues work, so an
