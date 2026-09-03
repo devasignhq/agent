@@ -27,6 +27,7 @@ export type PlanTest = {
   runner: TestRunner;
   testSignature: string; // sha256(criterion text + level + target files)
   strategyVersion: number; // bumps each time a flaky signature is regenerated
+  targetFiles: string[]; // repo files the test exercises (part of the signature)
 };
 
 export type PlanCommand = {

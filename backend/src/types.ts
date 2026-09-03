@@ -1135,6 +1135,7 @@ export type VerifyRun = {
   verdicts: CriterionVerdict[];
   timings: {
     forkedAt: number;
+    criteriaFinishedAt?: number;
     planStartedAt?: number;
     planFinishedAt?: number;
     resolvedAt?: number;
@@ -1265,6 +1266,10 @@ export type TestFlakeHistory = {
   flakeCount: number;
   quarantinedAt: number | null;
   retiredAt: number | null;
+  // What the signature stands for, so the planner can find history by criterion.
+  criterionText?: string;
+  level?: string;
+  targetFiles?: string[];
   updatedAt: number;
 };
 

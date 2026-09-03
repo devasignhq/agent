@@ -321,3 +321,13 @@ export async function dispatchWorkflow(
     );
   }
 }
+
+// Raw (non-JSON) GitHub read — the PR diff, a file at a ref. Same token path as gh().
+export async function ghText(installationId: number, path: string, headers: Record<string, string>): Promise<string> {
+  const token = await installationToken(installationId);
+  const res = await fetch(`https://api.github.com${path}`, {
+    headers: { ...headers, Authorization: `token ${token}`, "User-Agent": "devasign-app" },
+  });
+  if (!res.ok) throw new Error(`gh text ${res.status} on ${path}`);
+  return res.text();
+}
