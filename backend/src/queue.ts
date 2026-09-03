@@ -123,6 +123,25 @@ export type CrossRepoTopologyJob = {
   attempts: number;
 };
 
+// Verifier jobs. Their own bucket: a runner is long-polling for the plan and a
+// results upload is waiting on judgment — neither may sit behind a repo index.
+export type VerifyPlanJob = { id: string; type: "verify_plan"; payload: { runId: string }; enqueuedAt: number; attempts: number };
+export type VerifyJudgeJob = { id: string; type: "verify_judge"; payload: { runId: string }; enqueuedAt: number; attempts: number };
+export type VerifyFeedbackJob = {
+  id: string;
+  type: "verify_feedback";
+  payload: { reviewId: string; commentId: number };
+  enqueuedAt: number;
+  attempts: number;
+};
+export type VerifyOnboardJob = {
+  id: string;
+  type: "verify_onboard";
+  payload: { repoId: string; trigger: "install" | "manual" | "doctor" };
+  enqueuedAt: number;
+  attempts: number;
+};
+
 export type Job =
   | ReviewJob
   | MaintainerFeedbackJob
@@ -131,9 +150,15 @@ export type Job =
   | GuidanceIngestJob
   | BountyCriteriaJob
   | SecurityAuditJob
-  | CrossRepoTopologyJob;
+  | CrossRepoTopologyJob
+  | VerifyPlanJob
+  | VerifyJudgeJob
+  | VerifyFeedbackJob
+  | VerifyOnboardJob;
 
-const pending: { reviews: Job[]; index: Job[] } = { reviews: [], index: [] };
+const BUCKETS = ["reviews", "verify", "index"] as const;
+type Bucket = (typeof BUCKETS)[number];
+const pending: Record<Bucket, Job[]> = { reviews: [], verify: [], index: [] };
 const subscribers: Array<(job: Job) => void> = [];
 
 export function enqueueReview(reviewId: string): ReviewJob {
@@ -275,44 +300,72 @@ export function enqueueCrossRepoTopology(
   return job;
 }
 
+function enqueueVerify<J extends VerifyPlanJob | VerifyJudgeJob>(type: J["type"], runId: string): J {
+  const waiting = pending.verify.find(
+    (j): j is J => j.type === type && (j as J).payload.runId === runId
+  );
+  if (waiting) return waiting;
+  const job = { id: uuid(), type, payload: { runId }, enqueuedAt: Date.now(), attempts: 0 } as J;
+  pending.verify.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export const enqueueVerifyPlan = (runId: string) => enqueueVerify<VerifyPlanJob>("verify_plan", runId);
+export const enqueueVerifyJudge = (runId: string) => enqueueVerify<VerifyJudgeJob>("verify_judge", runId);
+
+export function enqueueVerifyFeedback(reviewId: string, commentId: number): VerifyFeedbackJob {
+  const job: VerifyFeedbackJob = {
+    id: uuid(),
+    type: "verify_feedback",
+    payload: { reviewId, commentId },
+    enqueuedAt: Date.now(),
+    attempts: 0,
+  };
+  pending.verify.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
+export function enqueueVerifyOnboard(payload: VerifyOnboardJob["payload"]): VerifyOnboardJob {
+  const waiting = pending.verify.find(
+    (j): j is VerifyOnboardJob => j.type === "verify_onboard" && j.payload.repoId === payload.repoId
+  );
+  if (waiting) return waiting;
+  const job: VerifyOnboardJob = { id: uuid(), type: "verify_onboard", payload, enqueuedAt: Date.now(), attempts: 0 };
+  pending.verify.push(job);
+  process.nextTick(notify);
+  return job;
+}
+
 export function onJob(cb: (job: Job) => void) {
   subscribers.push(cb);
   notify();
+}
+
+async function runOne(job: Job): Promise<void> {
+  job.attempts += 1;
+  for (const sub of subscribers) {
+    try {
+      await sub(job);
+    } catch (err) {
+      console.error("[queue] subscriber error", err);
+    }
+  }
 }
 
 let draining = false;
 async function notify() {
   if (draining || subscribers.length === 0) return;
   draining = true;
-  // Round-robin: take one review-bucket job, then one index-bucket job,
-  // repeat until both empty. Reviews come first inside a round so a freshly
-  // enqueued review never sits behind an index batch.
+  // Round-robin across buckets, reviews first within a round, so a freshly
+  // enqueued review never sits behind an index batch and a waiting runner
+  // never sits behind either.
   try {
-    while (pending.reviews.length > 0 || pending.index.length > 0) {
-      const job = pending.reviews.shift() || pending.index.shift();
-      if (!job) break;
-      job.attempts += 1;
-      for (const sub of subscribers) {
-        try {
-          await sub(job);
-        } catch (err) {
-          console.error("[queue] subscriber error", err);
-        }
-      }
-      // If both buckets have work, alternate by also draining one from the
-      // other side this round before looping.
-      if (pending.reviews.length > 0 && pending.index.length > 0) {
-        const partner = job.type === "index" ? pending.reviews.shift() : pending.index.shift();
-        if (partner) {
-          partner.attempts += 1;
-          for (const sub of subscribers) {
-            try {
-              await sub(partner);
-            } catch (err) {
-              console.error("[queue] subscriber error", err);
-            }
-          }
-        }
+    while (BUCKETS.some((b) => pending[b].length > 0)) {
+      for (const b of BUCKETS) {
+        const job = pending[b].shift();
+        if (job) await runOne(job);
       }
     }
   } finally {
@@ -322,8 +375,9 @@ async function notify() {
 
 export function queueSnapshot() {
   return {
-    pending: pending.reviews.length + pending.index.length,
+    pending: pending.reviews.length + pending.verify.length + pending.index.length,
     reviews: pending.reviews.length,
+    verify: pending.verify.length,
     index: pending.index.length,
     subscribers: subscribers.length,
   };
