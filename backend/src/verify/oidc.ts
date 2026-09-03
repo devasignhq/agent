@@ -3,7 +3,9 @@
 // issuer, and our audience. Claim names per GitHub's OIDC docs.
 import { createPublicKey, type JsonWebKey } from "node:crypto";
 import jwt from "jsonwebtoken";
-import { config } from "../config.js";
+import { readFile } from "node:fs/promises";
+import { fileURLToPath } from "node:url";
+import { config, isProductionLike } from "../config.js";
 
 export type ActionsClaims = {
   iss: string;
@@ -47,8 +49,24 @@ const JWKS_TTL_MS = 10 * 60_000;
 
 let cache: { keys: Jwk[]; fetchedAt: number } | null = null;
 
+export const GITHUB_OIDC_ISSUER = "https://token.actions.githubusercontent.com";
+export const GITHUB_OIDC_JWKS = "https://token.actions.githubusercontent.com/.well-known/jwks";
+
+// Overrides are a local-dev affordance; a production deploy always verifies against GitHub.
+function issuer(): string {
+  return isProductionLike() ? GITHUB_OIDC_ISSUER : config.verify.oidcIssuer;
+}
+function jwksUrl(): string {
+  return isProductionLike() ? GITHUB_OIDC_JWKS : config.verify.oidcJwksUrl;
+}
+
 async function fetchJwks(): Promise<Jwk[]> {
-  const res = await fetch(config.verify.oidcJwksUrl, {
+  const url = jwksUrl();
+  if (url.startsWith("file://")) {
+    const data = JSON.parse(await readFile(fileURLToPath(url), "utf8")) as { keys?: Jwk[] };
+    return Array.isArray(data.keys) ? data.keys : [];
+  }
+  const res = await fetch(url, {
     headers: { "User-Agent": "devasign-app", Accept: "application/json" },
     signal: AbortSignal.timeout(10_000),
   });
@@ -98,7 +116,7 @@ export async function verifyActionsToken(token: string, deps: OidcDeps = {}): Pr
   try {
     const claims = jwt.verify(token, pem, {
       algorithms: ["RS256"],
-      issuer: config.verify.oidcIssuer,
+      issuer: issuer(),
       audience: config.verify.oidcAudience,
       ...(deps.now ? { clockTimestamp: Math.floor(deps.now() / 1000) } : {}),
     }) as Record<string, unknown>;

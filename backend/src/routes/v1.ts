@@ -14,6 +14,9 @@ import { runnerLimiter } from "../rate-limit.js";
 import type { Installation, Repository, VerifyArtifact, VerifyArtifactKind } from "../types.js";
 import { prNumberFromRef, verifyActionsToken, type ActionsClaims, type OidcResult } from "../verify/oidc.js";
 import { artifactKey, artifactStorage, retentionExpiresAt, UPLOAD_LIMITS } from "../verify/storage.js";
+import { localArtifactPath, localStoreEnabled, verifyLocalSignature } from "../verify/storage-local.js";
+import { mkdir, readFile, writeFile } from "node:fs/promises";
+import path from "node:path";
 import {
   buildRunView,
   latestRunForReview,
@@ -404,8 +407,47 @@ export async function getRunHandler(req: RunnerRequest, res: Response): Promise<
 }
 
 export const v1 = Router();
-v1.use(express.json({ limit: "8mb" }));
 v1.use(runnerLimiter);
+
+// Dev-only artifact bytes (see verify/storage-local.ts). Registered before the
+// JSON parser: bodies are raw files.
+function localGuard(method: "PUT" | "GET", req: Request, res: Response): string | null {
+  if (!localStoreEnabled()) {
+    fail(res, 404, "not_found");
+    return null;
+  }
+  const key = decodeURIComponent(String(req.params.key || ""));
+  const exp = Number(req.query.exp);
+  const sig = String(req.query.sig || "");
+  const full = localArtifactPath(key);
+  if (!full || !verifyLocalSignature(method, key, exp, sig)) {
+    fail(res, 403, "bad_signature");
+    return null;
+  }
+  return full;
+}
+v1.put("/artifacts/local/:key", express.raw({ type: () => true, limit: UPLOAD_LIMITS.maxFileBytes }), async (req, res) => {
+  const full = localGuard("PUT", req, res);
+  if (!full) return;
+  await mkdir(path.dirname(full), { recursive: true });
+  await writeFile(full, req.body as Buffer);
+  res.status(200).end();
+});
+v1.get("/artifacts/local/:key", async (req, res) => {
+  const full = localGuard("GET", req, res);
+  if (!full) return;
+  try {
+    const bytes = await readFile(full);
+    const ext = path.extname(full).toLowerCase();
+    const type = ext === ".webm" ? "video/webm" : ext === ".zip" ? "application/zip" : ext === ".png" ? "image/png" : ext === ".jpg" ? "image/jpeg" : "text/plain; charset=utf-8";
+    res.setHeader("Content-Type", type);
+    res.send(bytes);
+  } catch {
+    fail(res, 404, "not_found");
+  }
+});
+
+v1.use(express.json({ limit: "8mb" }));
 v1.post("/runs/resolve", runnerAuth, resolveHandler);
 v1.post("/runs/:runId/artifacts", runnerAuth, artifactsHandler);
 v1.post("/runs/:runId/results", runnerAuth, resultsHandler);

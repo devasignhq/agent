@@ -10,6 +10,7 @@ import {
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
 import { config, isArtifactStorageConfigured } from "../config.js";
+import { localArtifactStorage } from "./storage-local.js";
 import type { Plan } from "../billing/plans.js";
 import type { VerifyArtifactKind } from "../types.js";
 
@@ -44,7 +45,8 @@ const EXT: Record<VerifyArtifactKind, string> = {
 
 export function artifactKey(repoId: string, runId: string, artifactId: string, kind: VerifyArtifactKind, contentType: string): string {
   let ext = EXT[kind];
-  if (kind === "screenshot" && /jpe?g/i.test(contentType)) ext = "jpg";
+  if ((kind === "screenshot" || kind === "poster") && /jpe?g/i.test(contentType)) ext = "jpg";
+  if (kind === "poster" && /png/i.test(contentType)) ext = "png";
   return `${repoId}/${runId}/${artifactId}.${ext}`;
 }
 
@@ -95,10 +97,11 @@ const s3Storage: ArtifactStorage = {
 
 let override: ArtifactStorage | null | undefined;
 
-/** The configured storage, or null when ARTIFACT_S3_* is unset (artifacts disabled). */
+/** The configured storage, or null when neither ARTIFACT_S3_* nor the dev store is set. */
 export function artifactStorage(): ArtifactStorage | null {
   if (override !== undefined) return override;
-  return isArtifactStorageConfigured() ? s3Storage : null;
+  if (isArtifactStorageConfigured()) return s3Storage;
+  return localArtifactStorage();
 }
 
 export function setArtifactStorageForTests(s: ArtifactStorage | null | undefined): void {

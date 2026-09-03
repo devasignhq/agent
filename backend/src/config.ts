@@ -203,8 +203,10 @@ export const config = {
   },
   // Verifier: runner auth (GitHub Actions OIDC) and branch timing.
   verify: {
-    oidcIssuer: "https://token.actions.githubusercontent.com",
-    oidcJwksUrl: "https://token.actions.githubusercontent.com/.well-known/jwks",
+    // Issuer/JWKS overrides are honoured only when NOT production-like (see
+    // verify/oidc.ts) — they exist so a local run can present a dev-minted token.
+    oidcIssuer: process.env.VERIFY_OIDC_ISSUER || "https://token.actions.githubusercontent.com",
+    oidcJwksUrl: process.env.VERIFY_OIDC_JWKS_URL || "https://token.actions.githubusercontent.com/.well-known/jwks",
     oidcAudience: process.env.VERIFY_OIDC_AUDIENCE || "devasign",
     // How long the review branch waits at the join before reporting "pending".
     joinTimeoutMs: Number(process.env.VERIFY_JOIN_TIMEOUT_MS || 60_000),
@@ -222,6 +224,11 @@ export const config = {
     secretAccessKey: process.env.ARTIFACT_S3_SECRET_ACCESS_KEY || "",
     putUrlTtlSeconds: Number(process.env.ARTIFACT_PUT_URL_TTL_SECONDS || 900),
     getUrlTtlSeconds: Number(process.env.ARTIFACT_GET_URL_TTL_SECONDS || 300),
+    // Dev-only file-backed store (refused when production-like): signed PUT/GET
+    // served by this server from /v1/artifacts/local. Lets a local runner upload
+    // recordings with no bucket. apiOrigin is the base those signed URLs use.
+    localDir: process.env.ARTIFACT_LOCAL_DIR || "",
+    apiOrigin: process.env.API_ORIGIN || `http://localhost:${Number(process.env.PORT || 8787)}`,
   },
 };
 
