@@ -1,0 +1,32 @@
+name: "DevAsign Verify"
+description: "Runs DevAsign's generated acceptance tests for this pull request inside your CI and reports per-criterion evidence."
+author: "DevAsign"
+branding:
+  icon: "check-circle"
+  color: "green"
+inputs:
+  api-url:
+    description: "DevAsign API origin."
+    required: false
+    default: "https://devasign-agent.onrender.com"
+  fail-on:
+    description: "never (default) or verdict — fail this job when a criterion fails verification."
+    required: false
+    default: "never"
+  version:
+    description: "@devasign/verify version range to run."
+    required: false
+    default: "1"
+  working-directory:
+    description: "Repository checkout to verify (monorepo package or subdirectory)."
+    required: false
+    default: "."
+runs:
+  using: "composite"
+  steps:
+    - name: Run DevAsign verification
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DEVASIGN_API_URL: ${{ inputs.api-url }}
+      run: npx --yes "@devasign/verify@${{ inputs.version }}" run --fail-on "${{ inputs.fail-on }}"
