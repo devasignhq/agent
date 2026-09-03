@@ -71,3 +71,6 @@ coverage/
 # Motion
 .motion/
 motion/
+# @devasign/verify local fixture runs
+verify/fixtures/**/.devasign/
+verify/fixtures/results.json
