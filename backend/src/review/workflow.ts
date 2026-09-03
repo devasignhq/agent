@@ -10,7 +10,7 @@ import type { Repository, RepoWorkflow } from "../types.js";
 
 // The stages that make an LLM call and can therefore carry maintainer
 // instructions. Shared by normalize/effective/advancedChanged and the pipeline.
-export const PROMPT_KEYS = ["criteria", "review", "holistic", "security", "defects", "deferrals", "docs", "crossRepo"] as const;
+export const PROMPT_KEYS = ["criteria", "review", "holistic", "security", "defects", "deferrals", "docs", "crossRepo", "verify"] as const;
 // Cap a single stage prompt so a pasted essay can't blow up the system prompt.
 const PROMPT_CAP = 2000;
 // Cap the stored workflow file name for the "Run GitHub Action" step.
@@ -29,10 +29,11 @@ const WORKFLOW_NAME_CAP = 200;
 export const WORKFLOW_DEFAULTS: RepoWorkflow = {
   version: 1,
   trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-  stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: false },
+  stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: false, verify: true },
   verdict: { blocking: true },
   prompts: {},
   actions: { enabled: false, workflow: "", runWhen: "passed" },
+  verify: { e2e: "auto", failOn: "never" },
 };
 
 // Merge a repo's stored (possibly partial/legacy) workflow over the defaults so
@@ -48,6 +49,7 @@ export function effectiveWorkflow(repo: Pick<Repository, "workflow">): RepoWorkf
     verdict: { ...WORKFLOW_DEFAULTS.verdict, ...(w.verdict || {}) },
     prompts: { ...(w.prompts || {}) },
     actions: { ...WORKFLOW_DEFAULTS.actions!, ...(w.actions || {}) },
+    verify: { ...WORKFLOW_DEFAULTS.verify!, ...(w.verify || {}) },
   };
 }
 
@@ -77,6 +79,11 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
     workflow: typeof a.workflow === "string" ? a.workflow.trim().slice(0, WORKFLOW_NAME_CAP) : "",
     runWhen: a.runWhen === "always" ? "always" : "passed",
   };
+  const vf = (o.verify || {}) as Record<string, any>;
+  const verify: NonNullable<RepoWorkflow["verify"]> = {
+    e2e: vf.e2e === "always" || vf.e2e === "never" ? vf.e2e : "auto",
+    failOn: vf.failOn === "verdict" ? "verdict" : "never",
+  };
   return {
     version: 1,
     trigger: {
@@ -90,10 +97,12 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
       docs: b(s.docs, WORKFLOW_DEFAULTS.stages.docs),
       deferrals: b(s.deferrals, WORKFLOW_DEFAULTS.stages.deferrals),
       crossRepo: b(s.crossRepo, WORKFLOW_DEFAULTS.stages.crossRepo),
+      verify: b(s.verify, WORKFLOW_DEFAULTS.stages.verify),
     },
     verdict: { blocking: b(v.blocking, WORKFLOW_DEFAULTS.verdict.blocking) },
     prompts,
     actions,
+    verify,
   };
 }
 

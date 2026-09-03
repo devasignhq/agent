@@ -801,10 +801,12 @@ function upsertRepoFromInstallEvent(
   );
   if (existing) {
     const visChanged = typeof repo.private === "boolean" && existing.private !== repo.private;
-    if (existing.installationId !== installDbId || visChanged) {
+    const learnId = typeof repo.id === "number" && existing.githubRepoId !== repo.id;
+    if (existing.installationId !== installDbId || visChanged || learnId) {
       db.update("repositories", (r) => r.id === existing.id, {
         installationId: installDbId,
         ...(typeof repo.private === "boolean" ? { private: repo.private } : {}),
+        ...(learnId ? { githubRepoId: repo.id } : {}),
       });
     }
     return;
@@ -820,6 +822,7 @@ function upsertRepoFromInstallEvent(
     modelOverrides: {},
     reviewsEnabled: true,
     indexState: "queued",
+    ...(typeof repo.id === "number" ? { githubRepoId: repo.id } : {}),
   });
   enqueueIndex({ repoId: newRepo.id, full: true });
 }
@@ -999,6 +1002,7 @@ function handlePullRequest(event: any) {
       modelOverrides: {},
       reviewsEnabled: true,
       indexState: "queued",
+      ...(typeof event.repository.id === "number" ? { githubRepoId: event.repository.id } : {}),
     };
     db.insert("repositories", repo);
     enqueueIndex({ repoId: repo.id, full: true });

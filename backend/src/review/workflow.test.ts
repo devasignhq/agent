@@ -23,6 +23,7 @@ test("effectiveWorkflow with no stored workflow reproduces prior behavior", () =
     docs: true,
     deferrals: true,
     crossRepo: false,
+    verify: true,
   });
   assert.deepEqual(wf.trigger, { onSynchronize: true, skipDrafts: false, skipBots: false });
   assert.equal(wf.verdict.blocking, true);
@@ -162,4 +163,31 @@ test("advancedChanged: editing the actions step is an ADVANCED change", () => {
   assert.equal(advancedChanged(enableEdit, runWhenEdit), true, "changing runWhen is advanced");
   const same = normalizeWorkflow({ ...enableEdit });
   assert.equal(advancedChanged(enableEdit, same), false, "identical actions are not a change");
+});
+
+test("verify stage defaults on with e2e:auto / failOn:never and normalizes", () => {
+  const def = effectiveWorkflow({ workflow: undefined });
+  assert.equal(def.stages.verify, true);
+  assert.deepEqual(def.verify, { e2e: "auto", failOn: "never" });
+
+  const legacy = effectiveWorkflow({ workflow: { version: 1, stages: { holistic: false } } as any });
+  assert.equal(legacy.stages.verify, true, "rows written before verify existed still run it");
+  assert.deepEqual(legacy.verify, { e2e: "auto", failOn: "never" });
+
+  const wf = normalizeWorkflow({
+    ...WORKFLOW_DEFAULTS,
+    stages: { ...WORKFLOW_DEFAULTS.stages, verify: false },
+    verify: { e2e: "never", failOn: "bogus" },
+    prompts: { verify: "  prefer integration tests  " },
+  });
+  assert.equal(wf.stages.verify, false);
+  assert.deepEqual(wf.verify, { e2e: "never", failOn: "never" });
+  assert.equal(wf.prompts?.verify, "prefer integration tests");
+
+  const bad = normalizeWorkflow({ version: 1, verify: { e2e: "sometimes", failOn: "verdict" } });
+  assert.deepEqual(bad.verify, { e2e: "auto", failOn: "verdict" });
+  // Toggling the stage is a BASIC edit, like every other stage.
+  assert.equal(advancedChanged(WORKFLOW_DEFAULTS, wf), true, "the prompt edit is advanced");
+  const stageOnly = normalizeWorkflow({ ...WORKFLOW_DEFAULTS, stages: { ...WORKFLOW_DEFAULTS.stages, verify: false } });
+  assert.equal(advancedChanged(WORKFLOW_DEFAULTS, stageOnly), false);
 });
