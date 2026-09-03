@@ -78,3 +78,11 @@ export const expensiveLimiter = rateLimit({
   windowMs: 60_000,
   limit: 30,
 });
+
+// The runner API (/v1). A job long-polls resolve every few seconds and then
+// signs + reports once; GitHub-hosted runners are mostly one VM per IP.
+export const runnerLimiter = rateLimit({
+  ...shared,
+  windowMs: 60_000,
+  limit: 300,
+});

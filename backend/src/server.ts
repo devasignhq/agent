@@ -50,6 +50,8 @@ import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex, enqueueSecurityAudit } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 import { requestContext } from "./request-context.js";
+import { v1 } from "./routes/v1.js";
+import { startVerifyReaper } from "./verify/reaper.js";
 
 // Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
 // fund/cancel/approve links in bounties/links.ts. A secret that is public (either
@@ -205,6 +207,11 @@ app.post(
   handleStripeWebhook
 );
 
+// Runner API (@devasign/verify). OIDC-authenticated, no browser Origin, and a
+// results payload can exceed 1mb — so it mounts here with its own JSON parser,
+// ahead of the global limit and the CSRF gate.
+app.use("/v1", v1);
+
 app.use(express.json({ limit: "1mb" }));
 
 // CSRF mitigation. The session cookie is SameSite=None in prod, so it rides
@@ -337,6 +344,7 @@ backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
 startTopologyRefresh();
+startVerifyReaper();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no
