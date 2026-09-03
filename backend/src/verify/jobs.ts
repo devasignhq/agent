@@ -1,26 +1,20 @@
-// Verify-branch background jobs. Phase 1 wires the queue and settles runs
-// honestly; the planner/judge bodies land in phase 2.
-import { db } from "../db.js";
-import { updateRun } from "./runs.js";
-
-const NOT_IMPLEMENTED = "verifier stage not available on this server yet";
+// Verify-branch background jobs (queue.ts bucket "verify").
+import { runVerifyJudge } from "./judge.js";
+import { runVerifyPlan } from "./plan.js";
 
 export async function runVerifyPlanJob(runId: string): Promise<void> {
-  const run = db.find("verifyRuns", (r) => r.id === runId);
-  if (!run || run.status !== "planning") return;
-  updateRun(run.id, { status: "failed", error: `planner: ${NOT_IMPLEMENTED}` });
+  await runVerifyPlan(runId);
 }
 
 export async function runVerifyJudgeJob(runId: string): Promise<void> {
-  const run = db.find("verifyRuns", (r) => r.id === runId);
-  if (!run || run.status !== "judging") return;
-  updateRun(run.id, { status: "failed", error: `judgment: ${NOT_IMPLEMENTED}` });
+  await runVerifyJudge(runId);
 }
 
-export async function runVerifyFeedbackJob(_reviewId: string, _commentId: number): Promise<void> {
-  console.warn(`[verify] feedback: ${NOT_IMPLEMENTED}`);
+// Phase 4b / 5.
+export async function runVerifyFeedbackJob(reviewId: string, commentId: number): Promise<void> {
+  console.warn(`[verify] feedback for ${reviewId}#${commentId}: not available on this server yet`);
 }
 
-export async function runVerifyOnboardJob(_repoId: string): Promise<void> {
-  console.warn(`[verify] onboarding: ${NOT_IMPLEMENTED}`);
+export async function runVerifyOnboardJob(repoId: string): Promise<void> {
+  console.warn(`[verify] onboarding for ${repoId}: not available on this server yet`);
 }
