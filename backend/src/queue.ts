@@ -139,7 +139,7 @@ export type VerifyFeedbackJob = {
 export type VerifyOnboardJob = {
   id: string;
   type: "verify_onboard";
-  payload: { repoId: string; trigger: "install" | "manual" | "doctor" };
+  payload: { repoId: string; trigger: "install" | "manual" | "doctor"; mode?: "separate" | "extend"; workflow?: string };
   enqueuedAt: number;
   attempts: number;
 };

@@ -2,6 +2,7 @@
 import { runVerifyJudge } from "./judge.js";
 import { runVerifyPlan } from "./plan.js";
 import { runVerifyFeedback } from "./feedback.js";
+import { runVerifyOnboard } from "./onboarding/job.js";
 import type { MaintainerComment } from "../queue.js";
 
 export async function runVerifyPlanJob(runId: string): Promise<void> {
@@ -16,8 +17,6 @@ export async function runVerifyFeedbackJob(reviewId: string, comment: Maintainer
   await runVerifyFeedback(reviewId, comment);
 }
 
-// Phase 5.
-
-export async function runVerifyOnboardJob(repoId: string): Promise<void> {
-  console.warn(`[verify] onboarding for ${repoId}: not available on this server yet`);
+export async function runVerifyOnboardJob(repoId: string, opts: { trigger: "install" | "manual" | "doctor"; mode?: "separate" | "extend"; workflow?: string }): Promise<void> {
+  await runVerifyOnboard(repoId, opts);
 }

@@ -378,6 +378,7 @@ const REQUIRED_APP_EVENTS = [
   "issue_comment",
   "pull_request_review",
   "pull_request_review_comment",
+  "check_run", // the "Adopt tests" button on the DevAsign · Verify check run
 ];
 async function verifyAppEventSubscriptions(): Promise<void> {
   const name = config.github.appName;

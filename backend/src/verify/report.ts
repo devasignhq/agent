@@ -231,10 +231,13 @@ export function spliceVerificationSection(body: string, section: string): string
   return `${body.replace(/\s+$/, "")}\n\n${section}`;
 }
 
-export function verifyCheckRunPayload(view: VerificationView, headSha: string) {
+export function verifyCheckRunPayload(view: VerificationView, headSha: string, opts: { doctor?: { code: string; message: string } | null; adoptRunId?: string | null } = {}) {
   let conclusion: "success" | "failure" | "neutral";
   let title: string;
-  if (view.state === "completed") {
+  if (opts.doctor) {
+    conclusion = "neutral";
+    title = "Setup needs attention";
+  } else if (view.state === "completed") {
     if (view.counts.fail > 0) {
       conclusion = "failure";
       title = `${view.counts.fail} of ${view.rows.length} criteria failed verification`;
@@ -271,12 +274,15 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string) {
     "",
     REPLY_LINE,
   ].join("\n");
+  // GitHub caps identifier at 20 chars: "adopt:" + 14 chars of the run id.
+  const actions = opts.adoptRunId ? [{ label: "Adopt tests", description: "Open a PR adding the generated tests", identifier: `adopt:${opts.adoptRunId.slice(0, 14)}` }] : [];
   return {
     name: VERIFY_CHECK_NAME,
     head_sha: headSha,
     status: "completed" as const,
     conclusion,
-    output: { title, summary: stateLine(view), text: text.slice(0, 60_000) },
+    output: { title, summary: opts.doctor ? `${opts.doctor.message} — criteria are unverifiable, not failed.` : stateLine(view), text: text.slice(0, 60_000) },
+    ...(actions.length ? { actions } : {}),
   };
 }
 
@@ -287,12 +293,15 @@ export async function postVerifyCheckRun(
   view: VerificationView
 ): Promise<{ id: number; url?: string } | null> {
   try {
+    const run = view.runId ? db.find("verifyRuns", (r) => r.id === view.runId) : null;
+    const plan = run?.planId ? db.find("verifyPlans", (p) => p.id === run.planId) : null;
+    const adoptable = run?.status === "completed" && (plan?.tests ?? []).some((t) => t.origin === "generated" && t.content);
     const res = await gh<{ id?: number; html_url?: string }>(
       install.installationId,
       `/repos/${repo.owner}/${repo.name}/check-runs`,
       {
         method: "POST",
-        body: JSON.stringify(verifyCheckRunPayload(view, review.headSha)),
+        body: JSON.stringify(verifyCheckRunPayload(view, review.headSha, { doctor: run?.doctor ?? null, adoptRunId: adoptable ? run!.id : null })),
         headers: { "Content-Type": "application/json" },
       }
     );

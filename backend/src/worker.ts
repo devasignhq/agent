@@ -81,7 +81,7 @@ async function runJob(job: Job): Promise<void> {
       return;
     case "verify_onboard":
       console.log(`[worker] verify_onboard ${job.payload.repoId} (${job.payload.trigger})`);
-      await runVerifyOnboardJob(job.payload.repoId);
+      await runVerifyOnboardJob(job.payload.repoId, { trigger: job.payload.trigger, mode: job.payload.mode, workflow: job.payload.workflow });
       return;
   }
 }

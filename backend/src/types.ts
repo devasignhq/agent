@@ -160,9 +160,13 @@ export type RepoVerifyState = {
   onboarding: {
     state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
     prNumber?: number;
+    prUrl?: string;
     mode?: "separate" | "extend";
     lastDiagnosis?: DoctorDiagnosis | null;
     firstSuccessfulRunId?: string | null;
+    expectedSecrets?: string[];
+    missingSecrets?: string[] | null; // null = the App could not read secret names
+    lastError?: string | null;
   };
 };
 
@@ -1159,7 +1163,7 @@ export type VerifyRun = {
   triggeredBy: { kind: "pr_event" | "comment" | "rerun" | "dispatch"; commentId?: number };
   // A feedback re-run plans only the affected criteria; the rest inherit this run's verdicts.
   inheritFromRunId?: string | null;
-  report?: { checkRunId?: number; checkRunUrl?: string; commentId?: number; commentUrl?: string };
+  report?: { checkRunId?: number; checkRunUrl?: string; commentId?: number; commentUrl?: string; adoptPrUrl?: string };
   createdAt: number;
   updatedAt: number;
 };

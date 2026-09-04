@@ -355,3 +355,80 @@ export async function repositoryDispatch(
   });
   if (!res.ok) throw new Error(`GitHub repository_dispatch ${res.status} on ${owner}/${name}: ${await res.text()}`);
 }
+
+// ── Git data helpers for the onboarding / adopt-test PRs (need contents:write) ──
+
+export async function getBranchSha(installationId: number, owner: string, name: string, branch: string): Promise<string> {
+  const b = await gh<{ commit?: { sha?: string } }>(installationId, `/repos/${owner}/${name}/branches/${encodeURIComponent(branch)}`);
+  if (!b?.commit?.sha) throw new Error(`branch ${branch} not found on ${owner}/${name}`);
+  return b.commit.sha;
+}
+
+/** Create `branch` at `sha`, or force it there when it already exists (a stale setup branch is ours to reset). */
+export async function ensureBranch(installationId: number, owner: string, name: string, branch: string, sha: string): Promise<void> {
+  const ref = `refs/heads/${branch}`;
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/git/refs`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ref, sha }),
+    });
+  } catch (err) {
+    if (!/422/.test(err instanceof Error ? err.message : String(err))) throw err;
+    await gh(installationId, `/repos/${owner}/${name}/git/${ref}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sha, force: true }),
+    });
+  }
+}
+
+/** Create or update one file on `branch` via the contents API (one commit per file). */
+export async function putFile(installationId: number, owner: string, name: string, branch: string, path: string, content: string, message: string): Promise<void> {
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  let sha: string | undefined;
+  try {
+    const cur = await gh<{ sha?: string }>(installationId, `/repos/${owner}/${name}/contents/${encoded}?ref=${encodeURIComponent(branch)}`);
+    sha = cur?.sha;
+  } catch {
+    sha = undefined; // new file
+  }
+  await gh(installationId, `/repos/${owner}/${name}/contents/${encoded}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, content: Buffer.from(content, "utf8").toString("base64"), branch, ...(sha ? { sha } : {}) }),
+  });
+}
+
+export async function readFileAtRef(installationId: number, owner: string, name: string, path: string, ref: string): Promise<string | null> {
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  try {
+    return await ghText(installationId, `/repos/${owner}/${name}/contents/${encoded}?ref=${encodeURIComponent(ref)}`, { Accept: "application/vnd.github.raw" });
+  } catch {
+    return null;
+  }
+}
+
+export async function createPullRequest(
+  installationId: number,
+  owner: string,
+  name: string,
+  args: { title: string; body: string; head: string; base: string }
+): Promise<{ number: number; html_url: string }> {
+  const pr = await gh<{ number: number; html_url: string }>(installationId, `/repos/${owner}/${name}/pulls`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(args),
+  });
+  return { number: pr.number, html_url: pr.html_url };
+}
+
+/** Names of the repo's Actions secrets, or null when the App cannot read them (needs secrets:read). */
+export async function listRepoSecretNames(installationId: number, owner: string, name: string): Promise<string[] | null> {
+  try {
+    const res = await gh<{ secrets?: Array<{ name: string }> }>(installationId, `/repos/${owner}/${name}/actions/secrets?per_page=100`);
+    return (res?.secrets ?? []).map((s) => s.name);
+  } catch {
+    return null;
+  }
+}

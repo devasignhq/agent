@@ -46,6 +46,8 @@ import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 import { buildRunView } from "../verify/runs.js";
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
+import { adoptGeneratedTests } from "../verify/onboarding/job.js";
+import { enqueueVerifyOnboard } from "../queue.js";
 
 export const api = Router();
 
@@ -1255,6 +1257,43 @@ api.get("/reviews/:id/verify", async (req, res) => {
     runs: runs.map((r) => ({ id: r.id, sha: r.sha, attempt: r.attempt, status: r.status, createdAt: r.createdAt, verdicts: r.verdicts.length })),
     flakeRate: repoFlakeRate(repo.id),
   });
+});
+
+// Verification setup checklist for a repo, and "Regenerate setup PR".
+api.get("/repositories/:id/verify/setup", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const v = ctx.repo.verify;
+  res.json({
+    onboarding: v?.onboarding ?? { state: "none" },
+    detected: v?.detected ?? null,
+    devasignYml: v?.devasignYml?.parsed ?? null,
+    runnerSeen: !!v?.detected || !!v?.onboarding?.firstSuccessfulRunId,
+  });
+});
+api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const mode = req.body?.mode === "extend" ? "extend" : "separate";
+  const workflow = typeof req.body?.workflow === "string" ? req.body.workflow.slice(0, 200) : undefined;
+  enqueueVerifyOnboard({ repoId: ctx.repo.id, trigger: "manual", mode, workflow });
+  res.json({ ok: true, queued: true });
+});
+// "Adopt this test": commit generated tests from a run into the customer's suite via a PR.
+api.post("/reviews/:id/verify/adopt", expensiveLimiter, async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const runId = typeof req.body?.runId === "string" ? req.body.runId : db.filter("verifyRuns", (r) => r.reviewId === review.id).sort((a, b) => b.createdAt - a.createdAt)[0]?.id;
+  if (!runId) return void res.status(404).json({ error: "run_not_found" });
+  const testIds = Array.isArray(req.body?.testIds) ? req.body.testIds.map(String) : null;
+  const out = await adoptGeneratedTests(runId, testIds);
+  res.status(out.status === "failed" ? 502 : 200).json(out);
 });
 
 // Criteria revision history (read-only; revision 1 is synthesis, later ones

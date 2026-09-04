@@ -18,6 +18,7 @@ import { criteriaForRun, updateRun } from "./runs.js";
 import { artifactStorage } from "./storage.js";
 import { notifyForReview } from "../notifications.js";
 import { afterFeedbackRunSettled } from "./feedback.js";
+import { noteRunSucceeded, postDoctorFollowup } from "./onboarding/job.js";
 import { v4 as uuid } from "uuid";
 
 export const FLAKY_REASON = "flaky test — quarantined";
@@ -282,6 +283,15 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
         await afterFeedbackRunSettled(updated ?? run);
       } catch (err) {
         console.warn("[verify] feedback settle hook failed:", err);
+      }
+      if (doctor) {
+        try {
+          await postDoctorFollowup(updated ?? run, doctor);
+        } catch (err) {
+          console.warn("[verify] doctor follow-up failed:", err);
+        }
+      } else if (updated) {
+        noteRunSucceeded(updated);
       }
       notifyForReview(
         run.reviewId,
