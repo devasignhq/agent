@@ -26,8 +26,11 @@ function sign(method: string, key: string, exp: number): string {
 
 export function verifyLocalSignature(method: string, key: string, exp: number, sig: string, now = Date.now()): boolean {
   if (!Number.isFinite(exp) || exp < now) return false;
-  const expected = sign(method, key, exp);
-  return sig.length === expected.length && timingSafeEqual(Buffer.from(sig), Buffer.from(expected));
+  const expected = Buffer.from(sign(method, key, exp));
+  const got = Buffer.from(sig);
+  // Byte lengths, not string lengths: timingSafeEqual throws on a mismatch, and
+  // a 64-character multi-byte signature is longer than 64 bytes.
+  return got.length === expected.length && timingSafeEqual(got, expected);
 }
 
 function url(method: "PUT" | "GET", key: string, ttlSeconds: number): string {

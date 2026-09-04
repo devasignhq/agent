@@ -321,9 +321,6 @@ export const isAnnualConfigured = () =>
       config.stripe.priceMaxAnnual &&
       config.stripe.annualCouponId
   );
-// Soroban escrow (bounties). Needs the RPC URL + the deployed contract & USDC
-// SAC ids + the admin signing seed. When false, bounty routes 503 and the escrow
-// keeper no-ops — the app still boots and every non-bounty feature is unaffected.
 export const isArtifactStorageConfigured = () =>
   Boolean(
     config.artifacts.endpoint &&
@@ -331,6 +328,9 @@ export const isArtifactStorageConfigured = () =>
       config.artifacts.accessKeyId &&
       config.artifacts.secretAccessKey
   );
+// Soroban escrow (bounties). Needs the RPC URL + the deployed contract & USDC
+// SAC ids + the admin signing seed. When false, bounty routes 503 and the escrow
+// keeper no-ops — the app still boots and every non-bounty feature is unaffected.
 export const isStellarConfigured = () =>
   Boolean(
     config.stellar.rpcUrl &&

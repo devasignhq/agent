@@ -6,6 +6,7 @@ import { v4 as uuid } from "uuid";
 import { config, isProductionLike } from "../config.js";
 import { db } from "../db.js";
 import { adoptGeneratedTests, noteOnboardingPrClosed } from "../verify/onboarding/job.js";
+import { ADOPT_PREFIX_LEN } from "../verify/report.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
 import { maintainerByGithubId } from "../users.js";
@@ -650,15 +651,29 @@ function handleAppAuthorization(event: any) {
   })();
 }
 
+// Which run an "adopt:<run id prefix>" button press refers to. The prefix is
+// scoped to the repo the event came from and required to be the full length
+// report.ts emits: an unscoped scan would adopt into whatever repo the first
+// matching run belongs to, and an empty prefix would match anything.
+export function adoptTargetFor(event: any): string | null {
+  const id = String(event?.requested_action?.identifier || "");
+  if (!id.startsWith("adopt:")) return null;
+  const prefix = id.slice("adopt:".length);
+  if (prefix.length < ADOPT_PREFIX_LEN) return null;
+  const [owner, name] = String(event?.repository?.full_name || "").split("/");
+  const install = db.find("installations", (i) => i.installationId === event?.installation?.id);
+  if (!owner || !name || !install) return null;
+  const repo = db.find("repositories", (r) => r.installationId === install.id && r.owner === owner && r.name === name);
+  if (!repo) return null;
+  return db.find("verifyRuns", (r) => r.repoId === repo.id && r.id.startsWith(prefix))?.id ?? null;
+}
+
 // A click on one of our check-run buttons. Only "adopt:<run id prefix>" today.
 function handleCheckRun(event: any) {
   if (event.action !== "requested_action") return;
-  const id = String(event.requested_action?.identifier || "");
-  if (!id.startsWith("adopt:")) return;
-  const prefix = id.slice("adopt:".length);
-  const run = db.find("verifyRuns", (r) => r.id.startsWith(prefix));
-  if (!run) return;
-  void adoptGeneratedTests(run.id, null).catch((err) => console.warn("[webhook] adopt-tests failed:", err));
+  const runId = adoptTargetFor(event);
+  if (!runId) return;
+  void adoptGeneratedTests(runId, null).catch((err) => console.warn("[webhook] adopt-tests failed:", err));
 }
 
 function handleInstallation(event: any) {

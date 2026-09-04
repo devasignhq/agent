@@ -31,3 +31,14 @@ test("disabled unless ARTIFACT_LOCAL_DIR is set; signed URLs verify by method+ke
     config.artifacts.localDir = prev;
   }
 });
+
+// timingSafeEqual throws when the buffers differ in length, so the guard has to
+// compare BYTES: a 64-character signature of multi-byte chars is 64 chars but
+// well over 64 bytes, and the string-length guard let it through to the throw.
+test("a multi-byte signature of the right character length is refused, not a throw", () => {
+  const exp = Date.now() + 60_000;
+  const hex = 64;
+  assert.equal(verifyLocalSignature("GET", "k", exp, "é".repeat(hex)), false);
+  assert.equal(verifyLocalSignature("GET", "k", exp, "\u{1F600}".repeat(hex)), false);
+  assert.equal(verifyLocalSignature("GET", "k", exp, ""), false);
+});

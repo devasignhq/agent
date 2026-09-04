@@ -12,6 +12,9 @@ export const VERIFICATION_START = "<!-- devasign:verification -->";
 export const VERIFICATION_END = "<!-- /devasign:verification -->";
 export const REPLY_LINE = "Reply to this comment or mention @devasign to adjust the criteria or re-run.";
 export const VERIFY_CHECK_NAME = "DevAsign · Verify";
+// GitHub caps a requested_action identifier at 20 chars: "adopt:" + this many
+// chars of the run id. The webhook requires the same length before it looks up.
+export const ADOPT_PREFIX_LEN = 14;
 
 export type VerificationRowVerdict = "pass" | "fail" | "unverifiable" | "pending";
 
@@ -277,8 +280,7 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
     "",
     REPLY_LINE,
   ].join("\n");
-  // GitHub caps identifier at 20 chars: "adopt:" + 14 chars of the run id.
-  const actions = opts.adoptRunId ? [{ label: "Adopt tests", description: "Open a PR adding the generated tests", identifier: `adopt:${opts.adoptRunId.slice(0, 14)}` }] : [];
+  const actions = opts.adoptRunId ? [{ label: "Adopt tests", description: "Open a PR adding the generated tests", identifier: `adopt:${opts.adoptRunId.slice(0, ADOPT_PREFIX_LEN)}` }] : [];
   return {
     name: VERIFY_CHECK_NAME,
     head_sha: headSha,

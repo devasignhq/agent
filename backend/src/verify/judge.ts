@@ -79,7 +79,7 @@ export function computeVerdicts(args: {
     }
     if (failed.length) {
       const first = failed[0];
-      const attempts = first.attempts.length || first.attempts.length;
+      const attempts = first.attempts.length;
       out.push({
         criterionId: c.id,
         verdict: "fail",

@@ -64,6 +64,11 @@ export function appendAddedCriteria(
   return [...existing, ...added];
 }
 
+/** Superseded by a reword, or marked not-applicable, through PR-comment feedback. */
+export function isRetiredCriterion(c: Criterion): boolean {
+  return !!c.supersededBy || !!c.notApplicable;
+}
+
 // Partition the scored criteria for the verdict comment / in-app timeline.
 // `regressed` are criteria an earlier commit satisfied that a later commit broke
 // — surfaced prominently because the developer needs to know their change undid
@@ -71,11 +76,6 @@ export function appendAddedCriteria(
 // `met` are currently satisfied; the comment collapses these instead of
 // re-listing them on every run. A criterion is only "regressed", never also
 // "unmet" — the prior-met check takes precedence over the not-met bucket.
-/** Superseded by a reword, or marked not-applicable, through PR-comment feedback. */
-export function isRetiredCriterion(c: Criterion): boolean {
-  return !!c.supersededBy || !!c.notApplicable;
-}
-
 export function splitForComment(
   criteria: Criterion[],
   prior: Map<string, PriorVerdict>
