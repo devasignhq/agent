@@ -1,6 +1,6 @@
 {
   "name": "@devasign/verify",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Runs DevAsign's generated acceptance tests inside your CI and reports per-criterion evidence.",
   "license": "GPL-3.0-or-later",
   "type": "module",
@@ -15,7 +15,7 @@
     "node": ">=20"
   },
   "scripts": {
-    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/cli.js --external:tsx --external:@playwright/test --banner:js=\"#!/usr/bin/env node\nimport { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\"",
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/cli.js --external:tsx --external:@playwright/test --banner:js=\"#!/usr/bin/env node\nimport { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\" && chmod +x dist/cli.js",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx/esm --test 'src/**/*.test.ts'",
     "test:e2e": "node --import tsx/esm --test test/e2e.test.ts",

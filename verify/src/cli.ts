@@ -99,6 +99,6 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}` || process.argv[1]?.endsWith("/dist/cli.js") || process.argv[1]?.endsWith("/src/cli.ts")) {
-  main().then((code) => process.exit(code));
-}
+// This module is the bundle's only entry point; npm runs it through a bin
+// symlink, so an argv/URL comparison here would silently skip main().
+main().then((code) => process.exit(code));

@@ -1,6 +1,6 @@
 // Wire contract with the DevAsign API (/v1). Mirrors backend/src/verify/contract.ts;
 // additive changes only, kept in sync by hand.
-export const CLI_VERSION = "1.0.0";
+export const CLI_VERSION = "1.0.1";
 export const API_VERSION = 1;
 
 export type TestLevel = "unit" | "integration" | "component" | "e2e";
