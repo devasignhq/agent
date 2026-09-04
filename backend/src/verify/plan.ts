@@ -2,6 +2,7 @@
 // proposes; the code enforces what it may not decide — existing tests must
 // exist, levels obey the ladder policy, flaky signatures are regenerated or
 // retired, and generated files live under .devasign/.
+import { posix } from "node:path";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config } from "../config.js";
@@ -128,20 +129,74 @@ export function planPolicy(args: {
 
 // The planner's paths come from a model reading an attacker-influenced diff, so
 // a traversal segment here would end up in the runner's checkout and in the
-// "Adopt tests" commit. Null drops the test.
-export function normalizeGeneratedPath(p: string, runner: TestRunner): string | null {
-  let clean = p.replace(/^\.\//, "").replace(/^\/+/, "");
-  if (clean.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
-  if (clean.startsWith(".devasign/")) return clean.startsWith(".devasign/tests/") ? clean : null;
-  clean = clean.replace(/^(tests?|__tests__|spec|e2e)\//, "");
+// "Adopt tests" commit. Null drops the test. `from` is the location the model
+// believed it was writing to, which is what its relative imports are anchored on.
+// Generated tests live here, and adoptGeneratedTests re-homes them under a
+// prefix of the SAME depth — the `../` counts baked into their imports by
+// rebaseRelativeImports depend on it (asserted in plan.test.ts).
+export const GENERATED_TEST_PREFIX = ".devasign/tests";
+
+export function normalizeGeneratedPath(p: string, runner: TestRunner): { path: string; from: string } | null {
+  const from = p.replace(/^\.\//, "").replace(/^\/+/, "");
+  if (from.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
+  if (from.startsWith(".devasign/")) return from.startsWith(`${GENERATED_TEST_PREFIX}/`) ? { path: from, from } : null;
+  const clean = from.replace(/^(tests?|__tests__|spec|e2e)\//, "");
   if (!clean) return null;
-  return runner === "playwright" ? `.devasign/tests/e2e/${clean}` : `.devasign/tests/${clean}`;
+  return { path: runner === "playwright" ? `${GENERATED_TEST_PREFIX}/e2e/${clean}` : `${GENERATED_TEST_PREFIX}/${clean}`, from };
+}
+
+// Imports are written relative to the path the model chose, but generated tests
+// are moved under .devasign/tests/ — so "./total.js" next to src/total.ts would
+// resolve to .devasign/tests/src/total.js and fail to load. Re-anchor them.
+//
+// The `from` and side-effect branches require that no quote appears between the
+// keyword and the specifier, so single-line string literals containing an import
+// statement are left alone. That guard does NOT extend to the call branches
+// (`import(`, `require(`, the mock family): a specifier inside a differently
+// quoted string there is still rewritten. Narrowing that needs a strings/comments
+// pass rather than a bigger regex — see the review note on acb9a82.
+const LEAD = [
+  String.raw`(?:^|\n)[ \t]*(?:import|export)[^'"\`]*?\bfrom\s*`,
+  String.raw`(?:^|\n)[ \t]*import\s*`,
+  String.raw`\b(?:import|require(?:\.resolve)?)\s*\(\s*`,
+  String.raw`\b(?:\w+\.)*(?:mock\.module|unstable_mockModule|(?:create|gen)MockFromModule|deepUnmock|(?:do|un|set|dont|doUn)?[Mm]ock|(?:import|require)(?:Actual|Mock))\s*\(\s*`,
+].join("|");
+const RELATIVE_IMPORT = new RegExp(`(${LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`]*)?)\\2`, "g");
+
+const withoutExt = (p: string): string => p.replace(/\.[cm]?[jt]sx?$/, "");
+
+export function rebaseRelativeImports(
+  content: string,
+  from: string,
+  to: string,
+  // Other generated files in the same plan, keyed by extensionless origin path:
+  // they move too, so a specifier pointing at one follows it rather than staying
+  // behind at a path the runner never writes.
+  siblings: ReadonlyMap<string, string> = new Map()
+): string {
+  const fromDir = posix.dirname(from);
+  const toDir = posix.dirname(to);
+  if (fromDir === toDir && !siblings.size) return content;
+  return content.replace(RELATIVE_IMPORT, (match, lead: string, quote: string, spec: string) => {
+    if (spec.includes("${")) return match; // interpolated: the path is not knowable here
+    const target = posix.normalize(posix.join(fromDir, spec));
+    // Above the repo root: no re-anchoring can make that resolve, and rewriting
+    // it would only disguise where the model meant to point.
+    if (target.startsWith("..")) return match;
+    const movedSibling = siblings.get(withoutExt(target));
+    // Keep the specifier's own basename (the model may write .js for a .ts file).
+    const resolved = movedSibling ? posix.join(posix.dirname(movedSibling), posix.basename(target)) : target;
+    const next = posix.relative(toDir, resolved);
+    if (next === posix.relative(toDir, target) && fromDir === toDir) return match;
+    return `${lead}${quote}${next.startsWith("./") || next.startsWith("../") ? next : `./${next}`}${quote}`;
+  });
 }
 
 export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
   const list = (raw as { tests?: unknown })?.tests;
   if (!Array.isArray(list)) return [];
-  const out: RawPlanTest[] = [];
+  const out: Array<RawPlanTest & { rebaseFrom?: string }> = [];
+  const moves: Array<{ from: string; to: string }> = [];
   for (const t of list) {
     const o = (t || {}) as Record<string, unknown>;
     const path = typeof o.path === "string" ? o.path.trim().slice(0, 300) : "";
@@ -152,11 +207,14 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
     const runner = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
     const content = typeof o.content === "string" && o.content.trim() ? o.content : null;
     if (origin === "generated" && !content) continue;
-    const safe = origin === "generated" ? normalizeGeneratedPath(path, runner) : path.replace(/^\.\//, "");
+    const moved = origin === "generated" ? normalizeGeneratedPath(path, runner) : null;
+    const safe = origin === "generated" ? moved?.path : path.replace(/^\.\//, "");
     if (!safe || safe.split("/").includes("..")) continue;
+    if (moved) moves.push({ from: moved.from, to: safe });
     out.push({
       path: safe,
       content: origin === "generated" ? content : null,
+      rebaseFrom: moved?.from,
       criterionIds: [...new Set(ids)],
       level,
       levelReason: typeof o.levelReason === "string" ? o.levelReason.slice(0, 300) : "",
@@ -165,7 +223,10 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
       targetFiles: Array.isArray(o.targetFiles) ? o.targetFiles.map(String).slice(0, 20) : [],
     });
   }
-  return out;
+  const siblings = new Map(moves.map((m) => [m.from.replace(/\.[cm]?[jt]sx?$/, ""), m.to]));
+  return out.map(({ rebaseFrom, ...t }) =>
+    rebaseFrom && t.content ? { ...t, content: rebaseRelativeImports(t.content, rebaseFrom, t.path, siblings) } : t
+  );
 }
 
 export function normalizeUnverifiable(raw: unknown, knownIds: Set<string>): Array<{ criterionId: string; reason: string }> {

@@ -6,11 +6,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, normalizeGeneratedPath, normalizeRawTests, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
 import type { PlanTest } from "./contract.js";
+import { ADOPT_DIR } from "./onboarding/job.js";
 
 const DIFF = ["diff --git a/src/handler.ts b/src/handler.ts", "--- a/src/handler.ts", "+++ b/src/handler.ts", "@@ -1 +1,2 @@", " export function handler() {}", "+export function refunds() { return 1; }"].join("\n");
 const BASE_TREE = ["package.json", "package-lock.json", "src/handler.ts", "src/handler.test.ts", "frontend/src/app.tsx"];
@@ -196,9 +197,9 @@ test("pure helpers: planPolicy, enforcePlanPolicy, buildCommands", () => {
 // The planner reads an attacker-influenceable diff, and its paths are written into
 // the runner's checkout and into the "Adopt tests" commit.
 test("generated test paths may never escape .devasign/tests/", () => {
-  assert.equal(normalizeGeneratedPath("checkout.spec.ts", "playwright"), ".devasign/tests/e2e/checkout.spec.ts");
-  assert.equal(normalizeGeneratedPath("tests/total.test.ts", "node-test"), ".devasign/tests/total.test.ts");
-  assert.equal(normalizeGeneratedPath(".devasign/tests/e2e/x.spec.ts", "playwright"), ".devasign/tests/e2e/x.spec.ts");
+  assert.equal(normalizeGeneratedPath("checkout.spec.ts", "playwright")?.path, ".devasign/tests/e2e/checkout.spec.ts");
+  assert.equal(normalizeGeneratedPath("tests/total.test.ts", "node-test")?.path, ".devasign/tests/total.test.ts");
+  assert.equal(normalizeGeneratedPath(".devasign/tests/e2e/x.spec.ts", "playwright")?.path, ".devasign/tests/e2e/x.spec.ts");
   for (const bad of ["../../.github/workflows/steal.yml", "a/../../../etc/passwd", "..", ".devasign/../x.ts", ".devasign/hooks/pre-push", "/etc/passwd/../x"]) {
     assert.equal(normalizeGeneratedPath(bad, "node-test"), null, bad);
   }
@@ -209,4 +210,137 @@ test("generated test paths may never escape .devasign/tests/", () => {
     { path: "src/../../../outside.test.ts", criterionIds: ["1"], origin: "existing", level: "unit", runner: "node-test" },
   ] };
   assert.deepEqual(normalizeRawTests(raw, known, "node-test").map((t) => t.path), [".devasign/tests/good.test.ts"]);
+});
+
+// Seen on the first live run: the model wrote `import { orderTotal } from "./total.js"`
+// for a test it placed at src/total.refunds.test.ts, the planner moved the file to
+// .devasign/tests/src/, and vitest could not resolve the import — so every criterion
+// came back unverifiable with nothing asserted.
+test("relative imports move with the test file", () => {
+  const content = [
+    "// criteria: 1, 2",
+    'import { describe, expect, it } from "vitest";',
+    'import { orderTotal } from "./total.js";',
+    'import { findOrder } from "../orders.js";',
+    'import helper from "./helpers/money.js";',
+    'vi.mock("./total.js", () => ({}));',
+    'const late = await import("./total.js");',
+    'import express from "express";',
+    'import thing from "@app/thing";',
+  ].join("\n");
+  const out = rebaseRelativeImports(content, "src/total.refunds.test.ts", ".devasign/tests/src/total.refunds.test.ts");
+  assert.match(out, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/);
+  assert.match(out, /from "\.\.\/\.\.\/\.\.\/orders\.js"/);
+  assert.match(out, /from "\.\.\/\.\.\/\.\.\/src\/helpers\/money\.js"/);
+  assert.match(out, /vi\.mock\("\.\.\/\.\.\/\.\.\/src\/total\.js"/);
+  assert.match(out, /import\("\.\.\/\.\.\/\.\.\/src\/total\.js"\)/);
+  assert.match(out, /from "express"/, "bare specifiers are untouched");
+  assert.match(out, /from "@app\/thing"/, "aliases are untouched");
+
+  // Forms the first cut of the rewriter missed. A side-effect import left
+  // unrebased reproduces byte-for-byte the load failure this exists to prevent.
+  const forms = [
+    ['import "./mocks/server.js";', 'import "../../../src/mocks/server.js";'],
+    ["import './mocks/server.js';", "import '../../../src/mocks/server.js';"],
+    ['vi.doMock("./total.js", () => ({}));', 'vi.doMock("../../../src/total.js", () => ({}));'],
+    ['vi.unmock("./total.js");', 'vi.unmock("../../../src/total.js");'],
+    ['jest.setMock("./total.js", {});', 'jest.setMock("../../../src/total.js", {});'],
+    ['const a = jest.requireActual("./total.js");', 'const a = jest.requireActual("../../../src/total.js");'],
+    ['const b = await vi.importActual("./total.js");', 'const b = await vi.importActual("../../../src/total.js");'],
+    ['const p = require.resolve("./total.js");', 'const p = require.resolve("../../../src/total.js");'],
+    ["const c = await import(`./total.js`);", "const c = await import(`../../../src/total.js`);"],
+    ['import {\n  a,\n} from "./total.js";', 'import {\n  a,\n} from "../../../src/total.js";'],
+    ['export { x } from "./total.js";', 'export { x } from "../../../src/total.js";'],
+    ['import "./.config/setup.js";', 'import "../../../src/.config/setup.js";'],
+  ];
+  for (const [input, want] of forms) {
+    assert.equal(rebaseRelativeImports(input, "src/x.test.ts", ".devasign/tests/src/x.test.ts"), want, input);
+  }
+
+  // A module-looking path inside a string literal is data, not an import: rewriting
+  // it would silently corrupt a test's expected value.
+  const literals = [
+    `assert.equal(msg, 'Cannot resolve module from "./config.json"');`,
+    'expect(err.message).toBe(`failed to import ./total.js`);',
+    '// see the note in ./total.js about rounding',
+  ];
+  for (const line of literals) {
+    assert.equal(rebaseRelativeImports(line, "src/x.test.ts", ".devasign/tests/src/x.test.ts"), line, line);
+  }
+
+  // An interpolated specifier is not knowable here, and one above the repo root
+  // cannot be made to resolve.
+  assert.equal(
+    rebaseRelativeImports("await import(`./${name}.js`);", "src/x.test.ts", ".devasign/tests/src/x.test.ts"),
+    "await import(`./${name}.js`);"
+  );
+  assert.equal(
+    rebaseRelativeImports('import x from "../../../../outside.js";', "src/x.test.ts", ".devasign/tests/src/x.test.ts"),
+    'import x from "../../../../outside.js";'
+  );
+
+  // A playwright spec the model put at e2e/ lands in .devasign/tests/e2e/.
+  const spec = 'import { expect, test } from "@playwright/test";\nimport { seed } from "./fixtures/seed.js";';
+  assert.match(
+    rebaseRelativeImports(spec, "e2e/order.spec.ts", ".devasign/tests/e2e/order.spec.ts"),
+    /from "\.\.\/\.\.\/\.\.\/e2e\/fixtures\/seed\.js"/
+  );
+  // Same directory: nothing to do.
+  assert.equal(rebaseRelativeImports(spec, ".devasign/tests/e2e/x.spec.ts", ".devasign/tests/e2e/x.spec.ts"), spec);
+
+  // The whole path, through normalizeRawTests.
+  const raw = { tests: [{ path: "src/total.refunds.test.ts", content: 'import { orderTotal } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" }] };
+  const [planned] = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  assert.equal(planned.path, ".devasign/tests/src/total.refunds.test.ts");
+  assert.equal(planned.content, 'import { orderTotal } from "../../../src/total.js";');
+});
+
+// The `from` field only earns its place when the destination diverges from the
+// model's path by more than the .devasign/tests/ prefix — which is exactly what
+// the `tests/` strip does. Without this case, deriving `from` back out of the
+// destination passes the whole suite while reintroducing the original bug.
+test("a stripped tests/ segment still resolves against where the model thought it was", () => {
+  const raw = { tests: [{ path: "tests/unit/total.test.ts", content: 'import { t } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" }] };
+  const [t] = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  assert.equal(t.path, ".devasign/tests/unit/total.test.ts");
+  assert.equal(t.content, 'import { t } from "../../../tests/unit/total.js";');
+});
+
+// node:test's mock.module is its only specifier-taking mock API, and jest/vitest
+// carry several more; each one left unrebased is this commit's own bug again.
+test("the module-mocking APIs of every selectable runner are re-anchored", () => {
+  const forms = [
+    'mock.module("./total.js", {});',
+    't.mock.module("./total.js", {});',
+    'jest.unstable_mockModule("./total.js", () => ({}));',
+    'const m = await vi.importMock("./total.js");',
+    'const r = jest.requireMock("./total.js");',
+    'jest.dontMock("./total.js");',
+    'vi.doUnmock("./total.js");',
+    'jest.createMockFromModule("./total.js");',
+  ];
+  for (const line of forms) {
+    const out = rebaseRelativeImports(line, "src/x.test.ts", ".devasign/tests/src/x.test.ts");
+    assert.equal(out, line.replace("./total.js", "../../../src/total.js"), line);
+  }
+});
+
+// Two generated files from one plan move together, so a reference between them
+// must follow the sibling rather than point back at a path nothing writes.
+test("a reference to another generated file in the same plan follows it", () => {
+  const raw = {
+    tests: [
+      { path: "src/total.test.ts", content: 'import { make } from "./factory.js";\nimport { orderTotal } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
+      { path: "src/factory.ts", content: "export const make = () => [];", criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
+    ],
+  };
+  const [spec] = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  assert.match(spec.content!, /from "\.\/factory\.js"/, "the sibling moved alongside it, so the specifier is unchanged");
+  assert.match(spec.content!, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/, "repo source is still re-anchored");
+});
+
+// adoptGeneratedTests commits the rebased bytes under its own prefix; the ../ counts
+// only survive because both prefixes are the same depth.
+test("the adopt prefix is the same depth as the generated-test prefix", () => {
+  assert.equal(ADOPT_DIR.split("/").length, GENERATED_TEST_PREFIX.split("/").length, "adopted imports would resolve elsewhere");
 });

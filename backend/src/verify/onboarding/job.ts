@@ -189,7 +189,9 @@ export async function postDoctorFollowup(run: VerifyRun, doctor: DoctorDiagnosis
   return { commented: id != null, patched };
 }
 
-const ADOPT_DIR = "tests/devasign";
+// Must stay the same depth as GENERATED_TEST_PREFIX: the generated content's
+// relative imports were re-anchored for that depth and are committed verbatim.
+export const ADOPT_DIR = "tests/devasign";
 
 export function adoptedPath(generatedPath: string): string | null {
   const rel = generatedPath.replace(/^\.devasign\/tests\//, "");
