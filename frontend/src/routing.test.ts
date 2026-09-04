@@ -26,6 +26,7 @@ test("the URL surface is exactly this — bookmarks and backend deep links depen
   // Written out by hand on purpose: renaming a route must fail here first.
   assert.deepEqual({ ...ROUTE_PATHS }, {
     agent: "/agent",
+    review: "/reviews/:reviewId",
     workflow: "/workflow",
     bounty: "/bounty",
     fundBounty: "/bounties/:id/fund",
@@ -98,7 +99,7 @@ test("both redirect targets are themselves routable", () => {
 });
 
 test("generatePath round-trips every param route", () => {
-  const stub: Record<string, string> = { id: "xyz", findingId: "F-1", section: "billing" };
+  const stub: Record<string, string> = { id: "xyz", findingId: "F-1", section: "billing", reviewId: "rev-1" };
   for (const path of Object.values(ROUTE_PATHS)) {
     if (!path.includes(":")) continue;
     const names = [...path.matchAll(/:(\w+)/g)].map((m) => m[1]);

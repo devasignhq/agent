@@ -1,0 +1,24 @@
+{
+  "planId": "plan-fixture",
+  "criteriaRevision": 1,
+  "criteria": [
+    { "id": "1", "text": "The total is formatted as US currency", "kind": "code" },
+    { "id": "2", "text": "The refunds line is visible on the revenue page", "kind": "ui" },
+    { "id": "3", "text": "A discounts line is visible on the revenue page", "kind": "ui" },
+    { "id": "4", "text": "A flaky check", "kind": "code" }
+  ],
+  "tests": [
+    { "id": "t1", "path": ".devasign/tests/criterion-1.test.ts", "criterionIds": ["1"], "level": "unit", "levelReason": "pure function", "origin": "generated", "runner": "bundled", "testSignature": "s1", "strategyVersion": 1, "targetFiles": ["src/total.mjs"],
+      "content": "// DevAsign generated test — criterion 1\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { formatTotal } from \"../../src/total.mjs\";\ntest(\"formats cents as USD\", () => {\n  assert.equal(formatTotal(123456), \"$1,234.56\");\n});\n" },
+    { "id": "t2", "path": ".devasign/tests/e2e/criterion-2.spec.ts", "criterionIds": ["2"], "level": "e2e", "levelReason": "visible in the UI", "origin": "generated", "runner": "playwright", "testSignature": "s2", "strategyVersion": 1, "targetFiles": ["index.html"],
+      "content": "// DevAsign generated test — criterion 2\nimport { test, expect } from \"@playwright/test\";\ntest(\"refunds line is visible\", async ({ page }) => {\n  await page.goto(\"/\");\n  await expect(page.getByTestId(\"refunds\")).toBeVisible();\n});\n" },
+    { "id": "t3", "path": ".devasign/tests/e2e/criterion-3.spec.ts", "criterionIds": ["3"], "level": "e2e", "levelReason": "visible in the UI", "origin": "generated", "runner": "playwright", "testSignature": "s3", "strategyVersion": 1, "targetFiles": ["index.html"],
+      "content": "// DevAsign generated test — criterion 3\nimport { test, expect } from \"@playwright/test\";\ntest(\"discounts line is visible\", async ({ page }) => {\n  await page.goto(\"/\");\n  await expect(page.getByTestId(\"discounts\")).toBeVisible({ timeout: 2000 });\n});\n" },
+    { "id": "t4", "path": ".devasign/tests/criterion-4.test.ts", "criterionIds": ["4"], "level": "unit", "levelReason": "deliberately flaky", "origin": "generated", "runner": "bundled", "testSignature": "s4", "strategyVersion": 1, "targetFiles": [],
+      "content": "// DevAsign generated test — criterion 4 (deliberately flaky: fails when the marker file is absent, then passes)\nimport { test } from \"node:test\";\nimport assert from \"node:assert/strict\";\nimport { existsSync, writeFileSync } from \"node:fs\";\nconst marker = \".devasign/artifacts/flaky-marker\";\ntest(\"second attempt passes\", () => {\n  if (!existsSync(marker)) { writeFileSync(marker, \"1\"); assert.fail(\"first attempt races\"); }\n});\n" }
+  ],
+  "commands": [],
+  "playwright": { "record": true, "configFrom": null, "installBrowsers": false },
+  "retries": { "generated": 2, "existing": 0 },
+  "uploadLimits": { "maxFileBytes": 104857600, "maxTotalBytes": 524288000, "maxFiles": 200 }
+}

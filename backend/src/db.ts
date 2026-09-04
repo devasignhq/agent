@@ -41,6 +41,13 @@ const empty: DB = {
   securityPrecedents: [],
   repoTopologies: [],
   parityFeatures: [],
+  verifyRuns: [],
+  criteriaRevisions: [],
+  prCommentActions: [],
+  verifyPlans: [],
+  verifyResults: [],
+  verifyArtifacts: [],
+  testFlakeHistory: [],
 };
 
 // Collection key -> Postgres table name. Unquoted identifiers fold to
@@ -65,6 +72,13 @@ const TABLES: Record<keyof DB, string> = {
   securityPrecedents: "security_precedents",
   repoTopologies: "repo_topologies",
   parityFeatures: "parity_features",
+  verifyRuns: "verify_runs",
+  criteriaRevisions: "criteria_revisions",
+  prCommentActions: "pr_comment_actions",
+  verifyPlans: "verify_plans",
+  verifyResults: "verify_results",
+  verifyArtifacts: "verify_artifacts",
+  testFlakeHistory: "test_flake_history",
 };
 
 const COLLECTIONS = Object.keys(TABLES) as (keyof DB)[];

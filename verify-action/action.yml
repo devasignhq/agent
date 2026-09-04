@@ -1,0 +1,37 @@
+name: "DevAsign Verify"
+description: "Runs DevAsign's generated acceptance tests for this pull request inside your CI and reports per-criterion evidence."
+author: "DevAsign"
+branding:
+  icon: "check-circle"
+  color: "green"
+inputs:
+  api-url:
+    description: "DevAsign API origin."
+    required: false
+    default: "https://devasign-agent.onrender.com"
+  fail-on:
+    description: "never (default) or verdict — fail this job when a criterion fails verification."
+    required: false
+    default: "never"
+  version:
+    description: "@devasign/verify version range to run."
+    required: false
+    default: "1"
+  working-directory:
+    description: "Repository checkout to verify (monorepo package or subdirectory)."
+    required: false
+    default: "."
+runs:
+  using: "composite"
+  steps:
+    - name: Run DevAsign verification
+      shell: bash
+      working-directory: ${{ inputs.working-directory }}
+      env:
+        DEVASIGN_API_URL: ${{ inputs.api-url }}
+        # Through env, never interpolated into the run: string — a workflow that
+        # wires untrusted data (a PR title, a dispatch payload) into an input
+        # would otherwise get shell injection in its own runner.
+        DEVASIGN_VERSION: ${{ inputs.version }}
+        DEVASIGN_FAIL_ON: ${{ inputs.fail-on }}
+      run: npx --yes "@devasign/verify@$DEVASIGN_VERSION" run --fail-on "$DEVASIGN_FAIL_ON"

@@ -277,9 +277,9 @@ const NotificationsPopover = ({ onClose, items, unreadCount, onMarkAllRead, onNa
     return () => { clearTimeout(t); document.removeEventListener("mousedown", onDoc); document.removeEventListener("keydown", onKey); };
   }, [onClose]);
   const handleRowClick = (n) => {
-    // Clicks navigate to the agent page for now; review-level deep-link is
-    // a follow-up. We always close the popover so the user lands on content.
-    if (onNavigate) onNavigate("agent");
+    // A review-scoped notification deep-links to its run page; anything else
+    // lands on the Agent page. Always close so the user lands on content.
+    if (onNavigate) onNavigate("agent", typeof n?.link === "string" && n.link.startsWith("/reviews/") ? n.link : null);
     onClose();
   };
   return (
@@ -876,7 +876,7 @@ const AppContent = () => {
             setForceStage(null);
             setHasInstall(null);
           }}
-          onNavigate={(k) => setCurrent(k)}
+          onNavigate={(k, path) => (path ? navigate(path) : setCurrent(k))}
           user={auth.user}
           notifications={notifications}
           workflowRepo={workflowRepo}
@@ -886,6 +886,7 @@ const AppContent = () => {
         <div className="content" style={current === "agent" || current === "workflow" ? { overflow: "hidden", display: "flex", flexDirection: "column" } : {}}>
           <Routes>
             <Route path={ROUTE_PATHS.agent}    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
+            <Route path={ROUTE_PATHS.review}   element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
             <Route path={ROUTE_PATHS.bounty}   element={<BountiesPage isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.fundBounty} element={<FundBountyPage />} />

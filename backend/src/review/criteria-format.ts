@@ -64,6 +64,11 @@ export function appendAddedCriteria(
   return [...existing, ...added];
 }
 
+/** Superseded by a reword, or marked not-applicable, through PR-comment feedback. */
+export function isRetiredCriterion(c: Criterion): boolean {
+  return !!c.supersededBy || !!c.notApplicable;
+}
+
 // Partition the scored criteria for the verdict comment / in-app timeline.
 // `regressed` are criteria an earlier commit satisfied that a later commit broke
 // — surfaced prominently because the developer needs to know their change undid
@@ -79,6 +84,9 @@ export function splitForComment(
   const unmet: Criterion[] = [];
   const met: Criterion[] = [];
   for (const c of criteria) {
+    // Reworded or dismissed via PR-comment feedback: the replacement is graded
+    // instead, so listing the retired text would re-open a closed question.
+    if (isRetiredCriterion(c)) continue;
     if (c.met === true) met.push(c);
     else if (prior.get(c.id)?.met === true) regressed.push(c);
     else unmet.push(c);

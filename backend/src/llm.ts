@@ -49,6 +49,14 @@ export function currentUsage(): UsageTotals | null {
   return store ? { ...store.total } : null;
 }
 
+export function currentUsageByModel(): Record<string, UsageTotals> | null {
+  const store = usageContext.getStore();
+  if (!store) return null;
+  const out: Record<string, UsageTotals> = {};
+  for (const [m, u] of store.byModel) out[m] = { ...u };
+  return out;
+}
+
 // USD per 1M tokens. Anthropic prices are pinned here (Opus 4.7/4.8 and the Haiku
 // index/free-tier model); Gemini's live in config so a price change is env-only.
 // A model absent from both still has its tokens counted — it just contributes $0,
@@ -134,12 +142,15 @@ export async function complete(opts: {
 // Like complete(), but also surfaces the API's stop_reason so callers can tell
 // a complete response from one cut off at max_tokens (a truncated JSON payload
 // can otherwise still "parse" via a smaller embedded object).
+export type LLMImage = { mediaType: string; base64: string };
+
 export async function completeWithMeta(opts: {
   system?: string;
   messages: LLMMessage[];
   maxTokens?: number;
   cacheSystem?: boolean;
   model?: string;
+  images?: LLMImage[]; // attached to the last message as image blocks (evidence screenshots)
 }): Promise<CompletionResult> {
   if (!client) return { text: mockComplete(opts), stopReason: "end_turn" };
 
@@ -154,7 +165,20 @@ export async function completeWithMeta(opts: {
     model,
     max_tokens: opts.maxTokens ?? 2048,
     system: sys as any,
-    messages: opts.messages.map((m) => ({ role: m.role, content: m.content })),
+    messages: opts.messages.map((m, i) =>
+      i === opts.messages.length - 1 && opts.images?.length
+        ? {
+            role: m.role,
+            content: [
+              ...opts.images.map((img) => ({
+                type: "image" as const,
+                source: { type: "base64" as const, media_type: img.mediaType as any, data: img.base64 },
+              })),
+              { type: "text" as const, text: m.content },
+            ],
+          }
+        : { role: m.role, content: m.content }
+    ),
   });
 
   // The API returns cache_*_input_tokens at runtime, but the pinned SDK's Usage
@@ -208,11 +232,82 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       endGoal:
         "Reviewer should confirm the change delivers the described user-facing capability with no regressions in the touched files.",
       criteria: [
-        { id: "1", text: "All paths described in the linked issue are implemented." },
-        { id: "2", text: "No regressions in existing covered behavior." },
-        { id: "3", text: "User-facing copy matches the ticket's wording." },
-        { id: "4", text: "Edge cases listed in the issue are handled." },
+        { id: "1", text: "All paths described in the linked issue are implemented.", kind: "code", implied: false, source: { input: "linear", ref: "ticket", excerpt: "implement all paths" } },
+        { id: "2", text: "No regressions in existing covered behavior.", kind: "code", implied: true },
+        { id: "3", text: "User-facing copy matches the ticket's wording.", kind: "ui", implied: false, source: { input: "linear", ref: "ticket" } },
+        { id: "4", text: "Edge cases listed in the issue are handled.", kind: "code", implied: false },
       ],
+    });
+  }
+
+  // Test planner: one generated test per criterion (Playwright for `ui`), citing
+  // the first listed existing test for the first criterion when the prompt lists
+  // any. Honors the prompt's per-criterion "max level" lines.
+  if (system?.includes("test planning")) {
+    const crits = [...last.matchAll(/^- \[([^\]]+)\] \((code|ui|unverifiable)\)(?: \[implied\])? (.+)$/gm)].map((m) => ({ id: m[1], kind: m[2], text: m[3] }));
+    const maxLevel = new Map([...last.matchAll(/^- \[([^\]]+)\]: max level (\w+)/gm)].map((m) => [m[1], m[2]]));
+    const existing = [...last.matchAll(/^  - (\S+)(?: \(imports: [^)]*\))?$/gm)].map((m) => m[1]).filter((p) => /\.(test|spec)\.[cm]?[jt]sx?$|_test\.\w+$|test_\w+\.py$/.test(p));
+    const tests: unknown[] = [];
+    let n = 0;
+    for (const c of crits) {
+      if (c.kind === "unverifiable") continue;
+      n += 1;
+      if (n === 1 && existing.length) {
+        tests.push({ path: existing[0], content: null, criterionIds: [c.id], level: "unit", levelReason: "[mock] an existing test already covers this criterion", origin: "existing", runner: "node-test", targetFiles: [] });
+        continue;
+      }
+      if (c.kind === "ui" && maxLevel.get(c.id) === "e2e") {
+        tests.push({
+          path: `.devasign/tests/e2e/criterion-${c.id}.spec.ts`,
+          content: `import { test, expect } from "@playwright/test";\n// DevAsign generated test — criterion ${c.id}\ntest("${c.text.replace(/"/g, "'")}", async ({ page }) => {\n  await page.goto("/");\n  await expect(page.getByRole("main")).toBeVisible();\n});\n`,
+          criterionIds: [c.id], level: "e2e", levelReason: "[mock] observable only in the rendered UI", origin: "generated", runner: "playwright", targetFiles: ["src/app.tsx"],
+        });
+        continue;
+      }
+      tests.push({
+        path: `.devasign/tests/criterion-${c.id}.test.ts`,
+        content: `import { test } from "node:test";\nimport assert from "node:assert/strict";\n// DevAsign generated test — criterion ${c.id}\ntest("${c.text.replace(/"/g, "'")}", () => {\n  assert.equal(1 + 1, 2);\n});\n`,
+        criterionIds: [c.id], level: "unit", levelReason: "[mock] the behaviour is a pure function of its inputs", origin: "generated", runner: "node-test", targetFiles: ["src/handler.ts"],
+      });
+    }
+    return JSON.stringify({ tests, unverifiable: crits.filter((c) => c.kind === "unverifiable").map((c) => ({ criterionId: c.id, reason: "[mock] not checkable in CI" })) });
+  }
+
+  // Verification feedback: deterministic rules over the comment text so the
+  // offline suite can drive reword / add / rerun / question / ignore and the
+  // low-confidence clarification path ("maybe …").
+  if (system?.includes("verification feedback")) {
+    const comment = (last.split(/^## Comment\n/m)[1] || last).trim();
+    const crits = [...last.matchAll(/^- \[([^\]]+)\] (.+?) — verdict: /gm)].map((m) => ({ id: m[1], text: m[2] }));
+    const low = /\bmaybe\b|\bperhaps\b/i.test(comment);
+    const conf = low ? 0.4 : 0.92;
+    const actions: unknown[] = [];
+    let reply: string | null = null;
+    if (/\?\s*$/.test(comment) || /^(why|how|what|which)\b/i.test(comment)) {
+      actions.push({ action: "question", confidence: 0.9, actedOnText: comment.slice(0, 120), criterionId: null, text: null });
+      reply = "[mock] The verdicts came from the recorded test outcomes listed above; see each criterion's evidence link.";
+    } else {
+      const reword = /should only show when refunds > 0/i.exec(comment);
+      if (reword) {
+        const target = crits.find((c) => /refund/i.test(c.text)) ?? crits[0];
+        if (target) actions.push({ action: "reword_criterion", confidence: conf, actedOnText: reword[0], criterionId: target.id, text: "The refunds line is shown only when refunds > 0." });
+      }
+      const add = /also check (?:that )?(.+?)(?:[.!]|$)/i.exec(comment);
+      if (add) actions.push({ action: "add_criterion", confidence: conf, actedOnText: add[0], criterionId: null, text: add[1].charAt(0).toUpperCase() + add[1].slice(1) + "." });
+      if (/\bre-?run\b/i.test(comment)) actions.push({ action: "rerun", confidence: 0.95, actedOnText: "re-run", criterionId: null, text: null });
+      const na = /(?:doesn't|does not) apply|not applicable|drop criterion (\S+)/i.exec(comment);
+      if (na) actions.push({ action: "mark_not_applicable", confidence: conf, actedOnText: na[0], criterionId: na[1] || crits[crits.length - 1]?.id || null, text: null });
+      if (!actions.length) actions.push({ action: "ignore", confidence: 0.95, actedOnText: comment.slice(0, 80), criterionId: null, text: null });
+    }
+    return JSON.stringify({ actions, reply });
+  }
+
+  // Verification judgment: echo the provisional (mechanical) verdicts with a
+  // mock reason — the model may only downgrade, and the mock never does.
+  if (system?.includes("verification judgment")) {
+    const rows = [...last.matchAll(/^- \[([^\]]+)\] provisional: (pass|fail|unverifiable)/gm)];
+    return JSON.stringify({
+      verdicts: rows.map((m) => ({ criterionId: m[1], verdict: m[2], reason: `[mock] ${m[2]} per the recorded test outcome`, evidenceArtifactIds: [] })),
     });
   }
 

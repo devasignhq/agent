@@ -6202,3 +6202,38 @@ pre.vln-code, .vln-code {
 .vln-ruling-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
 .vln-ruling-note-text { font-size: 13px; color: var(--fg); margin-bottom: 6px; }
 .vln-ruling-foot { display: flex; align-items: center; gap: 8px; margin-top: 10px; }
+
+/* ── Verification on the acceptance-criteria rows (acv- prefix: .ac-* is overloaded) ── */
+.acv-badges { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 6px; }
+.acv-badges .pill.mute { color: var(--fg-mute); border-color: var(--line-2); }
+.acv-test { font-size: 11px; }
+.acv-reason { font-size: 12px; margin-top: 4px; white-space: pre-wrap; }
+.acv-summary { margin-left: 8px; }
+.acv-summary a { color: var(--fg-dim); text-decoration: underline; }
+.ac-row.acv-target { outline: 1px solid var(--accent); outline-offset: -1px; }
+.acv-rec { margin-top: 8px; border: 1px solid var(--line); background: var(--bg-1); }
+.acv-rec-head {
+  display: grid; grid-template-columns: 96px 1fr auto auto; gap: 10px; align-items: center;
+  width: 100%; padding: 6px 8px; background: transparent; border: 0; color: var(--fg); text-align: left; cursor: pointer;
+}
+.acv-rec-head:disabled { cursor: default; }
+.acv-rec-head:hover:not(:disabled) { background: var(--bg-2); }
+.acv-rec-thumb { width: 96px; height: 54px; object-fit: cover; background: var(--bg-3); border: 1px solid var(--line-2); display: block; }
+.acv-rec-thumb.placeholder { display: grid; place-items: center; color: var(--fg-mute); }
+.acv-rec.expired .acv-rec-thumb { opacity: 0.4; }
+.acv-rec-title { font-size: 11px; color: var(--fg-dim); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.acv-rec-dur { font-size: 11px; }
+.acv-rec-chev { color: var(--fg-mute); display: grid; place-items: center; }
+.acv-rec-body { border-top: 1px solid var(--line); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
+.acv-rec-video { width: 100%; max-height: 420px; background: #000; display: block; }
+.acv-rec-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.acv-revisions { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); }
+.acv-revision { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
+.acv-revision:last-child { border-bottom: 0; }
+.acv-revision-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+.acv-revision-head a { color: var(--fg-dim); text-decoration: underline; }
+.acv-revision-changes { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--line-2); font-size: 11px; }
+
+.wf-verify-setup { margin-top: 8px; padding: 8px; border: 1px solid var(--line); background: var(--bg-1); cursor: default; }
+.wf-verify-setup a { color: var(--fg-dim); text-decoration: underline; }
+.wf-verify-setup select { background: var(--bg-2); color: var(--fg); border: 1px solid var(--line-2); padding: 2px 4px; }

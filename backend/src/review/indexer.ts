@@ -185,14 +185,26 @@ export async function buildRepoIndex(
 
 // ─── Full build ───────────────────────────────────────────────────────────
 
+export type TreeEntry = { path: string; type: string; size?: number; sha: string };
+
+/** The recursive git tree at `sha` (blobs + trees). */
+export async function fetchTree(
+  repo: Pick<Repository, "owner" | "name">,
+  install: Pick<Installation, "installationId">,
+  sha: string
+): Promise<TreeEntry[]> {
+  const tree = await gh<{ tree?: TreeEntry[] }>(
+    install.installationId,
+    `/repos/${repo.owner}/${repo.name}/git/trees/${sha}?recursive=1`
+  );
+  return Array.isArray(tree?.tree) ? tree.tree : [];
+}
+
 async function runFullIndex(repo: Repository, install: Installation): Promise<IndexSummary> {
   const headSha = await fetchHeadSha(repo, install);
 
   // List blobs on the default branch in a single tree call.
-  const tree = await gh<{ tree: Array<{ path: string; type: string; size?: number; sha: string }> }>(
-    install.installationId,
-    `/repos/${repo.owner}/${repo.name}/git/trees/${headSha}?recursive=1`
-  );
+  const tree = { tree: await fetchTree(repo, install, headSha) };
 
   const candidates = tree.tree.filter((entry) => entry.type === "blob" && isIndexable(entry.path, entry.size ?? 0));
 

@@ -44,6 +44,10 @@ import { addClient, removeClient } from "../notifications-stream.js";
 import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
+import { buildRunView } from "../verify/runs.js";
+import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
+import { adoptGeneratedTests } from "../verify/onboarding/job.js";
+import { enqueueVerifyOnboard } from "../queue.js";
 
 export const api = Router();
 
@@ -488,10 +492,12 @@ api.get("/repositories", (req, res) => {
     else if (rv.status === "changes_requested") s.blocked++;
     stats.set(rv.repoId, s);
   }
+  const flake = repoFlakeRates(repoIds);
   res.json(
     repos.map((r) => ({
       ...r,
       reviewStats: stats.get(r.id) || { total: 0, approved: 0, blocked: 0 },
+      flakeRate: flake.get(r.id) || { rate: 0, flaky: 0, total: 0 },
     }))
   );
 });
@@ -1230,6 +1236,85 @@ export function getReviewHandler(req: Request, res: Response) {
   res.json({ review, logs, task });
 }
 api.get("/reviews/:id", getReviewHandler);
+
+// Latest verify run for a review (same owner gate as the review read).
+api.get("/reviews/:id/verify", async (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const runs = db.filter("verifyRuns", (r) => r.reviewId === review.id).sort((a, b) => b.createdAt - a.createdAt);
+  // ?run=<id> views a specific run (the GitHub deep link pins one); default latest.
+  const wanted = typeof req.query.run === "string" ? runs.find((r) => r.id === req.query.run) : undefined;
+  const picked = wanted ?? runs[0];
+  const latest = picked ? await buildRunView(picked, { includeUsage: true }) : null;
+  res.json({
+    latest,
+    runs: runs.map((r) => ({ id: r.id, sha: r.sha, attempt: r.attempt, status: r.status, createdAt: r.createdAt, verdicts: r.verdicts.length })),
+    flakeRate: repoFlakeRate(repo.id),
+  });
+});
+
+// Verification setup checklist for a repo, and "Regenerate setup PR".
+api.get("/repositories/:id/verify/setup", (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const v = ctx.repo.verify;
+  res.json({
+    onboarding: v?.onboarding ?? { state: "none" },
+    detected: v?.detected ?? null,
+    devasignYml: v?.devasignYml?.parsed ?? null,
+    runnerSeen: !!v?.detected || !!v?.onboarding?.firstSuccessfulRunId,
+  });
+});
+api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, (req, res) => {
+  const ctx = ownedRepo(req, res);
+  if (!ctx) return;
+  const mode = req.body?.mode === "extend" ? "extend" : "separate";
+  const workflow = typeof req.body?.workflow === "string" ? req.body.workflow.slice(0, 200) : undefined;
+  enqueueVerifyOnboard({ repoId: ctx.repo.id, trigger: "manual", mode, workflow });
+  res.json({ ok: true, queued: true });
+});
+// "Adopt this test": commit generated tests from a run into the customer's suite via a PR.
+export async function adoptTestsHandler(req: Request, res: Response): Promise<void> {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  // The run id is caller-supplied and run ids are public (they appear in the PR
+  // comment's deep link), so it must belong to the review we just authorized.
+  const asked = typeof req.body?.runId === "string" ? req.body.runId : null;
+  const mine = db.filter("verifyRuns", (r) => r.reviewId === review.id);
+  const run = asked ? mine.find((r) => r.id === asked) : mine.sort((a, b) => b.createdAt - a.createdAt)[0];
+  if (!run) return void res.status(404).json({ error: "run_not_found" });
+  const testIds = Array.isArray(req.body?.testIds) ? req.body.testIds.map(String) : null;
+  const out = await adoptGeneratedTests(run.id, testIds);
+  res.status(out.status === "failed" ? 502 : 200).json(out);
+}
+api.post("/reviews/:id/verify/adopt", expensiveLimiter, adoptTestsHandler);
+
+// Criteria revision history (read-only; revision 1 is synthesis, later ones
+// come from PR-comment feedback). Same owner gate as the review read.
+api.get("/reviews/:id/criteria-revisions", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const revisions = db.filter("criteriaRevisions", (c) => c.reviewId === review.id).sort((a, b) => a.revision - b.revision);
+  res.json({ revisions, repo: { owner: repo.owner, name: repo.name }, prNumber: review.prNumber });
+});
 
 // Re-run a review (e.g. after the user attached a Loom and updated the task).
 // Same owner-scoped gate as the read above — this re-queues work, so an

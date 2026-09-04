@@ -5,6 +5,7 @@ import assert from "node:assert/strict";
 import {
   appendAddedCriteria,
   buildCriteriaSection,
+  isRetiredCriterion,
   splitForComment,
   type PriorVerdict,
 } from "./criteria-format.js";
@@ -186,4 +187,21 @@ test("splitForComment: an inconclusive (met:null) prior is not treated as a regr
   const { regressed, unmet } = splitForComment(filled, prior);
   assert.equal(regressed.length, 0);
   assert.deepEqual(unmet.map((c) => c.id), ["c1"]);
+});
+
+// PR-comment feedback retires a criterion by pointing it at its replacement
+// (reword) or flagging it not-applicable — it is never deleted, because the
+// revision history has to keep it. The review must stop grading it.
+test("criteria retired through comment feedback drop out of the comment split", () => {
+  const criteria: Criterion[] = [
+    { id: "1", text: "old wording", met: false, evidence: null, supersededBy: "4" },
+    { id: "2", text: "not our problem", met: false, evidence: null, notApplicable: true },
+    { id: "3", text: "still open", met: false, evidence: null },
+    { id: "4", text: "new wording", met: true, evidence: null },
+  ];
+  assert.deepEqual(criteria.map(isRetiredCriterion), [true, true, false, false]);
+  const { regressed, unmet, met } = splitForComment(criteria, new Map<string, PriorVerdict>([["1", { met: true, evidence: null }]]));
+  assert.deepEqual(unmet.map((c) => c.id), ["3"], "only live criteria stay open");
+  assert.deepEqual(met.map((c) => c.id), ["4"]);
+  assert.deepEqual(regressed.map((c) => c.id), [], "a retired criterion cannot regress");
 });

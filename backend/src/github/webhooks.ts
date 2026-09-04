@@ -5,6 +5,8 @@ import type { Request, Response } from "express";
 import { v4 as uuid } from "uuid";
 import { config, isProductionLike } from "../config.js";
 import { db } from "../db.js";
+import { adoptGeneratedTests, noteOnboardingPrClosed } from "../verify/onboarding/job.js";
+import { ADOPT_PREFIX_LEN } from "../verify/report.js";
 import { gh, postPRComment } from "./app.js";
 import { addInstallMember, attributedUserFor } from "./installations.js";
 import { maintainerByGithubId } from "../users.js";
@@ -13,8 +15,7 @@ import {
   enqueueIndex,
   enqueueMaintainerFeedback,
   enqueueReview,
-  enqueueSecurityAudit,
-} from "../queue.js";
+  enqueueSecurityAudit, enqueueVerifyOnboard } from "../queue.js";
 import { effectiveSecurityPolicy } from "../security/policy.js";
 import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
@@ -142,6 +143,9 @@ export function handleWebhook(req: Request, res: Response) {
     case "github_app_authorization":
       handleAppAuthorization(event);
       break;
+    case "check_run":
+      handleCheckRun(event);
+      break;
     case "ping":
       // GitHub sends this when the webhook is created. Nothing to do.
       break;
@@ -232,6 +236,7 @@ function handleIssueComment(event: any) {
         authorAssociation,
         sourceUrl: event.comment?.html_url || "",
         sourceEvent: "issue_comment",
+        ...(typeof event.comment?.id === "number" ? { commentId: event.comment.id } : {}),
       });
       console.log(`[webhook] issue_comment: enqueued feedback for review ${existing.id}`);
       return;
@@ -353,6 +358,7 @@ function handlePullRequestReview(event: any) {
       authorAssociation,
       sourceUrl: event.review?.html_url || "",
       sourceEvent: "pull_request_review",
+      ...(typeof event.review?.id === "number" ? { commentId: event.review.id } : {}),
     });
     console.log(`[webhook] pull_request_review: enqueued for review ${review.id}`);
   })();
@@ -433,6 +439,7 @@ function handlePullRequestReviewComment(event: any) {
       authorAssociation,
       sourceUrl: event.comment?.html_url || "",
       sourceEvent: "pull_request_review_comment",
+      ...(typeof event.comment?.id === "number" ? { commentId: event.comment.id } : {}),
     });
     console.log(`[webhook] pull_request_review_comment: enqueued for review ${review.id}`);
   })();
@@ -644,6 +651,31 @@ function handleAppAuthorization(event: any) {
   })();
 }
 
+// Which run an "adopt:<run id prefix>" button press refers to. The prefix is
+// scoped to the repo the event came from and required to be the full length
+// report.ts emits: an unscoped scan would adopt into whatever repo the first
+// matching run belongs to, and an empty prefix would match anything.
+export function adoptTargetFor(event: any): string | null {
+  const id = String(event?.requested_action?.identifier || "");
+  if (!id.startsWith("adopt:")) return null;
+  const prefix = id.slice("adopt:".length);
+  if (prefix.length < ADOPT_PREFIX_LEN) return null;
+  const [owner, name] = String(event?.repository?.full_name || "").split("/");
+  const install = db.find("installations", (i) => i.installationId === event?.installation?.id);
+  if (!owner || !name || !install) return null;
+  const repo = db.find("repositories", (r) => r.installationId === install.id && r.owner === owner && r.name === name);
+  if (!repo) return null;
+  return db.find("verifyRuns", (r) => r.repoId === repo.id && r.id.startsWith(prefix))?.id ?? null;
+}
+
+// A click on one of our check-run buttons. Only "adopt:<run id prefix>" today.
+function handleCheckRun(event: any) {
+  if (event.action !== "requested_action") return;
+  const runId = adoptTargetFor(event);
+  if (!runId) return;
+  void adoptGeneratedTests(runId, null).catch((err) => console.warn("[webhook] adopt-tests failed:", err));
+}
+
 function handleInstallation(event: any) {
   if (event.action === "created" || event.action === "added") {
     // Auto-link to the user who clicked Install on GitHub. The webhook
@@ -673,7 +705,8 @@ function handleInstallation(event: any) {
     // so the frontend has something to show in the onboarding repo browser
     // (and Settings → Models) immediately — without waiting for a PR webhook.
     for (const r of event.repositories || []) {
-      upsertRepoFromInstallEvent(install.id, r);
+      const repoId = upsertRepoFromInstallEvent(install.id, r);
+      if (repoId) enqueueVerifyOnboard({ repoId, trigger: "install" });
     }
     db.insert("authAudit", {
       id: uuid(),
@@ -768,7 +801,8 @@ function handleInstallationRepos(event: any) {
   // Same as on initial install: materialise Repository rows for the newly
   // granted repos so the UI can show them right away.
   for (const r of event.repositories_added || []) {
-    upsertRepoFromInstallEvent(install.id, r);
+    const repoId = upsertRepoFromInstallEvent(install.id, r);
+    if (repoId) enqueueVerifyOnboard({ repoId, trigger: "install" });
   }
   // Drop rows for repos the user revoked.
   for (const r of event.repositories_removed || []) {
@@ -791,23 +825,25 @@ function handleInstallationRepos(event: any) {
 function upsertRepoFromInstallEvent(
   installDbId: string,
   repo: { id?: number; name?: string; full_name?: string; private?: boolean }
-) {
+): string | null {
   const fullName: string = repo.full_name || "";
   const [owner, name] = fullName.split("/");
-  if (!owner || !name) return;
+  if (!owner || !name) return null;
   const existing = db.find(
     "repositories",
     (r) => r.owner === owner && r.name === name
   );
   if (existing) {
     const visChanged = typeof repo.private === "boolean" && existing.private !== repo.private;
-    if (existing.installationId !== installDbId || visChanged) {
+    const learnId = typeof repo.id === "number" && existing.githubRepoId !== repo.id;
+    if (existing.installationId !== installDbId || visChanged || learnId) {
       db.update("repositories", (r) => r.id === existing.id, {
         installationId: installDbId,
         ...(typeof repo.private === "boolean" ? { private: repo.private } : {}),
+        ...(learnId ? { githubRepoId: repo.id } : {}),
       });
     }
-    return;
+    return existing.id;
   }
   const newRepo = db.insert("repositories", {
     id: uuid(),
@@ -820,8 +856,10 @@ function upsertRepoFromInstallEvent(
     modelOverrides: {},
     reviewsEnabled: true,
     indexState: "queued",
+    ...(typeof repo.id === "number" ? { githubRepoId: repo.id } : {}),
   });
   enqueueIndex({ repoId: newRepo.id, full: true });
+  return newRepo.id;
 }
 
 // Author-facing notices posted when a PR can't be reviewed under the owner's
@@ -867,6 +905,11 @@ function handlePullRequest(event: any) {
   // reasons against. Non-merge closes are ignored.
   if (event.action === "closed") {
     const pullReq = event.pull_request;
+    {
+      // Our own onboarding PR closing (merged or not) moves the repo's setup state.
+      const r = db.find("repositories", (x) => x.owner === owner && x.name === name);
+      if (r && pullReq?.number) noteOnboardingPrClosed(r.id, pullReq.number, !!pullReq.merged);
+    }
     if (!pullReq?.merged) return;
     // Bounty payout: if this merged PR delivers a delegated bounty, release the
     // escrow to the contributor (admin-signed). Independent of the re-index below.
@@ -999,6 +1042,7 @@ function handlePullRequest(event: any) {
       modelOverrides: {},
       reviewsEnabled: true,
       indexState: "queued",
+      ...(typeof event.repository.id === "number" ? { githubRepoId: event.repository.id } : {}),
     };
     db.insert("repositories", repo);
     enqueueIndex({ repoId: repo.id, full: true });

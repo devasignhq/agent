@@ -244,6 +244,24 @@ export type Repository = {
   // Repo-index state (backend RepoIndexState) — "none" until first indexed.
   indexState?: "none" | "queued" | "indexing" | "ready" | "stale" | "errored";
   indexedAt?: number;
+  githubRepoId?: number;
+  // Verifier state (backend RepoVerifyState) + the flake rate attached by
+  // GET /api/repositories (last 30 runs; not persisted).
+  verify?: {
+    detected?: unknown;
+    onboarding: {
+      state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
+      prNumber?: number;
+      prUrl?: string;
+      mode?: "separate" | "extend";
+      firstSuccessfulRunId?: string | null;
+      expectedSecrets?: string[];
+      missingSecrets?: string[] | null;
+      lastError?: string | null;
+      lastDiagnosis?: { code: string; message: string } | null;
+    };
+  };
+  flakeRate?: { rate: number; flaky: number; total: number };
 };
 
 // Per-repo review workflow (mirror of backend/src/types.ts RepoWorkflow).
@@ -341,6 +359,73 @@ export type Criterion = {
   text: string;
   met: boolean | null;
   evidence: string | null;
+  evidenceCode?: { path: string; startLine: number; language: string | null; code: string } | null;
+  suggestedChange?: unknown | null;
+  // Verifier fields (mirror of backend/src/types.ts; absent = code, not implied).
+  kind?: "code" | "ui" | "unverifiable";
+  implied?: boolean;
+  source?: { input: string; ref?: string; excerpt?: string };
+  revision?: number;
+  supersededBy?: string | null;
+  notApplicable?: boolean;
+};
+
+// ---- verification (backend/src/verify/contract.ts RunView) ----
+export type CriterionVerdict = {
+  criterionId: string;
+  verdict: "pass" | "fail" | "unverifiable";
+  reason: string;
+  evidenceRefs: Array<{ artifactId?: string; testId?: string; resultId?: string }>;
+  flaky?: boolean;
+  retired?: boolean;
+};
+
+export type RunViewArtifact = {
+  id: string;
+  kind: "video" | "trace" | "screenshot" | "log" | "test_file" | "poster";
+  testId?: string;
+  criterionIds: string[];
+  bytes: number;
+  state: "pending_upload" | "uploaded" | "expired";
+  expiresAt: number;
+  posterArtifactId?: string | null;
+  path: string;
+  attempt?: number;
+  getUrl: string | null;
+  posterUrl: string | null;
+  urlExpiresAt: number | null;
+};
+
+export type RunView = {
+  run: {
+    id: string;
+    status: string;
+    sha: string;
+    attempt: number;
+    verdicts: CriterionVerdict[];
+    error?: string | null;
+    doctor?: { code: string; message: string } | null;
+    timings: Record<string, unknown>;
+    report?: { checkRunUrl?: string; commentUrl?: string };
+    createdAt: number;
+  };
+  criteria: Criterion[];
+  revision: number;
+  plan: { id: string; tests: Array<{ id: string; path: string; criterionIds: string[]; level: string; origin: "existing" | "generated"; runner: string }>; unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }> } | null;
+  results: Array<{ id: string; testId: string; criterionIds: string[]; status: string; attempts: Array<{ n: number; status: string; durationMs: number; error?: string; artifactIds: string[] }>; durationMs: number; error?: string }> | null;
+  artifacts: RunViewArtifact[];
+  report: { checkRunUrl?: string; commentUrl?: string };
+};
+
+export type CriteriaRevision = {
+  id: string;
+  schemaVersion: 1;
+  reviewId: string;
+  revision: number;
+  causedByCommentId: number | null;
+  criteria: Criterion[];
+  diff: Array<{ op: "add" | "remove" | "reword" | "not_applicable"; criterionId: string; before?: string; after?: string }>;
+  createdAt: number;
 };
 
 export type PRReview = {
@@ -354,6 +439,9 @@ export type PRReview = {
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;
+  additions?: number | null;
+  deletions?: number | null;
+  changedFiles?: number | null;
   // Criterion ids that an earlier commit met but a later commit broke. Lets the
   // timeline flag a "previously met, now broken" regression instead of just
   // "unmet" (mirror of backend/src/types.ts). Optional — absent on older rows.
@@ -369,7 +457,10 @@ export type ReviewLogKind =
   | "tool"
   | "comment"
   | "verdict"
-  | "error";
+  | "error"
+  | "holistic"
+  | "finding"
+  | "verify";
 
 export type ReviewLogEntry = {
   id: string;
@@ -817,6 +908,22 @@ export const api = {
       method: "POST",
       body: "{}",
     }),
+  // Verification: the latest (or a specific) verify run with signed evidence URLs.
+  verifyRun: (reviewId: string, runId?: string) =>
+    request<{ latest: RunView | null; runs: Array<{ id: string; sha: string; attempt: number; status: string; createdAt: number; verdicts: number }>; flakeRate: { rate: number; flaky: number; total: number } }>(
+      `/api/reviews/${reviewId}/verify${runId ? `?run=${encodeURIComponent(runId)}` : ""}`
+    ),
+  adoptTests: (reviewId: string, runId: string | undefined, testIds: string[] | null) =>
+    request<{ status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string }>(`/api/reviews/${reviewId}/verify/adopt`, {
+      method: "POST",
+      body: JSON.stringify({ runId, testIds }),
+    }),
+  verifySetup: (repoId: string) =>
+    request<{ onboarding: NonNullable<Repository["verify"]>["onboarding"]; detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null; devasignYml: { start?: string; url?: string; e2e?: string } | null; runnerSeen: boolean }>(`/api/repositories/${repoId}/verify/setup`),
+  requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string }) =>
+    request<{ ok: true; queued: true }>(`/api/repositories/${repoId}/verify/setup-pr`, { method: "POST", body: JSON.stringify(opts) }),
+  criteriaRevisions: (reviewId: string) =>
+    request<{ revisions: CriteriaRevision[]; repo: { owner: string; name: string }; prNumber: number }>(`/api/reviews/${reviewId}/criteria-revisions`),
 
   // tasks
   task: (id: string) => request<Task>(`/api/tasks/${id}`),

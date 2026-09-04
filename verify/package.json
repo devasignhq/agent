@@ -1,0 +1,48 @@
+{
+  "name": "@devasign/verify",
+  "version": "1.0.1",
+  "description": "Runs DevAsign's generated acceptance tests inside your CI and reports per-criterion evidence.",
+  "license": "GPL-3.0-or-later",
+  "type": "module",
+  "bin": {
+    "devasign-verify": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "esbuild src/cli.ts --bundle --platform=node --target=node20 --format=esm --outfile=dist/cli.js --external:tsx --external:@playwright/test --banner:js=\"#!/usr/bin/env node\nimport { createRequire as __cr } from 'node:module'; const require = __cr(import.meta.url);\" && chmod +x dist/cli.js",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "node --import tsx/esm --test 'src/**/*.test.ts'",
+    "test:e2e": "node --import tsx/esm --test test/e2e.test.ts",
+    "dev": "tsx src/cli.ts",
+    "prepublishOnly": "npm run typecheck && npm test && npm run build"
+  },
+  "dependencies": {
+    "@playwright/test": "^1.55.0",
+    "tsx": "^4.22.4",
+    "yaml": "^2.9.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.4",
+    "esbuild": "^0.25.0",
+    "typescript": "^5.6.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/devasignhq/agent.git",
+    "directory": "verify"
+  },
+  "homepage": "https://github.com/devasignhq/verify-action",
+  "keywords": [
+    "devasign",
+    "ci",
+    "testing",
+    "playwright",
+    "verification"
+  ]
+}

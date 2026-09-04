@@ -50,6 +50,11 @@ import { durabilityBarrier } from "./durability.js";
 import { enqueueIndex, enqueueSecurityAudit } from "./queue.js";
 import { authLimiter, globalLimiter } from "./rate-limit.js";
 import { requestContext } from "./request-context.js";
+import { v1 } from "./routes/v1.js";
+import { startVerifyReaper } from "./verify/reaper.js";
+import { startVerifyLiveSignals } from "./verify/live.js";
+import { startArtifactRetention } from "./verify/retention.js";
+import { rerenderReport } from "./verify/report.js";
 
 // Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
 // fund/cancel/approve links in bounties/links.ts. A secret that is public (either
@@ -205,6 +210,11 @@ app.post(
   handleStripeWebhook
 );
 
+// Runner API (@devasign/verify). OIDC-authenticated, no browser Origin, and a
+// results payload can exceed 1mb — so it mounts here with its own JSON parser,
+// ahead of the global limit and the CSRF gate.
+app.use("/v1", v1);
+
 app.use(express.json({ limit: "1mb" }));
 
 // CSRF mitigation. The session cookie is SameSite=None in prod, so it rides
@@ -330,6 +340,7 @@ startBountyLiveSignals();
 // Same for security findings/scan runs → the sponsor app's Security page, plus
 // the bounty→finding state linkage. See security/live.ts.
 startSecurityLiveSignals();
+startVerifyLiveSignals();
 // One-shot, idempotent: legacy index-embedded vulnerabilities → the
 // first-class securityFindings collection (see security/migrate.ts).
 backfillLegacyVulnerabilities();
@@ -337,6 +348,9 @@ backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
 startTopologyRefresh();
+// A reaped run (lost / timed out) still owes the PR an honest update.
+startVerifyReaper((run) => void rerenderReport(run.id).catch(() => {}));
+startArtifactRetention();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no
@@ -364,6 +378,7 @@ const REQUIRED_APP_EVENTS = [
   "issue_comment",
   "pull_request_review",
   "pull_request_review_comment",
+  "check_run", // the "Adopt tests" button on the DevAsign · Verify check run
 ];
 async function verifyAppEventSubscriptions(): Promise<void> {
   const name = config.github.appName;

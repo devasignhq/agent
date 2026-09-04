@@ -25,6 +25,8 @@ process.env.STELLAR_USDC_SAC_ID ||= "C_EPHEMERAL_TEST";
 // must be a format-valid (funds-less, throwaway) ed25519 seed, not "S_…TEST".
 const { Keypair } = await import("@stellar/stellar-sdk");
 process.env.STELLAR_ADMIN_SECRET ||= Keypair.random().secret();
+// Dev-only artifact store so a seeded verification run can serve recordings.
+process.env.ARTIFACT_LOCAL_DIR ||= `${process.env.TMPDIR || "/tmp"}/devasign-artifacts-ephemeral`;
 
 // Dynamic import so the assignments above run first (static imports hoist).
 await import("../src/server.js");
@@ -531,3 +533,11 @@ seedScan({
   ].map((line, i) => ({ at: now - 2 * HOUR + i * 4000, line })),
 });
 console.log("[ephemeral] seeded security findings + scan runs for ephemeral-repo-1");
+
+// EPHEMERAL_VERIFY_ASSETS=<dir of a kept @devasign/verify fixture run> seeds a
+// reviewed PR with a completed verification run on the ephemeral install, so
+// the run page (recordings, badges, revisions) can be checked in a browser.
+if (process.env.EPHEMERAL_VERIFY_ASSETS) {
+  const { seedVerifyRun } = await import("./ephemeral-verify-seed.js");
+  seedVerifyRun(process.env.EPHEMERAL_VERIFY_ASSETS, "ephemeral-install-1");
+}

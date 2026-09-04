@@ -1,0 +1,5 @@
+verify:
+  e2e: auto
+  start: node server.mjs
+  url: http://localhost:4173
+  ready: /healthz

@@ -1,4 +1,12 @@
 // Domain types mirror the Firestore sketch in devasign.md §3.
+import type {
+  DetectedSetup,
+  DevasignVerifyConfig,
+  DoctorDiagnosis,
+  PlanCommand,
+  PlanTest,
+  RunnerResults,
+} from "./verify/contract.js";
 
 export type User = {
   id: string;
@@ -75,6 +83,7 @@ export type RepoWorkflow = {
     docs: boolean;      // DEVASIGN.md conventions + doc-drift check
     deferrals: boolean; // self-admitted deferred/incomplete-work scan
     crossRepo: boolean; // sibling-repo breakage + feature-parity pass (Pro/Max)
+    verify: boolean;    // generated-test verification in the customer's CI (parallel branch)
   };
   verdict: {
     blocking: boolean; // false = post advisory COMMENT, never REQUEST_CHANGES
@@ -90,6 +99,12 @@ export type RepoWorkflow = {
     deferrals?: string; // deferred-work scan
     docs?: string;      // DEVASIGN.md guidance
     crossRepo?: string; // cross-repo impact + parity
+    verify?: string;    // test planner + judgment
+  };
+  // Verifier policy. `.devasign.yml` in the repo overrides `e2e` per repo.
+  verify?: {
+    e2e: "auto" | "always" | "never";
+    failOn: "never" | "verdict";
   };
   // Optional "Run GitHub Action" step (ADVANCED): when enabled, dispatch a
   // chosen GitHub Actions workflow after a review. `runWhen` gates dispatch on
@@ -134,7 +149,26 @@ export type Repository = {
   // Per-repo security audit policy (triggers/engines/severity gates). Optional;
   // read through effectiveSecurityPolicy() which merges defaults.
   securityPolicy?: RepoSecurityPolicy;
+  // GitHub's numeric repo id — what an Actions OIDC token identifies the repo by.
+  githubRepoId?: number;
+  verify?: RepoVerifyState;
 }
+
+export type RepoVerifyState = {
+  detected?: DetectedSetup | null;
+  devasignYml?: { raw: string; parsed: DevasignVerifyConfig | null; sha: string } | null;
+  onboarding: {
+    state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
+    prNumber?: number;
+    prUrl?: string;
+    mode?: "separate" | "extend";
+    lastDiagnosis?: DoctorDiagnosis | null;
+    firstSuccessfulRunId?: string | null;
+    expectedSecrets?: string[];
+    missingSecrets?: string[] | null; // null = the App could not read secret names
+    lastError?: string | null;
+  };
+};
 
 // A repo-scoped guidance material attached on the Workflow "Ingest context"
 // node. `summary` is the distilled, checkable review guidelines extracted from
@@ -526,6 +560,14 @@ export type EvidenceCode = {
   code: string;
 };
 
+export type CriterionKind = "code" | "ui" | "unverifiable";
+
+export type CriterionSource = {
+  input: "linear" | "pr_body" | "pr_title" | "agent_intent" | "diff" | "comment" | "bounty";
+  ref?: string;
+  excerpt?: string;
+};
+
 export type Criterion = {
   id: string;
   text: string;
@@ -536,6 +578,13 @@ export type Criterion = {
   // attached to UNMET criteria and cleared whenever a dispute flips `met`.
   evidenceCode?: EvidenceCode | null;
   suggestedChange?: SuggestedChange | null;
+  // Verifier fields (additive; absent = kind "code", not implied, revision 1).
+  kind?: CriterionKind;
+  implied?: boolean;
+  source?: CriterionSource;
+  revision?: number;
+  supersededBy?: string | null;
+  notApplicable?: boolean;
 };
 
 export type PRReview = {
@@ -606,7 +655,8 @@ export type ReviewLogKind =
   | "verdict"
   | "error"
   | "holistic"
-  | "finding";
+  | "finding"
+  | "verify";
 
 export type ReviewLogEntry = {
   id: string;
@@ -1033,6 +1083,211 @@ export type ParityFeature = {
   lastSeenReviewId: string;
 };
 
+// ---------------------------------------------------------------------------
+// Verifier rows. Artifacts (video/trace/log bytes) never live here — only their
+// storage keys; see verify/storage.ts.
+// ---------------------------------------------------------------------------
+export type TokenUsage = {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadTokens: number;
+  cacheCreationTokens: number;
+  costUsd: number;
+};
+
+export type VerifyRunStatus =
+  | "setup_pending"
+  | "planning"
+  | "awaiting_runner"
+  | "running"
+  | "judging"
+  | "completed"
+  | "timed_out"
+  | "lost"
+  | "skipped"
+  | "failed";
+
+export type VerifySkipReason = "no_criteria" | "verify_disabled" | "storage_unconfigured" | "fork_pr";
+
+export type CriterionVerdict = {
+  criterionId: string;
+  verdict: "pass" | "fail" | "unverifiable";
+  reason: string;
+  evidenceRefs: Array<{ artifactId?: string; testId?: string; resultId?: string }>;
+  flaky?: boolean;
+  retired?: boolean;
+};
+
+export type VerifyStageUsage = Partial<Record<"anthropic" | "gemini", TokenUsage>>;
+
+export type VerifyRun = {
+  id: string;
+  schemaVersion: 1;
+  reviewId: string;
+  repoId: string;
+  installationId: string;
+  prNumber: number;
+  sha: string;
+  attempt: number;
+  status: VerifyRunStatus;
+  skipReason?: VerifySkipReason | null;
+  error?: string | null;
+  criteriaRevision: number;
+  planTier: "free" | "pro" | "max";
+  planId?: string | null;
+  resultsId?: string | null;
+  verdicts: CriterionVerdict[];
+  timings: {
+    forkedAt: number;
+    criteriaFinishedAt?: number;
+    planStartedAt?: number;
+    planFinishedAt?: number;
+    resolvedAt?: number;
+    resultsAt?: number;
+    judgedAt?: number;
+    reportedAt?: number;
+    reviewBranch?: { startedAt: number; finishedAt?: number };
+  };
+  tokenUsage: Partial<Record<"plan" | "judge" | "feedback", VerifyStageUsage>>;
+  artifactBytes: number;
+  runnerMeta?: {
+    actionsRunId?: string;
+    runAttempt?: string;
+    runnerOs?: string;
+    cliVersion?: string;
+    jobUrl?: string;
+    workflowSha?: string;
+    eventName?: string;
+  };
+  doctor?: DoctorDiagnosis | null;
+  triggeredBy: { kind: "pr_event" | "comment" | "rerun" | "dispatch"; commentId?: number };
+  // A feedback re-run plans only the affected criteria; the rest inherit this run's verdicts.
+  inheritFromRunId?: string | null;
+  report?: { checkRunId?: number; checkRunUrl?: string; commentId?: number; commentUrl?: string; adoptPrUrl?: string };
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type CriteriaRevision = {
+  id: string;
+  schemaVersion: 1;
+  reviewId: string;
+  revision: number;
+  causedByCommentId: number | null;
+  criteria: Criterion[];
+  diff: Array<{
+    op: "add" | "remove" | "reword" | "not_applicable";
+    criterionId: string;
+    before?: string;
+    after?: string;
+  }>;
+  createdAt: number;
+};
+
+export type PRCommentActionKind =
+  | "add_criterion"
+  | "remove_criterion"
+  | "reword_criterion"
+  | "mark_not_applicable"
+  | "rerun"
+  | "question"
+  | "ignore";
+
+export type PRCommentAction = {
+  id: string;
+  schemaVersion: 1;
+  reviewId: string;
+  githubCommentId: number;
+  surface: "issue_comment" | "review_comment";
+  authorLogin: string;
+  body: string;
+  classified: Array<{
+    action: PRCommentActionKind;
+    confidence: number;
+    actedOnText: string;
+    criterionId?: string;
+    text?: string;
+  }>;
+  outcome: "applied" | "clarification_requested" | "ignored" | "answered" | "queued";
+  revision?: number;
+  replyCommentId?: number | null;
+  // The full comment, kept while queued behind an in-flight run.
+  queuedComment?: {
+    body: string;
+    author: string;
+    authorAssociation: string;
+    sourceUrl: string;
+    sourceEvent: "issue_comment" | "pull_request_review" | "pull_request_review_comment" | "in_app_message";
+    commentId?: number;
+  };
+  handledAt: number | null;
+  createdAt: number;
+};
+
+export type VerifyPlan = {
+  id: string;
+  schemaVersion: 1;
+  runId: string;
+  repoId: string;
+  criteriaRevision: number;
+  tests: PlanTest[];
+  commands: PlanCommand[];
+  unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
+  createdAt: number;
+};
+
+export type VerifyResults = {
+  id: string;
+  schemaVersion: 1;
+  runId: string;
+  payload: RunnerResults;
+  createdAt: number;
+};
+
+export type VerifyArtifactKind = "video" | "trace" | "screenshot" | "log" | "test_file" | "poster";
+
+export type VerifyArtifact = {
+  id: string;
+  schemaVersion: 1;
+  runId: string;
+  repoId: string;
+  testId?: string;
+  criterionIds: string[];
+  kind: VerifyArtifactKind;
+  path: string;
+  storageKey: string;
+  bytes: number;
+  contentType: string;
+  posterArtifactId?: string | null;
+  attempt?: number;
+  state: "pending_upload" | "uploaded" | "expired";
+  expiresAt: number;
+  uploadedAt?: number | null;
+  expiredAt?: number | null;
+  createdAt: number;
+};
+
+export type TestFlakeHistory = {
+  id: string;
+  schemaVersion: 1;
+  repoId: string;
+  testSignature: string;
+  history: Array<{
+    runId: string;
+    outcome: "pass" | "fail" | "flaky" | "error";
+    strategyVersion: number;
+    at: number;
+  }>;
+  flakeCount: number;
+  quarantinedAt: number | null;
+  retiredAt: number | null;
+  // What the signature stands for, so the planner can find history by criterion.
+  criterionText?: string;
+  level?: string;
+  targetFiles?: string[];
+  updatedAt: number;
+};
+
 export type DB = {
   users: User[];
   installations: Installation[];
@@ -1053,4 +1308,11 @@ export type DB = {
   securityPrecedents: SecurityPrecedent[];
   repoTopologies: RepoTopology[];
   parityFeatures: ParityFeature[];
+  verifyRuns: VerifyRun[];
+  criteriaRevisions: CriteriaRevision[];
+  prCommentActions: PRCommentAction[];
+  verifyPlans: VerifyPlan[];
+  verifyResults: VerifyResults[];
+  verifyArtifacts: VerifyArtifact[];
+  testFlakeHistory: TestFlakeHistory[];
 };

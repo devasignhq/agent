@@ -54,6 +54,7 @@ export async function purgeAccount(
   );
   const reviews = db.filter("prReviews", (r) => repoIds.has(r.repoId));
   const reviewIds = new Set(reviews.map((r) => r.id));
+  const verifyRunIds = new Set(db.filter("verifyRuns", (r) => repoIds.has(r.repoId)).map((r) => r.id));
   // PR-linked tasks carry no userId (only Linear tasks do), so collect them via
   // the reviews we're deleting; Linear tasks are dropped by userId below.
   const prTaskIds = new Set(
@@ -94,6 +95,13 @@ export async function purgeAccount(
   track(user, "account purged");
 
   // ── Erase local state, child rows first ─────────────────────────────────────
+  db.remove("verifyArtifacts", (a) => repoIds.has(a.repoId));
+  db.remove("verifyResults", (r) => verifyRunIds.has(r.runId));
+  db.remove("verifyPlans", (p) => repoIds.has(p.repoId));
+  db.remove("verifyRuns", (r) => repoIds.has(r.repoId));
+  db.remove("criteriaRevisions", (c) => reviewIds.has(c.reviewId));
+  db.remove("prCommentActions", (c) => reviewIds.has(c.reviewId));
+  db.remove("testFlakeHistory", (t) => repoIds.has(t.repoId));
   db.remove("reviewLogs", (l) => reviewIds.has(l.reviewId));
   db.remove("prReviews", (r) => reviewIds.has(r.id));
   db.remove("repoIndex", (e) => repoIds.has(e.repoId));
