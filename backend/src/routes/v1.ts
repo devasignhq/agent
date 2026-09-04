@@ -441,6 +441,7 @@ v1.get("/artifacts/local/:key", async (req, res) => {
     const ext = path.extname(full).toLowerCase();
     const type = ext === ".webm" ? "video/webm" : ext === ".zip" ? "application/zip" : ext === ".png" ? "image/png" : ext === ".jpg" ? "image/jpeg" : "text/plain; charset=utf-8";
     res.setHeader("Content-Type", type);
+    res.setHeader("Access-Control-Allow-Origin", "*");
     res.send(bytes);
   } catch {
     fail(res, 404, "not_found");

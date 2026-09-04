@@ -46,7 +46,7 @@ const LEDGER_FIELDS = ["status", "hash", "confirmedAt", "amountStroops", "bounty
 
 // True when `next` differs from `prev` in at least one field that isn't in
 // `ignored`. An insert (prev === null) is always a change.
-function changedBeyond(prev: unknown, next: unknown, ignored: Set<string>): boolean {
+export function changedBeyond(prev: unknown, next: unknown, ignored: Set<string>): boolean {
   if (!prev) return true;
   const a = prev as Record<string, unknown>;
   const b = next as Record<string, unknown>;

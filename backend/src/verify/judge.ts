@@ -16,6 +16,7 @@ import { usageByProvider } from "./plan.js";
 import { rerenderReport } from "./report.js";
 import { criteriaForRun, updateRun } from "./runs.js";
 import { artifactStorage } from "./storage.js";
+import { notifyForReview } from "../notifications.js";
 import { v4 as uuid } from "uuid";
 
 export const FLAKY_REASON = "flaky test — quarantined";
@@ -262,6 +263,13 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
       } catch (err) {
         console.warn("[verify] rerenderReport failed:", err);
       }
+      notifyForReview(
+        run.reviewId,
+        counts.fail ? "blocker" : "review",
+        `PR #${run.prNumber} — Verification: ${counts.pass} passed, ${counts.fail} failed, ${counts.unverifiable} unverifiable`,
+        doctor ? `Setup needs attention: ${doctor.message}` : verdicts.map((v) => `[${v.criterionId}] ${v.verdict}`).join(" · "),
+        `/reviews/${run.reviewId}?run=${run.id}`
+      );
       return updated;
     })
   );

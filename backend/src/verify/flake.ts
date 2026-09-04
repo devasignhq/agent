@@ -88,6 +88,31 @@ export function flakeRowsForCriterion(repoId: string, criterionText: string): Te
   );
 }
 
+/** One pass for many repos (GET /api/repositories attaches this per card). */
+export function repoFlakeRates(repoIds: Set<string>, lastRuns = 30): Map<string, { rate: number; flaky: number; total: number }> {
+  const runsByRepo = new Map<string, string[]>();
+  for (const r of db.filter("verifyRuns", (r) => repoIds.has(r.repoId) && r.status === "completed").sort((a, b) => b.createdAt - a.createdAt)) {
+    const list = runsByRepo.get(r.repoId) ?? [];
+    if (list.length < lastRuns) list.push(r.id);
+    runsByRepo.set(r.repoId, list);
+  }
+  const out = new Map<string, { rate: number; flaky: number; total: number }>();
+  for (const [repoId, ids] of runsByRepo) {
+    const idSet = new Set(ids);
+    let total = 0;
+    let flaky = 0;
+    for (const row of db.filter("testFlakeHistory", (t) => t.repoId === repoId)) {
+      for (const h of row.history) {
+        if (!idSet.has(h.runId)) continue;
+        total += 1;
+        if (h.outcome === "flaky") flaky += 1;
+      }
+    }
+    out.set(repoId, { rate: total ? flaky / total : 0, flaky, total });
+  }
+  return out;
+}
+
 /** Repo flake rate over the last N runs: quarantined generated tests / generated tests. */
 export function repoFlakeRate(repoId: string, lastRuns = 30): { rate: number; flaky: number; total: number } {
   const runIds = db

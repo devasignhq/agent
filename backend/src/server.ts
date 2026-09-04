@@ -52,6 +52,9 @@ import { authLimiter, globalLimiter } from "./rate-limit.js";
 import { requestContext } from "./request-context.js";
 import { v1 } from "./routes/v1.js";
 import { startVerifyReaper } from "./verify/reaper.js";
+import { startVerifyLiveSignals } from "./verify/live.js";
+import { startArtifactRetention } from "./verify/retention.js";
+import { rerenderReport } from "./verify/report.js";
 
 // Session cookies are JWTs signed with SESSION_SECRET, as are the bounty
 // fund/cancel/approve links in bounties/links.ts. A secret that is public (either
@@ -337,6 +340,7 @@ startBountyLiveSignals();
 // Same for security findings/scan runs → the sponsor app's Security page, plus
 // the bounty→finding state linkage. See security/live.ts.
 startSecurityLiveSignals();
+startVerifyLiveSignals();
 // One-shot, idempotent: legacy index-embedded vulnerabilities → the
 // first-class securityFindings collection (see security/migrate.ts).
 backfillLegacyVulnerabilities();
@@ -344,7 +348,9 @@ backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
 startTopologyRefresh();
-startVerifyReaper();
+// A reaped run (lost / timed out) still owes the PR an honest update.
+startVerifyReaper((run) => void rerenderReport(run.id).catch(() => {}));
+startArtifactRetention();
 
 // Flush staged writes to Postgres on a clean exit so mutations still inside
 // the debounce window aren't lost. Stop accepting new connections FIRST so no

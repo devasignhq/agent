@@ -45,7 +45,7 @@ import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 import { buildRunView } from "../verify/runs.js";
-import { repoFlakeRate } from "../verify/flake.js";
+import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 
 export const api = Router();
 
@@ -490,10 +490,12 @@ api.get("/repositories", (req, res) => {
     else if (rv.status === "changes_requested") s.blocked++;
     stats.set(rv.repoId, s);
   }
+  const flake = repoFlakeRates(repoIds);
   res.json(
     repos.map((r) => ({
       ...r,
       reviewStats: stats.get(r.id) || { total: 0, approved: 0, blocked: 0 },
+      flakeRate: flake.get(r.id) || { rate: 0, flaky: 0, total: 0 },
     }))
   );
 });
@@ -1244,12 +1246,30 @@ api.get("/reviews/:id/verify", async (req, res) => {
     return void res.status(403).json({ error: "forbidden" });
   }
   const runs = db.filter("verifyRuns", (r) => r.reviewId === review.id).sort((a, b) => b.createdAt - a.createdAt);
-  const latest = runs[0] ? await buildRunView(runs[0], { includeUsage: true }) : null;
+  // ?run=<id> views a specific run (the GitHub deep link pins one); default latest.
+  const wanted = typeof req.query.run === "string" ? runs.find((r) => r.id === req.query.run) : undefined;
+  const picked = wanted ?? runs[0];
+  const latest = picked ? await buildRunView(picked, { includeUsage: true }) : null;
   res.json({
     latest,
     runs: runs.map((r) => ({ id: r.id, sha: r.sha, attempt: r.attempt, status: r.status, createdAt: r.createdAt, verdicts: r.verdicts.length })),
     flakeRate: repoFlakeRate(repo.id),
   });
+});
+
+// Criteria revision history (read-only; revision 1 is synthesis, later ones
+// come from PR-comment feedback). Same owner gate as the review read.
+api.get("/reviews/:id/criteria-revisions", (req, res) => {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const revisions = db.filter("criteriaRevisions", (c) => c.reviewId === review.id).sort((a, b) => a.revision - b.revision);
+  res.json({ revisions, repo: { owner: repo.owner, name: repo.name }, prNumber: review.prNumber });
 });
 
 // Re-run a review (e.g. after the user attached a Loom and updated the task).
