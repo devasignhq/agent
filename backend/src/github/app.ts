@@ -331,3 +331,27 @@ export async function ghText(installationId: number, path: string, headers: Reco
   if (!res.ok) throw new Error(`gh text ${res.status} on ${path}`);
   return res.text();
 }
+
+// Fire a repository_dispatch so the customer's verify workflow re-runs for a PR
+// (needs the App's contents:write). Throws on a non-2xx so callers can record why.
+export async function repositoryDispatch(
+  installationId: number,
+  owner: string,
+  name: string,
+  eventType: string,
+  clientPayload: Record<string, unknown>
+): Promise<void> {
+  const token = await installationToken(installationId);
+  const res = await fetch(`https://api.github.com/repos/${owner}/${name}/dispatches`, {
+    method: "POST",
+    headers: {
+      Authorization: `token ${token}`,
+      Accept: "application/vnd.github+json",
+      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "devasign-app",
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ event_type: eventType, client_payload: clientPayload }),
+  });
+  if (!res.ok) throw new Error(`GitHub repository_dispatch ${res.status} on ${owner}/${name}: ${await res.text()}`);
+}

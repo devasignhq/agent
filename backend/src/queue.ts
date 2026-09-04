@@ -10,6 +10,8 @@ export type MaintainerComment = {
   author: string;
   authorAssociation: string;
   sourceUrl: string;
+  // GitHub id of the comment (issue comment / review comment / review), when known.
+  commentId?: number;
   sourceEvent:
     | "issue_comment"
     | "pull_request_review"
@@ -130,7 +132,7 @@ export type VerifyJudgeJob = { id: string; type: "verify_judge"; payload: { runI
 export type VerifyFeedbackJob = {
   id: string;
   type: "verify_feedback";
-  payload: { reviewId: string; commentId: number };
+  payload: { reviewId: string; comment: MaintainerComment };
   enqueuedAt: number;
   attempts: number;
 };
@@ -314,11 +316,11 @@ function enqueueVerify<J extends VerifyPlanJob | VerifyJudgeJob>(type: J["type"]
 export const enqueueVerifyPlan = (runId: string) => enqueueVerify<VerifyPlanJob>("verify_plan", runId);
 export const enqueueVerifyJudge = (runId: string) => enqueueVerify<VerifyJudgeJob>("verify_judge", runId);
 
-export function enqueueVerifyFeedback(reviewId: string, commentId: number): VerifyFeedbackJob {
+export function enqueueVerifyFeedback(reviewId: string, comment: MaintainerComment): VerifyFeedbackJob {
   const job: VerifyFeedbackJob = {
     id: uuid(),
     type: "verify_feedback",
-    payload: { reviewId, commentId },
+    payload: { reviewId, comment },
     enqueuedAt: Date.now(),
     attempts: 0,
   };

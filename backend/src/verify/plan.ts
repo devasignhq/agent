@@ -35,6 +35,8 @@ export type PlannerLLM = (args: { system: string; user: string; maxTokens: numbe
 
 export type PlannerDeps = {
   llm?: PlannerLLM;
+  // Feedback re-runs plan only the criteria a comment changed; the rest inherit verdicts.
+  onlyCriteriaIds?: string[];
   fetchTree?: (repo: Repository, install: Installation, sha: string) => Promise<TreeEntry[]>;
   readFile?: (install: Installation, repo: Repository, path: string, sha: string) => Promise<string | null>;
   fetchDiff?: (install: Installation, repo: Repository, prNumber: number) => Promise<string>;
@@ -310,7 +312,8 @@ export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: { ids:
 async function gatherContext(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<PlanContext> {
   const review = db.find("prReviews", (r) => r.id === run.reviewId);
   const { criteria: all } = criteriaForRun(run);
-  const criteria = all.filter((c) => (c.kind ?? "code") !== "unverifiable" && !c.notApplicable && !c.supersededBy);
+  const only = deps.onlyCriteriaIds ? new Set(deps.onlyCriteriaIds) : null;
+  const criteria = all.filter((c) => (c.kind ?? "code") !== "unverifiable" && !c.notApplicable && !c.supersededBy && (!only || only.has(c.id)));
   const [diff, tree] = await Promise.all([
     (deps.fetchDiff ?? defaultFetchDiff)(install, repo, run.prNumber),
     (deps.fetchTree ?? fetchTree)(repo, install, run.sha),

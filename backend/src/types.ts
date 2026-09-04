@@ -1157,6 +1157,8 @@ export type VerifyRun = {
   };
   doctor?: DoctorDiagnosis | null;
   triggeredBy: { kind: "pr_event" | "comment" | "rerun" | "dispatch"; commentId?: number };
+  // A feedback re-run plans only the affected criteria; the rest inherit this run's verdicts.
+  inheritFromRunId?: string | null;
   report?: { checkRunId?: number; checkRunUrl?: string; commentId?: number; commentUrl?: string };
   createdAt: number;
   updatedAt: number;
@@ -1205,6 +1207,15 @@ export type PRCommentAction = {
   outcome: "applied" | "clarification_requested" | "ignored" | "answered" | "queued";
   revision?: number;
   replyCommentId?: number | null;
+  // The full comment, kept while queued behind an in-flight run.
+  queuedComment?: {
+    body: string;
+    author: string;
+    authorAssociation: string;
+    sourceUrl: string;
+    sourceEvent: "issue_comment" | "pull_request_review" | "pull_request_review_comment" | "in_app_message";
+    commentId?: number;
+  };
   handledAt: number | null;
   createdAt: number;
 };

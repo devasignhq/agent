@@ -273,6 +273,35 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ tests, unverifiable: crits.filter((c) => c.kind === "unverifiable").map((c) => ({ criterionId: c.id, reason: "[mock] not checkable in CI" })) });
   }
 
+  // Verification feedback: deterministic rules over the comment text so the
+  // offline suite can drive reword / add / rerun / question / ignore and the
+  // low-confidence clarification path ("maybe …").
+  if (system?.includes("verification feedback")) {
+    const comment = (last.split(/^## Comment\n/m)[1] || last).trim();
+    const crits = [...last.matchAll(/^- \[([^\]]+)\] (.+?) — verdict: /gm)].map((m) => ({ id: m[1], text: m[2] }));
+    const low = /\bmaybe\b|\bperhaps\b/i.test(comment);
+    const conf = low ? 0.4 : 0.92;
+    const actions: unknown[] = [];
+    let reply: string | null = null;
+    if (/\?\s*$/.test(comment) || /^(why|how|what|which)\b/i.test(comment)) {
+      actions.push({ action: "question", confidence: 0.9, actedOnText: comment.slice(0, 120), criterionId: null, text: null });
+      reply = "[mock] The verdicts came from the recorded test outcomes listed above; see each criterion's evidence link.";
+    } else {
+      const reword = /should only show when refunds > 0/i.exec(comment);
+      if (reword) {
+        const target = crits.find((c) => /refund/i.test(c.text)) ?? crits[0];
+        if (target) actions.push({ action: "reword_criterion", confidence: conf, actedOnText: reword[0], criterionId: target.id, text: "The refunds line is shown only when refunds > 0." });
+      }
+      const add = /also check (?:that )?(.+?)(?:[.!]|$)/i.exec(comment);
+      if (add) actions.push({ action: "add_criterion", confidence: conf, actedOnText: add[0], criterionId: null, text: add[1].charAt(0).toUpperCase() + add[1].slice(1) + "." });
+      if (/\bre-?run\b/i.test(comment)) actions.push({ action: "rerun", confidence: 0.95, actedOnText: "re-run", criterionId: null, text: null });
+      const na = /(?:doesn't|does not) apply|not applicable|drop criterion (\S+)/i.exec(comment);
+      if (na) actions.push({ action: "mark_not_applicable", confidence: conf, actedOnText: na[0], criterionId: na[1] || crits[crits.length - 1]?.id || null, text: null });
+      if (!actions.length) actions.push({ action: "ignore", confidence: 0.95, actedOnText: comment.slice(0, 80), criterionId: null, text: null });
+    }
+    return JSON.stringify({ actions, reply });
+  }
+
   // Verification judgment: echo the provisional (mechanical) verdicts with a
   // mock reason — the model may only downgrade, and the mock never does.
   if (system?.includes("verification judgment")) {

@@ -48,6 +48,7 @@ export function createVerifyRun(input: {
   criteriaRevision?: number;
   triggeredBy: VerifyRun["triggeredBy"];
   planTier?: Plan;
+  inheritFromRunId?: string | null;
 }): VerifyRun {
   const now = Date.now();
   const prior = db.filter("verifyRuns", (r) => r.reviewId === input.review.id && r.sha === input.review.headSha);
@@ -73,6 +74,7 @@ export function createVerifyRun(input: {
     tokenUsage: {},
     artifactBytes: 0,
     triggeredBy: input.triggeredBy,
+    inheritFromRunId: input.inheritFromRunId ?? null,
     createdAt: now,
     updatedAt: now,
   });
@@ -82,8 +84,27 @@ function revisionKey(criteria: Criterion[]): string {
   return JSON.stringify(criteria.map((c) => [c.id, c.text, c.kind ?? "code", !!c.notApplicable, c.supersededBy ?? null]));
 }
 
+/** What changed between two criteria lists, in revision-diff terms. */
+export function diffCriteria(prev: Criterion[], next: Criterion[]): CriteriaRevision["diff"] {
+  const out: CriteriaRevision["diff"] = [];
+  const before = new Map(prev.map((c) => [c.id, c]));
+  const after = new Map(next.map((c) => [c.id, c]));
+  for (const c of next) {
+    const p = before.get(c.id);
+    if (!p) {
+      out.push({ op: "add", criterionId: c.id, after: c.text });
+      continue;
+    }
+    if (p.text !== c.text) out.push({ op: "reword", criterionId: c.id, before: p.text, after: c.text });
+    if (!p.notApplicable && c.notApplicable) out.push({ op: "not_applicable", criterionId: c.id, before: c.text });
+    if (!p.supersededBy && c.supersededBy) out.push({ op: "remove", criterionId: c.id, before: c.text, after: after.get(c.supersededBy)?.text });
+  }
+  for (const p of prev) if (!after.has(p.id)) out.push({ op: "remove", criterionId: p.id, before: p.text });
+  return out;
+}
+
 /** Record the criteria as a revision; a snapshot identical to the latest one is reused, not duplicated. */
-export function snapshotCriteriaRevision(reviewId: string, criteria: Criterion[], causedByCommentId: number | null, diff: CriteriaRevision["diff"] = []): CriteriaRevision {
+export function snapshotCriteriaRevision(reviewId: string, criteria: Criterion[], causedByCommentId: number | null, diff?: CriteriaRevision["diff"]): CriteriaRevision {
   const rows = db.filter("criteriaRevisions", (c) => c.reviewId === reviewId).sort((a, b) => b.revision - a.revision);
   const latest = rows[0] ?? null;
   if (latest && revisionKey(latest.criteria) === revisionKey(criteria)) return latest;
@@ -94,7 +115,7 @@ export function snapshotCriteriaRevision(reviewId: string, criteria: Criterion[]
     revision: (latest?.revision ?? 0) + 1,
     causedByCommentId,
     criteria: criteria.map((c) => ({ ...c })),
-    diff,
+    diff: diff ?? (latest ? diffCriteria(latest.criteria, criteria) : []),
     createdAt: Date.now(),
   });
 }

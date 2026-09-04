@@ -7,6 +7,8 @@ name: DevAsign verify
 on:
   pull_request:
     types: [opened, synchronize, reopened]
+  repository_dispatch:
+    types: [devasign-verify]   # re-runs requested from a PR comment
 permissions:
   contents: read
   id-token: write   # the runner authenticates to DevAsign with the job's OIDC token

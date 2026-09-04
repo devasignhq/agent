@@ -17,6 +17,7 @@ import { rerenderReport } from "./report.js";
 import { criteriaForRun, updateRun } from "./runs.js";
 import { artifactStorage } from "./storage.js";
 import { notifyForReview } from "../notifications.js";
+import { afterFeedbackRunSettled } from "./feedback.js";
 import { v4 as uuid } from "uuid";
 
 export const FLAKY_REASON = "flaky test — quarantined";
@@ -186,7 +187,20 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
   const { criteria } = criteriaForRun(run);
   const doctor = results.payload.doctor ?? null;
 
-  const code = computeVerdicts({ criteria, results: results.payload.results, plan, doctor, artifacts });
+  const all = computeVerdicts({ criteria, results: results.payload.results, plan, doctor, artifacts });
+  // A feedback re-run planned only the affected criteria; everything else keeps
+  // the previous run's verdict (never shown to the model) rather than reading
+  // as "no test ran".
+  const prior = run.inheritFromRunId ? db.find("verifyRuns", (r) => r.id === run.inheritFromRunId) : null;
+  const inherited = new Map<string, CriterionVerdict>();
+  if (prior) {
+    const covered = new Set([...results.payload.results.flatMap((r) => r.criterionIds), ...(plan?.tests ?? []).flatMap((t) => t.criterionIds), ...(plan?.unverifiable ?? []).map((u) => u.criterionId)]);
+    for (const v of prior.verdicts) {
+      if (!covered.has(v.criterionId) && all.some((x) => x.criterionId === v.criterionId)) inherited.set(v.criterionId, { ...v, reason: `${v.reason} (from the previous run)` });
+    }
+  }
+  const code = all.filter((v) => !inherited.has(v.criterionId));
+  const withInherited = (vs: CriterionVerdict[]) => all.map((v) => inherited.get(v.criterionId) ?? vs.find((x) => x.criterionId === v.criterionId) ?? v);
 
   // Flake history: every generated test's outcome, by signature.
   const testById = new Map((plan?.tests ?? []).map((t) => [t.id, t]));
@@ -240,6 +254,7 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
       } catch (err) {
         console.warn(`[verify] judgment model call failed for run ${run.id}; keeping mechanical verdicts:`, err);
       }
+      verdicts = withInherited(verdicts);
       const judgedAt = Date.now();
       const updated = updateRun(run.id, {
         status: "completed",
@@ -262,6 +277,11 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
         await rerenderReport(run.id);
       } catch (err) {
         console.warn("[verify] rerenderReport failed:", err);
+      }
+      try {
+        await afterFeedbackRunSettled(updated ?? run);
+      } catch (err) {
+        console.warn("[verify] feedback settle hook failed:", err);
       }
       notifyForReview(
         run.reviewId,

@@ -232,6 +232,7 @@ function handleIssueComment(event: any) {
         authorAssociation,
         sourceUrl: event.comment?.html_url || "",
         sourceEvent: "issue_comment",
+        ...(typeof event.comment?.id === "number" ? { commentId: event.comment.id } : {}),
       });
       console.log(`[webhook] issue_comment: enqueued feedback for review ${existing.id}`);
       return;
@@ -353,6 +354,7 @@ function handlePullRequestReview(event: any) {
       authorAssociation,
       sourceUrl: event.review?.html_url || "",
       sourceEvent: "pull_request_review",
+      ...(typeof event.review?.id === "number" ? { commentId: event.review.id } : {}),
     });
     console.log(`[webhook] pull_request_review: enqueued for review ${review.id}`);
   })();
@@ -433,6 +435,7 @@ function handlePullRequestReviewComment(event: any) {
       authorAssociation,
       sourceUrl: event.comment?.html_url || "",
       sourceEvent: "pull_request_review_comment",
+      ...(typeof event.comment?.id === "number" ? { commentId: event.comment.id } : {}),
     });
     console.log(`[webhook] pull_request_review_comment: enqueued for review ${review.id}`);
   })();

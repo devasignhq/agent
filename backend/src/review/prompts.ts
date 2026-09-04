@@ -17,6 +17,7 @@
 //   "You are DevAsign's cross-repo impact step."        → key "cross-repo impact step"
 //   "You are DevAsign's test planning step."            → key "test planning"
 //   "You are DevAsign's verification judgment step."    → key "verification judgment"
+//   "You are DevAsign's verification feedback step."    → key "verification feedback"
 // prompts.test.ts asserts these prefixes so drift turns into a red test.
 // Never phrase a marker sentence such that another branch's key becomes its
 // substring ("PR security review step" must not contain "PR review" — checked).
@@ -1096,5 +1097,29 @@ export function verificationJudgmentSystemPrompt(): string {
     "selector, a timeout, a boot failure, or a missing environment variable as evidence that the PR is wrong — those " +
     "are unverifiable. A false red costs more trust than an honest could-not-verify. Keep flaky verdicts as given.\n" +
     "\nOutput exactly the JSON object above. Never use emoji in any text you output."
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Verifier: PR-comment feedback classification
+// ---------------------------------------------------------------------------
+
+export function verificationFeedbackSystemPrompt(): string {
+  return (
+    "You are DevAsign's verification feedback step. A maintainer commented on a pull request whose acceptance " +
+    "criteria DevAsign verified with generated tests. Classify the comment into actions and emit a JSON object: " +
+    "{\"actions\": [{\"action\": \"add_criterion\"|\"remove_criterion\"|\"reword_criterion\"|\"mark_not_applicable\"|" +
+    "\"rerun\"|\"question\"|\"ignore\", \"confidence\": number, \"actedOnText\": string, \"criterionId\": string|null, " +
+    "\"text\": string|null}], \"reply\": string|null}.\n" +
+    "\nRules: `actedOnText` is the exact span of the comment each action derives from. `criterionId` names the " +
+    "existing criterion a reword/removal/not-applicable applies to (match on meaning, not wording); `text` is the " +
+    "full new criterion wording for add/reword — one checkable sentence in the same style as the existing criteria. " +
+    "A comment that adjusts what a criterion demands (a condition, a threshold, wording) is a reword; one that " +
+    "introduces a new requirement is an add; one that says a criterion does not apply here is mark_not_applicable; " +
+    "a request to run again is rerun. A question about the verdicts, tests, or evidence is `question` — answer it in " +
+    "`reply` in two or three sentences citing the verdicts and evidence you were given, never inventing test results. " +
+    "Acknowledgements, thanks, off-topic chatter, and discussion between humans are `ignore` with no reply. " +
+    "`confidence` is your certainty (0-1) that the action is what the maintainer meant; below 0.6 DevAsign asks " +
+    "for clarification instead of acting, so do not inflate it. Output exactly the JSON object. Never use emoji."
   );
 }
