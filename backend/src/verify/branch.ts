@@ -10,6 +10,7 @@ import { createVerifyRun, snapshotCriteriaRevision, TERMINAL_STATUSES, updateRun
 
 export const VERIFY_STAGE_DISABLED = "Verification disabled by workflow";
 export const VERIFY_NO_CRITERIA = "No verifiable criteria — verification skipped";
+export const VERIFY_FORK_PR = "PR from a fork — verification skipped (GitHub issues no OIDC token to fork workflows)";
 export const VERIFY_FORKED = "Verification branch forked";
 
 type Log = (action: string, extra?: Partial<ReviewLogEntry>) => void;
@@ -27,6 +28,7 @@ export function startVerifyBranch(args: {
   wf: RepoWorkflow;
   criteria: Criterion[];
   criteriaFinishedAt: number;
+  headFromFork?: boolean;
   log: Log;
 }): VerifyBranch {
   const { review, repo, install, wf, criteria, log } = args;
@@ -41,6 +43,14 @@ export function startVerifyBranch(args: {
   if (!verifiable.length) {
     const run = createVerifyRun({ ...base, status: "skipped", skipReason: "no_criteria" });
     log(VERIFY_NO_CRITERIA, { meta: { runId: run.id } });
+    return { run, settled: Promise.resolve(run) };
+  }
+  // A `pull_request` workflow on a fork's PR gets a read-only token and no OIDC
+  // token at all, so no runner can ever claim this run — planning one would only
+  // produce a 60-minute timeout on every push.
+  if (args.headFromFork) {
+    const run = createVerifyRun({ ...base, status: "skipped", skipReason: "fork_pr" });
+    log(VERIFY_FORK_PR, { meta: { runId: run.id } });
     return { run, settled: Promise.resolve(run) };
   }
   const run = createVerifyRun({ ...base, status: "planning" });

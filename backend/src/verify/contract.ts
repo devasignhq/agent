@@ -126,6 +126,7 @@ export type ResolveEmptyReason =
   | "no_criteria"
   | "verify_disabled"
   | "storage_unconfigured"
+  | "fork_pr"
   | "superseded"
   | "already_completed";
 

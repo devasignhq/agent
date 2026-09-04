@@ -31,6 +31,7 @@ import type {
   ApiError,
   ArtifactSignFile,
   ArtifactSignResponse,
+  DetectedSetup,
   ResolveRequest,
   ResolveResponse,
   ResultsResponse,
@@ -114,10 +115,49 @@ function parseResolveBody(body: unknown): ResolveRequest | null {
   };
 }
 
+const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun", "pip", "poetry", "go"]);
+const MONOREPO_TOOLS = new Set(["pnpm", "turbo", "nx", "workspaces"]);
+const FRAMEWORKS = new Set(["vitest", "jest", "pytest", "playwright", "cypress", "go-test", "node-test"]);
+const SERVICES = new Set(["postgres", "mysql", "redis"]);
+
+const strings = (v: unknown, max: number): string[] =>
+  Array.isArray(v) ? v.filter((x) => typeof x === "string" && x).map((x) => String(x).slice(0, 300)).slice(0, max) : [];
+
+/** The runner's setup is stored and later read field by field by the planner, so
+ *  every field is filled in here — a partial object would break every later plan. */
+export function normalizeDetectedSetup(raw: unknown): DetectedSetup | null {
+  if (!raw || typeof raw !== "object") return null;
+  const o = raw as Record<string, unknown>;
+  if (!Array.isArray(o.frameworks)) return null;
+  const mono = o.monorepo && typeof o.monorepo === "object" ? (o.monorepo as Record<string, unknown>) : null;
+  return {
+    languages: strings(o.languages, 20),
+    packageManager: typeof o.packageManager === "string" && PACKAGE_MANAGERS.has(o.packageManager) ? (o.packageManager as DetectedSetup["packageManager"]) : null,
+    monorepo: mono
+      ? { tool: typeof mono.tool === "string" && MONOREPO_TOOLS.has(mono.tool) ? (mono.tool as "pnpm" | "turbo" | "nx" | "workspaces") : null, packages: strings(mono.packages, 100) }
+      : null,
+    frameworks: o.frameworks
+      .filter((f): f is Record<string, unknown> => !!f && typeof f === "object" && typeof (f as Record<string, unknown>).name === "string" && FRAMEWORKS.has(String((f as Record<string, unknown>).name)))
+      .slice(0, 20)
+      .map((f) => ({
+        name: f.name as DetectedSetup["frameworks"][number]["name"],
+        ...(typeof f.version === "string" ? { version: f.version.slice(0, 40) } : {}),
+        ...(typeof f.configPath === "string" ? { configPath: f.configPath.slice(0, 300) } : {}),
+      })),
+    testCommands: strings(o.testCommands, 20),
+    envExampleVars: strings(o.envExampleVars, 100),
+    existingWorkflows: strings(o.existingWorkflows, 50),
+    ...(typeof o.nodeVersion === "string" ? { nodeVersion: o.nodeVersion.slice(0, 40) } : {}),
+    ...(typeof o.pythonVersion === "string" ? { pythonVersion: o.pythonVersion.slice(0, 40) } : {}),
+    services: strings(o.services, 10).filter((x): x is "postgres" | "mysql" | "redis" => SERVICES.has(x)),
+  };
+}
+
 function rememberSetup(repo: Repository, setup: ResolveRequest["setup"]): void {
-  if (!setup || !Array.isArray(setup.frameworks)) return;
+  const detected = normalizeDetectedSetup(setup);
+  if (!detected) return;
   db.update("repositories", (r) => r.id === repo.id, {
-    verify: { onboarding: { state: "none" }, ...(repo.verify || {}), detected: setup },
+    verify: { onboarding: { state: "none" }, ...(repo.verify || {}), detected },
   });
 }
 
@@ -242,6 +282,7 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
   const now = Date.now();
   const expiresAt = retentionExpiresAt(req.runner!.plan, now);
   const idByRef = new Map<string, string>();
+  const refById = new Map<string, string>();
   const rows: VerifyArtifact[] = [];
 
   for (const f of files) {
@@ -261,8 +302,13 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
       out.rejected.push({ clientRef: f.clientRef, reason: "quota" });
       continue;
     }
+    if (idByRef.has(f.clientRef)) {
+      out.rejected.push({ clientRef: f.clientRef, reason: "invalid" });
+      continue;
+    }
     const id = uuid();
     idByRef.set(f.clientRef, id);
+    refById.set(id, f.clientRef);
     rows.push({
       id,
       schemaVersion: 1,
@@ -301,8 +347,7 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
   for (const row of rows) {
     const { url, headers } = await storage.signPut(row.storageKey, row.contentType, config.artifacts.putUrlTtlSeconds);
     db.insert("verifyArtifacts", row);
-    const clientRef = [...idByRef.entries()].find(([, id]) => id === row.id)![0];
-    out.uploads.push({ clientRef, artifactId: row.id, putUrl: url, headers, urlExpiresAt, retentionExpiresAt: expiresAt });
+    out.uploads.push({ clientRef: refById.get(row.id)!, artifactId: row.id, putUrl: url, headers, urlExpiresAt, retentionExpiresAt: expiresAt });
   }
   updateRun(run.id, { artifactBytes: totalBytes });
   res.json(out);
@@ -415,6 +460,24 @@ export async function getRunHandler(req: RunnerRequest, res: Response): Promise<
 export const v1 = Router();
 v1.use(runnerLimiter);
 
+// Express 4 does not catch a rejected handler promise: it escapes as an
+// unhandled rejection and Node exits, losing every in-memory queued job. Every
+// /v1 handler and its auth middleware goes through this.
+type MaybeAsync = (req: RunnerRequest, res: Response, next: NextFunction) => void | Promise<void>;
+export function guard(handler: MaybeAsync): (req: Request, res: Response, next: NextFunction) => void {
+  return (req, res, next) => {
+    const onError = (err: unknown) => {
+      console.error(`[verify] /v1${req.path} failed:`, err);
+      if (!res.headersSent) fail(res, 500, "internal_error");
+    };
+    try {
+      Promise.resolve(handler(req as RunnerRequest, res, next)).catch(onError);
+    } catch (err) {
+      onError(err);
+    }
+  };
+}
+
 // Dev-only artifact bytes (see verify/storage-local.ts). Registered before the
 // JSON parser: bodies are raw files.
 function localGuard(method: "PUT" | "GET", req: Request, res: Response): string | null {
@@ -432,14 +495,15 @@ function localGuard(method: "PUT" | "GET", req: Request, res: Response): string 
   }
   return full;
 }
-v1.put("/artifacts/local/:key", express.raw({ type: () => true, limit: UPLOAD_LIMITS.maxFileBytes }), async (req, res) => {
+v1.put("/artifacts/local/:key", express.raw({ type: () => true, limit: UPLOAD_LIMITS.maxFileBytes }), guard(async (req, res) => {
   const full = localGuard("PUT", req, res);
   if (!full) return;
   await mkdir(path.dirname(full), { recursive: true });
-  await writeFile(full, req.body as Buffer);
+  // express.raw leaves an empty body as {}, which writeFile would throw on.
+  await writeFile(full, Buffer.isBuffer(req.body) ? req.body : Buffer.alloc(0));
   res.status(200).end();
-});
-v1.get("/artifacts/local/:key", async (req, res) => {
+}));
+v1.get("/artifacts/local/:key", guard(async (req, res) => {
   const full = localGuard("GET", req, res);
   if (!full) return;
   try {
@@ -452,13 +516,13 @@ v1.get("/artifacts/local/:key", async (req, res) => {
   } catch {
     fail(res, 404, "not_found");
   }
-});
+}));
 
 v1.use(express.json({ limit: "8mb" }));
-v1.post("/runs/resolve", runnerAuth, resolveHandler);
-v1.post("/runs/:runId/artifacts", runnerAuth, artifactsHandler);
-v1.post("/runs/:runId/results", runnerAuth, resultsHandler);
-v1.get("/runs/:runId", readAuth, getRunHandler);
+v1.post("/runs/resolve", guard(runnerAuth), guard(resolveHandler));
+v1.post("/runs/:runId/artifacts", guard(runnerAuth), guard(artifactsHandler));
+v1.post("/runs/:runId/results", guard(runnerAuth), guard(resultsHandler));
+v1.get("/runs/:runId", guard(readAuth), guard(getRunHandler));
 v1.get("/health", (_req, res) => {
   res.json({ ok: true, apiVersion: 1, verifyEnabled: effectiveWorkflow({ workflow: undefined }).stages.verify });
 });

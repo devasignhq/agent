@@ -35,6 +35,7 @@ export type VerificationRow = {
 export type VerificationState =
   | "pending"
   | "planning"
+  | "fork"
   | "setup_pending"
   | "completed"
   | "skipped"
@@ -88,7 +89,7 @@ export function buildVerificationView(args: {
   let state: VerificationState;
   let nudge: string | undefined;
   if (!run) state = "pending";
-  else if (run.status === "skipped") state = run.skipReason === "verify_disabled" ? "disabled" : "skipped";
+  else if (run.status === "skipped") state = run.skipReason === "verify_disabled" ? "disabled" : run.skipReason === "fork_pr" ? "fork" : "skipped";
   else if (run.status === "planning") state = "planning";
   else if (run.status === "completed") state = "completed";
   else if (run.status === "failed") state = "failed";
@@ -134,9 +135,9 @@ export function buildVerificationView(args: {
         state === "completed"
           ? "no test ran for this criterion"
           : run?.error || (state === "timed_out" ? "the runner did not report results" : "the run did not finish");
-    } else if (state === "skipped" || state === "disabled") {
+    } else if (state === "skipped" || state === "disabled" || state === "fork") {
       verdict = "unverifiable";
-      reason = state === "disabled" ? "verification is turned off for this repo" : "not verifiable in CI";
+      reason = state === "disabled" ? "verification is turned off for this repo" : state === "fork" ? "not run on fork pull requests" : "not verifiable in CI";
     } else {
       const planned = plan?.unverifiable.find((u) => u.criterionId === c.id);
       if (planned) {
@@ -194,6 +195,8 @@ function stateLine(view: VerificationView): string {
       return "No criteria on this PR can be verified by a test.";
     case "disabled":
       return "Verification is turned off in this repo's workflow.";
+    case "fork":
+      return "Verification does not run on pull requests from forks — GitHub issues no OIDC token to a fork's workflow, so the runner cannot authenticate.";
     case "timed_out":
       return "The runner did not report results in time — every criterion is unverifiable for this push.";
     case "lost":
@@ -254,9 +257,9 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
   } else if (view.state === "pending" || view.state === "planning") {
     conclusion = "neutral";
     title = "Verification pending";
-  } else if (view.state === "disabled" || view.state === "skipped") {
+  } else if (view.state === "disabled" || view.state === "skipped" || view.state === "fork") {
     conclusion = "neutral";
-    title = view.state === "disabled" ? "Verification disabled" : "Nothing to verify";
+    title = view.state === "disabled" ? "Verification disabled" : view.state === "fork" ? "Not run on fork PRs" : "Nothing to verify";
   } else {
     conclusion = "neutral";
     title = view.state === "timed_out" ? "Verification timed out" : "Verification did not complete";

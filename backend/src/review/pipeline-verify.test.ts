@@ -10,7 +10,7 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config } from "../config.js";
 import { runReviewJob } from "./pipeline.js";
-import { VERIFY_FORKED, VERIFY_STAGE_DISABLED } from "../verify/branch.js";
+import { VERIFY_FORK_PR, VERIFY_FORKED, VERIFY_STAGE_DISABLED } from "../verify/branch.js";
 import { VERIFICATION_END, VERIFICATION_START } from "../verify/report.js";
 import { resultsHandler } from "../routes/v1.js";
 import { runVerifyJudge } from "../verify/judge.js";
@@ -27,7 +27,7 @@ function ghResponse(body: any) {
   return { ok: true, status: 200, json: async () => body, text: async () => (typeof body === "string" ? body : JSON.stringify(body)) } as any;
 }
 
-function installFetchStub() {
+function installFetchStub(headRepoFullName = "acme/widgets") {
   const calls: Call[] = [];
   const comments = new Map<number, string>();
   let nextId = 4242;
@@ -48,7 +48,7 @@ function installFetchStub() {
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET") return ghResponse([{ sha: "abc1234", commit: { message: "Add widget" } }]);
     if (/\/pulls\/\d+$/.test(u) && method === "GET") {
       if (accept.includes("diff")) return ghResponse(DIFF);
-      return ghResponse({ title: "Add widget", body: "<!-- devasign:intent -->I added doWork to the handler.<!-- /devasign:intent -->", head: { sha: "abc1234", ref: "feature" }, base: { sha: "def5678" }, additions: 1, deletions: 0, changed_files: 1, commits: 1 });
+      return ghResponse({ title: "Add widget", body: "<!-- devasign:intent -->I added doWork to the handler.<!-- /devasign:intent -->", head: { sha: "abc1234", ref: "feature", repo: { full_name: headRepoFullName } }, base: { sha: "def5678" }, additions: 1, deletions: 0, changed_files: 1, commits: 1 });
     }
     if (/\/git\/trees\//.test(u) && method === "GET") return ghResponse({ tree: TREE });
     if (/\/contents\/package\.json/.test(u)) return ghResponse('{"scripts":{"test":"node --test"}}');
@@ -159,5 +159,34 @@ test("stages.verify=false → the branch is skipped, logged, and reported as dis
     assert.match(String(patch!.body?.body), /Verification is turned off in this repo's workflow/);
   } finally {
     restore();
+  }
+});
+
+// A fork's `pull_request` workflow gets a read-only token and no OIDC token, so
+// no runner can ever claim the run. Planning one only produced a 60-minute
+// timeout and a misleading "the runner did not report results" on every push.
+test("a PR from a fork is skipped up front instead of timing out an hour later", async () => {
+  const { review } = seedReview();
+  const { calls, comments, restore } = installFetchStub("contributor/widgets");
+  try {
+    await runReviewJob(review.id);
+    const run = db.find("verifyRuns", (r) => r.reviewId === review.id)!;
+    assert.equal(run.status, "skipped");
+    assert.equal(run.skipReason, "fork_pr");
+    assert.ok(!run.planId, "no plan is written for a run nothing can claim");
+    assert.ok(db.filter("reviewLogs", (l) => l.reviewId === review.id).some((l) => l.action === VERIFY_FORK_PR));
+
+    const body = [...comments.values()].at(-1) ?? "";
+    assert.match(body, /Verification does not run on pull requests from forks/);
+    assert.doesNotMatch(body, /did not report results/);
+    const verify = calls.filter((c) => c.method === "POST" && /\/check-runs$/.test(c.url)).map((c) => c.body).find((c) => c.name === "DevAsign · Verify");
+    assert.equal(verify.conclusion, "neutral");
+    assert.equal(verify.output.title, "Not run on fork PRs");
+  } finally {
+    restore();
+    db.remove("verifyRuns", (r) => r.reviewId === review.id);
+    db.remove("criteriaRevisions", (c) => c.reviewId === review.id);
+    db.remove("reviewLogs", (l) => l.reviewId === review.id);
+    db.remove("prReviews", (r) => r.id === review.id);
   }
 });

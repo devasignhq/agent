@@ -562,6 +562,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       wf,
       criteria,
       criteriaFinishedAt,
+      headFromFork: context.headFromFork,
       log: (action, extra) => log(review.id, "verify", action, extra),
     });
 
@@ -1312,6 +1313,9 @@ type Context = {
   commitMessages: string;
   // PR head branch (pr.head.ref) — the ref a "Run GitHub Action" dispatch uses.
   branch: string;
+  // The head is a fork of this repo. GitHub gives a fork's `pull_request` run a
+  // read-only token and no OIDC, so verification cannot run there.
+  headFromFork: boolean;
   videos: VideoSummary[];
   primaryIssues: number[];
   secondaryIssues: number[];
@@ -1346,6 +1350,7 @@ async function ingestContext(
   let commitMessages = "";
   let prBody = "";
   let prBranch = "";
+  let headFromFork = false;
   let linkedLinearIssue: { id: string; identifier: string; url: string } | null = null;
   let linearSeedCriteria: Criterion[] = [];
   let linearSeedEndGoal: string | null = null;
@@ -1368,6 +1373,10 @@ async function ingestContext(
       );
       prBody = pr.body || "";
       prBranch = pr.head?.ref || "";
+      // Only a positively different head repository counts: a missing field must
+      // not silently disable verification for an ordinary PR.
+      const headRepo = String(pr.head?.repo?.full_name || "").toLowerCase();
+      headFromFork = !!headRepo && headRepo !== `${repo.owner}/${repo.name}`.toLowerCase();
       sources.push({
         kind: "github_pr",
         ref: `${repo.owner}/${repo.name}#${review.prNumber}`,
@@ -1652,6 +1661,7 @@ async function ingestContext(
     commits,
     commitMessages,
     branch: prBranch,
+    headFromFork,
     videos,
     primaryIssues,
     secondaryIssues,

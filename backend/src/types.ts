@@ -1107,7 +1107,7 @@ export type VerifyRunStatus =
   | "skipped"
   | "failed";
 
-export type VerifySkipReason = "no_criteria" | "verify_disabled" | "storage_unconfigured";
+export type VerifySkipReason = "no_criteria" | "verify_disabled" | "storage_unconfigured" | "fork_pr";
 
 export type CriterionVerdict = {
   criterionId: string;
