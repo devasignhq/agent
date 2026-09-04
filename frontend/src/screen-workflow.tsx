@@ -836,6 +836,63 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
   );
 }
 
+// Verification setup checklist for the selected repo: onboarding PR state,
+// detected stack, missing secrets, and "Regenerate setup PR" (never re-opens a
+// PR the user closed on its own).
+const VerifySetupPanel = ({ repo }) => {
+  const [setup, setSetup] = React.useState(null);
+  const [mode, setMode] = React.useState("separate");
+  const [workflow, setWorkflow] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const load = React.useCallback(() => api.verifySetup(repo.id).then(setSetup).catch(() => setSetup(null)), [repo.id]);
+  React.useEffect(() => { void load(); }, [load]);
+  if (!setup) return null;
+  const ob = setup.onboarding || { state: "none" };
+  const label =
+    ob.state === "verified" ? "verified — a run succeeded" :
+    ob.state === "pr_merged" ? "workflow merged — waiting for the first run" :
+    ob.state === "pr_open" ? `setup PR #${ob.prNumber} open` :
+    ob.state === "pr_closed" ? `setup PR #${ob.prNumber} was closed` : "not set up";
+  const workflows = setup.detected?.existingWorkflows || [];
+  const boot = setup.devasignYml?.start ? ` · boots with ${setup.devasignYml.start}` : " · no app start configured (UI criteria unverifiable)";
+  return (
+    <div className="wf-verify-setup" onClick={(e) => e.stopPropagation()}>
+      <div className="mono mute" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>verification setup</div>
+      <div className="mono" style={{ fontSize: 11, marginTop: 4 }}>
+        <span className={`pill ${ob.state === "verified" ? "ok" : ob.state === "pr_open" || ob.state === "pr_merged" ? "info" : "nit"}`}>{label}</span>
+        {ob.prUrl && <> <a href={ob.prUrl} target="_blank" rel="noreferrer">open</a></>}
+      </div>
+      {setup.detected && (
+        <div className="mono mute" style={{ fontSize: 11, marginTop: 4 }}>
+          {(setup.detected.frameworks || []).map((f) => f.name).join(", ") || "no test framework (bundled runner)"}{boot}
+        </div>
+      )}
+      {ob.missingSecrets && ob.missingSecrets.length > 0 && (
+        <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>missing secrets: {ob.missingSecrets.join(", ")}</div>
+      )}
+      {ob.lastDiagnosis && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>setup needs attention: {ob.lastDiagnosis.message}</div>}
+      {ob.lastError && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>{ob.lastError}</div>}
+      {ob.state !== "verified" && (
+        <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
+          <select className="mono" value={mode} onChange={(e) => setMode(e.target.value)} style={{ fontSize: 11 }}>
+            <option value="separate">separate workflow</option>
+            {workflows.length > 0 && <option value="extend">add a step to an existing workflow</option>}
+          </select>
+          {mode === "extend" && (
+            <select className="mono" value={workflow} onChange={(e) => setWorkflow(e.target.value)} style={{ fontSize: 11 }}>
+              <option value="">pick a workflow</option>
+              {workflows.map((w) => <option key={w} value={w}>{w}</option>)}
+            </select>
+          )}
+          <button type="button" className="btn sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.requestSetupPr(repo.id, { mode, workflow: workflow || undefined }); setTimeout(() => { void load(); setBusy(false); }, 2500); } catch { setBusy(false); } }}>
+            {busy ? "Opening…" : ob.state === "none" ? "Open setup PR" : "Regenerate setup PR"}
+          </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
 const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) => void } = {}) => {
   const { user } = useAuth();
   const [repos, setRepos] = React.useState<Repository[]>([]);
@@ -1084,6 +1141,7 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
                     </span>
                   </div>
                 )}
+                {r.id === repoId && <VerifySetupPanel repo={r} />}
                 {r.flakeRate && r.flakeRate.total > 0 && (
                   <div className="pr-card-row" style={{ marginTop: 4 }} title="Quarantined generated tests over the last 30 verification runs">
                     <span className={`mono ${r.flakeRate.rate > 0.1 ? "t-warn" : "mute"}`} style={{ fontSize: 11 }}>

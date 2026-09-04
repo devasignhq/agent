@@ -249,7 +249,17 @@ export type Repository = {
   // GET /api/repositories (last 30 runs; not persisted).
   verify?: {
     detected?: unknown;
-    onboarding: { state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified"; prNumber?: number; firstSuccessfulRunId?: string | null };
+    onboarding: {
+      state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
+      prNumber?: number;
+      prUrl?: string;
+      mode?: "separate" | "extend";
+      firstSuccessfulRunId?: string | null;
+      expectedSecrets?: string[];
+      missingSecrets?: string[] | null;
+      lastError?: string | null;
+      lastDiagnosis?: { code: string; message: string } | null;
+    };
   };
   flakeRate?: { rate: number; flaky: number; total: number };
 };
@@ -903,6 +913,15 @@ export const api = {
     request<{ latest: RunView | null; runs: Array<{ id: string; sha: string; attempt: number; status: string; createdAt: number; verdicts: number }>; flakeRate: { rate: number; flaky: number; total: number } }>(
       `/api/reviews/${reviewId}/verify${runId ? `?run=${encodeURIComponent(runId)}` : ""}`
     ),
+  adoptTests: (reviewId: string, runId: string | undefined, testIds: string[] | null) =>
+    request<{ status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string }>(`/api/reviews/${reviewId}/verify/adopt`, {
+      method: "POST",
+      body: JSON.stringify({ runId, testIds }),
+    }),
+  verifySetup: (repoId: string) =>
+    request<{ onboarding: NonNullable<Repository["verify"]>["onboarding"]; detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null; devasignYml: { start?: string; url?: string; e2e?: string } | null; runnerSeen: boolean }>(`/api/repositories/${repoId}/verify/setup`),
+  requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string }) =>
+    request<{ ok: true; queued: true }>(`/api/repositories/${repoId}/verify/setup-pr`, { method: "POST", body: JSON.stringify(opts) }),
   criteriaRevisions: (reviewId: string) =>
     request<{ revisions: CriteriaRevision[]; repo: { owner: string; name: string }; prNumber: number }>(`/api/reviews/${reviewId}/criteria-revisions`),
 

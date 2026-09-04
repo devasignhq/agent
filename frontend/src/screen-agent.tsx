@@ -656,8 +656,9 @@ const RecordingBlock = ({ rec, testName, durationMs, initiallyOpen, onStale }) =
   );
 };
 
-const AcceptanceRow = ({ a, v, expanded, onStale }) => {
+const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
   const [open, setOpen] = React.useState(false);
+  const [adopt, setAdopt] = React.useState(null); // null | "busy" | { url } | { error }
   const hasNote = Boolean(a.note);
   const rowRef = React.useRef(null);
   React.useEffect(() => {
@@ -682,6 +683,13 @@ const AcceptanceRow = ({ a, v, expanded, onStale }) => {
             {a.implied && <span className="pill nit" title="Implied by the ticket, not stated in it">implied</span>}
             {v.test && <span className="mono mute acv-test">{v.test.level}{v.test.origin === "existing" ? " (existing)" : ""} · {v.test.name}</span>}
             {v.attempts > 1 && <span className="mono mute acv-test">{v.attempts} attempts</span>}
+            {v.test?.origin === "generated" && onAdopt && v.verdict !== "pending" && (
+              adopt && adopt.url
+                ? <a className="mono acv-test" href={adopt.url} target="_blank" rel="noreferrer">adopt PR opened</a>
+                : <button type="button" className="btn sm ghost" disabled={adopt === "busy"} title="Commit this generated test into the repository's own suite via a PR" onClick={async () => { setAdopt("busy"); try { const r = await onAdopt(v.test.id); setAdopt(r?.prUrl ? { url: r.prUrl } : { error: r?.reason || r?.status || "failed" }); } catch (e) { setAdopt({ error: e?.message || "failed" }); } }}>
+                    {adopt === "busy" ? "Opening PR…" : adopt && adopt.error ? `Adopt failed: ${adopt.error}` : "Adopt this test"}
+                  </button>
+            )}
           </div>
         )}
         {v && v.reason && v.verdict !== "pending" && <div className="mute mono acv-reason">{v.reason}</div>}
@@ -712,7 +720,7 @@ const AcceptanceRow = ({ a, v, expanded, onStale }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // Goal panel (right column) — same layout as the previous pop-up
 // ────────────────────────────────────────────────────────────────────────────
-const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deepLink, onRefreshVerify }) => {
+const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deepLink, onRefreshVerify, onAdopt }) => {
   // Local-only hide set for constraints without a backend attachment id
   // (legacy attachments persisted before we added `id`, or static demo
   // strings). Click → fade out, no network round-trip.
@@ -937,6 +945,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
                 v={liveMode && verification ? verificationForCriterion(verification, a.criterionId) : null}
                 expanded={!!deepLink?.criterionId && deepLink.criterionId === a.criterionId}
                 onStale={onRefreshVerify}
+                onAdopt={onAdopt}
               />
             ))}
           </div>
@@ -2141,6 +2150,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           revisions={revisions}
           deepLink={deepLink}
           onRefreshVerify={refreshVerify}
+          onAdopt={async (testId) => api.adoptTests(pickedId, verifyView?.run?.id, [testId])}
           onDeleteConstraint={async (attachmentId) => {
             if (!detail?.task?.id) return;
             try {

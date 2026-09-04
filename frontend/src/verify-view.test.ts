@@ -44,7 +44,7 @@ test("verificationForCriterion: verdict, test, attempts, the latest attempt's re
   const v = verificationForCriterion(view(), "1", NOW)!;
   assert.equal(v.verdict, "fail");
   assert.equal(v.reason, "refunds line missing");
-  assert.deepEqual(v.test, { name: ".devasign/tests/e2e/refunds.spec.ts", level: "e2e", origin: "generated" });
+  assert.deepEqual(v.test, { id: "t1", name: ".devasign/tests/e2e/refunds.spec.ts", level: "e2e", origin: "generated" });
   assert.equal(v.attempts, 3);
   assert.equal(formatDuration(v.durationMs), "4.2s");
   assert.equal(v.recording?.artifactId, "v3", "the latest attempt's recording is the primary one");

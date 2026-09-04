@@ -6233,3 +6233,7 @@ pre.vln-code, .vln-code {
 .acv-revision-head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
 .acv-revision-head a { color: var(--fg-dim); text-decoration: underline; }
 .acv-revision-changes { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--line-2); font-size: 11px; }
+
+.wf-verify-setup { margin-top: 8px; padding: 8px; border: 1px solid var(--line); background: var(--bg-1); cursor: default; }
+.wf-verify-setup a { color: var(--fg-dim); text-decoration: underline; }
+.wf-verify-setup select { background: var(--bg-2); color: var(--fg); border: 1px solid var(--line-2); padding: 2px 4px; }
