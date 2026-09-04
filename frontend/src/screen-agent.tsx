@@ -8,6 +8,19 @@ import { api, isTransientApiError } from "./api";
 import { pushRecent } from "./recent-reviews";
 import { useAuth } from "./auth-context";
 import { useLiveTopic } from "./live-context";
+import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import {
+  commentUrl,
+  formatDuration,
+  isSignedUrlStale,
+  parseDeepLink,
+  revisionRows,
+  traceViewerUrl,
+  verdictLabel,
+  verdictTone,
+  verificationCounts,
+  verificationForCriterion,
+} from "./verify-view";
 
 // Backstop cadence for the review queue. The stream is the primary path; this
 // only has to catch a wedged connection, so it matches the notification
@@ -600,17 +613,84 @@ const TerminalFor = ({ pr, lines }) =>
 // One acceptance-criterion row. The agent's reasoning note can run to a dozen
 // lines, which pushes the rest of the criteria off-screen — so it collapses to
 // a single line by default and expands in place on click.
-const AcceptanceRow = ({ a }) => {
+// A Playwright recording for one criterion: collapsed (poster, test, duration)
+// by default, an inline player with full-screen + trace viewer when opened.
+// Expired recordings keep the block (with the retention note) but no player.
+const RecordingBlock = ({ rec, testName, durationMs, initiallyOpen, onStale }) => {
+  const [open, setOpen] = React.useState(!!initiallyOpen);
+  const videoRef = React.useRef(null);
+  React.useEffect(() => { if (initiallyOpen) setOpen(true); }, [initiallyOpen]);
+  const stale = !rec.expired && isSignedUrlStale(rec.urlExpiresAt, Date.now());
+  React.useEffect(() => { if (open && stale && onStale) onStale(); }, [open, stale]); // eslint-disable-line react-hooks/exhaustive-deps
+  const label = rec.attempt ? `${testName} · attempt ${rec.attempt}` : testName;
+  return (
+    <div className={`acv-rec ${open && !rec.expired ? "open" : ""} ${rec.expired ? "expired" : ""}`}>
+      <button
+        type="button"
+        className="acv-rec-head"
+        aria-expanded={open && !rec.expired}
+        disabled={rec.expired}
+        title={rec.expired ? "Recording expired" : open ? "Collapse" : "Watch recording"}
+        onClick={() => setOpen((v) => !v)}
+      >
+        {rec.posterUrl && !rec.expired
+          ? <img className="acv-rec-thumb" src={rec.posterUrl} alt="" />
+          : <div className="acv-rec-thumb placeholder"><Icon name="doc" size={12} /></div>}
+        <span className="acv-rec-title mono">{label}</span>
+        {durationMs > 0 && <span className="mute mono acv-rec-dur">{formatDuration(durationMs)}</span>}
+        {rec.expired
+          ? <span className="pill nit">expired after {rec.expiredAfterDays} {rec.expiredAfterDays === 1 ? "day" : "days"}</span>
+          : <span className="acv-rec-chev"><Icon name={open ? "chevron-d" : "chevron-r"} size={11} /></span>}
+      </button>
+      {open && !rec.expired && (
+        <div className="acv-rec-body">
+          <video ref={videoRef} className="acv-rec-video" controls playsInline preload="metadata" poster={rec.posterUrl || undefined} src={rec.getUrl || undefined} />
+          <div className="acv-rec-actions">
+            <button type="button" className="btn sm ghost" onClick={() => { const el = videoRef.current; if (el && el.requestFullscreen) el.requestFullscreen(); }}>Full screen</button>
+            {rec.trace?.getUrl && <a className="btn sm ghost" href={traceViewerUrl(rec.trace.getUrl)} target="_blank" rel="noreferrer">Open trace</a>}
+            {rec.getUrl && <a className="btn sm ghost" href={rec.getUrl} target="_blank" rel="noreferrer">Download</a>}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
+const AcceptanceRow = ({ a, v, expanded, onStale }) => {
   const [open, setOpen] = React.useState(false);
   const hasNote = Boolean(a.note);
+  const rowRef = React.useRef(null);
+  React.useEffect(() => {
+    if (expanded && rowRef.current && rowRef.current.scrollIntoView) rowRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
+  }, [expanded]);
+  const attemptRecs = v?.flaky ? v.attemptRecordings : [];
   return (
-    <div className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"}`}>
+    <div ref={rowRef} className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"} ${expanded ? "acv-target" : ""}`} data-criterion-id={a.criterionId}>
       <div className="ac-check">
         {a.met ? <Icon name="check" size={11} /> : a.regressed ? <Icon name="warn" size={11} /> : <span className="mono">!</span>}
       </div>
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
         {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
+        {v && (
+          <div className="acv-badges">
+            <span className={`pill ${verdictTone(v.verdict)}`} title={v.reason || undefined}>
+              <i className="dot"></i> {v.verdict === "pending" ? "verifying" : verdictLabel(v.verdict)}
+            </span>
+            {v.flaky && <span className="pill warn" title="The test's outcome changed between attempts; quarantined, never a fail">flaky test</span>}
+            {v.retired && <span className="pill nit" title="Three flaky runs of this test signature; DevAsign stopped generating it">could not verify reliably</span>}
+            {a.implied && <span className="pill nit" title="Implied by the ticket, not stated in it">implied</span>}
+            {v.test && <span className="mono mute acv-test">{v.test.level}{v.test.origin === "existing" ? " (existing)" : ""} · {v.test.name}</span>}
+            {v.attempts > 1 && <span className="mono mute acv-test">{v.attempts} attempts</span>}
+          </div>
+        )}
+        {v && v.reason && v.verdict !== "pending" && <div className="mute mono acv-reason">{v.reason}</div>}
+        {v && v.recording && !v.flaky && (
+          <RecordingBlock rec={v.recording} testName={v.test?.name || "recording"} durationMs={v.durationMs} initiallyOpen={expanded} onStale={onStale} />
+        )}
+        {attemptRecs.map((rec) => (
+          <RecordingBlock key={rec.artifactId} rec={rec} testName={v.test?.name || "recording"} durationMs={0} initiallyOpen={expanded && rec === attemptRecs[attemptRecs.length - 1]} onStale={onStale} />
+        ))}
         {hasNote && (
           <button
             type="button"
@@ -632,7 +712,7 @@ const AcceptanceRow = ({ a }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // Goal panel (right column) — same layout as the previous pop-up
 // ────────────────────────────────────────────────────────────────────────────
-const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
+const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deepLink, onRefreshVerify }) => {
   // Local-only hide set for constraints without a backend attachment id
   // (legacy attachments persisted before we added `id`, or static demo
   // strings). Click → fade out, no network round-trip.
@@ -684,7 +764,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
       ? {
           title: live.title,
           ticket: { id: live.prNumber ? `#${live.prNumber}` : "—", url: "", source: "github", summary: live.endGoal || "(no end-goal synthesised yet)", assignee: "—", reporter: "—" },
-          acceptance: live.criteria.map((c, i) => ({ id: i + 1, text: c.text, met: c.met === true, regressed: (live.regressedCriteriaIds || []).includes(c.id), note: c.evidence || undefined })),
+          acceptance: live.criteria.filter((c) => !c.supersededBy).map((c, i) => ({ id: i + 1, criterionId: c.id, text: c.text, met: c.met === true, regressed: (live.regressedCriteriaIds || []).includes(c.id), note: c.evidence || undefined, implied: !!c.implied, kind: c.kind || "code", notApplicable: !!c.notApplicable })),
           // Constraint rows in live mode carry the attachment id + the URL /
           // contentRef so the X click can match the corresponding source
           // entry in "sources analyzed" and hide it in lockstep.
@@ -828,6 +908,15 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
             <span className="mute mono" style={{ marginLeft: 8, textTransform: "none", letterSpacing: 0 }}>
               {metCount} / {goal.acceptance.length} met
             </span>
+            {verification && liveMode && (() => {
+              const c = verificationCounts(verification, live.criteria || []);
+              return (
+                <span className="mute mono acv-summary" style={{ textTransform: "none", letterSpacing: 0 }}>
+                  · verified {c.pass} pass · {c.fail} fail · {c.unverifiable} unverifiable{c.pending ? ` · ${c.pending} pending` : ""}
+                  {verification.report?.checkRunUrl && <> · <a href={verification.report.checkRunUrl} target="_blank" rel="noreferrer">check run</a></>}
+                </span>
+              );
+            })()}
           </div>
           <div className="ac-list">
             {goal.acceptance.length === 0 &&
@@ -841,9 +930,39 @@ const GoalPanel = ({ pr, live, onDeleteConstraint }) => {
                 </div>
               </div>
             }
-            {sortedAcceptance.map((a) => <AcceptanceRow key={a.id} a={a} />)}
+            {sortedAcceptance.map((a) => (
+              <AcceptanceRow
+                key={a.criterionId || a.id}
+                a={a}
+                v={liveMode && verification ? verificationForCriterion(verification, a.criterionId) : null}
+                expanded={!!deepLink?.criterionId && deepLink.criterionId === a.criterionId}
+                onStale={onRefreshVerify}
+              />
+            ))}
           </div>
         </div>
+
+        {revisions && revisions.revisions && revisions.revisions.length > 0 && (
+          <div className="drawer-section">
+            <div className="drawer-label">criteria revisions</div>
+            <ul className="acv-revisions">
+              {revisionRows(revisions.revisions).map((r) => (
+                <li key={r.revision} className="acv-revision">
+                  <div className="acv-revision-head">
+                    <span className="mono">rev {r.revision}</span>
+                    <span className="mute mono">{new Date(r.at).toLocaleString()}</span>
+                    {r.commentId
+                      ? <a className="mono" href={commentUrl(revisions.repo, revisions.prNumber, r.commentId)} target="_blank" rel="noreferrer">from PR comment</a>
+                      : <span className="mute mono">synthesized</span>}
+                  </div>
+                  <ul className="acv-revision-changes">
+                    {r.changes.map((c, i) => <li key={i} className="mute mono">{c}</li>)}
+                  </ul>
+                </li>
+              ))}
+            </ul>
+          </div>
+        )}
 
         <div className="drawer-section">
           <div className="drawer-label">constraints</div>
@@ -1247,6 +1366,7 @@ function mapLogEntry(entry) {
     error:    { icon: "warn",   flavor: "danger" },
     holistic: { icon: "brain",  flavor: "info"   },
     finding:  { icon: "warn",   flavor: "warn"   },
+    verify:   { icon: "check",  flavor: "info"   },
   };
   let v = map[entry.kind] || { icon: "dot", flavor: "" };
   // Commit pushes and maintainer-comment arrivals both carry kind="ingest"
@@ -1494,6 +1614,18 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   const [liveReviews, setLiveReviews] = React.useState([]); // backend PRReview[]
   const [pickedId, setPickedId] = React.useState(null);     // backend review.id (uuid)
   const [detail, setDetail] = React.useState(null);         // { review, logs, task }
+  // /reviews/:reviewId?run=&criterion= — the GitHub comment's "Watch recording"
+  // deep link. A routed id is the selection; the auto-select below stays out.
+  const routeParams = useParams();
+  const [searchParams] = useSearchParams();
+  const navigate = useNavigate();
+  const routeReviewId = routeParams.reviewId || null;
+  const deepLink = React.useMemo(() => parseDeepLink(searchParams), [searchParams]);
+  const [verifyView, setVerifyView] = React.useState(null); // RunView | null
+  const [revisions, setRevisions] = React.useState(null);
+  React.useEffect(() => {
+    if (routeReviewId) setPickedId((cur) => (cur === routeReviewId ? cur : routeReviewId));
+  }, [routeReviewId]);
   const [error, setError] = React.useState(null);
 
   // Have we ever painted a real queue? Once we have, a later poll that fails on
@@ -1691,10 +1823,30 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   // "Failed to fetch". The `next !== pickedId` guard also stops a null→null
   // self-trigger when the filtered queue is already empty.
   React.useEffect(() => {
+    if (routeReviewId) return; // the URL owns the selection
     if (pickedId && filteredReviews.some((r) => r.id === pickedId)) return;
     const next = filteredReviews[0]?.id ?? null;
     if (next !== pickedId) setPickedId(next);
-  }, [filteredReviews, pickedId]);
+  }, [filteredReviews, pickedId, routeReviewId]);
+
+  // Verification (verdicts, evidence, signed URLs) for the picked review. Fresh
+  // URLs on every fetch; refetched on the live "verify" signal and when a
+  // recording's URL is about to expire while open.
+  const refreshVerify = React.useCallback(async () => {
+    if (!pickedId) { setVerifyView(null); return; }
+    try {
+      const v = await api.verifyRun(pickedId, deepLink.runId || undefined);
+      setVerifyView(v.latest);
+    } catch {
+      // keep the last view
+    }
+  }, [pickedId, deepLink.runId]);
+  React.useEffect(() => { void refreshVerify(); }, [refreshVerify, detail?.review?.status]);
+  useLiveTopic("verify", () => void refreshVerify());
+  React.useEffect(() => {
+    if (!pickedId) { setRevisions(null); return; }
+    api.criteriaRevisions(pickedId).then(setRevisions).catch(() => setRevisions(null));
+  }, [pickedId, detail?.review?.criteria?.length]);
 
   // The selected card (for the queue and the right-rail goal panel — we shim
   // queue.id over uiId so the existing card renderer works unchanged).
@@ -1709,6 +1861,8 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   // filter fallback) must not count.
   const handlePick = React.useCallback((id) => {
     setPickedId(id);
+    // Keep the URL in step so the selection is shareable and survives a reload.
+    if (id) navigate(`/reviews/${id}`, { replace: true });
     if (!user?.id) return;
     const card = mappedReviews.find((m) => m.id === id);
     if (!card) return;
@@ -1722,7 +1876,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       title: card.title,
       flag,
     });
-  }, [mappedReviews, user?.id]);
+  }, [mappedReviews, user?.id, navigate]);
 
   // Timeline events: map backend logs to event objects, then concat any local
   // optimistic ones (composer sends that haven't yet round-tripped).
@@ -1983,6 +2137,10 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
             attachments: detail.task?.attachments,
             sources: extractIngestedSources(detail.logs, detail.task?.attachments || []),
           } : null}
+          verification={verifyView}
+          revisions={revisions}
+          deepLink={deepLink}
+          onRefreshVerify={refreshVerify}
           onDeleteConstraint={async (attachmentId) => {
             if (!detail?.task?.id) return;
             try {

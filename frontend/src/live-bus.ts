@@ -19,8 +19,8 @@
 
 // What a consumer can subscribe to. One topic per independently-refetchable
 // slice of app data, NOT one per page.
-export type Topic = "notifications" | "reviews" | "bounties" | "wallet" | "security";
-export const ALL_TOPICS: readonly Topic[] = ["notifications", "reviews", "bounties", "wallet", "security"];
+export type Topic = "notifications" | "reviews" | "bounties" | "wallet" | "security" | "verify";
+export const ALL_TOPICS: readonly Topic[] = ["notifications", "reviews", "bounties", "wallet", "security", "verify"];
 
 // Frame `type` values the backend may send (backend/src/notifications-stream.ts).
 export type FrameType =
@@ -28,7 +28,8 @@ export type FrameType =
   | "notifications-read"
   | "bounties-changed"
   | "wallet-changed"
-  | "security-changed";
+  | "security-changed"
+  | "verify-changed";
 
 // The whole routing policy, in one readable object — "what does frame X
 // refresh?" is answered by reading this rather than by tracing control flow.
@@ -47,6 +48,9 @@ export const TOPIC_ROUTES: Record<FrameType, readonly Topic[]> = {
   // Security page's dashboard, gate terminal and finding detail all refetch
   // through one overview endpoint, so one topic covers them.
   "security-changed": ["security"],
+  // Verify run / artifact writes (backend/src/verify/live.ts): the run view on
+  // the Agent page refetches; the review list too, since its cards show verdicts.
+  "verify-changed": ["verify", "reviews"],
 };
 
 // How long to collect frames before refetching. The dominant cost control on

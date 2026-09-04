@@ -1084,6 +1084,13 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
                     </span>
                   </div>
                 )}
+                {r.flakeRate && r.flakeRate.total > 0 && (
+                  <div className="pr-card-row" style={{ marginTop: 4 }} title="Quarantined generated tests over the last 30 verification runs">
+                    <span className={`mono ${r.flakeRate.rate > 0.1 ? "t-warn" : "mute"}`} style={{ fontSize: 11 }}>
+                      flake {Math.round(r.flakeRate.rate * 100)}% ({r.flakeRate.flaky}/{r.flakeRate.total})
+                    </span>
+                  </div>
+                )}
               </div>
             );
           })}

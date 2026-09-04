@@ -3,6 +3,7 @@
 // Param names are a contract: the screens read them straight off useParams().
 export const ROUTE_PATHS = {
   agent: "/agent",
+  review: "/reviews/:reviewId",
   workflow: "/workflow",
   bounty: "/bounty",
   fundBounty: "/bounties/:id/fund",

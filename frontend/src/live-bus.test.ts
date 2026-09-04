@@ -41,7 +41,7 @@ function fakeTimer() {
   return t;
 }
 
-const NONE = { notifications: 0, reviews: 0, bounties: 0, wallet: 0, security: 0 };
+const NONE = { notifications: 0, reviews: 0, bounties: 0, wallet: 0, security: 0, verify: 0 };
 
 // Subscribe a counter to every topic so a test can assert the exact fan-out.
 function counters(bus: LiveBus): Record<Topic, number> {
@@ -64,7 +64,7 @@ test("a notifications-changed frame refreshes notifications AND the review queue
   bus.deliver(frame("notifications-changed"));
   assert.deepEqual(n, NONE, "nothing should fire before the window elapses");
   timer.fire();
-  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 0, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 0, wallet: 0, security: 0, verify: 0 });
 });
 
 test("a bounties-changed frame routes to the bounties topic only", () => {
@@ -75,7 +75,7 @@ test("a bounties-changed frame routes to the bounties topic only", () => {
   const n = counters(bus);
   bus.deliver(frame("bounties-changed"));
   timer.fire();
-  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0, verify: 0 });
 });
 
 test("a notifications-read frame refreshes notifications only", () => {
@@ -86,7 +86,7 @@ test("a notifications-read frame refreshes notifications only", () => {
   const n = counters(bus);
   bus.deliver(frame("notifications-read"));
   timer.fire();
-  assert.deepEqual(n, { notifications: 1, reviews: 0, bounties: 0, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 1, reviews: 0, bounties: 0, wallet: 0, security: 0, verify: 0 });
 });
 
 test("a burst of frames coalesces into a single refetch per subscriber", () => {
@@ -95,7 +95,7 @@ test("a burst of frames coalesces into a single refetch per subscriber", () => {
   const n = counters(bus);
   for (let i = 0; i < 5; i++) bus.deliver(frame("notifications-changed"));
   timer.fire();
-  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 0, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 0, wallet: 0, security: 0, verify: 0 });
 });
 
 test("the debounce window is fixed, not sliding", () => {
@@ -160,10 +160,10 @@ test("a malformed frame refreshes everything and reports the raw payload", () =>
   const n = counters(bus);
   bus.deliver("not json at all");
   timer.fire();
-  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 1, wallet: 1, security: 1 });
+  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 1, wallet: 1, security: 1, verify: 1 });
   bus.deliver(JSON.stringify({ no: "type" }));
   timer.fire();
-  assert.deepEqual(n, { notifications: 2, reviews: 2, bounties: 2, wallet: 2, security: 2 });
+  assert.deepEqual(n, { notifications: 2, reviews: 2, bounties: 2, wallet: 2, security: 2, verify: 2 });
   assert.deepEqual(unrouted, ["not json at all", '{"no":"type"}']);
 });
 
@@ -180,7 +180,7 @@ test("an unknown frame type refreshes everything rather than being dropped", () 
   const n = counters(bus);
   bus.deliver(frame("some-future-thing"));
   timer.fire();
-  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 1, wallet: 1, security: 1 });
+  assert.deepEqual(n, { notifications: 1, reviews: 1, bounties: 1, wallet: 1, security: 1, verify: 1 });
   assert.deepEqual(unrouted, ['{"type":"some-future-thing"}']);
 });
 
@@ -192,10 +192,10 @@ test("flush() notifies dirty subscribers immediately and disarms the window", ()
   bus.markDirty(["bounties"]);
   assert.equal(timer.armed, 1);
   bus.flush();
-  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0, verify: 0 });
   assert.deepEqual(timer.cleared, [1], "the pending window must be cleared");
   timer.fire(); // a spent handle firing anyway must not double-refetch
-  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0, verify: 0 });
 });
 
 test("flush() with nothing dirty notifies no one and arms nothing", () => {
@@ -248,7 +248,7 @@ test("cancelPending() drops a queued refetch but keeps subscriptions alive", () 
   assert.deepEqual(n, NONE, "the cancelled refetch must not fire");
   bus.markDirty(["bounties"]);
   timer.fire();
-  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0 });
+  assert.deepEqual(n, { notifications: 0, reviews: 0, bounties: 1, wallet: 0, security: 0, verify: 0 });
 });
 
 test("stop() clears the window exactly once and silences later frames", () => {
