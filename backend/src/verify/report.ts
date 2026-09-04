@@ -317,17 +317,29 @@ export async function postVerifyCheckRun(
   }
 }
 
+/** The run whose state should be shown for a commit: the newest judged one, else the caller's. */
+export function bestRunForSha(run: VerifyRun): VerifyRun {
+  const judged = db
+    .filter("verifyRuns", (r) => r.reviewId === run.reviewId && r.sha === run.sha && r.verdicts.length > 0)
+    .sort((a, b) => b.createdAt - a.createdAt);
+  return judged[0] ?? run;
+}
+
 /** Late update: re-post the check run and splice the section into the existing comment. */
 export async function rerenderReport(runId: string): Promise<void> {
-  const run = db.find("verifyRuns", (r) => r.id === runId);
-  if (!run) return;
-  const review = db.find("prReviews", (r) => r.id === run.reviewId);
-  const repo = db.find("repositories", (r) => r.id === run.repoId);
+  const settled = db.find("verifyRuns", (r) => r.id === runId);
+  if (!settled) return;
+  const review = db.find("prReviews", (r) => r.id === settled.reviewId);
+  const repo = db.find("repositories", (r) => r.id === settled.repoId);
   if (!review || !repo) return;
   const install = db.find("installations", (i) => i.id === repo.installationId);
   if (!install) return;
+  // A run that never produced verdicts (re-run attempt, reaped timeout) must not
+  // paint over an earlier run of the same commit that did. Judged evidence wins.
+  const run = bestRunForSha(settled);
   const view = buildVerificationView({ run, review, repo, criteria: review.criteria });
-  await postVerifyCheckRun(install, repo, review, view);
+  // Always the run's own commit: review.headSha may already point at a newer push.
+  await postVerifyCheckRun(install, repo, { headSha: run.sha }, view);
   const commentId = review.progressCommentId;
   if (commentId == null || review.progressCommentSha !== run.sha) return;
   try {

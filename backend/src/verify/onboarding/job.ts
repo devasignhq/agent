@@ -191,8 +191,11 @@ export async function postDoctorFollowup(run: VerifyRun, doctor: DoctorDiagnosis
 
 const ADOPT_DIR = "tests/devasign";
 
-export function adoptedPath(generatedPath: string): string {
+export function adoptedPath(generatedPath: string): string | null {
   const rel = generatedPath.replace(/^\.devasign\/tests\//, "");
+  // Second gate on the planner's path (plan.ts is the first): this string
+  // becomes a commit path in the customer's repository.
+  if (!rel || rel.startsWith("/") || rel.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
   return `${ADOPT_DIR}/${rel}`;
 }
 
@@ -204,14 +207,14 @@ export async function adoptGeneratedTests(runId: string, testIds: string[] | nul
   const repo = run ? db.find("repositories", (r) => r.id === run.repoId) : null;
   const install = repo ? db.find("installations", (i) => i.id === repo.installationId) : null;
   if (!run || !plan || !repo || !install) return { status: "skipped", reason: "run, plan, or installation missing" };
-  const tests = plan.tests.filter((t) => t.origin === "generated" && t.content && (!testIds || testIds.includes(t.id)));
+  const tests = plan.tests.filter((t) => t.origin === "generated" && t.content && adoptedPath(t.path) && (!testIds || testIds.includes(t.id)));
   if (!tests.length) return { status: "skipped", reason: "no generated tests to adopt" };
   try {
     const base = await d.prHeadRef(install, repo, run.prNumber);
     if (!base) return { status: "failed", reason: "could not resolve the PR's branch" };
     const branch = `devasign/adopt-${run.id.slice(0, 8)}`;
     await d.ensureBranch(install, repo, branch, run.sha);
-    for (const t of tests) await d.putFile(install, repo, branch, adoptedPath(t.path), t.content!, `Adopt DevAsign test for criteria ${t.criterionIds.join(", ")}`);
+    for (const t of tests) await d.putFile(install, repo, branch, adoptedPath(t.path)!, t.content!, `Adopt DevAsign test for criteria ${t.criterionIds.join(", ")}`);
     const pr = await d.createPr(install, repo, {
       title: `Adopt DevAsign generated tests (PR #${run.prNumber})`,
       body: [

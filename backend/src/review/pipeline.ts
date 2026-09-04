@@ -52,6 +52,7 @@ import { recordParityFeatures } from "./cross-repo/parity.js";
 import {
   appendAddedCriteria,
   buildCriteriaSection,
+  isRetiredCriterion,
   splitForComment,
   type PriorVerdict,
 } from "./criteria-format.js";
@@ -587,7 +588,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         suggestedChange: m?.met === false ? m?.suggestedChange ?? null : null,
       };
     });
-    const allMet = filledCriteria.every((c) => c.met === true);
+    const allMet = filledCriteria.filter((c) => !isRetiredCriterion(c)).every((c) => c.met === true);
     // Criteria an earlier commit satisfied that this diff broke — persisted and
     // rendered as "previously met, now broken" so the developer sees the
     // regression instead of it being lumped in with never-met criteria.
@@ -4352,7 +4353,8 @@ export async function runMaintainerFeedbackJob(
   //    re-scored criteria. The security gate is never softened — a flip to passed
   //    re-checks the diff for introduced blockers first (detectIntroducedBlockers).
   if (refined.disputed.length) {
-    const allMet = criteria.length > 0 && criteria.every((c) => c.met === true);
+    const live = criteria.filter((c) => !isRetiredCriterion(c));
+    const allMet = live.length > 0 && live.every((c) => c.met === true);
     let status: PRReviewStatus = "changes_requested";
     let blockerSummary = "";
     if (allMet) {

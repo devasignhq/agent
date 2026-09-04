@@ -7,7 +7,7 @@ import { db } from "../db.js";
 import { config } from "../config.js";
 import { completeWithMeta, currentUsageByModel, withModel, withUsage } from "../llm.js";
 import { modelForPlan } from "../billing/plans.js";
-import { ghText } from "../github/app.js";
+import { ghText, repositoryDispatch } from "../github/app.js";
 import { fetchTree, type TreeEntry } from "../review/indexer.js";
 import { extractJSON } from "../review/parse.js";
 import { testPlannerSystemPrompt } from "../review/prompts.js";
@@ -19,7 +19,7 @@ import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLe
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
-import { criteriaForRun, updateRun } from "./runs.js";
+import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, updateRun } from "./runs.js";
 import { hasBootConfig, parseDevasignVerify } from "./yml.js";
 
 export const LEVELS: TestLevel[] = ["unit", "integration", "component", "e2e"];
@@ -40,7 +40,11 @@ export type PlannerDeps = {
   fetchTree?: (repo: Repository, install: Installation, sha: string) => Promise<TreeEntry[]>;
   readFile?: (install: Installation, repo: Repository, path: string, sha: string) => Promise<string | null>;
   fetchDiff?: (install: Installation, repo: Repository, prNumber: number) => Promise<string>;
+  dispatch?: (install: Installation, repo: Repository, payload: Record<string, unknown>) => Promise<void>;
 };
+
+const defaultDispatch = (install: Installation, repo: Repository, payload: Record<string, unknown>) =>
+  repositoryDispatch(install.installationId, repo.owner, repo.name, "devasign-verify", payload);
 
 export type PlanPolicy = {
   e2ePolicy: "auto" | "always" | "never";
@@ -122,10 +126,15 @@ export function planPolicy(args: {
   return { e2ePolicy, e2eAllowed, bootConfigured, apiOnly, maxLevel };
 }
 
-function normalizeGeneratedPath(p: string, runner: TestRunner): string {
+// The planner's paths come from a model reading an attacker-influenced diff, so
+// a traversal segment here would end up in the runner's checkout and in the
+// "Adopt tests" commit. Null drops the test.
+export function normalizeGeneratedPath(p: string, runner: TestRunner): string | null {
   let clean = p.replace(/^\.\//, "").replace(/^\/+/, "");
-  if (clean.startsWith(".devasign/")) return clean;
+  if (clean.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
+  if (clean.startsWith(".devasign/")) return clean.startsWith(".devasign/tests/") ? clean : null;
   clean = clean.replace(/^(tests?|__tests__|spec|e2e)\//, "");
+  if (!clean) return null;
   return runner === "playwright" ? `.devasign/tests/e2e/${clean}` : `.devasign/tests/${clean}`;
 }
 
@@ -143,8 +152,10 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
     const runner = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
     const content = typeof o.content === "string" && o.content.trim() ? o.content : null;
     if (origin === "generated" && !content) continue;
+    const safe = origin === "generated" ? normalizeGeneratedPath(path, runner) : path.replace(/^\.\//, "");
+    if (!safe || safe.split("/").includes("..")) continue;
     out.push({
-      path: origin === "generated" ? normalizeGeneratedPath(path, runner) : path.replace(/^\.\//, ""),
+      path: safe,
       content: origin === "generated" ? content : null,
       criterionIds: [...new Set(ids)],
       level,
@@ -370,6 +381,18 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   };
 }
 
+async function retriggerRunner(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<void> {
+  try {
+    await (deps.dispatch ?? defaultDispatch)(install, repo, { pr: run.prNumber, sha: run.sha, runId: run.id, reviewId: run.reviewId });
+    forgetRunnerPoll(repo.id, run.prNumber, run.sha);
+    db.insert("reviewLogs", { id: uuid(), reviewId: run.reviewId, kind: "verify", at: Date.now(), action: "Runner re-triggered: the plan was not ready when CI asked", meta: { runId: run.id } });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    console.warn(`[verify] repository_dispatch failed for ${repo.owner}/${repo.name}:`, msg);
+    db.insert("reviewLogs", { id: uuid(), reviewId: run.reviewId, kind: "verify", at: Date.now(), action: "Could not re-trigger the runner", detail: `${msg.slice(0, 300)} — the workflow needs a repository_dispatch trigger and the App needs contents:write; push a commit to re-run instead.`, meta: { runId: run.id } });
+  }
+}
+
 /** Plan a run. Returns the updated run row (awaiting_runner, skipped, or failed). */
 export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Promise<VerifyRun | null> {
   const run = db.find("verifyRuns", (r) => r.id === runId);
@@ -381,13 +404,25 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
   }
   const planStartedAt = Date.now();
   updateRun(run.id, { timings: { ...run.timings, planStartedAt } });
+  // The review may have already posted its comment while planning ran long; every
+  // terminal outcome (ready, skipped, failed) has to refresh it.
+  const settle = async (updated: VerifyRun | null): Promise<VerifyRun | null> => {
+    if (updated?.report?.commentId) {
+      try {
+        await rerenderReport(run.id);
+      } catch (err) {
+        console.warn(`[verify] could not refresh the report for run ${run.id}:`, err);
+      }
+    }
+    return updated;
+  };
   const model = modelForPlan(run.planTier);
   return withModel(model, () =>
     withUsage(async () => {
       try {
         const ctx = await gatherContext(run, repo, install, deps);
         if (!ctx.criteria.length) {
-          return updateRun(run.id, { status: "skipped", skipReason: "no_criteria", timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } });
+          return await settle(updateRun(run.id, { status: "skipped", skipReason: "no_criteria", timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } }));
         }
         const wf = effectiveWorkflow(repo);
         const system = withMaintainerInstructions(testPlannerSystemPrompt(), wf.prompts?.verify);
@@ -474,6 +509,9 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           timings: { ...run.timings, planStartedAt, planFinishedAt },
           tokenUsage: { ...run.tokenUsage, plan: usageByProvider() },
         });
+        // The runner may have polled while this plan was still queued and given
+        // up; nothing else would ever hand it the plan.
+        if (runnerGaveUp(repo.id, run.prNumber, run.sha)) await retriggerRunner(run, repo, install, deps);
         db.insert("reviewLogs", {
           id: uuid(),
           reviewId: run.reviewId,
@@ -487,12 +525,11 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           ].join("\n"),
           meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens" },
         });
-        if (updated?.report?.commentId) await rerenderReport(run.id);
-        return updated;
+        return await settle(updated);
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         console.error(`[verify] planner failed for run ${run.id}:`, err);
-        return updateRun(run.id, { status: "failed", error: `planner: ${msg.slice(0, 300)}`, timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } });
+        return await settle(updateRun(run.id, { status: "failed", error: `planner: ${msg.slice(0, 300)}`, timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } }));
       }
     })
   );

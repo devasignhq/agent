@@ -6,6 +6,7 @@ import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config } from "../config.js";
 import {
+  bestRunForSha,
   buildVerificationView,
   formatVerificationSection,
   REPLY_LINE,
@@ -116,5 +117,27 @@ test("hasRunnerEvidence is read from resolved runs on the repo", () => {
     assert.equal(view.state, "pending");
   } finally {
     db.remove("verifyRuns", (x) => x.repoId === repoId);
+  }
+});
+
+// Nothing cancels a superseded run, so a re-run attempt (or a feedback run whose
+// repository_dispatch failed) is reaped as timed_out and used to be rendered over
+// the judged verdicts of the run that actually produced evidence.
+test("a run with no verdicts never displaces a judged run for the same commit", () => {
+  const reviewId = uuid();
+  const judged = { ...baseRun({}), id: uuid(), reviewId, sha: "abc", status: "completed", createdAt: 100, verdicts: [{ criterionId: "1", verdict: "pass", reason: "the test passed", evidenceRefs: [] }] } as VerifyRun;
+  const reaped = { ...baseRun({}), id: uuid(), reviewId, sha: "abc", status: "timed_out", createdAt: 200, verdicts: [] } as VerifyRun;
+  const otherSha = { ...baseRun({}), id: uuid(), reviewId, sha: "def", status: "completed", createdAt: 300, verdicts: [{ criterionId: "1", verdict: "fail", reason: "x", evidenceRefs: [] }] } as VerifyRun;
+  for (const r of [judged, reaped, otherSha]) db.insert("verifyRuns", r);
+  try {
+    assert.equal(bestRunForSha(reaped).id, judged.id, "the judged run wins");
+    assert.equal(bestRunForSha(judged).id, judged.id);
+    assert.equal(bestRunForSha(otherSha).id, otherSha.id, "a different commit is never borrowed from");
+    // With no judged run for the commit, the caller's own run is used.
+    const only = { ...baseRun({}), id: uuid(), reviewId, sha: "zzz", status: "timed_out", createdAt: 400, verdicts: [] } as VerifyRun;
+    db.insert("verifyRuns", only);
+    assert.equal(bestRunForSha(only).id, only.id);
+  } finally {
+    db.remove("verifyRuns", (r) => r.reviewId === reviewId);
   }
 });

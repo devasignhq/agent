@@ -54,7 +54,9 @@ export function computeVerdicts(args: {
   for (const c of args.criteria) {
     if (!isVerifiable(c)) continue;
     const covering = args.results.filter((r) => r.criterionIds.includes(c.id));
-    if (args.doctor) {
+    // A doctor diagnosis covers the tests that could not run (usually the e2e
+    // subset); criteria whose own tests ran keep their real pass/fail.
+    if (args.doctor && (!covering.length || covering.every((r) => r.status === "error" || r.status === "skipped"))) {
       out.push({ criterionId: c.id, verdict: "unverifiable", reason: `setup needs attention: ${args.doctor.message}`.slice(0, 300), evidenceRefs: args.doctor.logArtifactId ? [{ artifactId: args.doctor.logArtifactId }] : [] });
       continue;
     }
@@ -178,7 +180,9 @@ export function buildJudgeUserPrompt(args: {
 
 export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promise<VerifyRun | null> {
   const run = db.find("verifyRuns", (r) => r.id === runId);
-  if (!run || run.status !== "judging") return run ?? null;
+  // A judge job delayed past the reaper's window finds its run already "lost";
+  // the results are stored, so judge them rather than discard the evidence.
+  if (!run || (run.status !== "judging" && !(run.status === "lost" && run.resultsId))) return run ?? null;
   const repo = db.find("repositories", (r) => r.id === run.repoId);
   if (!repo) return updateRun(run.id, { status: "failed", error: "repository row missing" });
   const results = run.resultsId ? db.find("verifyResults", (r) => r.id === run.resultsId) : null;

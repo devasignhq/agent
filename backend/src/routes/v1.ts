@@ -20,6 +20,8 @@ import path from "node:path";
 import {
   buildRunView,
   latestRunForReview,
+  forgetRunnerPoll,
+  noteRunnerPoll,
   planTierForRepo,
   runnerPlanFor,
   TERMINAL_STATUSES,
@@ -129,12 +131,14 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
 
   const review = db.find("prReviews", (r) => r.repoId === runner.repo.id && r.prNumber === body.pr);
   if (!review) {
+    noteRunnerPoll(runner.repo.id, body.pr, body.sha);
     const out: ResolveResponse = { ok: true, status: "pending", runId: null, retryAfterMs: 5_000 };
     return void res.status(202).json(out);
   }
   const run = latestRunForReview(review.id, body.sha);
   if (!run) {
     const superseded = review.headSha.toLowerCase() !== body.sha.toLowerCase();
+    if (!superseded) noteRunnerPoll(runner.repo.id, body.pr, body.sha);
     const out: ResolveResponse = superseded
       ? { ok: true, status: "empty", runId: null, reason: "superseded" }
       : { ok: true, status: "pending", runId: null, retryAfterMs: 5_000 };
@@ -152,6 +156,7 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
       return void res.json(out);
     }
     case "planning": {
+      noteRunnerPoll(runner.repo.id, body.pr, body.sha);
       const out: ResolveResponse = { ok: true, status: "pending", runId: run.id, retryAfterMs: 3_000 };
       return void res.status(202).json(out);
     }
@@ -163,6 +168,7 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
     case "running": {
       const plan = run.planId ? db.find("verifyPlans", (p) => p.id === run.planId) : null;
       if (!plan) return fail(res, 500, "plan_missing");
+      forgetRunnerPoll(runner.repo.id, body.pr, body.sha);
       const now = Date.now();
       updateRun(run.id, {
         status: "running",

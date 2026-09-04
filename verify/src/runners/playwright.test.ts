@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { generatePlaywrightConfig, mapReport, ourPlaywrightDir, webServerFromYml, type PwReport } from "./playwright.js";
+import { fileStatus, generatePlaywrightConfig, mapReport, ourPlaywrightDir, testOutcome, webServerFromYml, type PwReport } from "./playwright.js";
 import { Workspace } from "../workspace.js";
 import type { LocalArtifact, PlanTest } from "../types.js";
 
@@ -68,4 +68,73 @@ test("mapReport: attempts from per-retry results, attachments become artifacts, 
   const [missing] = mapReport({ suites: [] }, [{ ...t, id: "t9", path: "x.spec.ts" }], ws, [], "Error: Process from config.webServer was not able to start");
   assert.equal(missing.status, "error");
   assert.match(missing.error!, /webServer/);
+});
+
+// Project entries win over config entries in Playwright's resolution, so a
+// customer project carrying its own testDir/use/retries silently defeated the
+// forced recording, and a `dependencies` on a project we dropped aborts the run
+// before a single test executes.
+test("the kept project cannot override the forced recording, testDir, or depend on a dropped project", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-pw-proj-"));
+  writeFileSync(
+    path.join(root, "playwright.config.ts"),
+    `export default { testDir: "./e2e", projects: [
+       { name: "setup", testMatch: /.*\\.setup\\.ts/ },
+       { name: "chromium", testDir: "./e2e", testMatch: /.*\\.spec\\.ts/, retries: 5, dependencies: ["setup"], teardown: "cleanup", grep: /@smoke/, use: { video: "off", trace: "off", screenshot: "off", locale: "en-GB" } },
+     ] };\n`
+  );
+  const testDir = path.join(root, ".devasign/tests/e2e");
+  const src = generatePlaywrightConfig({ root, baseConfigRel: "playwright.config.ts", testDir, outputDir: path.join(root, ".devasign/artifacts/pw"), reportFile: path.join(root, "r.json"), retries: 2, webServer: null });
+  const ws = new Workspace(root);
+  ws.linkPackage("@playwright/test", ourPlaywrightDir());
+  const cfg = (await import(ws.write(".devasign/playwright.config.ts", src))).default;
+  const [project] = cfg.projects;
+  assert.equal(project.name, "chromium");
+  assert.equal(project.dependencies, undefined, "a dependency on the dropped setup project would abort the run");
+  assert.equal(project.teardown, undefined);
+  assert.equal(project.testDir, undefined, "our testDir must not be shadowed");
+  assert.equal(project.testMatch, undefined);
+  assert.equal(project.retries, undefined);
+  assert.equal(project.grep, undefined, "their grep would filter out every generated test");
+  assert.equal(project.use.video, "on");
+  assert.equal(project.use.trace, "on");
+  assert.equal(project.use.screenshot, "on");
+  assert.equal(project.use.locale, "en-GB", "settings we do not force are kept");
+  assert.equal(cfg.testDir, testDir);
+  assert.equal(cfg.retries, 2);
+});
+
+// Playwright's retries live inside one test's results[]; two test() blocks in a
+// file are independent outcomes. Counting them all as "attempts" turned a
+// deterministic failure into a quarantined flake.
+test("a file whose second test always fails is a failure, not a flake", () => {
+  assert.equal(testOutcome(["pass"]), "pass");
+  assert.equal(testOutcome(["fail", "pass"]), "flaky");
+  assert.equal(testOutcome(["fail", "fail"]), "fail");
+  assert.equal(testOutcome(["error"]), "error");
+  assert.equal(testOutcome([]), "error");
+  assert.equal(fileStatus([["pass"], ["fail", "fail"]]), "fail");
+  assert.equal(fileStatus([["pass"], ["fail", "pass"]]), "flaky");
+  assert.equal(fileStatus([["pass"], ["error"]]), "error");
+  assert.equal(fileStatus([["pass"], ["pass"]]), "pass");
+  assert.equal(fileStatus([]), "error");
+
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-pw-agg-"));
+  const ws = new Workspace(root);
+  const planned = [{ id: "t1", path: ".devasign/tests/e2e/cart.spec.ts", criterionIds: ["1"], level: "e2e", origin: "generated", runner: "playwright" } as PlanTest];
+  const report: PwReport = {
+    suites: [
+      {
+        file: ".devasign/tests/e2e/cart.spec.ts",
+        specs: [
+          { title: "adds item", file: ".devasign/tests/e2e/cart.spec.ts", tests: [{ results: [{ status: "passed", retry: 0, duration: 10 }] }] },
+          { title: "shows total", file: ".devasign/tests/e2e/cart.spec.ts", tests: [{ results: [{ status: "failed", retry: 0, duration: 9, error: { message: "expect(total).toBe(12)" } }, { status: "failed", retry: 1, duration: 9, error: { message: "expect(total).toBe(12)" } }] }] },
+        ],
+      },
+    ],
+  };
+  const artifacts: LocalArtifact[] = [];
+  const [out] = mapReport(report, planned, ws, artifacts, "");
+  assert.equal(out.status, "fail", "one passing sibling test must not mask a real failure");
+  assert.equal(out.attempts.length, 3, "every result is still kept as evidence");
 });

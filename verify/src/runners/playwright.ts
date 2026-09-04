@@ -42,9 +42,17 @@ export function generatePlaywrightConfig(a: ConfigArgs): string {
     baseImport,
     "const b: any = (__base as any)?.default ?? __base ?? {};",
     "// One browser project only: recordings once, and no browsers we did not install.",
-    "const projects = Array.isArray(b.projects) && b.projects.length",
-    "  ? [b.projects.find((p: any) => /chrom/i.test(String(p?.name || ''))) ?? b.projects[0]]",
-    "  : undefined;",
+    "// Project fields win over config fields in Playwright, so the customer's own",
+    "// testDir/retries/recording settings are stripped and ours are re-applied here;",
+    "// dependencies/teardown would reference projects we did not keep.",
+    "const __pick = (ps: any[]) => ps.find((p: any) => /chrom/i.test(String(p?.name || ''))) ?? ps[0];",
+    "const __clean = (p: any) => {",
+    "  const q: any = { ...p };",
+    "  for (const k of ['dependencies', 'teardown', 'testDir', 'testMatch', 'testIgnore', 'retries', 'outputDir', 'grep', 'grepInvert', 'snapshotDir']) delete q[k];",
+    "  q.use = { ...(q.use || {}), video: 'on', trace: 'on', screenshot: 'on' };",
+    "  return q;",
+    "};",
+    "const projects = Array.isArray(b.projects) && b.projects.length ? [__clean(__pick(b.projects))] : undefined;",
     "export default defineConfig({",
     "  ...b,",
     `  testDir: ${j(a.testDir)},`,
@@ -103,6 +111,24 @@ export function stripAnsi(s: string): string {
 const KIND_BY_ATTACHMENT: Record<string, LocalArtifact["kind"] | undefined> = { video: "video", trace: "trace", screenshot: "screenshot" };
 const TYPE_BY_KIND: Record<string, string> = { video: "video/webm", trace: "application/zip", screenshot: "image/png" };
 
+/** A single test() block: its last retry decides, an earlier failure makes it flaky. */
+export function testOutcome(retries: AttemptStatus[]): "pass" | "fail" | "flaky" | "error" {
+  if (!retries.length) return "error";
+  const last = retries[retries.length - 1];
+  if (last === "pass") return retries.every((s) => s === "pass") ? "pass" : "flaky";
+  return retries.includes("fail") ? "fail" : "error";
+}
+
+/** The file's status is its worst test's: one real failure is a failure, not a flake. */
+export function fileStatus(perTest: AttemptStatus[][]): "pass" | "fail" | "flaky" | "error" {
+  const outcomes = perTest.map(testOutcome);
+  if (!outcomes.length) return "error";
+  if (outcomes.includes("fail")) return "fail";
+  if (outcomes.includes("flaky")) return "flaky";
+  if (outcomes.includes("error")) return "error";
+  return "pass";
+}
+
 /** One RunnerResult per planned Playwright file, attempts from the report's per-retry results. */
 export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, artifacts: LocalArtifact[], overallOutput: string): RunnerResult[] {
   const specs = flattenSpecs(report);
@@ -112,8 +138,13 @@ export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, ar
     const attempts: RunnerAttempt[] = [];
     let n = 0;
     let anyResult = false;
+    // Playwright retries live inside ONE test's results[]; separate test() blocks
+    // in the same file are independent outcomes, not attempts at the same thing.
+    const perTest: AttemptStatus[][] = [];
     for (const spec of mine) {
       for (const pt of spec.tests) {
+        const own: AttemptStatus[] = [];
+        perTest.push(own);
         for (const r of [...(pt.results || [])].sort((x, y) => (x.retry ?? 0) - (y.retry ?? 0))) {
           anyResult = true;
           n += 1;
@@ -140,6 +171,7 @@ export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, ar
             artifacts.push({ clientRef: posterRef, kind: "poster", path: screenshotPath, displayPath: ws.relative(screenshotPath), contentType: "image/png", testId: t.id, criterionIds: t.criterionIds, attempt: n, posterFor: videoRef });
             refs.push(posterRef);
           }
+          own.push(status);
           attempts.push({ n, status, durationMs: Math.round(r.duration ?? 0), error: status === "pass" ? undefined : stripAnsi(message || r.status).split("\n").slice(0, 3).join(" ").slice(0, 500), artifactIds: refs });
         }
       }
@@ -147,10 +179,9 @@ export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, ar
     if (!anyResult) {
       const err = report.errors?.[0]?.message || overallOutput.split("\n").find((l) => /Error|error/.test(l)) || "no result for this test";
       attempts.push({ n: 1, status: "error", durationMs: 0, error: err.slice(0, 500), artifactIds: [] });
+      perTest.push(["error"]);
     }
-    const statuses = attempts.map((a) => a.status);
-    const passes = statuses.filter((s) => s === "pass").length;
-    const status = passes === statuses.length ? "pass" : passes > 0 ? "flaky" : statuses.includes("fail") ? "fail" : "error";
+    const status = fileStatus(perTest.filter((t) => t.length));
     results.push({
       id: `r-${t.id}`,
       testId: t.id,

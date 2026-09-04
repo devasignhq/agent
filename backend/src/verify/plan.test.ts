@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, normalizeGeneratedPath, normalizeRawTests, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
@@ -191,4 +191,22 @@ test("pure helpers: planPolicy, enforcePlanPolicy, buildCommands", () => {
     { id: "b", path: "tests/test_b.py", content: null, criterionIds: ["2"], level: "integration", levelReason: "", origin: "existing", runner: "pytest", testSignature: "s", strategyVersion: 1, targetFiles: [] },
   ]);
   assert.deepEqual(cmds.map((c) => c.cmd), ['npx vitest run ".devasign/tests/a.test.ts"', 'python -m pytest -q "tests/test_b.py"']);
+});
+
+// The planner reads an attacker-influenceable diff, and its paths are written into
+// the runner's checkout and into the "Adopt tests" commit.
+test("generated test paths may never escape .devasign/tests/", () => {
+  assert.equal(normalizeGeneratedPath("checkout.spec.ts", "playwright"), ".devasign/tests/e2e/checkout.spec.ts");
+  assert.equal(normalizeGeneratedPath("tests/total.test.ts", "node-test"), ".devasign/tests/total.test.ts");
+  assert.equal(normalizeGeneratedPath(".devasign/tests/e2e/x.spec.ts", "playwright"), ".devasign/tests/e2e/x.spec.ts");
+  for (const bad of ["../../.github/workflows/steal.yml", "a/../../../etc/passwd", "..", ".devasign/../x.ts", ".devasign/hooks/pre-push", "/etc/passwd/../x"]) {
+    assert.equal(normalizeGeneratedPath(bad, "node-test"), null, bad);
+  }
+  const known = new Set(["1"]);
+  const raw = { tests: [
+    { path: "../../.github/workflows/steal.yml", content: "on: push", criterionIds: ["1"], origin: "generated", level: "unit", runner: "node-test" },
+    { path: "good.test.ts", content: "test", criterionIds: ["1"], origin: "generated", level: "unit", runner: "node-test" },
+    { path: "src/../../../outside.test.ts", criterionIds: ["1"], origin: "existing", level: "unit", runner: "node-test" },
+  ] };
+  assert.deepEqual(normalizeRawTests(raw, known, "node-test").map((t) => t.path), [".devasign/tests/good.test.ts"]);
 });

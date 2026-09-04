@@ -823,7 +823,9 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
 
   }
 
-  const metCount = goal.acceptance.filter((a) => a.met).length;
+  // Not-applicable rows are still shown, but they are not open work.
+  const liveAcceptance = goal.acceptance.filter((a) => !a.notApplicable);
+  const metCount = liveAcceptance.filter((a) => a.met).length;
   // Lead with what needs attention: regressions ("was met, now broken") first,
   // then still-open criteria, then the met ones. Stable sort keeps each group's
   // own order. Mirrors how the GitHub review comment is structured.
@@ -914,7 +916,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
           <div className="drawer-label">
             acceptance criteria
             <span className="mute mono" style={{ marginLeft: 8, textTransform: "none", letterSpacing: 0 }}>
-              {metCount} / {goal.acceptance.length} met
+              {metCount} / {liveAcceptance.length} met
             </span>
             {verification && liveMode && (() => {
               const c = verificationCounts(verification, live.criteria || []);

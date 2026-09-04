@@ -143,3 +143,31 @@ test("runVerifyJudge completes the run, records flake history, logs, and keeps m
     db.remove("installations", (i) => i.id === installId);
   }
 });
+
+// The CLI's doctor covers only the tests it could not run (usually the e2e
+// subset); unit/integration results collected before it are real evidence.
+test("a doctor diagnosis only clouds the criteria whose own tests could not run", () => {
+  const criteria = [
+    { id: "1", text: "checkout works end to end", met: null, evidence: null, kind: "ui" },
+    { id: "2", text: "total is formatted as currency", met: null, evidence: null },
+    { id: "3", text: "refunds line hidden at zero", met: null, evidence: null },
+    { id: "4", text: "no test was planned", met: null, evidence: null },
+  ] as any;
+  const result = (id: string, criterionId: string, status: string) =>
+    ({ id, testId: `t-${id}`, criterionIds: [criterionId], test: "x", runner: "node-test", level: "unit", origin: "generated", status, attempts: [{ n: 1, status: status === "pass" ? "pass" : "fail", durationMs: 1, artifactIds: [] }], durationMs: 1, artifactIds: [] }) as any;
+  const doctor = { stage: "start", code: "no_start_command", message: "no app start / login configured" } as any;
+  const out = computeVerdicts({
+    criteria,
+    results: [result("r1", "1", "error"), result("r2", "2", "fail"), result("r3", "3", "pass")],
+    plan: null,
+    doctor,
+    artifacts: [],
+  });
+  const by = new Map(out.map((v) => [v.criterionId, v]));
+  assert.equal(by.get("1")?.verdict, "unverifiable", "the e2e criterion the doctor explains");
+  assert.match(by.get("1")!.reason, /setup needs attention/);
+  assert.equal(by.get("2")?.verdict, "fail", "a unit test that ran and failed is still a failure");
+  assert.equal(by.get("3")?.verdict, "pass", "a unit test that ran and passed is still a pass");
+  assert.equal(by.get("4")?.verdict, "unverifiable");
+  assert.match(by.get("4")!.reason, /setup needs attention/);
+});

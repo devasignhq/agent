@@ -26,6 +26,30 @@ export const TERMINAL_STATUSES: ReadonlySet<VerifyRunStatus> = new Set([
   "failed",
 ]);
 
+// A runner long-polls /v1/runs/resolve while the review job is still queued and
+// gives up after its own timeout. Remembering that it called lets the planner
+// re-trigger CI instead of leaving the run to be reaped. In-process only: a
+// redeploy loses the queue too, so there is nothing to re-trigger for.
+const runnerPolls = new Map<string, number>();
+export const RUNNER_GONE_MS = 90_000;
+
+const pollKey = (repoId: string, prNumber: number, sha: string) => `${repoId}:${prNumber}:${sha.toLowerCase()}`;
+
+export function noteRunnerPoll(repoId: string, prNumber: number, sha: string, at = Date.now()): void {
+  if (runnerPolls.size > 500) runnerPolls.clear();
+  runnerPolls.set(pollKey(repoId, prNumber, sha), at);
+}
+
+/** True when a runner polled for this commit and has since stopped waiting. */
+export function runnerGaveUp(repoId: string, prNumber: number, sha: string, now = Date.now()): boolean {
+  const at = runnerPolls.get(pollKey(repoId, prNumber, sha));
+  return at != null && now - at > RUNNER_GONE_MS;
+}
+
+export function forgetRunnerPoll(repoId: string, prNumber: number, sha: string): void {
+  runnerPolls.delete(pollKey(repoId, prNumber, sha));
+}
+
 export function planTierForRepo(repo: Pick<Repository, "installationId">): Plan {
   const ownerId = db.find("installations", (i) => i.id === repo.installationId)?.userId;
   return ownerId ? planForUser(ownerId) : "free";

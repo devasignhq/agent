@@ -1280,7 +1280,7 @@ api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, (req, res) => {
   res.json({ ok: true, queued: true });
 });
 // "Adopt this test": commit generated tests from a run into the customer's suite via a PR.
-api.post("/reviews/:id/verify/adopt", expensiveLimiter, async (req, res) => {
+export async function adoptTestsHandler(req: Request, res: Response): Promise<void> {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const review = db.find("prReviews", (r) => r.id === req.params.id);
@@ -1289,12 +1289,17 @@ api.post("/reviews/:id/verify/adopt", expensiveLimiter, async (req, res) => {
   if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
     return void res.status(403).json({ error: "forbidden" });
   }
-  const runId = typeof req.body?.runId === "string" ? req.body.runId : db.filter("verifyRuns", (r) => r.reviewId === review.id).sort((a, b) => b.createdAt - a.createdAt)[0]?.id;
-  if (!runId) return void res.status(404).json({ error: "run_not_found" });
+  // The run id is caller-supplied and run ids are public (they appear in the PR
+  // comment's deep link), so it must belong to the review we just authorized.
+  const asked = typeof req.body?.runId === "string" ? req.body.runId : null;
+  const mine = db.filter("verifyRuns", (r) => r.reviewId === review.id);
+  const run = asked ? mine.find((r) => r.id === asked) : mine.sort((a, b) => b.createdAt - a.createdAt)[0];
+  if (!run) return void res.status(404).json({ error: "run_not_found" });
   const testIds = Array.isArray(req.body?.testIds) ? req.body.testIds.map(String) : null;
-  const out = await adoptGeneratedTests(runId, testIds);
+  const out = await adoptGeneratedTests(run.id, testIds);
   res.status(out.status === "failed" ? 502 : 200).json(out);
-});
+}
+api.post("/reviews/:id/verify/adopt", expensiveLimiter, adoptTestsHandler);
 
 // Criteria revision history (read-only; revision 1 is synthesis, later ones
 // come from PR-comment feedback). Same owner gate as the review read.
