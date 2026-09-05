@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
@@ -292,7 +292,9 @@ test("relative imports move with the test file", () => {
   const raw = { tests: [{ path: "src/total.refunds.test.ts", content: 'import { orderTotal } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" }] };
   const [planned] = normalizeRawTests(raw, new Set(["1"]), "vitest");
   assert.equal(planned.path, ".devasign/tests/src/total.refunds.test.ts");
-  assert.equal(planned.content, 'import { orderTotal } from "../../../src/total.js";');
+  assert.equal(planned.rebaseFrom, "src/total.refunds.test.ts");
+  const [rewritten] = rebaseGeneratedContent([planned]).tests;
+  assert.equal(rewritten.content, 'import { orderTotal } from "../../../src/total.js";');
 });
 
 // The `from` field only earns its place when the destination diverges from the
@@ -303,7 +305,10 @@ test("a stripped tests/ segment still resolves against where the model thought i
   const raw = { tests: [{ path: "tests/unit/total.test.ts", content: 'import { t } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" }] };
   const [t] = normalizeRawTests(raw, new Set(["1"]), "vitest");
   assert.equal(t.path, ".devasign/tests/unit/total.test.ts");
-  assert.equal(t.content, 'import { t } from "../../../tests/unit/total.js";');
+  // The point of the case: `from` is NOT derivable from the destination.
+  assert.equal(t.rebaseFrom, "tests/unit/total.test.ts");
+  const [rewritten] = rebaseGeneratedContent([t]).tests;
+  assert.equal(rewritten.content, 'import { t } from "../../../tests/unit/total.js";');
 });
 
 // node:test's mock.module is its only specifier-taking mock API, and jest/vitest
@@ -334,7 +339,7 @@ test("a reference to another generated file in the same plan follows it", () => 
       { path: "src/factory.ts", content: "export const make = () => [];", criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
     ],
   };
-  const [spec] = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  const [spec] = rebaseGeneratedContent(normalizeRawTests(raw, new Set(["1"]), "vitest")).tests;
   assert.match(spec.content!, /from "\.\/factory\.js"/, "the sibling moved alongside it, so the specifier is unchanged");
   assert.match(spec.content!, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/, "repo source is still re-anchored");
 });
@@ -343,4 +348,151 @@ test("a reference to another generated file in the same plan follows it", () => 
 // only survive because both prefixes are the same depth.
 test("the adopt prefix is the same depth as the generated-test prefix", () => {
   assert.equal(ADOPT_DIR.split("/").length, GENERATED_TEST_PREFIX.split("/").length, "adopted imports would resolve elsewhere");
+});
+
+// A specifier the rewriter declines to touch cannot load once the file moves, so
+// it is reported rather than shipped as a mystery load failure.
+test("interpolated and above-root specifiers are reported, and the test still ships", () => {
+  const raw = {
+    tests: [
+      { path: "src/a.test.ts", content: 'await import(`./${name}.js`);\nimport x from "../../../../outside.js";\nimport { ok } from "./total.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
+    ],
+  };
+  const { tests, unresolved } = rebaseGeneratedContent(normalizeRawTests(raw, new Set(["1"]), "vitest"));
+  assert.equal(tests.length, 1, "nothing is dropped");
+  assert.match(tests[0].content!, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/, "the resolvable import is still re-anchored");
+  assert.match(tests[0].content!, /import\(`\.\/\$\{name\}\.js`\)/, "the interpolated one is left as written");
+  assert.deepEqual(
+    unresolved.map((u) => [u.path, u.specifier, u.reason]),
+    [
+      [".devasign/tests/src/a.test.ts", "./${name}.js", "interpolated"],
+      [".devasign/tests/src/a.test.ts", "../../../../outside.js", "above_root"],
+    ]
+  );
+});
+
+// The code check runs first, so a specifier that is data never counts as one the
+// rewriter failed to resolve.
+test("a ${ } inside a string literal is not reported as an unresolved import", () => {
+  const raw = { tests: [{ path: "src/a.test.ts", content: `expect(msg).toBe('import("./\${x}.js") failed');`, criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" }] };
+  const { tests, unresolved } = rebaseGeneratedContent(normalizeRawTests(raw, new Set(["1"]), "vitest"));
+  assert.deepEqual(unresolved, []);
+  assert.equal(tests[0].content, `expect(msg).toBe('import("./\${x}.js") failed');`, "test data is untouched");
+});
+
+// Only JS/TS imports are re-anchored; a pytest file is relocated too, but its
+// imports are by module name and the move does not disturb them.
+test("non-JS generated content is left alone", () => {
+  const raw = { tests: [{ path: "tests/test_total.py", content: "from src.total import order_total\n", criterionIds: ["1"], origin: "generated", level: "unit", runner: "pytest" }] };
+  const { tests } = rebaseGeneratedContent(normalizeRawTests(raw, new Set(["1"]), "pytest"));
+  assert.equal(tests[0].path, ".devasign/tests/test_total.py");
+  assert.equal(tests[0].content, "from src.total import order_total\n");
+});
+
+// Two survivors claiming one origin: no redirect is knowably right.
+test("an origin claimed by two survivors falls back to the plain re-anchor", () => {
+  const both = [
+    { path: ".devasign/tests/e2e/util.spec.ts", content: null, rebaseFrom: "src/util.ts" },
+    { path: ".devasign/tests/util.ts", content: null, rebaseFrom: "src/util.ts" },
+    { path: ".devasign/tests/src/a.test.ts", content: 'import { u } from "./util.js";', rebaseFrom: "src/a.test.ts" },
+  ];
+  const { tests } = rebaseGeneratedContent(both);
+  assert.equal(tests[2].content, 'import { u } from "../../../src/util.js";');
+});
+
+// Findings 3+4 live in the ORDER of the planner's steps, so they are pinned where
+// that order actually runs. DIFF touches only src/handler.ts, so a code criterion
+// is capped at integration and a component-level test is dropped by policy.
+const sibling = (over: Record<string, unknown> = {}) => ({
+  path: "src/factory.ts", content: "export const make = () => [];", criterionIds: ["1"],
+  level: "unit", levelReason: "r", origin: "generated", runner: "vitest", targetFiles: ["src/handler.ts"], ...over,
+});
+const referrer = (over: Record<string, unknown> = {}) => ({
+  path: "src/total.test.ts", content: 'import { make } from "./factory.js";', criterionIds: ["1"],
+  level: "unit", levelReason: "r", origin: "generated", runner: "vitest", targetFiles: ["src/handler.ts"], ...over,
+});
+const planned = (runId: string) => db.find("verifyPlans", (p) => p.runId === runId)!;
+
+test("a sibling dropped by policy is not followed — the referrer falls back to the repo path", async () => {
+  const s = seed([crit("1")]);
+  // The sibling asks for component, which the API-only diff forbids.
+  const { deps: d } = deps({ responses: [{ tests: [referrer(), sibling({ level: "component" })] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const tests = planned(s.run.id).tests;
+    assert.deepEqual(tests.map((t) => t.path), [".devasign/tests/src/total.test.ts"], "the sibling was dropped");
+    assert.equal(tests[0].content, 'import { make } from "../../../src/factory.js";', "no redirect to a file nothing writes");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a sibling dropped by retirement is not followed either", async () => {
+  const s = seed([crit("1")]);
+  const sig = testSignature("Criterion 1 holds", "unit", ["src/factory.ts"]);
+  for (let i = 0; i < 3; i++) {
+    recordFlakeOutcome({ repoId: s.repo.id, signature: sig, runId: `old${i}`, outcome: "flaky", strategyVersion: 1, criterionText: "Criterion 1 holds", level: "unit", targetFiles: ["src/factory.ts"] });
+  }
+  const { deps: d } = deps({ responses: [{ tests: [referrer(), sibling({ targetFiles: ["src/factory.ts"] })] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const tests = planned(s.run.id).tests;
+    assert.deepEqual(tests.map((t) => t.path), [".devasign/tests/src/total.test.ts"]);
+    assert.equal(tests[0].content, 'import { make } from "../../../src/factory.js";');
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("when the dropped sibling's path is a real repo file, the fallback now points at it", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d } = deps({
+    tree: [...BASE_TREE, "src/factory.ts"],
+    responses: [{ tests: [referrer(), sibling({ level: "component" })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(planned(s.run.id).tests[0].content, 'import { make } from "../../../src/factory.js";', "resolves to the file that exists");
+  } finally {
+    s.cleanup();
+  }
+});
+
+// Both planner batches are written into the same checkout, so they share one
+// sibling scope. Under per-call scoping this specifier would be re-anchored away.
+test("a sibling generated by the re-plan batch is still followed", async () => {
+  const s = seed([crit("1"), crit("2")]);
+  const { deps: d } = deps({
+    responses: [
+      { tests: [referrer(), gen("2", "e2e")] }, // criterion 2's e2e violates the API-only cap → re-plan
+      { tests: [sibling({ criterionIds: ["2"] })] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const tests = planned(s.run.id).tests;
+    assert.equal(tests.length, 2, "the re-plan test survived");
+    const ref = tests.find((t) => t.path.endsWith("total.test.ts"))!;
+    assert.equal(ref.content, 'import { make } from "./factory.js";', "both land in .devasign/tests/src/, so the specifier stands");
+  } finally {
+    s.cleanup();
+  }
+});
+
+// The cheapest guard against moving the rewrite and forgetting to call it.
+test("the persisted plan carries rewritten content, and unresolved imports reach the log", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d } = deps({
+    responses: [{ tests: [referrer({ content: 'import { orderTotal } from "./total.js";\nimport x from "../../../../outside.js";' })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const test0 = planned(s.run.id).tests[0];
+    assert.match(test0.content!, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/, "content is rewritten on the way to the runner");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.match(String(log.detail), /unresolved imports: .*outside\.js \(above_root\)/);
+    assert.equal((log.meta?.unresolvedImports as unknown[]).length, 1);
+  } finally {
+    s.cleanup();
+  }
 });

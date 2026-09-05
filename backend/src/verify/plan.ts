@@ -17,6 +17,7 @@ import { effectiveWorkflow } from "../review/workflow.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format.js";
 import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, VerifyStageUsage } from "../types.js";
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
+import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
@@ -58,6 +59,9 @@ export type PlanPolicy = {
 export type RawPlanTest = {
   path: string;
   content: string | null;
+  // The path the model chose, before relocation — what its relative imports are
+  // anchored on. Absent for existing tests, which are not moved or rewritten.
+  rebaseFrom?: string;
   criterionIds: string[];
   level: TestLevel;
   levelReason: string;
@@ -149,12 +153,9 @@ export function normalizeGeneratedPath(p: string, runner: TestRunner): { path: s
 // are moved under .devasign/tests/ — so "./total.js" next to src/total.ts would
 // resolve to .devasign/tests/src/total.js and fail to load. Re-anchor them.
 //
-// The `from` and side-effect branches require that no quote appears between the
-// keyword and the specifier, so single-line string literals containing an import
-// statement are left alone. That guard does NOT extend to the call branches
-// (`import(`, `require(`, the mock family): a specifier inside a differently
-// quoted string there is still rewritten. Narrowing that needs a strings/comments
-// pass rather than a bigger regex — see the review note on acb9a82.
+// Every match is gated on code-spans.ts: only a specifier whose own quotes open a
+// literal in code position is rewritten, so module-looking text inside a string,
+// a comment, or a template literal is left as the data it is.
 const LEAD = [
   String.raw`(?:^|\n)[ \t]*(?:import|export)[^'"\`]*?\bfrom\s*`,
   String.raw`(?:^|\n)[ \t]*import\s*`,
@@ -165,24 +166,42 @@ const RELATIVE_IMPORT = new RegExp(`(${LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`]*)?)\\2
 
 const withoutExt = (p: string): string => p.replace(/\.[cm]?[jt]sx?$/, "");
 
+export type SkippedSpecifier = { specifier: string; reason: "interpolated" | "above_root" };
+
 export function rebaseRelativeImports(
   content: string,
   from: string,
   to: string,
-  // Other generated files in the same plan, keyed by extensionless origin path:
-  // they move too, so a specifier pointing at one follows it rather than staying
-  // behind at a path the runner never writes.
-  siblings: ReadonlyMap<string, string> = new Map()
+  opts: {
+    // Other generated files in the same plan, keyed by extensionless origin path:
+    // they move too, so a specifier pointing at one follows it rather than staying
+    // behind at a path the runner never writes.
+    siblings?: ReadonlyMap<string, string>;
+    // Specifiers left alone on purpose. They cannot resolve after the move, so the
+    // caller reports them instead of shipping a silent load failure.
+    onUnresolved?: (skipped: SkippedSpecifier) => void;
+  } = {}
 ): string {
+  const siblings = opts.siblings ?? new Map<string, string>();
   const fromDir = posix.dirname(from);
   const toDir = posix.dirname(to);
   if (fromDir === toDir && !siblings.size) return content;
-  return content.replace(RELATIVE_IMPORT, (match, lead: string, quote: string, spec: string) => {
-    if (spec.includes("${")) return match; // interpolated: the path is not knowable here
+  const spans = codeSpans(content);
+  return content.replace(RELATIVE_IMPORT, (match, lead: string, quote: string, spec: string, offset: number) => {
+    // Before the checks below, so a `${` inside a string is never counted as an
+    // unresolved import.
+    if (!isRewritableSpecifier(spans, offset, lead, spec)) return match;
+    if (spec.includes("${")) {
+      opts.onUnresolved?.({ specifier: spec, reason: "interpolated" });
+      return match;
+    }
     const target = posix.normalize(posix.join(fromDir, spec));
     // Above the repo root: no re-anchoring can make that resolve, and rewriting
     // it would only disguise where the model meant to point.
-    if (target.startsWith("..")) return match;
+    if (target.startsWith("..")) {
+      opts.onUnresolved?.({ specifier: spec, reason: "above_root" });
+      return match;
+    }
     const movedSibling = siblings.get(withoutExt(target));
     // Keep the specifier's own basename (the model may write .js for a .ts file).
     const resolved = movedSibling ? posix.join(posix.dirname(movedSibling), posix.basename(target)) : target;
@@ -195,8 +214,7 @@ export function rebaseRelativeImports(
 export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
   const list = (raw as { tests?: unknown })?.tests;
   if (!Array.isArray(list)) return [];
-  const out: Array<RawPlanTest & { rebaseFrom?: string }> = [];
-  const moves: Array<{ from: string; to: string }> = [];
+  const out: RawPlanTest[] = [];
   for (const t of list) {
     const o = (t || {}) as Record<string, unknown>;
     const path = typeof o.path === "string" ? o.path.trim().slice(0, 300) : "";
@@ -210,7 +228,6 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
     const moved = origin === "generated" ? normalizeGeneratedPath(path, runner) : null;
     const safe = origin === "generated" ? moved?.path : path.replace(/^\.\//, "");
     if (!safe || safe.split("/").includes("..")) continue;
-    if (moved) moves.push({ from: moved.from, to: safe });
     out.push({
       path: safe,
       content: origin === "generated" ? content : null,
@@ -223,10 +240,48 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
       targetFiles: Array.isArray(o.targetFiles) ? o.targetFiles.map(String).slice(0, 20) : [],
     });
   }
-  const siblings = new Map(moves.map((m) => [m.from.replace(/\.[cm]?[jt]sx?$/, ""), m.to]));
-  return out.map(({ rebaseFrom, ...t }) =>
-    rebaseFrom && t.content ? { ...t, content: rebaseRelativeImports(t.content, rebaseFrom, t.path, siblings) } : t
-  );
+  return out;
+}
+
+export type UnresolvedImport = SkippedSpecifier & { path: string };
+
+const REWRITABLE_EXT = /\.[cm]?[jt]sx?$/;
+const MAX_UNRESOLVED = 50;
+
+/**
+ * Re-anchor the generated tests that actually ship. Filters nothing and never
+ * touches `path` — testSignature reads it, so moving one would reset that test's
+ * flake history.
+ */
+export function rebaseGeneratedContent<T extends { path: string; content: string | null; rebaseFrom?: string }>(
+  tests: readonly T[]
+): { tests: T[]; unresolved: UnresolvedImport[] } {
+  const siblings = new Map<string, string>();
+  const ambiguous = new Set<string>();
+  for (const t of tests) {
+    if (!t.rebaseFrom) continue;
+    const stem = withoutExt(t.rebaseFrom);
+    if (siblings.has(stem) && siblings.get(stem) !== t.path) ambiguous.add(stem);
+    else siblings.set(stem, t.path);
+  }
+  // Two survivors claiming one origin: no redirect is knowably right, so fall
+  // back to the plain re-anchor.
+  for (const stem of ambiguous) siblings.delete(stem);
+
+  const unresolved: UnresolvedImport[] = [];
+  const out = tests.map((t) => {
+    // Only JS/TS imports are re-anchored; a pytest or go file is relocated too,
+    // but its imports are by module name, which the move does not disturb.
+    if (!t.rebaseFrom || !t.content || !REWRITABLE_EXT.test(t.path)) return t;
+    const content = rebaseRelativeImports(t.content, t.rebaseFrom, t.path, {
+      siblings,
+      onUnresolved: (skipped) => {
+        if (unresolved.length < MAX_UNRESOLVED) unresolved.push({ path: t.path, ...skipped });
+      },
+    });
+    return content === t.content ? t : { ...t, content };
+  });
+  return { tests: out, unresolved };
 }
 
 export function normalizeUnverifiable(raw: unknown, knownIds: Set<string>): Array<{ criterionId: string; reason: string }> {
@@ -513,7 +568,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
 
         // Signatures, quarantine strategy bumps, and retirement.
         const critText = new Map(ctx.criteria.map((c) => [c.id, c.text]));
-        const finalTests: PlanTest[] = [];
+        const survivors: Array<RawPlanTest & { signature: string; strategyVersion: number }> = [];
         const retired = new Set<string>();
         for (const t of kept) {
           const text = t.criterionIds.map((id) => critText.get(id) || "").join(" | ");
@@ -524,20 +579,27 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             continue;
           }
           const strategyVersion = t.origin === "generated" && isQuarantined(row) ? latestStrategyVersion(row) + 1 : latestStrategyVersion(row);
-          finalTests.push({
-            id: uuid(),
-            path: t.path,
-            content: t.content,
-            criterionIds: t.criterionIds,
-            level: t.level,
-            levelReason: t.levelReason,
-            origin: t.origin,
-            runner: t.runner,
-            testSignature: signature,
-            strategyVersion,
-            targetFiles: t.targetFiles,
-          });
+          survivors.push({ ...t, signature, strategyVersion });
         }
+        // Only here is the written set final — both planner batches, past policy
+        // and retirement — so a sibling redirect can only point at a file the
+        // runner actually writes. Any filter added after this reopens that bug.
+        const { tests: rebased, unresolved } = rebaseGeneratedContent(survivors);
+        // Minting the id here keeps buildCommands(finalTests) from ever running
+        // against a stale array or ids that no longer exist.
+        const finalTests: PlanTest[] = rebased.map((t) => ({
+          id: uuid(),
+          path: t.path,
+          content: t.content,
+          criterionIds: t.criterionIds,
+          level: t.level,
+          levelReason: t.levelReason,
+          origin: t.origin,
+          runner: t.runner,
+          testSignature: t.signature,
+          strategyVersion: t.strategyVersion,
+          targetFiles: t.targetFiles,
+        }));
         const finalCovered = new Set(finalTests.flatMap((t) => t.criterionIds));
         const planUnverifiable: VerifyPlan["unverifiable"] = [];
         for (const c of ctx.criteria) {
@@ -583,8 +645,9 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
             ...(dropped.length ? [`dropped: ${dropped.join("; ")}`] : []),
+            ...(unresolved.length ? [`unresolved imports: ${unresolved.map((u) => `${u.path} → ${u.specifier} (${u.reason})`).join("; ")}`] : []),
           ].join("\n"),
-          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens" },
+          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens" },
         });
         return await settle(updated);
       } catch (err) {

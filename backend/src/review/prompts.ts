@@ -1065,11 +1065,12 @@ export function testPlannerSystemPrompt(): string {
     "put such a criterion in `unverifiable` with the policy's reason instead. An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
     "\n## Generated test rules\n" +
-    "Complete, runnable files in the repo's own conventions and language; import the code under test with paths " +
-    "relative to the path you give in `path`, which is relative to the repository root (for JavaScript and " +
-    "TypeScript tests the file is relocated under .devasign/tests/ and those relative imports are re-anchored for " +
-    "you; in other languages import the code under test the way the repo's own suite does, by package or module " +
-    "name, never by a path relative to your file). Never read files relative to the test's own location — no " +
+    "Complete, runnable files in the repo's own conventions and language. `path` is relative to the repository " +
+    "root, and every generated file is relocated under .devasign/tests/ before it runs, whatever the language. " +
+    "For JavaScript and TypeScript, import the code under test with paths relative to the `path` you give and " +
+    "that relocation is re-anchored for you. In every other language import the code under test the way the " +
+    "repo's own suite does, by package or module name, never by a path relative to your file — nothing " +
+    "re-anchors those. Never read files relative to the test's own location — no " +
     "__dirname, import.meta.url or readFileSync of a fixture; inline any fixture data. " +
     "Deterministic; no network; seed data isolated per test; one criterion's " +
     "behaviour per assertion group; the first line is a comment naming the criterion ids it proves. Playwright " +
