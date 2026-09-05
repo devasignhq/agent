@@ -12,7 +12,11 @@
     "seed": "tsx scripts/seed.ts",
     "dev:ephemeral": "tsx scripts/ephemeral-dev.ts",
     "test": "DATABASE_URL= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts'",
-    "eval:criteria": "tsx scripts/eval-criteria.ts"
+    "eval:criteria": "tsx scripts/eval-criteria.ts",
+    "audit": "npm audit --audit-level=high"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.32.1",
@@ -44,5 +48,8 @@
     "@types/node": "^22.7.4",
     "@types/pg": "^8.20.0",
     "typescript": "^5.6.2"
+  },
+  "overrides": {
+    "toml": "^4.2.0"
   }
 }
