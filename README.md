@@ -10,9 +10,15 @@ On top of review, DevAsign turns issues into **funded bounties**: maintainers
 escrow USDC on Stellar (Soroban), contributors apply and submit work, and the
 same review engine gates the payout.
 
+Review is a judgement; **verification** is evidence. DevAsign generates
+acceptance tests for a PR's criteria, runs them **inside your own CI** — your
+runners, your secrets, your code never leaves your infrastructure — and reports
+per-criterion pass/fail with browser recordings attached to the PR.
+
 ## Repository layout
 
-This repo holds three apps that share one backend:
+This repo holds three apps that share one backend, plus the two packages that
+run verification in your CI:
 
 - [`backend/`](backend) — Node + Express API: GitHub OAuth + GitHub App,
   webhook receiver, in-memory job queue, review worker, Anthropic + Gemini LLM
@@ -22,6 +28,11 @@ This repo holds three apps that share one backend:
   Terminal/CLI dark theme, Geist + Geist Mono, orange accent `#ff7a3d`.
 - [`contributor/`](contributor) — the standalone **contributor** app (Vite +
   React + TS): bounty discovery, apply, dashboard, and wallet.
+- [`verify/`](verify) — [`@devasign/verify`](verify/README.md), the Node CLI that
+  runs the generated tests on your runner and uploads evidence.
+- [`verify-action/`](verify-action) — the composite GitHub Action wrapping that
+  CLI (`devasignhq/verify-action@v1`).
+- [`motion/`](motion) — the product video, rendered from code with Remotion.
 
 The two frontends are separate apps with separate accounts (a maintainer
 account and a contributor account are distinct even for the same GitHub
@@ -50,6 +61,11 @@ What works out of the box:
 - `GET  /api/bounties`, `POST /api/bounties`, and the funding / apply / submit /
   payout lifecycle (see **Bounties** below)
 - `GET  /api/security/overview`, `POST /api/security/scan` (see **Security** below)
+- `GET  /api/reviews/:id/verify`, `POST /api/reviews/:id/verify/adopt`,
+  `GET/POST /api/repositories/:id/verify/setup[-pr]` (see **Verification** below)
+- `POST /v1/runs/resolve`, `POST /v1/runs/:id/results`, `POST /v1/runs/:id/artifacts`,
+  `GET /v1/runs/:id` — the **runner API**, mounted at `/v1` and authenticated by
+  GitHub OIDC rather than a session cookie
 - `GET  /api/me`, `GET /api/integrations`, `GET /api/billing/subscription`,
   `GET /api/notifications/stream` (SSE), …
 
@@ -71,7 +87,8 @@ Screens:
 
 - Auth (GitHub OAuth gate)
 - Onboarding (GitHub install → integrations → IDE/CLI → wallet)
-- Agents (PR queue + review log timeline + end-goal panel + multimodal composer)
+- Agents (PR queue + review log timeline + end-goal panel + multimodal composer,
+  plus the per-criterion verification panel and its browser recordings)
 - Bounties (list + drawer + create/fund modal + applications inbox + invoice PDF)
 - Security (repo scans, findings by severity, one-click issue → bounty)
 - Workflow (per-repo review models and stage toggles)
@@ -124,6 +141,70 @@ findings, and a maintainer can turn any finding into a GitHub issue — and from
 there a funded bounty — in one click. Findings can be exported (CSV/PDF) on paid
 plans.
 
+## Verification
+
+Review argues that a PR meets its criteria; verification *demonstrates* it.
+DevAsign generates acceptance tests from the End goal, and they run **in your
+CI, on your runners** — the code and secrets never leave your infrastructure,
+and this backend only ever sees results and recordings.
+
+Add the Action to a workflow:
+
+```yaml
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write        # required — the runner authenticates by OIDC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: devasignhq/verify-action@v1
+        # with:
+        #   fail-on: verdict   # opt in to blocking; default never fails the job
+```
+
+or run the CLI directly with `npx @devasign/verify run`. Either way the runner
+authenticates with the workflow's **GitHub OIDC token** (`VERIFY_OIDC_AUDIENCE`),
+not an API key you have to store.
+
+How a run works:
+
+1. **Plan** — the runner calls `POST /v1/runs/resolve` with its OIDC token and
+   gets the test plan for that PR head SHA.
+2. **Run** — it executes the plan with your repo's own tooling, or its bundled
+   Playwright runner when you have none, recording video, trace and screenshots.
+3. **Report** — results go to `POST /v1/runs/:id/results`; artifacts upload by
+   signed `PUT` straight to object storage, so the bytes never pass through this
+   server.
+4. **Judge** — DevAsign scores per-criterion `pass` / `fail` / `unverifiable` /
+   `pending`, writes a `### Verification` section into the review comment, and
+   posts a separate **`DevAsign · Verify`** Check Run.
+
+Deliberate properties:
+
+- **Not a merge gate.** The Action's `fail-on` defaults to `never`, so
+  verification reports evidence without blocking your merges until you opt in.
+- **Flakes aren't failures.** A failing generated test is retried twice;
+  pass-after-retry is recorded as `flaky`, never `fail`. Your own tests are
+  never retried.
+- **Setup problems are diagnosed, not failed.** A missing start command or
+  secret is uploaded as a structured diagnosis and the job still exits 0.
+- **The runner is a guest in your repo.** It writes only under `.devasign/` and
+  cleans up after itself; it never edits `package.json`, lockfiles, or your
+  `playwright.config.*`.
+- **Recordings expire.** A retention sweep deletes artifacts on a plan-based
+  schedule and marks the row expired, so the UI says "recording expired"
+  instead of breaking.
+
+Getting set up is one click: DevAsign detects your stack and opens an onboarding
+PR on branch `devasign/enable-verification` adding
+`.github/workflows/devasign-verify.yml` and a `verify:` block in `.devasign.yml`
+(`install` / `build` / `start` / `url` / `ready` / `seed`, plus `services`,
+`login` and `env` for end-to-end runs). `devasign-verify doctor` diagnoses a
+setup locally, and any generated test can be **adopted** into your own suite
+from the PR in one click.
+
 ## The review pipeline
 
 Per [`design.md`](design.md), the worker drains a job per PR and runs, in order:
@@ -138,6 +219,12 @@ Per [`design.md`](design.md), the worker drains a job per PR and runs, in order:
 5. **Defect review** — a correctness pass ("is this code right?") independent of
    the spec, so it still runs when no index/spec exists.
 6. **Output & log** — post the Check Run + PR review and record a timeline.
+
+Verification runs as its own job loop beside this one (`verify_plan`,
+`verify_judge`, `verify_feedback`, `verify_onboard`) rather than as a step
+inside it, because it waits on your CI. Output joins whatever has landed within
+`VERIFY_JOIN_TIMEOUT_MS` and posts the rest as `pending`, so a slow CI run never
+holds up the review.
 
 Maintainer feedback can **re-score** existing verdicts (clear false positives,
 re-open passed criteria), not just add criteria.
@@ -156,6 +243,7 @@ re-open passed criteria), not just add criteria.
 | Persistence | ✅ Postgres (Neon); in-memory snapshot at boot, resilient write-through on mutation |
 | Bounties + Stellar/Soroban escrow | ✅ non-custodial (Freighter-signed create/release, admin-signed release/refund); contract deploy is environment config |
 | Security audit | ✅ fingerprinted findings, severity tiers, precedents/policy, issue → bounty |
+| Verification (tests in your CI) | ✅ OIDC-authenticated runner API, `@devasign/verify` CLI + `verify-action`, own Check Run, signed-URL artifacts, retention sweep |
 | Integrations | ✅ Slack & Discord broadcast; Linear OAuth + ingestion + webhooks |
 | Billing (Stripe) | ✅ live when `STRIPE_SECRET_KEY` set: checkout, portal, plan changes, credits |
 | Notifications | ✅ per-user SSE stream + live row-change fan-out |
@@ -173,6 +261,9 @@ frontends only need `VITE_API_BASE`. Notable groups:
 - **Stellar** — `STELLAR_*` (network, RPC/Horizon, escrow contract, USDC, admin key)
 - **Billing** — `STRIPE_*` (secret, price ids, webhook secret)
 - **Integrations** — `SLACK_*`, `DISCORD_*`, `LINEAR_*`
+- **Verifier** — `VERIFY_OIDC_*` (issuer, audience, JWKS), `VERIFY_JOIN_TIMEOUT_MS`,
+  `VERIFY_RUN_TIMEOUT_MS`, and `ARTIFACT_S3_*` for the private recordings bucket
+  (Cloudflare R2 or any S3-compatible store; unset = verify without recordings)
 - **Ops** — `RESEND_API_KEY` / `EMAIL_FROM`, `STATSIG_*`
 
 ## End-to-end smoke test
