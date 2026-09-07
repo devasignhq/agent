@@ -35,8 +35,10 @@ runs:
     # Keyed on the exact @playwright/test version pinned in verify/package.json: a range
     # would keep hitting this key while serving a stale cache, so Chromium would
     # re-download every run and never re-save. Bump both together.
+    # Negated on purpose: if the inputs context is ever unavailable here the
+    # expression still enables the cache, rather than silently disabling it.
     - name: Cache Playwright browsers
-      if: inputs.cache-browsers == 'true'
+      if: inputs.cache-browsers != 'false'
       uses: actions/cache@v4
       with:
         path: ~/.cache/ms-playwright
