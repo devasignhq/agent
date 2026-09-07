@@ -41,3 +41,5 @@ How it behaves:
 | `fail-on` | `never` | `verdict` fails the job on a failed criterion |
 | `version` | `1` | `@devasign/verify` version range |
 | `working-directory` | `.` | checkout directory to verify |
+| `resolve-timeout` | CLI default | seconds to wait for a test plan; DevAsign may shorten this and re-run the workflow once the plan is ready |
+| `cache-browsers` | `true` | cache the Playwright browser download between runs; set `false` to opt out |
