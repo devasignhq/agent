@@ -10,7 +10,7 @@ import { securityScanBlocked } from "../billing/plans.js";
 import { db } from "../db.js";
 import { currentUsage, withUsage } from "../llm.js";
 import { track } from "../statsig.js";
-import { fetchBlob } from "../review/indexer.js";
+import { fetchBlob, runPool } from "../review/indexer.js";
 import type { SecurityAuditJobPayload } from "../queue.js";
 import type {
   Installation,
@@ -103,23 +103,6 @@ export function selectCandidates(args: {
 function analyticsUser(userId: string | undefined): User | string | null {
   if (!userId) return null;
   return db.find("users", (u) => u.id === userId) ?? userId;
-}
-
-async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>) {
-  if (items.length === 0) return;
-  const queue = items.slice();
-  const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
-    while (queue.length > 0) {
-      const item = queue.shift();
-      if (item === undefined) break;
-      try {
-        await fn(item);
-      } catch (err) {
-        console.warn("[security] worker error:", err);
-      }
-    }
-  });
-  await Promise.all(workers);
 }
 
 export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promise<void> {

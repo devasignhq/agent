@@ -547,7 +547,7 @@ function log(
 
 // ─── Concurrency primitive (no new deps) ──────────────────────────────────
 
-async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>) {
+export async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Promise<void>, label = "indexer") {
   if (items.length === 0) return;
   const queue = items.slice();
   const workers = Array.from({ length: Math.min(concurrency, queue.length) }, async () => {
@@ -557,7 +557,7 @@ async function runPool<T>(items: T[], concurrency: number, fn: (item: T) => Prom
       try {
         await fn(item);
       } catch (err) {
-        console.warn("[indexer] worker error:", err);
+        console.warn(`[${label}] worker error:`, err);
       }
     }
   });

@@ -69,7 +69,7 @@ import {
   devasignDocsSystemPrompt,
   type CriteriaMode,
 } from "./prompts.js";
-import { fetchTree } from "./indexer.js";
+import { fetchTree, runPool } from "./indexer.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary, stripGutterArtifacts } from "./diff-format.js";
 import { extractJSON, repairBledProseField } from "./parse.js";
 
@@ -1598,32 +1598,35 @@ async function ingestContext(
     return true;
   });
 
-  // Hand each video to Gemini for transcription/understanding so the downstream
-  // Opus reviewer can reason about what the recorded UX actually shows.
-  const videos: VideoSummary[] = [];
-  for (const v of dedupedTargets) {
-    if (!v.url) continue;
-    try {
-      const s = await summarizeVideo({ url: v.url, note: v.note });
-      videos.push(s);
-      sources.push({
-        kind: "video_summary",
-        ref: v.url,
-        text:
+  // Hand each video to Gemini so the downstream reviewer can reason about what the
+  // recorded UX shows. Written into slots, not appended: prompt order is content.
+  const videoSlots: Array<{ summary: VideoSummary; source: IngestedSource } | null> = dedupedTargets.map(() => null);
+  await runPool(
+    dedupedTargets.map((v, i) => ({ v, i })),
+    3,
+    async ({ v, i }) => {
+      if (!v.url) return;
+      try {
+        const s = await summarizeVideo({ url: v.url, note: v.note });
+        const text =
           `Source: ${v.source}\n` +
           `Provider: ${s.provider} (model: ${s.model})\n` +
           `Summary: ${s.summary}\n` +
-          (s.keyMoments.length
-            ? `Key moments:\n${s.keyMoments.map((k) => `  ${k.t} — ${k.note}`).join("\n")}\n`
-            : "") +
-          (s.acceptanceSignals.length
-            ? `Acceptance signals:\n${s.acceptanceSignals.map((a) => `  - ${a}`).join("\n")}\n`
-            : "") +
-          (s.unreliable ? "(unreliable: model could not directly watch the video)\n" : ""),
-      });
-    } catch (err) {
-      console.warn("[ingest] video summarize failed for", v.url, err);
-    }
+          (s.keyMoments.length ? `Key moments:\n${s.keyMoments.map((k) => `  ${k.t} — ${k.note}`).join("\n")}\n` : "") +
+          (s.acceptanceSignals.length ? `Acceptance signals:\n${s.acceptanceSignals.map((a) => `  - ${a}`).join("\n")}\n` : "") +
+          (s.unreliable ? "(unreliable: model could not directly watch the video)\n" : "");
+        videoSlots[i] = { summary: s, source: { kind: "video_summary", ref: v.url, text } };
+      } catch (err) {
+        console.warn("[ingest] video summarize failed for", v.url, err);
+      }
+    },
+    "ingest"
+  );
+  const videos: VideoSummary[] = [];
+  for (const slot of videoSlots) {
+    if (!slot) continue;
+    videos.push(slot.summary);
+    sources.push(slot.source);
   }
 
   // The bounty this PR delivers, if any: the explicit prNumber link (set by
