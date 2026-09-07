@@ -109,6 +109,8 @@ export type ResolveRequest = {
   setup?: DetectedSetup;
   actions?: { runId: string; jobUrl?: string; runnerOs?: string };
   cliVersion?: string;
+  // Final poll before the runner stops waiting, so a plan landing after it can re-dispatch CI.
+  giveUp?: boolean;
 };
 
 export type RunnerPlan = {
@@ -128,10 +130,12 @@ export type ResolveEmptyReason =
   | "storage_unconfigured"
   | "fork_pr"
   | "superseded"
-  | "already_completed";
+  | "already_completed"
+  | "onboarding_pr"
+  | "not_reviewed";
 
 export type ResolveResponse =
-  | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number }
+  | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number; giveUpAfterMs?: number }
   | { ok: true; status: "ready"; runId: string; plan: RunnerPlan }
   | { ok: true; status: "empty"; runId: string | null; reason: ResolveEmptyReason }
   | { ok: true; status: "setup"; runId: string; onboardingPr?: number };

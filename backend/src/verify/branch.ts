@@ -4,7 +4,7 @@
 import { db } from "../db.js";
 import { config } from "../config.js";
 import type { Criterion, Installation, PRReview, RepoWorkflow, Repository, ReviewLogEntry, VerifyRun } from "../types.js";
-import { runVerifyPlan } from "./plan.js";
+import { runVerifyPlan, type PlannerDeps } from "./plan.js";
 import { buildVerificationView, type VerificationView } from "./report.js";
 import { createVerifyRun, snapshotCriteriaRevision, TERMINAL_STATUSES, updateRun } from "./runs.js";
 
@@ -29,6 +29,7 @@ export function startVerifyBranch(args: {
   criteria: Criterion[];
   criteriaFinishedAt: number;
   headFromFork?: boolean;
+  deps?: PlannerDeps;
   log: Log;
 }): VerifyBranch {
   const { review, repo, install, wf, criteria, log } = args;
@@ -59,7 +60,7 @@ export function startVerifyBranch(args: {
     detail: `${verifiable.length} criteria to verify; planning tests in parallel with the review`,
     meta: { runId: run.id, criteria: verifiable.length, revision: revision.revision },
   });
-  const settled = runVerifyPlan(run.id).catch((err) => {
+  const settled = runVerifyPlan(run.id, args.deps ?? {}).catch((err) => {
     console.error(`[verify] branch failed for run ${run.id}:`, err);
     return updateRun(run.id, { status: "failed", error: err instanceof Error ? err.message.slice(0, 300) : String(err) });
   });

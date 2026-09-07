@@ -69,6 +69,7 @@ import {
   devasignDocsSystemPrompt,
   type CriteriaMode,
 } from "./prompts.js";
+import { fetchTree, runPool } from "./indexer.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary, stripGutterArtifacts } from "./diff-format.js";
 import { extractJSON, repairBledProseField } from "./parse.js";
 
@@ -317,6 +318,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     // a. Ingest
     const context = await ingestContext(review, repo, install);
+    // The planner needs this tree but nothing before the fork does, so start it here and
+    // let it run under criteria synthesis instead of on the plan's critical path. Gated on
+    // the stage: a repo with verification off must not pay for a tree nobody reads.
+    const verifyTreeSha = review.headSha;
+    const verifyTree = install && wf.stages.verify && !context.headFromFork ? fetchTree(repo, install, verifyTreeSha).catch(() => null) : null;
     log(review.id, "ingest", "Context ingested", {
       detail: `${context.sources.length} source(s)`,
       meta: {
@@ -563,6 +569,17 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       criteria,
       criteriaFinishedAt,
       headFromFork: context.headFromFork,
+      // Hand over what ingest already fetched. An empty diff means ingest failed, and a
+      // mid-job push moves headSha off verifyTreeSha — both must fall back, not plan blind.
+      deps: {
+        ...(context.diff ? { fetchDiff: async () => context.diff } : {}),
+        ...(verifyTree
+          ? {
+              fetchTree: async (r: Repository, i: Installation, sha: string) =>
+                (sha === verifyTreeSha ? await verifyTree : null) ?? fetchTree(r, i, sha),
+            }
+          : {}),
+      },
       log: (action, extra) => log(review.id, "verify", action, extra),
     });
 
@@ -1581,32 +1598,35 @@ async function ingestContext(
     return true;
   });
 
-  // Hand each video to Gemini for transcription/understanding so the downstream
-  // Opus reviewer can reason about what the recorded UX actually shows.
-  const videos: VideoSummary[] = [];
-  for (const v of dedupedTargets) {
-    if (!v.url) continue;
-    try {
-      const s = await summarizeVideo({ url: v.url, note: v.note });
-      videos.push(s);
-      sources.push({
-        kind: "video_summary",
-        ref: v.url,
-        text:
+  // Hand each video to Gemini so the downstream reviewer can reason about what the
+  // recorded UX shows. Written into slots, not appended: prompt order is content.
+  const videoSlots: Array<{ summary: VideoSummary; source: IngestedSource } | null> = dedupedTargets.map(() => null);
+  await runPool(
+    dedupedTargets.map((v, i) => ({ v, i })),
+    3,
+    async ({ v, i }) => {
+      if (!v.url) return;
+      try {
+        const s = await summarizeVideo({ url: v.url, note: v.note });
+        const text =
           `Source: ${v.source}\n` +
           `Provider: ${s.provider} (model: ${s.model})\n` +
           `Summary: ${s.summary}\n` +
-          (s.keyMoments.length
-            ? `Key moments:\n${s.keyMoments.map((k) => `  ${k.t} — ${k.note}`).join("\n")}\n`
-            : "") +
-          (s.acceptanceSignals.length
-            ? `Acceptance signals:\n${s.acceptanceSignals.map((a) => `  - ${a}`).join("\n")}\n`
-            : "") +
-          (s.unreliable ? "(unreliable: model could not directly watch the video)\n" : ""),
-      });
-    } catch (err) {
-      console.warn("[ingest] video summarize failed for", v.url, err);
-    }
+          (s.keyMoments.length ? `Key moments:\n${s.keyMoments.map((k) => `  ${k.t} — ${k.note}`).join("\n")}\n` : "") +
+          (s.acceptanceSignals.length ? `Acceptance signals:\n${s.acceptanceSignals.map((a) => `  - ${a}`).join("\n")}\n` : "") +
+          (s.unreliable ? "(unreliable: model could not directly watch the video)\n" : "");
+        videoSlots[i] = { summary: s, source: { kind: "video_summary", ref: v.url, text } };
+      } catch (err) {
+        console.warn("[ingest] video summarize failed for", v.url, err);
+      }
+    },
+    "ingest"
+  );
+  const videos: VideoSummary[] = [];
+  for (const slot of videoSlots) {
+    if (!slot) continue;
+    videos.push(slot.summary);
+    sources.push(slot.source);
   }
 
   // The bounty this PR delivers, if any: the explicit prNumber link (set by

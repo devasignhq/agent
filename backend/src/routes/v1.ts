@@ -21,8 +21,10 @@ import {
   buildRunView,
   latestRunForReview,
   forgetRunnerPoll,
+  noteRunnerGone,
   noteRunnerPoll,
   planTierForRepo,
+  runnerWaitedWithoutReview,
   runnerPlanFor,
   TERMINAL_STATUSES,
   updateRun,
@@ -112,6 +114,7 @@ function parseResolveBody(body: unknown): ResolveRequest | null {
     setup: b.setup && typeof b.setup === "object" ? (b.setup as ResolveRequest["setup"]) : undefined,
     actions: b.actions && typeof b.actions === "object" ? (b.actions as ResolveRequest["actions"]) : undefined,
     cliVersion: typeof b.cliVersion === "string" ? b.cliVersion.slice(0, 40) : undefined,
+    giveUp: b.giveUp === true,
   };
 }
 
@@ -167,21 +170,39 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
   if (!body) return fail(res, 400, "invalid_body", { detail: "sha (hex) and pr (positive int) are required" });
   const refPr = prNumberFromRef(runner.claims.ref);
   if (refPr != null && refPr !== body.pr) return fail(res, 403, "pr_mismatch");
+  // Must stay after rememberSetup: the onboarding PR's run is often the first
+  // runner contact, and that write is what clears the repo's "setup pending" state.
   rememberSetup(runner.repo, body.setup);
+
+  // DevAsign never reviews its own onboarding PR, so no plan will ever exist for it.
+  const onboardingPr = runner.repo.verify?.onboarding?.prNumber;
+  if (onboardingPr != null && onboardingPr === body.pr) {
+    const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "onboarding_pr" };
+    return void res.json(out);
+  }
 
   const review = db.find("prReviews", (r) => r.repoId === runner.repo.id && r.prNumber === body.pr);
   if (!review) {
     noteRunnerPoll(runner.repo.id, body.pr, body.sha);
-    const out: ResolveResponse = { ok: true, status: "pending", runId: null, retryAfterMs: 5_000 };
+    if (body.giveUp) noteRunnerGone(runner.repo.id, body.pr, body.sha);
+    // Declined at the webhook (bot, draft, ineligible author, cap) — nothing is coming.
+    if (runnerWaitedWithoutReview(runner.repo.id, body.pr, body.sha)) {
+      const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "not_reviewed" };
+      return void res.json(out);
+    }
+    const out: ResolveResponse = { ok: true, status: "pending", runId: null, retryAfterMs: 5_000, giveUpAfterMs: config.verify.runnerGiveUpMs };
     return void res.status(202).json(out);
   }
   const run = latestRunForReview(review.id, body.sha);
   if (!run) {
     const superseded = review.headSha.toLowerCase() !== body.sha.toLowerCase();
-    if (!superseded) noteRunnerPoll(runner.repo.id, body.pr, body.sha);
+    if (!superseded) {
+      noteRunnerPoll(runner.repo.id, body.pr, body.sha);
+      if (body.giveUp) noteRunnerGone(runner.repo.id, body.pr, body.sha);
+    }
     const out: ResolveResponse = superseded
       ? { ok: true, status: "empty", runId: null, reason: "superseded" }
-      : { ok: true, status: "pending", runId: null, retryAfterMs: 5_000 };
+      : { ok: true, status: "pending", runId: null, retryAfterMs: 5_000, giveUpAfterMs: config.verify.runnerGiveUpMs };
     return void res.status(superseded ? 200 : 202).json(out);
   }
 
@@ -197,7 +218,8 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
     }
     case "planning": {
       noteRunnerPoll(runner.repo.id, body.pr, body.sha);
-      const out: ResolveResponse = { ok: true, status: "pending", runId: run.id, retryAfterMs: 3_000 };
+      if (body.giveUp) noteRunnerGone(runner.repo.id, body.pr, body.sha);
+      const out: ResolveResponse = { ok: true, status: "pending", runId: run.id, retryAfterMs: 3_000, giveUpAfterMs: config.verify.runnerGiveUpMs };
       return void res.status(202).json(out);
     }
     case "skipped": {

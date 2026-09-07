@@ -423,6 +423,24 @@ export async function createPullRequest(
   return { number: pr.number, html_url: pr.html_url };
 }
 
+/** The open PR for `head` (branch name, no owner prefix), or null. */
+export async function findOpenPullRequest(
+  installationId: number,
+  owner: string,
+  name: string,
+  head: string
+): Promise<{ number: number; html_url: string } | null> {
+  try {
+    const prs = await gh<Array<{ number: number; html_url: string }>>(
+      installationId,
+      `/repos/${owner}/${name}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&per_page=1`
+    );
+    return prs?.[0] ? { number: prs[0].number, html_url: prs[0].html_url } : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Names of the repo's Actions secrets, or null when the App cannot read them (needs secrets:read). */
 export async function listRepoSecretNames(installationId: number, owner: string, name: string): Promise<string[] | null> {
   try {

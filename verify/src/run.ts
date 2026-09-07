@@ -30,9 +30,22 @@ export type RunOptions = {
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
+export const MIN_SERVER_DEADLINE_MS = 30_000;
+
+/**
+ * The server knows how long planning really takes, so let it shorten our wait — but never
+ * extend it, or a stuck backend could pin a CI job open for its whole timeout.
+ */
+export function serverDeadline(current: number, startedAt: number, hintMs: number | undefined): number {
+  if (typeof hintMs !== "number" || !Number.isFinite(hintMs) || hintMs <= 0) return current;
+  return Math.min(current, startedAt + Math.max(hintMs, MIN_SERVER_DEADLINE_MS));
+}
+
 export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: RunnerResults["setup"], timeoutMs: number): Promise<ResolveResponse> {
-  const deadline = Date.now() + timeoutMs;
+  const startedAt = Date.now();
+  let deadline = startedAt + timeoutMs;
   let polls = 0;
+  let finalPoll = false;
   for (;;) {
     const res = await api.resolve({
       sha: ctx.sha,
@@ -42,13 +55,18 @@ export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: Runner
       setup: polls === 0 ? setup : undefined,
       actions: { runId: ctx.runId, jobUrl: ctx.jobUrl, runnerOs: ctx.runnerOs },
       cliVersion: CLI_VERSION,
+      // Tells the server this job is leaving, so a plan landing later re-dispatches CI
+      // instead of stranding the run until it times out.
+      ...(finalPoll ? { giveUp: true } : {}),
     });
     polls += 1;
     if (res.status !== "pending") return res;
-    if (Date.now() > deadline) return res;
+    if (finalPoll) return res;
+    deadline = serverDeadline(deadline, startedAt, res.giveUpAfterMs);
     const wait = Math.min(Math.max(res.retryAfterMs || 5_000, 2_000), 30_000);
     if (polls === 1 || polls % 6 === 0) log.info(`waiting for DevAsign to plan the tests${res.runId ? ` (run ${res.runId})` : ""}…`);
     await sleep(wait);
+    if (Date.now() >= deadline) finalPoll = true;
   }
 }
 

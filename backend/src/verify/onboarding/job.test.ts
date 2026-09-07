@@ -9,7 +9,7 @@ import { parse } from "yaml";
 import { db } from "../../db.js";
 import { adoptedPath, adoptGeneratedTests, noteOnboardingPrClosed, noteRunSucceeded, postDoctorFollowup, runVerifyOnboard, type OnboardDeps } from "./job.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "../runs.js";
-import { ACTION_REF, DEVASIGN_YML_PATH, ONBOARDING_BRANCH, WORKFLOW_PATH } from "./generate.js";
+import { ACTION_REF, DEVASIGN_YML_PATH, generateWorkflow, ONBOARDING_BRANCH, WORKFLOW_PATH, WORKFLOW_VERSION } from "./generate.js";
 
 function seed(over: { userId?: string } = {}) {
   const installId = uuid();
@@ -17,7 +17,7 @@ function seed(over: { userId?: string } = {}) {
   db.insert("users", { id: userId, githubId: 1, githubLogin: "owner", email: "o@x", plan: "pro", createdAt: 0 } as any);
   db.insert("installations", { id: installId, userId, accountId: 1, accountLogin: "acme", installationId: 9, repoIds: [] } as any);
   const repo = db.insert("repositories", { id: uuid(), installationId: installId, owner: "acme", name: "shop", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true } as any);
-  const calls = { branches: [] as string[], files: {} as Record<string, string>, prs: [] as any[], comments: [] as string[] };
+  const calls = { branches: [] as string[], files: {} as Record<string, string>, prs: [] as any[], comments: [] as string[], openPr: null as { number: number; html_url: string } | null };
   const tree = ["package.json", "package-lock.json", "src/app.ts", "src/app.test.ts", ".env.example", ".github/workflows/ci.yml"];
   const contents: Record<string, string> = {
     "package.json": JSON.stringify({ scripts: { dev: "vite", test: "vitest run" }, dependencies: { vite: "5" }, devDependencies: { vitest: "2" } }),
@@ -31,6 +31,7 @@ function seed(over: { userId?: string } = {}) {
     ensureBranch: async (_i, _r, branch) => { calls.branches.push(branch); },
     putFile: async (_i, _r, _b, path, content) => { calls.files[path] = content; },
     createPr: async (_i, _r, args) => { calls.prs.push(args); return { number: 40 + calls.prs.length, html_url: `https://github.com/acme/shop/pull/${40 + calls.prs.length}` }; },
+    findPr: async () => calls.openPr,
     secretNames: async () => ["API_KEY"],
     postComment: async (_i, _r, _n, body) => { calls.comments.push(body); return 1; },
     prHeadRef: async () => "feature/refunds",
@@ -96,10 +97,10 @@ test("extend mode appends to the existing CI job; a repo that already runs the a
     noteOnboardingPrClosed(s.repo.id, 999, true);
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding.state, "pr_merged", "another PR closing is ignored");
 
-    // Already set up on main: skip and mark merged.
+    // Already set up on main: an automatic trigger leaves it alone and marks it merged.
     const already = { ...s.deps, tree: async () => [{ path: WORKFLOW_PATH, type: "blob", sha: "s", size: 1 }, { path: "package.json", type: "blob", sha: "s", size: 1 }] };
     db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "none" } } });
-    const skip = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, already);
+    const skip = await runVerifyOnboard(s.repo.id, { trigger: "install" }, already);
     assert.equal(skip.status, "skipped");
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding.state, "pr_merged");
   } finally {
@@ -183,4 +184,41 @@ test("adopt: generated tests land under tests/devasign/ on a branch off the PR h
   } finally {
     s.cleanup();
   }
+});
+
+test("a manual regenerate reaches a repo that already merged its setup PR — the only path that can update one", async () => {
+  const s = seed();
+  try {
+    const onboarded = { ...s.deps, tree: async () => [WORKFLOW_PATH, "package.json"].map((path) => ({ path, type: "blob" as const, sha: "s", size: 1 })) };
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "pr_merged" } } });
+
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, onboarded);
+    assert.equal(out.status, "opened", "regenerate must not be a silent no-op");
+    assert.ok(s.calls.files[WORKFLOW_PATH], "the workflow is rewritten at the current generator version");
+    const ob = db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding;
+    assert.equal(ob?.state, "pr_open");
+    assert.equal(ob?.workflowPath, WORKFLOW_PATH, "where our step lives is now persisted");
+    assert.equal(ob?.workflowVersion, WORKFLOW_VERSION, "so a stale copy is detectable later");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("regenerating while the setup PR is open reuses it instead of 422-ing on a duplicate head", async () => {
+  const s = seed();
+  try {
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41" };
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps);
+    assert.equal(out.status, "opened");
+    assert.equal(out.prNumber, 41, "the existing PR is reused");
+    assert.equal(s.calls.prs.length, 0, "no second PR is attempted for the same branch");
+    assert.deepEqual(s.calls.branches, [ONBOARDING_BRANCH], "the branch is still force-updated with the new commits");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the generated workflow carries a version marker so a stale copy can be spotted", () => {
+  const wf = generateWorkflow({ languages: ["ts"], frameworks: [], testCommands: [], services: [], envExampleVars: [], packageManager: "npm" } as any, { node: true, nodeVersion: "20" } as any, [], ["package.json"]);
+  assert.match(wf, new RegExp(`# devasign-workflow: v${WORKFLOW_VERSION}`));
 });

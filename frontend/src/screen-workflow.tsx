@@ -872,23 +872,27 @@ const VerifySetupPanel = ({ repo }) => {
       )}
       {ob.lastDiagnosis && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>setup needs attention: {ob.lastDiagnosis.message}</div>}
       {ob.lastError && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>{ob.lastError}</div>}
-      {ob.state !== "verified" && (
-        <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
-          <select className="mono" value={mode} onChange={(e) => setMode(e.target.value)} style={{ fontSize: 11 }}>
-            <option value="separate">separate workflow</option>
-            {workflows.length > 0 && <option value="extend">add a step to an existing workflow</option>}
-          </select>
-          {mode === "extend" && (
-            <select className="mono" value={workflow} onChange={(e) => setWorkflow(e.target.value)} style={{ fontSize: 11 }}>
-              <option value="">pick a workflow</option>
-              {workflows.map((w) => <option key={w} value={w}>{w}</option>)}
+      {/* Shown even once verified: this is the only way an onboarded repo ever gets an
+          updated workflow, and the mode selectors are only meaningful before one exists. */}
+      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
+        {ob.state !== "verified" && (
+          <>
+            <select className="mono" value={mode} onChange={(e) => setMode(e.target.value)} style={{ fontSize: 11 }}>
+              <option value="separate">separate workflow</option>
+              {workflows.length > 0 && <option value="extend">add a step to an existing workflow</option>}
             </select>
-          )}
-          <button type="button" className="btn sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.requestSetupPr(repo.id, { mode, workflow: workflow || undefined }); setTimeout(() => { void load(); setBusy(false); }, 2500); } catch { setBusy(false); } }}>
-            {busy ? "Opening…" : ob.state === "none" ? "Open setup PR" : "Regenerate setup PR"}
-          </button>
-        </div>
-      )}
+            {mode === "extend" && (
+              <select className="mono" value={workflow} onChange={(e) => setWorkflow(e.target.value)} style={{ fontSize: 11 }}>
+                <option value="">pick a workflow</option>
+                {workflows.map((w) => <option key={w} value={w}>{w}</option>)}
+              </select>
+            )}
+          </>
+        )}
+        <button type="button" className="btn sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.requestSetupPr(repo.id, { mode, workflow: workflow || undefined }); setTimeout(() => { void load(); setBusy(false); }, 2500); } catch { setBusy(false); } }}>
+          {busy ? "Opening…" : ob.state === "none" ? "Open setup PR" : ob.state === "verified" ? "Update workflow" : "Regenerate setup PR"}
+        </button>
+      </div>
     </div>
   );
 };

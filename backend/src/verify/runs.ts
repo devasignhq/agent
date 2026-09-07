@@ -30,20 +30,46 @@ export const TERMINAL_STATUSES: ReadonlySet<VerifyRunStatus> = new Set([
 // gives up after its own timeout. Remembering that it called lets the planner
 // re-trigger CI instead of leaving the run to be reaped. In-process only: a
 // redeploy loses the queue too, so there is nothing to re-trigger for.
-const runnerPolls = new Map<string, number>();
-export const RUNNER_GONE_MS = 90_000;
+type RunnerPoll = { first: number; last: number; gone?: boolean };
+const runnerPolls = new Map<string, RunnerPoll>();
+// Runners poll every 3-5s. Shorter than the old 90s so a plan that lands after
+// the runner quit re-dispatches promptly; cancel-in-progress bounds a false positive.
+export const RUNNER_GONE_MS = 30_000;
+// A webhook that was going to create this review has had this long to arrive.
+export const NO_REVIEW_GRACE_MS = 60_000;
 
 const pollKey = (repoId: string, prNumber: number, sha: string) => `${repoId}:${prNumber}:${sha.toLowerCase()}`;
 
 export function noteRunnerPoll(repoId: string, prNumber: number, sha: string, at = Date.now()): void {
   if (runnerPolls.size > 500) runnerPolls.clear();
-  runnerPolls.set(pollKey(repoId, prNumber, sha), at);
+  const key = pollKey(repoId, prNumber, sha);
+  const prev = runnerPolls.get(key);
+  runnerPolls.set(key, prev ? { ...prev, last: at } : { first: at, last: at });
+}
+
+/** The runner said this was its final poll, so the plan will have nobody to collect it. */
+export function noteRunnerGone(repoId: string, prNumber: number, sha: string, at = Date.now()): void {
+  const key = pollKey(repoId, prNumber, sha);
+  const prev = runnerPolls.get(key);
+  runnerPolls.set(key, prev ? { ...prev, last: at, gone: true } : { first: at, last: at, gone: true });
 }
 
 /** True when a runner polled for this commit and has since stopped waiting. */
 export function runnerGaveUp(repoId: string, prNumber: number, sha: string, now = Date.now()): boolean {
-  const at = runnerPolls.get(pollKey(repoId, prNumber, sha));
-  return at != null && now - at > RUNNER_GONE_MS;
+  const e = runnerPolls.get(pollKey(repoId, prNumber, sha));
+  return !!e && (e.gone === true || now - e.last > RUNNER_GONE_MS);
+}
+
+/** A runner has been polling this long with still no review row: none is coming. */
+export function runnerWaitedWithoutReview(
+  repoId: string,
+  prNumber: number,
+  sha: string,
+  graceMs = NO_REVIEW_GRACE_MS,
+  now = Date.now()
+): boolean {
+  const e = runnerPolls.get(pollKey(repoId, prNumber, sha));
+  return !!e && now - e.first >= graceMs;
 }
 
 export function forgetRunnerPoll(repoId: string, prNumber: number, sha: string): void {

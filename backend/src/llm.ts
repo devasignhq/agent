@@ -64,6 +64,7 @@ export function currentUsageByModel(): Record<string, UsageTotals> | null {
 const ANTHROPIC_PRICES: Record<string, { inPerM: number; outPerM: number }> = {
   "claude-opus-4-8": { inPerM: 5, outPerM: 25 },
   "claude-opus-4-7": { inPerM: 5, outPerM: 25 },
+  "claude-sonnet-5": { inPerM: 2, outPerM: 10 },
   "claude-haiku-4-5": { inPerM: 1, outPerM: 5 },
 };
 

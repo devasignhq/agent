@@ -21,7 +21,7 @@ import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
-import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, updateRun } from "./runs.js";
+import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, RUNNER_GONE_MS, updateRun } from "./runs.js";
 import { hasBootConfig, parseDevasignVerify } from "./yml.js";
 
 export const LEVELS: TestLevel[] = ["unit", "integration", "component", "e2e"];
@@ -89,6 +89,15 @@ export function usageByProvider(): VerifyStageUsage {
 
 const defaultLLM: PlannerLLM = async ({ system, user, maxTokens }) =>
   completeWithMeta({ system, cacheSystem: true, maxTokens, messages: [{ role: "user", content: user }] });
+
+// Planning is mechanical next to review judgment — the ladder policy, path safety and
+// flake retirement are all enforced in code after the model — so it need not share the tier.
+export function plannerLLM(llm: PlannerLLM, tier: VerifyRun["planTier"]): PlannerLLM {
+  const model = config.verify.plannerModel;
+  // Free already plans on the cheap model; overriding would only raise its cost.
+  if (!model || tier === "free") return llm;
+  return (args) => withModel(model, () => llm(args));
+}
 
 async function defaultReadFile(install: Installation, repo: Repository, path: string, sha: string): Promise<string | null> {
   try {
@@ -509,6 +518,22 @@ async function retriggerRunner(run: VerifyRun, repo: Repository, install: Instal
   }
 }
 
+const secs = (ms: number) => `${Math.max(0, Math.round(ms / 100) / 10)}s`;
+
+/**
+ * A runner that quits between the plan landing and RUNNER_GONE_MS elapsing would strand the
+ * run in awaiting_runner until the reaper times it out an hour later. Re-check once.
+ */
+function scheduleGiveUpRecheck(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): void {
+  const timer = setTimeout(() => {
+    const fresh = db.find("verifyRuns", (r) => r.id === run.id);
+    if (!fresh || fresh.status !== "awaiting_runner" || fresh.timings.resolvedAt != null) return;
+    if (!runnerGaveUp(repo.id, run.prNumber, run.sha)) return;
+    void retriggerRunner(fresh, repo, install, deps);
+  }, RUNNER_GONE_MS + 5_000);
+  timer.unref?.();
+}
+
 /** Plan a run. Returns the updated run row (awaiting_runner, skipped, or failed). */
 export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Promise<VerifyRun | null> {
   const run = db.find("verifyRuns", (r) => r.id === runId);
@@ -537,16 +562,19 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
     withUsage(async () => {
       try {
         const ctx = await gatherContext(run, repo, install, deps);
+        const gatherMs = Date.now() - planStartedAt;
         if (!ctx.criteria.length) {
           return await settle(updateRun(run.id, { status: "skipped", skipReason: "no_criteria", timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } }));
         }
         const wf = effectiveWorkflow(repo);
         const system = withMaintainerInstructions(testPlannerSystemPrompt(), wf.prompts?.verify);
-        const llm = deps.llm ?? defaultLLM;
+        const llm = plannerLLM(deps.llm ?? defaultLLM, run.planTier);
         const knownIds = new Set(ctx.criteria.map((c) => c.id));
         const fallbackRunner = fallbackRunnerFor(ctx.setup);
 
+        const llmStartedAt = Date.now();
         const first = await llm({ system, user: buildPlannerUserPrompt(ctx), maxTokens: 16_000 });
+        const firstLlmMs = Date.now() - llmStartedAt;
         const parsed = extractJSON(first.text) ?? {};
         let tests = normalizeRawTests(parsed, knownIds, fallbackRunner);
         const unverifiable = new Map(normalizeUnverifiable(parsed, knownIds).map((u) => [u.criterionId, u.reason]));
@@ -557,8 +585,11 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const covered = new Set(kept.flatMap((t) => t.criterionIds));
         const uncovered = ctx.criteria.map((c) => c.id).filter((id) => !covered.has(id) && !unverifiable.has(id));
         const violatedIds = uncovered.filter((id) => violations.some((v) => v.test.criterionIds.includes(id)));
+        let replanMs = 0;
         if (violatedIds.length) {
+          const replanStartedAt = Date.now();
           const second = await llm({ system, user: buildPlannerUserPrompt(ctx, { replan: { ids: violatedIds } }), maxTokens: 12_000 });
+          replanMs = Date.now() - replanStartedAt;
           const again = normalizeRawTests(extractJSON(second.text) ?? {}, new Set(violatedIds), fallbackRunner);
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
@@ -635,6 +666,9 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         // The runner may have polled while this plan was still queued and given
         // up; nothing else would ever hand it the plan.
         if (runnerGaveUp(repo.id, run.prNumber, run.sha)) await retriggerRunner(run, repo, install, deps);
+        else scheduleGiveUpRecheck(run, repo, install, deps);
+        const queuedMs = planStartedAt - (run.timings.criteriaFinishedAt ?? run.timings.forkedAt);
+        const totalMs = planFinishedAt - planStartedAt;
         db.insert("reviewLogs", {
           id: uuid(),
           reviewId: run.reviewId,
@@ -642,12 +676,13 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           at: planFinishedAt,
           action: `Test plan ready: ${generated} generated, ${finalTests.length - generated} existing, ${planUnverifiable.length} unverifiable`,
           detail: [
+            `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""})`,
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
             ...(dropped.length ? [`dropped: ${dropped.join("; ")}`] : []),
             ...(unresolved.length ? [`unresolved imports: ${unresolved.map((u) => `${u.path} → ${u.specifier} (${u.reason})`).join("; ")}`] : []),
           ].join("\n"),
-          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens" },
+          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens", ms: { queued: queuedMs, gather: gatherMs, llm: firstLlmMs, replan: replanMs, total: totalMs } },
         });
         return await settle(updated);
       } catch (err) {

@@ -1,6 +1,6 @@
 // Wire contract with the DevAsign API (/v1). Mirrors backend/src/verify/contract.ts;
 // additive changes only, kept in sync by hand.
-export const CLI_VERSION = "1.0.1";
+export const CLI_VERSION = "1.1.0";
 export const API_VERSION = 1;
 
 export type TestLevel = "unit" | "integration" | "component" | "e2e";
@@ -94,6 +94,7 @@ export type ResolveRequest = {
   setup?: DetectedSetup;
   actions?: { runId: string; jobUrl?: string; runnerOs?: string };
   cliVersion?: string;
+  giveUp?: boolean;
 };
 
 export type RunnerPlan = {
@@ -108,7 +109,7 @@ export type RunnerPlan = {
 };
 
 export type ResolveResponse =
-  | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number }
+  | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number; giveUpAfterMs?: number }
   | { ok: true; status: "ready"; runId: string; plan: RunnerPlan }
   | { ok: true; status: "empty"; runId: string | null; reason: string }
   | { ok: true; status: "setup"; runId: string; onboardingPr?: number };

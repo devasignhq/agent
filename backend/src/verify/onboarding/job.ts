@@ -5,7 +5,7 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../../db.js";
 import { config } from "../../config.js";
-import { createPullRequest, ensureBranch, gh, getBranchSha, listRepoSecretNames, postPRCommentReturningId, putFile, readFileAtRef } from "../../github/app.js";
+import { createPullRequest, ensureBranch, findOpenPullRequest, gh, getBranchSha, listRepoSecretNames, postPRCommentReturningId, putFile, readFileAtRef } from "../../github/app.js";
 import { fetchTree, type TreeEntry } from "../../review/indexer.js";
 import { pushNotification } from "../../notifications.js";
 import type { Installation, Repository, VerifyRun } from "../../types.js";
@@ -26,6 +26,7 @@ import {
   prBody,
   stackHints,
   WORKFLOW_PATH,
+  WORKFLOW_VERSION,
 } from "./generate.js";
 
 export type OnboardDeps = {
@@ -35,6 +36,7 @@ export type OnboardDeps = {
   ensureBranch?: (install: Installation, repo: Repository, branch: string, sha: string) => Promise<void>;
   putFile?: (install: Installation, repo: Repository, branch: string, path: string, content: string, message: string) => Promise<void>;
   createPr?: (install: Installation, repo: Repository, args: { title: string; body: string; head: string; base: string }) => Promise<{ number: number; html_url: string }>;
+  findPr?: (install: Installation, repo: Repository, head: string) => Promise<{ number: number; html_url: string } | null>;
   secretNames?: (install: Installation, repo: Repository) => Promise<string[] | null>;
   postComment?: (install: Installation, repo: Repository, prNumber: number, body: string) => Promise<number | null>;
   prHeadRef?: (install: Installation, repo: Repository, prNumber: number) => Promise<string | null>;
@@ -47,6 +49,7 @@ const defaults: Required<OnboardDeps> = {
   ensureBranch: (install, repo, branch, sha) => ensureBranch(install.installationId, repo.owner, repo.name, branch, sha),
   putFile: (install, repo, branch, path, content, message) => putFile(install.installationId, repo.owner, repo.name, branch, path, content, message),
   createPr: (install, repo, args) => createPullRequest(install.installationId, repo.owner, repo.name, args),
+  findPr: (install, repo, head) => findOpenPullRequest(install.installationId, repo.owner, repo.name, head),
   secretNames: (install, repo) => listRepoSecretNames(install.installationId, repo.owner, repo.name),
   postComment: (install, repo, prNumber, body) => postPRCommentReturningId(install.installationId, repo.owner, repo.name, prNumber, body),
   prHeadRef: async (install, repo, prNumber) => {
@@ -81,7 +84,10 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
     const files: Record<string, string | null> = {};
     for (const p of [...FILES_TO_READ, ...workflowPaths]) files[p] = paths.includes(p) ? await d.read(install, repo, p, headSha) : null;
     const workflows = workflowPaths.map((p) => ({ path: p, text: files[p] || "" }));
-    if (paths.includes(WORKFLOW_PATH) || workflows.some((w) => w.text.includes(ACTION_REF.split("@")[0]))) {
+    const alreadyOnDefault = paths.includes(WORKFLOW_PATH) || workflows.some((w) => w.text.includes(ACTION_REF.split("@")[0]));
+    // A manual regenerate is the only way an onboarded repo ever gets an updated workflow,
+    // so it must proceed here; install/doctor triggers still stop.
+    if (alreadyOnDefault && opts.trigger !== "manual") {
       setOnboarding(repo, { state: "pr_merged" });
       return { status: "skipped", reason: "the verify workflow is already in the default branch" };
     }
@@ -112,23 +118,44 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
         workflowPath = target!.path;
         extendedJob = ext.job;
         out[workflowPath] = ext.text;
+      } else if (alreadyOnDefault && target?.text.includes(ACTION_REF.split("@")[0])) {
+        // Their CI already runs us. Falling back to a separate workflow here would
+        // double-run verification on every PR; leave the workflow alone.
+        workflowPath = target.path;
       } else {
         mode = "separate";
       }
     }
-    if (mode === "separate") out[WORKFLOW_PATH] = generateWorkflow(setup, hints, expected, paths);
+    if (mode === "separate" && workflowPath === WORKFLOW_PATH) out[WORKFLOW_PATH] = generateWorkflow(setup, hints, expected, paths);
     if (ymlText !== (files[DEVASIGN_YML_PATH] || "")) out[DEVASIGN_YML_PATH] = ymlText;
+
+    if (!Object.keys(out).length) {
+      setOnboarding(repo, { workflowPath, workflowVersion: WORKFLOW_VERSION, lastError: null });
+      return { status: "skipped", reason: "the verification setup is already up to date" };
+    }
 
     await d.ensureBranch(install, repo, ONBOARDING_BRANCH, headSha);
     for (const [path, content] of Object.entries(out)) await d.putFile(install, repo, ONBOARDING_BRANCH, path, content, `${path.includes("workflows") ? "Add" : "Configure"} DevAsign verification (${path})`);
-    const pr = await d.createPr(install, repo, {
-      title: ONBOARDING_TITLE,
-      body: prBody({ mode, workflowPath, hints, setup, verify, expected, missing, extendedJob }),
-      head: ONBOARDING_BRANCH,
-      base: repo.defaultBranch || "main",
-    });
-    setOnboarding(repo, { state: "pr_open", prNumber: pr.number, prUrl: pr.html_url, mode, lastError: null, expectedSecrets: expected, missingSecrets: missing }, { detected: repo.verify?.detected ?? setup });
-    if (install.userId) pushNotification(install.userId, "system", `Enable DevAsign verification on ${repo.owner}/${repo.name}`, `PR #${pr.number} adds the verify workflow${missing?.length ? ` — ${missing.length} secret(s) still missing` : ""}`, { link: pr.html_url });
+    // ensureBranch force-pushes, so an already-open PR now carries the new commits;
+    // creating a second one for the same head would just 422.
+    const existingPr = await d.findPr(install, repo, ONBOARDING_BRANCH);
+    const pr =
+      existingPr ??
+      (await d.createPr(install, repo, {
+        title: ONBOARDING_TITLE,
+        body: prBody({ mode, workflowPath, hints, setup, verify, expected, missing, extendedJob }),
+        head: ONBOARDING_BRANCH,
+        base: repo.defaultBranch || "main",
+      }));
+    setOnboarding(
+      repo,
+      { state: "pr_open", prNumber: pr.number, prUrl: pr.html_url, mode, workflowPath, workflowVersion: WORKFLOW_VERSION, lastError: null, expectedSecrets: expected, missingSecrets: missing },
+      { detected: repo.verify?.detected ?? setup }
+    );
+    if (install.userId) {
+      const verb = existingPr ? "updates" : "adds";
+      pushNotification(install.userId, "system", `Enable DevAsign verification on ${repo.owner}/${repo.name}`, `PR #${pr.number} ${verb} the verify workflow${missing?.length ? ` — ${missing.length} secret(s) still missing` : ""}`, { link: pr.html_url });
+    }
     return { status: "opened", prNumber: pr.number, prUrl: pr.html_url };
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

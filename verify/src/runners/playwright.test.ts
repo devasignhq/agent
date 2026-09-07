@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileStatus, generatePlaywrightConfig, mapReport, ourPlaywrightDir, testOutcome, webServerFromYml, type PwReport } from "./playwright.js";
+import { fileStatus, generatePlaywrightConfig, hasChromium, mapReport, ourPlaywrightDir, playwrightBrowsersRoot, testOutcome, webServerFromYml, type PwReport } from "./playwright.js";
 import { Workspace } from "../workspace.js";
 import type { LocalArtifact, PlanTest } from "../types.js";
 
@@ -137,4 +137,25 @@ test("a file whose second test always fails is a failure, not a flake", () => {
   const [out] = mapReport(report, planned, ws, artifacts, "");
   assert.equal(out.status, "fail", "one passing sibling test must not mask a real failure");
   assert.equal(out.attempts.length, 3, "every result is still kept as evidence");
+});
+
+test("playwrightBrowsersRoot honours an explicit PLAYWRIGHT_BROWSERS_PATH", () => {
+  assert.equal(playwrightBrowsersRoot({ PLAYWRIGHT_BROWSERS_PATH: "/opt/pw" } as any, "/home/x"), "/opt/pw");
+});
+
+test("playwrightBrowsersRoot falls back to the platform cache dir", () => {
+  const root = playwrightBrowsersRoot({} as any, "/home/x");
+  assert.ok(root.includes("ms-playwright"), root);
+  assert.ok(root.startsWith("/home/x") || root.includes("ms-playwright"));
+});
+
+test("hasChromium recognises an installed browser and ignores anything else", () => {
+  assert.equal(hasChromium("/any", () => ["chromium-1187", "ffmpeg-1011"]), true);
+  assert.equal(hasChromium("/any", () => ["chromium_headless_shell-1187"]), true);
+  assert.equal(hasChromium("/any", () => ["firefox-1234", "webkit-2079"]), false, "another browser is not Chromium");
+  assert.equal(hasChromium("/any", () => ["chromium"]), false, "an unversioned leftover is not an install");
+});
+
+test("hasChromium treats a missing cache dir as empty, not an error", () => {
+  assert.equal(hasChromium("/nope", () => { throw new Error("ENOENT"); }), false);
 });
