@@ -2,7 +2,8 @@
 // generated config that extends the customer's, never edits it. Playwright's
 // own retries give fresh contexts per attempt and mark pass-after-retry `flaky`.
 import { createRequire } from "node:module";
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { homedir } from "node:os";
 import path from "node:path";
 import { classifyPlaywrightError } from "../classify.js";
 import { runCommand } from "../exec.js";
@@ -200,7 +201,28 @@ export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, ar
   return results;
 }
 
+export function playwrightBrowsersRoot(env: NodeJS.ProcessEnv = process.env, home = homedir()): string {
+  if (env.PLAYWRIGHT_BROWSERS_PATH) return env.PLAYWRIGHT_BROWSERS_PATH;
+  if (process.platform === "darwin") return path.join(home, "Library", "Caches", "ms-playwright");
+  if (process.platform === "win32") return path.join(env.LOCALAPPDATA || home, "ms-playwright");
+  return path.join(home, ".cache", "ms-playwright");
+}
+
+export function hasChromium(root: string, read: (p: string) => string[] = readdirSync): boolean {
+  try {
+    return read(root).some((d) => /^chromium(_headless_shell)?-\d+$/.test(d));
+  } catch {
+    return false;
+  }
+}
+
 export async function ensureBrowsers(root: string, ws: Workspace): Promise<{ ok: boolean; log: string }> {
+  // `--with-deps` shells out to apt-get under sudo and costs the same whether or not the
+  // browser is already there, so a warm cache must skip the whole step, not just the flag.
+  if (hasChromium(playwrightBrowsersRoot())) {
+    log.info("Chromium already installed; skipping download");
+    return { ok: true, log: "cached" };
+  }
   const cli = playwrightCli(root);
   const args = [...cli.args, "install", ...(process.platform === "linux" ? ["--with-deps"] : []), "chromium"];
   log.info("installing Chromium for Playwright");

@@ -162,6 +162,10 @@ export type RepoVerifyState = {
     prNumber?: number;
     prUrl?: string;
     mode?: "separate" | "extend";
+    // Where our step actually lives (extend mode puts it in the customer's own file),
+    // and which generator wrote it — together these make a stale copy detectable.
+    workflowPath?: string;
+    workflowVersion?: number;
     lastDiagnosis?: DoctorDiagnosis | null;
     firstSuccessfulRunId?: string | null;
     expectedSecrets?: string[];

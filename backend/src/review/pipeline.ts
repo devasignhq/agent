@@ -69,6 +69,7 @@ import {
   devasignDocsSystemPrompt,
   type CriteriaMode,
 } from "./prompts.js";
+import { fetchTree } from "./indexer.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary, stripGutterArtifacts } from "./diff-format.js";
 import { extractJSON, repairBledProseField } from "./parse.js";
 
@@ -317,6 +318,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     // a. Ingest
     const context = await ingestContext(review, repo, install);
+    // The planner needs this tree but nothing before the fork does, so start it here and
+    // let it run under criteria synthesis instead of on the plan's critical path. Gated on
+    // the stage: a repo with verification off must not pay for a tree nobody reads.
+    const verifyTreeSha = review.headSha;
+    const verifyTree = install && wf.stages.verify && !context.headFromFork ? fetchTree(repo, install, verifyTreeSha).catch(() => null) : null;
     log(review.id, "ingest", "Context ingested", {
       detail: `${context.sources.length} source(s)`,
       meta: {
@@ -563,6 +569,17 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       criteria,
       criteriaFinishedAt,
       headFromFork: context.headFromFork,
+      // Hand over what ingest already fetched. An empty diff means ingest failed, and a
+      // mid-job push moves headSha off verifyTreeSha — both must fall back, not plan blind.
+      deps: {
+        ...(context.diff ? { fetchDiff: async () => context.diff } : {}),
+        ...(verifyTree
+          ? {
+              fetchTree: async (r: Repository, i: Installation, sha: string) =>
+                (sha === verifyTreeSha ? await verifyTree : null) ?? fetchTree(r, i, sha),
+            }
+          : {}),
+      },
       log: (action, extra) => log(review.id, "verify", action, extra),
     });
 

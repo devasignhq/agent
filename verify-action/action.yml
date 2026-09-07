@@ -21,9 +21,26 @@ inputs:
     description: "Repository checkout to verify (monorepo package or subdirectory)."
     required: false
     default: "."
+  resolve-timeout:
+    description: "Max seconds to wait for a test plan. DevAsign may shorten this and re-run the workflow once the plan is ready."
+    required: false
+    default: ""
+  cache-browsers:
+    description: "Cache the Playwright browser download between runs. Set false to opt out."
+    required: false
+    default: "true"
 runs:
   using: "composite"
   steps:
+    # Keyed on the exact @playwright/test version pinned in verify/package.json: a range
+    # would keep hitting this key while serving a stale cache, so Chromium would
+    # re-download every run and never re-save. Bump both together.
+    - name: Cache Playwright browsers
+      if: inputs.cache-browsers == 'true'
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/ms-playwright
+        key: devasign-playwright-1.55.0-${{ runner.os }}-${{ runner.arch }}
     - name: Run DevAsign verification
       shell: bash
       working-directory: ${{ inputs.working-directory }}
@@ -34,4 +51,10 @@ runs:
         # would otherwise get shell injection in its own runner.
         DEVASIGN_VERSION: ${{ inputs.version }}
         DEVASIGN_FAIL_ON: ${{ inputs.fail-on }}
-      run: npx --yes "@devasign/verify@$DEVASIGN_VERSION" run --fail-on "$DEVASIGN_FAIL_ON"
+        DEVASIGN_RESOLVE_TIMEOUT: ${{ inputs.resolve-timeout }}
+      run: |
+        args=(run --fail-on "$DEVASIGN_FAIL_ON")
+        if [ -n "$DEVASIGN_RESOLVE_TIMEOUT" ]; then
+          args+=(--resolve-timeout "$DEVASIGN_RESOLVE_TIMEOUT")
+        fi
+        npx --yes "@devasign/verify@$DEVASIGN_VERSION" "${args[@]}"

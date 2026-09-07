@@ -151,10 +151,15 @@ function installSteps(setup: DetectedSetup, hints: StackHints, paths: string[]):
   return steps;
 }
 
+// Bump when the generated workflow changes shape, so an onboarded repo can be told
+// its copy is stale (the only marker; nothing else in the file is machine-read).
+export const WORKFLOW_VERSION = 2;
+
 export const WORKFLOW_HEADER =
   "# Added by DevAsign. Runs DevAsign's generated acceptance tests for each pull\n" +
   "# request inside this CI and reports per-criterion evidence on the PR.\n" +
-  "# Secrets stay here: DevAsign never receives them. Edit freely.\n";
+  "# Secrets stay here: DevAsign never receives them. Edit freely.\n" +
+  `# devasign-workflow: v${WORKFLOW_VERSION}\n`;
 
 export function generateWorkflow(setup: DetectedSetup, hints: StackHints, secrets: string[], paths: string[]): string {
   const env: Record<string, string> = { ...connectionEnv(setup) };

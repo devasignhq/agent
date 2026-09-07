@@ -212,6 +212,12 @@ export const config = {
     joinTimeoutMs: Number(process.env.VERIFY_JOIN_TIMEOUT_MS || 60_000),
     // Silence from a resolved runner past this settles the run as timed_out.
     runTimeoutMs: Number(process.env.VERIFY_RUN_TIMEOUT_MS || 60 * 60_000),
+    // Advertised to the runner so it stops burning CI minutes on a slow plan; the
+    // backend re-dispatches the workflow once the plan is ready. Shortens only.
+    runnerGiveUpMs: Number(process.env.VERIFY_RUNNER_GIVE_UP_MS || 120_000),
+    // Planner model, independent of the judge/feedback tier. Empty inherits.
+    // Any id set here MUST have a row in ANTHROPIC_PRICES or cost records $0.
+    plannerModel: process.env.VERIFY_PLANNER_MODEL || "claude-sonnet-5",
   },
   // Private S3-compatible bucket (Cloudflare R2) for run artifacts. When unset,
   // runs still verify but produce no recordings (artifacts are rejected as
