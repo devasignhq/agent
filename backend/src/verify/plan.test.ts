@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
@@ -36,12 +36,12 @@ function seed(criteria: Criterion[]) {
   return { run, repo, review, cleanup };
 }
 
-function deps(opts: { tree?: string[]; files?: Record<string, string>; responses: unknown[] }) {
+function deps(opts: { tree?: string[]; files?: Record<string, string>; diff?: string; responses: unknown[] }) {
   const prompts: string[] = [];
   const responses = [...opts.responses];
   const d: PlannerDeps = {
     fetchTree: async () => (opts.tree ?? BASE_TREE).map((path) => ({ path, type: "blob", sha: "s", size: 10 })),
-    fetchDiff: async () => DIFF,
+    fetchDiff: async () => opts.diff ?? DIFF,
     readFile: async (_i, _r, path) => opts.files?.[path] ?? null,
     llm: async ({ user }) => {
       prompts.push(user);
@@ -495,4 +495,118 @@ test("the persisted plan carries rewritten content, and unresolved imports reach
   } finally {
     s.cleanup();
   }
+});
+
+// --- The PR's own tests are not evidence, and a browser rung stays reachable ---
+
+const TEST_DIFF = [
+  DIFF,
+  "diff --git a/src/handler.test.ts b/src/handler.test.ts",
+  "--- /dev/null",
+  "+++ b/src/handler.test.ts",
+  "@@ -0,0 +1,2 @@",
+  "+import { refunds } from './handler.js';",
+  "+test('refunds', () => {});",
+].join("\n");
+
+const UI_DIFF = [
+  "diff --git a/src/Canvas.tsx b/src/Canvas.tsx",
+  "--- a/src/Canvas.tsx",
+  "+++ b/src/Canvas.tsx",
+  "@@ -1 +1,2 @@",
+  " export function Canvas() {}",
+  "+export function menu() { return 1; }",
+].join("\n");
+
+const BOOT_YML = "verify:\n  e2e: auto\n  start: npm run dev\n  url: http://localhost:5173\n";
+const bootDeps = (responses: unknown[]) =>
+  deps({ tree: [...BASE_TREE, ".devasign.yml"], files: { ".devasign.yml": BOOT_YML }, diff: UI_DIFF, responses });
+
+test("a test file this PR wrote is withheld from the prompt and cannot be cited as evidence", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = deps({
+    diff: TEST_DIFF,
+    responses: [
+      { tests: [{ path: "src/handler.test.ts", content: null, criterionIds: ["1"], level: "unit", levelReason: "x", origin: "existing", runner: "node-test", targetFiles: [] }] },
+      { tests: [gen("1", "unit")] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => [t.origin, t.path]), [["generated", ".devasign/tests/criterion-1.test.ts"]], "the criterion got a test of DevAsign's own");
+    assert.deepEqual(plan.prAuthoredTests, ["src/handler.test.ts"]);
+    // The path is in the tree, so it is only the PR's authorship that rejected it.
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify");
+    assert.match(String(log?.detail), /src\/handler\.test\.ts \(pr_authored\)/);
+    assert.ok(!prompts[0].includes("  - src/handler.test.ts"), "the PR's own test is not listed as citable");
+    assert.match(prompts[0], /1 test file this PR adds or changes is withheld/);
+    assert.equal(prompts.length, 2);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a criterion waved off as unverifiable is re-asked when a browser rung was still open", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = bootDeps([
+    { tests: [], unverifiable: [{ criterionId: "1", reason: "not deterministic in the headless environment" }] },
+    { tests: [gen("1", "e2e", { levelReason: "node geometry is only measured by a real browser" })] },
+  ]);
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2, "the escape hatch triggered exactly one re-plan");
+    assert.match(prompts[1], /Re-plan ONLY these criteria/);
+    assert.match(prompts[1], /\[1\]: you marked these unverifiable/);
+    assert.deepEqual(plan.unverifiable, [], "the criterion is no longer unverifiable");
+    assert.deepEqual(plan.tests.map((t) => [t.level, t.runner]), [["e2e", "playwright"]], "a code criterion capped at component reached the browser");
+    // Fix 4: the repo has no Playwright of its own, so the planner is told it gets one.
+    assert.match(prompts[0], /Playwright: supplied by the runner/);
+    assert.match(prompts[0], /may still be planned at e2e/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a criterion the planner stands behind as unverifiable keeps its second reason", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = bootDeps([
+    { tests: [], unverifiable: [{ criterionId: "1", reason: "first pass reason" }] },
+    { unverifiable: [{ criterionId: "1", reason: "no test at any level can decide this" }] },
+  ]);
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2);
+    assert.deepEqual(plan.tests, []);
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: "no test at any level can decide this" }]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the browser rung is one justified rung of overshoot, not an open cap", () => {
+  const setup = { languages: [], frameworks: [], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] };
+  const ui = planPolicy({ criteria: [crit("1")], wfE2e: "auto", yml: { start: "x", url: "y" }, setup, touched: ["src/a.tsx"] });
+  assert.equal(ui.maxLevel.get("1"), "component", "the cap itself is unchanged");
+  assert.equal(hasUntriedRung("1", ui), true);
+
+  const reason = "component renders into a DOM shim that never measures the node";
+  const keep = enforcePlanPolicy([gen("1", "e2e", { levelReason: reason }) as any], ui, new Set());
+  assert.deepEqual(keep.kept.map((t) => t.level), ["e2e"], "a justified escalation is admitted");
+
+  const bare = enforcePlanPolicy([gen("1", "e2e", { levelReason: "needs a browser" }) as any], ui, new Set());
+  assert.deepEqual(bare.violations.map((v) => v.reason), ["level"], "an unjustified one is not");
+
+  const twoRungs = enforcePlanPolicy([gen("1", "e2e", { levelReason: reason }) as any], { ...ui, maxLevel: new Map([["1", "unit" as const]]) }, new Set());
+  assert.deepEqual(twoRungs.violations.map((v) => v.reason), ["level"], "only component may overshoot, and only by one rung");
+
+  const api = planPolicy({ criteria: [crit("1")], wfE2e: "auto", yml: { start: "x", url: "y" }, setup, touched: ["src/a.ts"] });
+  assert.equal(hasUntriedRung("1", api), false);
+  const apiOnly = enforcePlanPolicy([gen("1", "e2e", { levelReason: reason }) as any], api, new Set());
+  assert.deepEqual(apiOnly.violations.map((v) => v.reason), ["level"], "an API-only diff never escalates");
+
+  const noBoot = planPolicy({ criteria: [crit("1")], wfE2e: "auto", yml: null, setup, touched: ["src/a.tsx"] });
+  assert.equal(hasUntriedRung("1", noBoot), false, "no boot config, nothing to re-ask for");
 });

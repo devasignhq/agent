@@ -54,6 +54,9 @@ export type PlanPolicy = {
   bootConfigured: boolean;
   apiOnly: boolean;
   maxLevel: Map<string, TestLevel>;
+  // Test files this PR adds or changes. They ship inside the change under review,
+  // so they carry its blind spots and cannot stand as evidence for it.
+  prAuthoredTests: Set<string>;
 };
 
 export type RawPlanTest = {
@@ -137,7 +140,7 @@ export function planPolicy(args: {
     if (kind === "ui") maxLevel.set(c.id, e2eAllowed ? "e2e" : "component");
     else maxLevel.set(c.id, apiOnly ? "integration" : "component");
   }
-  return { e2ePolicy, e2eAllowed, bootConfigured, apiOnly, maxLevel };
+  return { e2ePolicy, e2eAllowed, bootConfigured, apiOnly, maxLevel, prAuthoredTests: new Set(args.touched.filter(isTestPath)) };
 }
 
 // The planner's paths come from a model reading an attacker-influenced diff, so
@@ -301,22 +304,51 @@ export function normalizeUnverifiable(raw: unknown, knownIds: Set<string>): Arra
     .filter((u) => knownIds.has(u.criterionId));
 }
 
-/** Drop existing tests that aren't in the tree (hallucinated) and tests above their allowed level. */
+export type PlanViolation = "missing_existing" | "pr_authored" | "level";
+
+// A component test renders into a DOM shim with no layout engine, so behaviour
+// that only real geometry can settle — canvas, drag, virtualised lists — is
+// invisible one rung below the browser. Such a criterion may overshoot its cap
+// by exactly that rung, and only with a reason naming what component cannot see.
+const MIN_ESCALATION_REASON = 20;
+
+export function mayEscalateToBrowser(t: RawPlanTest, policy: PlanPolicy): boolean {
+  if (t.level !== "e2e" || !policy.e2eAllowed || policy.apiOnly) return false;
+  if ((t.levelReason ?? "").trim().length < MIN_ESCALATION_REASON) return false;
+  return t.criterionIds.some((id) => policy.maxLevel.get(id) === "component");
+}
+
+/**
+ * Whether a browser test was still open to a criterion the model called unverifiable —
+ * either its cap already says e2e, or it is capped at component on a frontend diff and
+ * could have escalated. Only then is re-asking worth a second call.
+ */
+export function hasUntriedRung(criterionId: string, policy: PlanPolicy): boolean {
+  if (!policy.e2eAllowed) return false;
+  const cap = policy.maxLevel.get(criterionId);
+  return cap === "e2e" || (cap === "component" && !policy.apiOnly);
+}
+
+/** Drop existing tests that aren't in the tree (hallucinated), tests this PR wrote, and tests above their allowed level. */
 export function enforcePlanPolicy(
   tests: RawPlanTest[],
   policy: PlanPolicy,
   treePaths: Set<string>
-): { kept: RawPlanTest[]; violations: Array<{ test: RawPlanTest; reason: "missing_existing" | "level" }> } {
+): { kept: RawPlanTest[]; violations: Array<{ test: RawPlanTest; reason: PlanViolation }> } {
   const kept: RawPlanTest[] = [];
-  const violations: Array<{ test: RawPlanTest; reason: "missing_existing" | "level" }> = [];
+  const violations: Array<{ test: RawPlanTest; reason: PlanViolation }> = [];
   for (const t of tests) {
     if (t.origin === "existing" && !treePaths.has(t.path)) {
       violations.push({ test: t, reason: "missing_existing" });
       continue;
     }
+    if (t.origin === "existing" && policy.prAuthoredTests.has(t.path)) {
+      violations.push({ test: t, reason: "pr_authored" });
+      continue;
+    }
     if (t.origin === "generated") {
-      const allowed = t.criterionIds.some((id) => LEVEL_RANK[t.level] <= LEVEL_RANK[policy.maxLevel.get(id) ?? "unit"]);
-      if (!allowed || (t.level === "e2e" && !policy.e2eAllowed)) {
+      const withinCap = t.criterionIds.some((id) => LEVEL_RANK[t.level] <= LEVEL_RANK[policy.maxLevel.get(id) ?? "unit"]);
+      if ((!withinCap && !mayEscalateToBrowser(t, policy)) || (t.level === "e2e" && !policy.e2eAllowed)) {
         violations.push({ test: t, reason: "level" });
         continue;
       }
@@ -389,12 +421,23 @@ function renderCriteria(criteria: Criterion[]): string {
   return criteria.map((c) => `- [${c.id}] (${c.kind ?? "code"})${c.implied ? " [implied]" : ""} ${c.text}`).join("\n");
 }
 
-function renderPolicy(policy: PlanPolicy, ids: string[]): string {
+function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup): string {
+  const hasPlaywright = setup.frameworks.some((f) => f.name === "playwright");
   return [
     ...ids.map((id) => `- [${id}]: max level ${policy.maxLevel.get(id)}`),
     `- E2E allowed: ${policy.e2eAllowed ? "yes" : `no (${policy.e2ePolicy === "never" ? "e2e: never" : NO_BOOT_REASON})`}`,
     `- Diff scope: ${policy.apiOnly ? "api-only (no frontend files touched)" : "includes frontend files"}`,
-  ].join("\n");
+    // Without this the model reads "Test frameworks: vitest" and rules the
+    // browser out, even where the runner would have supplied one.
+    policy.e2eAllowed && !hasPlaywright
+      ? "- Playwright: supplied by the runner, browsers installed automatically — plan e2e tests even though the repo has no Playwright dependency of its own."
+      : "",
+    policy.e2eAllowed && !policy.apiOnly
+      ? "- A criterion capped at component may still be planned at e2e when only a real browser can observe it, if levelReason says what component cannot see."
+      : "",
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 export type PlanContext = {
@@ -413,22 +456,40 @@ export type PlanContext = {
   prTitle: string;
 };
 
-export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: { ids: string[] } } = {}): string {
-  const target = opts.replan ? ctx.criteria.filter((c) => opts.replan!.ids.includes(c.id)) : ctx.criteria;
+export type ReplanCohorts = { level: string[]; escalate: string[] };
+
+function replanHeader(r: ReplanCohorts): string {
+  const lines = ["## Re-plan ONLY these criteria"];
+  if (r.level.length) lines.push(`- [${r.level.join("], [")}]: your previous test was rejected. Plan at or below the max level below.`);
+  if (r.escalate.length)
+    lines.push(
+      `- [${r.escalate.join("], [")}]: you marked these unverifiable, but the Level policy below still allows a rung you did not attempt. ` +
+        "Plan a test at that rung, with a levelReason naming what the level beneath it cannot observe. Repeat the unverifiable entry only if no test at any allowed level could decide the criterion."
+    );
+  // The criteria list follows immediately; without the break it reads as one list.
+  return lines.join("\n") + "\n";
+}
+
+export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: ReplanCohorts } = {}): string {
+  const replanIds = opts.replan ? [...opts.replan.level, ...opts.replan.escalate] : [];
+  const target = opts.replan ? ctx.criteria.filter((c) => replanIds.includes(c.id)) : ctx.criteria;
   const diff = formatRawDiff(truncateDiffAtHunkBoundary(ctx.diff, DIFF_CAP).text);
   const lines = [
     `# Test plan for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
     "",
-    opts.replan ? "## Re-plan ONLY these criteria at or below their max level (the previous plan exceeded it)" : "## Acceptance criteria",
+    opts.replan ? replanHeader(opts.replan) : "## Acceptance criteria",
     renderCriteria(target),
     "",
     "## Level policy",
-    renderPolicy(ctx.policy, target.map((c) => c.id)),
+    renderPolicy(ctx.policy, target.map((c) => c.id), ctx.setup),
     "",
     "## Repository test setup",
     renderSetup(ctx.setup, ctx.yml),
     "",
     `## Existing test files (${ctx.existingTests.length})`,
+    ctx.policy.prAuthoredTests.size
+      ? `(${ctx.policy.prAuthoredTests.size} test ${ctx.policy.prAuthoredTests.size === 1 ? "file" : "files"} this PR adds or changes ${ctx.policy.prAuthoredTests.size === 1 ? "is" : "are"} withheld from this list and may not be cited.)`
+      : "",
     ...ctx.existingTests.slice(0, MAX_EXISTING_LISTED).map((p) => `  - ${p}`),
     "",
     "## Existing tests touching the diff",
@@ -472,10 +533,12 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const touched = diffPaths(diff);
   const wf = effectiveWorkflow(repo);
   const policy = planPolicy({ criteria, wfE2e: wf.verify?.e2e ?? "auto", yml, setup, touched });
-  const existingTests = paths.filter(isTestPath);
+  // The tree is the PR head, so it holds the tests the PR itself wrote. Keeping
+  // them off both lists is what stops a change being graded by its own tests.
+  const existingTests = paths.filter((p) => isTestPath(p) && !policy.prAuthoredTests.has(p));
   const touchedStems = new Set(touched.map((p) => (p.split("/").pop() || p).replace(/\.[^.]+$/, "")));
   const candidates = db
-    .filter("repoIndex", (e) => e.repoId === repo.id && isTestPath(e.path))
+    .filter("repoIndex", (e) => e.repoId === repo.id && isTestPath(e.path) && !policy.prAuthoredTests.has(e.path))
     .filter((e) => e.imports.some((imp) => touchedStems.has((imp.split("/").pop() || imp).replace(/\.[^.]+$/, ""))))
     .slice(0, 20)
     .map((e) => ({ path: e.path, imports: e.imports }));
@@ -581,19 +644,26 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
         const dropped = violations.map((v) => `${v.test.path} (${v.reason})`);
 
-        // One re-plan for criteria a violating test left uncovered, with the cap spelled out.
+        // One re-plan, covering two cohorts: criteria a violating test left uncovered,
+        // and criteria the model waved off as unverifiable while a rung it never tried
+        // was still open to it. Both go in a single call.
         const covered = new Set(kept.flatMap((t) => t.criterionIds));
         const uncovered = ctx.criteria.map((c) => c.id).filter((id) => !covered.has(id) && !unverifiable.has(id));
         const violatedIds = uncovered.filter((id) => violations.some((v) => v.test.criterionIds.includes(id)));
+        const escapedIds = [...unverifiable.keys()].filter((id) => !covered.has(id) && hasUntriedRung(id, ctx.policy));
+        const replanIds = [...violatedIds, ...escapedIds];
         let replanMs = 0;
-        if (violatedIds.length) {
+        if (replanIds.length) {
           const replanStartedAt = Date.now();
-          const second = await llm({ system, user: buildPlannerUserPrompt(ctx, { replan: { ids: violatedIds } }), maxTokens: 12_000 });
+          const user = buildPlannerUserPrompt(ctx, { replan: { level: violatedIds, escalate: escapedIds } });
+          const second = await llm({ system, user, maxTokens: 12_000 });
           replanMs = Date.now() - replanStartedAt;
-          const again = normalizeRawTests(extractJSON(second.text) ?? {}, new Set(violatedIds), fallbackRunner);
+          const secondJson = extractJSON(second.text) ?? {};
+          const replanKnown = new Set(replanIds);
+          const again = normalizeRawTests(secondJson, replanKnown, fallbackRunner);
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
-          for (const u of normalizeUnverifiable(extractJSON(second.text) ?? {}, new Set(violatedIds))) unverifiable.set(u.criterionId, u.reason);
+          for (const u of normalizeUnverifiable(secondJson, replanKnown)) unverifiable.set(u.criterionId, u.reason);
           for (const v of enforced.violations) dropped.push(`${v.test.path} (${v.reason}, re-plan)`);
         }
 
@@ -653,6 +723,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           tests: finalTests,
           commands: buildCommands(finalTests),
           unverifiable: planUnverifiable,
+          prAuthoredTests: [...ctx.policy.prAuthoredTests],
           createdAt: Date.now(),
         });
         const planFinishedAt = Date.now();
@@ -682,7 +753,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             ...(dropped.length ? [`dropped: ${dropped.join("; ")}`] : []),
             ...(unresolved.length ? [`unresolved imports: ${unresolved.map((u) => `${u.path} → ${u.specifier} (${u.reason})`).join("; ")}`] : []),
           ].join("\n"),
-          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, truncated: first.stopReason === "max_tokens", ms: { queued: queuedMs, gather: gatherMs, llm: firstLlmMs, replan: replanMs, total: totalMs } },
+          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, prAuthoredTests: [...ctx.policy.prAuthoredTests], escalated: escapedIds, truncated: first.stopReason === "max_tokens", ms: { queued: queuedMs, gather: gatherMs, llm: firstLlmMs, replan: replanMs, total: totalMs } },
         });
         return await settle(updated);
       } catch (err) {

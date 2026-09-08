@@ -66,6 +66,10 @@ test("completed: recording link only on rows with a video, expired wording, fail
   const view = buildVerificationView({ run, review, repo, criteria, plan, results: [], artifacts });
   assert.equal(view.state, "completed");
   assert.deepEqual(view.counts, { pass: 1, fail: 1, unverifiable: 0, pending: 0 });
+  assert.ok(!formatVerificationSection(view).includes("of its own"), "no note when the PR shipped no tests");
+  // A PR that ships its own tests says so, so the pass count is not read as independent.
+  const withOwn = buildVerificationView({ run, review, repo, criteria, plan: { ...plan, prAuthoredTests: ["src/menu.test.tsx", "src/anchor.test.ts"] }, results: [], artifacts });
+  assert.match(formatVerificationSection(withOwn), /This PR adds or changes 2 test files of its own; they were not used as evidence\./);
   const section = formatVerificationSection(view);
   const origin = config.webOrigin.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   assert.match(section, new RegExp(`\\*\\*1\\.\\*\\* .* — \\*\\*FAIL\\*\\* · refunds line missing · e2e \`\\.devasign/tests/e2e/refunds\\.spec\\.ts\` · \\[▶ Watch recording\\]\\(${origin}/reviews/rev\\?run=run1&criterion=1\\)`));
