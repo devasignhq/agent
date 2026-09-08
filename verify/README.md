@@ -16,3 +16,5 @@ Guarantees:
 - Setup problems (no start command, missing secret names, wrong runtime) are uploaded as a structured diagnosis, and the process exits 0.
 
 Local run against a dev backend: mint a token with `backend/scripts/verify-dev-token.ts`, then `devasign-verify run --api-url http://localhost:8787 --token <jwt> --pr <n> --sha <head-sha>`. Offline: `--plan-file plan.json --results-out results.json`.
+
+Exit code: 0 unless `--fail-on verdict` (a criterion failed) or `--fail-on unverifiable` (a criterion failed or could not be verified) is set; unset, the repository's DevAsign setting applies. An unknown `--fail-on` value exits 2. Criteria the plan could not cover are printed as warnings with their reason and fix link, and the Actions step summary lists every criterion. On Actions the CLI also writes `run-id`, `outcome` and `browsers` to `GITHUB_OUTPUT`.

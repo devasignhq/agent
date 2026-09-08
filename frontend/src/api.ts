@@ -378,6 +378,7 @@ export type CriterionVerdict = {
   evidenceRefs: Array<{ artifactId?: string; testId?: string; resultId?: string }>;
   flaky?: boolean;
   retired?: boolean;
+  fixUrl?: string;
 };
 
 export type RunViewArtifact = {

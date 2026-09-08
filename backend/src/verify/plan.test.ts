@@ -6,7 +6,8 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, hasUntriedRung, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
@@ -36,22 +37,53 @@ function seed(criteria: Criterion[]) {
   return { run, repo, review, cleanup };
 }
 
-function deps(opts: { tree?: string[]; files?: Record<string, string>; diff?: string; responses: unknown[] }) {
+// A scripted answer: a plain object is a manifest; `{ __stop, raw }` fakes a cut
+// or prose answer. Body calls are answered from the manifest entry's `content`
+// unless `bodies[path]` scripts them.
+type Scripted = unknown | { __stop: "max_tokens" | "end_turn"; raw?: string };
+function scripted(r: Scripted): StructuredResult {
+  const s = r as { __stop?: string; raw?: string };
+  if (s && typeof s === "object" && s.__stop) return { input: null, text: s.raw ?? "", stopReason: s.__stop, raw: s.raw ?? "" };
+  return { input: r ?? {}, text: JSON.stringify(r ?? {}), stopReason: "tool_use", raw: JSON.stringify(r ?? {}) };
+}
+
+function deps(opts: { tree?: string[]; files?: Record<string, string>; diff?: string; responses: Scripted[]; bodies?: Record<string, Scripted[]> }) {
   const prompts: string[] = [];
+  const bodyPrompts: string[] = [];
   const responses = [...opts.responses];
+  const bodies = Object.fromEntries(Object.entries(opts.bodies ?? {}).map(([k, v]) => [k, [...v]]));
+  const seen: Array<{ path?: string; content?: string }> = [];
+  let inFlight = 0;
+  const gauge = { maxInFlight: 0, manifestBudgets: [] as number[] };
   const d: PlannerDeps = {
     fetchTree: async () => (opts.tree ?? BASE_TREE).map((path) => ({ path, type: "blob", sha: "s", size: 10 })),
     fetchDiff: async () => opts.diff ?? DIFF,
     readFile: async (_i, _r, path) => opts.files?.[path] ?? null,
-    llm: async ({ user }) => {
-      prompts.push(user);
-      return { text: JSON.stringify(responses.shift() ?? {}), stopReason: "end_turn" };
+    llm: async ({ messages, tool, maxTokens }) => {
+      const user = messages[0].content;
+      if (tool.name !== "submit_test_file") {
+        prompts.push(user);
+        gauge.manifestBudgets.push(maxTokens);
+        const next = responses.shift();
+        for (const t of ((next as { tests?: unknown[] })?.tests ?? []) as Array<{ path?: string; content?: string }>) seen.push(t);
+        return scripted(next);
+      }
+      bodyPrompts.push(user);
+      inFlight += 1;
+      gauge.maxInFlight = Math.max(gauge.maxInFlight, inFlight);
+      await new Promise((r) => setTimeout(r, 2));
+      inFlight -= 1;
+      const path = /^- path: (.+)$/m.exec(user)?.[1] ?? "";
+      const queued = bodies[path]?.shift();
+      if (queued !== undefined) return scripted(queued);
+      const src = seen.find((t) => t.path === path || t.path === `./${path}`);
+      return scripted({ path, content: src?.content ?? `// DevAsign generated test\n` });
     },
   };
-  return { deps: d, prompts };
+  return { deps: d, prompts, bodyPrompts, gauge };
 }
 
-const gen = (id: string, level: PlanTest["level"], extra: Partial<PlanTest> = {}) => ({
+const gen = (id: string, level: PlanTest["level"], extra: Partial<PlanTest> & { strategy?: string } = {}) => ({
   path: `criterion-${id}.test.ts`, content: `// DevAsign generated test — criterion ${id}\n`, criterionIds: [id], level, levelReason: "r",
   origin: "generated", runner: level === "e2e" ? "playwright" : "node-test", targetFiles: ["src/handler.ts"], ...extra,
 });
@@ -147,8 +179,9 @@ test("no boot config: a ui criterion that needs e2e is unverifiable with a fix l
     assert.deepEqual(plan.tests.map((t) => t.criterionIds[0]), ["2"]);
     assert.equal(plan.unverifiable[0].criterionId, "1");
     assert.equal(plan.unverifiable[0].reason, NO_BOOT_REASON);
-    assert.match(String(plan.unverifiable[0].fixUrl), /\/settings\/verify\?repo=/);
-    assert.match(prompts[0], /E2E allowed: no \(no app start \/ login configured\)/);
+    assert.match(String(plan.unverifiable[0].fixUrl), /\/workflow\?repo=/);
+    assert.match(prompts[0], /Browser \(e2e\) tests: not available \(no app start \/ login configured\)/);
+    assert.match(prompts[0], /UI criteria remain testable at component level/);
     assert.match(prompts[0], /\[1\]: max level component/);
   } finally {
     s.cleanup();
@@ -608,5 +641,189 @@ test("the browser rung is one justified rung of overshoot, not an open cap", () 
   assert.deepEqual(apiOnly.violations.map((v) => v.reason), ["level"], "an API-only diff never escalates");
 
   const noBoot = planPolicy({ criteria: [crit("1")], wfE2e: "auto", yml: null, setup, touched: ["src/a.tsx"] });
-  assert.equal(hasUntriedRung("1", noBoot), false, "no boot config, nothing to re-ask for");
+  assert.equal(hasUntriedRung("1", noBoot), true, "no boot config still leaves the component rung open");
+});
+
+const cut = (raw = '{"tests":[{"path":"criterion-1.test.ts","criterionIds":["1"],"level":"unit","levelReason":"r","origin":"gener') => ({ __stop: "max_tokens" as const, raw });
+
+test("a manifest cut off twice marks every criterion cut off, never a config problem", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const { deps: d, prompts, bodyPrompts, gauge } = deps({ diff: UI_DIFF, responses: [cut(), cut()] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2, "one budget bump, no repair for a cut");
+    assert.deepEqual(gauge.manifestBudgets, [8_000, 16_000]);
+    assert.equal(bodyPrompts.length, 0);
+    assert.deepEqual(plan.tests, []);
+    assert.deepEqual(plan.unverifiable, [
+      { criterionId: "1", reason: PLAN_CUT_OFF_REASON },
+      { criterionId: "2", reason: PLAN_CUT_OFF_REASON },
+    ]);
+    assert.ok(!plan.unverifiable.some((u) => u.reason === NO_BOOT_REASON || u.fixUrl), "a cut is never reported as missing boot config");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.deepEqual(log.meta?.cutOff, ["1", "2"]);
+    assert.match(String(log.detail), /cut off: manifest stopped at max_tokens after 2 attempt\(s\)/);
+    assert.equal((log.meta as any).attempts.manifest.length, 2);
+    assert.match((log.meta as any).attempts.manifest[0].head, /^\{"tests"/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a manifest cut once is re-asked with the larger budget and then planned normally", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, gauge } = deps({ responses: [cut(), { tests: [gen("1", "unit")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(gauge.manifestBudgets, [8_000, 16_000]);
+    assert.deepEqual(plan.unverifiable, []);
+    assert.equal(plan.tests.length, 1);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.deepEqual(log.meta?.cutOff, []);
+    assert.ok(!String(log.detail).includes("cut off:"));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("an invalid manifest gets one repair pass, and a second failure is reported as unusable", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = deps({ responses: [{ tests: "nope" }, { tests: [gen("1", "unit")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2);
+    assert.equal(plan.tests.length, 1);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    const attempts = (log.meta as any).attempts.manifest;
+    assert.equal(attempts[0].kind, "initial");
+    assert.match(attempts[0].reason, /tests is not an array/);
+    assert.equal(attempts[1].kind, "repair");
+  } finally {
+    s.cleanup();
+  }
+  const s2 = seed([crit("1")]);
+  const second = deps({ responses: [{ tests: "nope" }, { __stop: "end_turn", raw: "I cannot plan this." }] });
+  try {
+    await runVerifyPlan(s2.run.id, second.deps);
+    const plan = db.find("verifyPlans", (p) => p.runId === s2.run.id)!;
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: PLAN_UNUSABLE_REASON }]);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s2.review.id && l.kind === "verify")!;
+    assert.match(String(log.detail), /unusable: manifest returned no usable plan after 2 attempt\(s\)/);
+  } finally {
+    s2.cleanup();
+  }
+});
+
+test("a body cut off twice drops that file alone; its sibling still ships, rebased", async () => {
+  const s = seed([crit("1"), crit("2")]);
+  const { deps: d, bodyPrompts } = deps({
+    responses: [{ tests: [gen("1", "unit"), gen("2", "unit", { path: "src/two.test.ts", content: 'import { one } from "./one.js";\n' })] }],
+    bodies: { "criterion-1.test.ts": [cut("import"), cut("import")] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(bodyPrompts.length, 3, "two attempts for the cut file, one for its sibling");
+    assert.deepEqual(plan.tests.map((t) => t.path), [".devasign/tests/src/two.test.ts"]);
+    assert.match(plan.tests[0].content!, /from "\.\.\/\.\.\/\.\.\/src\/one\.js"/);
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: PLAN_CUT_OFF_REASON }]);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.deepEqual(log.meta?.cutOff, ["1"]);
+    assert.match(String(log.detail), /body failed: \.devasign\/tests\/criterion-1\.test\.ts \(output cut at max_tokens=24000\)/);
+    assert.match(bodyPrompts[0], /^- path: criterion-1\.test\.ts$/m);
+    assert.match(bodyPrompts[0], /^  - \[1\] Criterion 1 holds$/m);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("bodies are authored warm-first, then at most three at a time", async () => {
+  const ids = ["1", "2", "3", "4", "5", "6", "7"];
+  const s = seed(ids.map((id) => crit(id)));
+  const { deps: d, bodyPrompts, gauge } = deps({ responses: [{ tests: ids.map((id) => gen(id, "unit")) }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.tests.length, 7);
+    assert.equal(bodyPrompts.length, 7);
+    assert.equal(gauge.maxInFlight, 3);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a retired signature costs no body call", async () => {
+  const s = seed([crit("1")]);
+  const sig = testSignature("Criterion 1 holds", "unit", ["src/handler.ts"]);
+  for (let i = 0; i < 3; i++) recordFlakeOutcome({ repoId: s.repo.id, signature: sig, runId: `old${i}`, outcome: "flaky", strategyVersion: 1, criterionText: "Criterion 1 holds", level: "unit", targetFiles: ["src/handler.ts"] });
+  const { deps: d, bodyPrompts } = deps({ responses: [{ tests: [gen("1", "unit")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 0);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: RETIRED_REASON }]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a quarantined test's body request names the new strategy version", async () => {
+  const s = seed([crit("1")]);
+  const sig = testSignature("Criterion 1 holds", "unit", ["src/handler.ts"]);
+  recordFlakeOutcome({ repoId: s.repo.id, signature: sig, runId: "old", outcome: "flaky", strategyVersion: 1, criterionText: "Criterion 1 holds", level: "unit", targetFiles: ["src/handler.ts"] });
+  const { deps: d, bodyPrompts } = deps({ responses: [{ tests: [gen("1", "unit", { strategy: "assert the return value" })] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.match(bodyPrompts[0], /^- strategy version: 2/m);
+    assert.match(bodyPrompts[0], /^- strategy: assert the return value$/m);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("no boot config: a UI criterion waved off with the no-boot reason is re-asked for a component test", async () => {
+  const s = seed([crit("1", "ui")]);
+  const { deps: d, prompts } = deps({
+    diff: UI_DIFF,
+    responses: [
+      { tests: [], unverifiable: [{ criterionId: "1", reason: "no app start / login configured" }] },
+      { tests: [gen("1", "component", { runner: "vitest", targetFiles: ["src/Canvas.tsx"] })] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /Re-plan ONLY these criteria/);
+    assert.match(prompts[1], /\[1\]: you marked these unverifiable/);
+    assert.match(prompts[1], /highest level the policy allows/);
+    assert.match(prompts[0], /UI criteria remain testable at component level/);
+    assert.deepEqual(plan.unverifiable, []);
+    assert.deepEqual(plan.tests.map((t) => t.level), ["component"]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a UI criterion the planner still ties to app start after the re-ask keeps the boot reason and its fix link", async () => {
+  const s = seed([crit("1", "ui")]);
+  const { deps: d, prompts } = deps({
+    diff: UI_DIFF,
+    responses: [
+      { tests: [], unverifiable: [{ criterionId: "1", reason: "needs the app running (no app start configured)" }] },
+      { tests: [], unverifiable: [{ criterionId: "1", reason: "the pill only appears once the app boots; no login is configured" }] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 2);
+    assert.equal(plan.unverifiable[0].reason, NO_BOOT_REASON);
+    assert.match(plan.unverifiable[0].fixUrl!, /\/workflow\?repo=/);
+  } finally {
+    s.cleanup();
+  }
 });

@@ -6,17 +6,18 @@ import { resolveArtifactRefs, uploadArtifacts } from "./artifacts.js";
 import { readContext, type RunContext } from "./context.js";
 import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js";
 import { diagnosePlaywrightOutput, preflight } from "./doctor.js";
-import { log } from "./log.js";
+import { log, setOutput } from "./log.js";
 import type { TokenSource } from "./oidc.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
-import { CLI_VERSION, type DoctorDiagnosis, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
+import { CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
 import { Workspace } from "./workspace.js";
 
 export type RunOptions = {
   apiUrl: string;
   token: TokenSource;
-  failOn: "never" | "verdict";
+  // Unset: the plan's server-side default, then "never".
+  failOn?: FailOn;
   resolveTimeoutMs: number;
   testTimeoutMs: number;
   keep: boolean;
@@ -102,6 +103,7 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
       if (plan.playwright?.installBrowsers || !repoHasPlaywright(ws.root)) {
         const inst = await ensureBrowsers(ws.root, ws);
         if (!inst.ok) log.warn("Chromium install reported a failure; continuing — the run will tell us if the browser is missing");
+        else setOutput("browsers", "true");
       }
       const generated = pw.filter((t) => t.origin === "generated");
       const existing = pw.filter((t) => t.origin === "existing");
@@ -123,10 +125,30 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
   return { results, artifacts, doctor };
 }
 
-function summaryTable(results: RunnerResult[], plan: RunnerPlan): string {
-  const byId = new Map(plan.criteria.map((c) => [c.id, c]));
-  const rows = results.map((r) => `| ${r.criterionIds.map((id) => `${id}. ${byId.get(id)?.text ?? ""}`).join("<br>")} | ${r.status} | ${r.level} ${r.origin} \`${r.test}\` | ${r.attempts.length} |`);
-  return ["| Criterion | Test outcome | Test | Attempts |", "|---|---|---|---|", ...rows].join("\n");
+const cell = (s: string) => s.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
+
+// Every criterion gets a row, so a plan with no runnable test still says why.
+export function summaryTable(plan: RunnerPlan, results: RunnerResult[]): string {
+  const unverifiable = new Map((plan.unverifiable ?? []).map((u) => [u.criterionId, u]));
+  const rows = plan.criteria.map((c) => {
+    const mine = results.filter((r) => r.criterionIds.includes(c.id));
+    const u = unverifiable.get(c.id);
+    if (mine.length) {
+      const tests = mine.map((r) => `${r.level} ${r.origin} \`${cell(r.test)}\``).join("<br>");
+      const outcome = mine.map((r) => `${r.status} (${r.attempts.length} attempt${r.attempts.length === 1 ? "" : "s"})`).join("<br>");
+      return `| ${c.id}. ${cell(c.text)} | ${tests} | ${outcome} | |`;
+    }
+    const note = u ? `${cell(u.reason)}${u.fixUrl ? ` — [configure app start](${u.fixUrl})` : ""}` : "no test planned";
+    return `| ${c.id}. ${cell(c.text)} | — | unverifiable | ${note} |`;
+  });
+  return ["| Criterion | Test | Outcome | Notes |", "|---|---|---|---|", ...rows].join("\n");
+}
+
+export function announceUnverifiable(plan: RunnerPlan): void {
+  for (const u of plan.unverifiable ?? []) {
+    log.warn(`criterion ${u.criterionId} is unverifiable: ${u.reason}${u.fixUrl ? ` — fix: ${u.fixUrl}` : ""}`);
+  }
+  if (plan.tests.length === 0) log.warn("no tests could be planned for this PR; every criterion will be reported as unverifiable");
 }
 
 export async function run(opts: RunOptions): Promise<number> {
@@ -172,7 +194,10 @@ export async function run(opts: RunOptions): Promise<number> {
     plan = resolved.plan;
     runId = resolved.runId;
     log.info(`plan ${plan.planId}: ${plan.tests.length} test(s) for ${plan.criteria.length} criteria (run ${runId})`);
+    setOutput("run-id", runId);
   }
+  announceUnverifiable(plan);
+  const failOn: FailOn = opts.failOn ?? plan.failOn ?? "never";
 
   try {
     const { results, artifacts, doctor } = await executePlan(plan, ws, { yml, testTimeoutMs: opts.testTimeoutMs, setup });
@@ -205,25 +230,27 @@ export async function run(opts: RunOptions): Promise<number> {
       log.info("results uploaded — DevAsign is judging; the PR check run and comment will update");
     }
     const counts = finalResults.reduce((m, r) => ((m[r.status] = (m[r.status] || 0) + 1), m), {} as Record<string, number>);
-    log.info(`outcome: ${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "no tests"}${doctor ? ` · setup needs attention: ${doctor.code}` : ""}`);
+    const unplanned = plan.unverifiable?.length ?? 0;
+    const outcome = `${Object.entries(counts).map(([k, v]) => `${v} ${k}`).join(", ") || "no tests ran"}${unplanned ? `, ${unplanned} unverifiable by plan` : ""}`;
+    log.info(`outcome: ${outcome}${doctor ? ` · setup needs attention: ${doctor.code}` : ""}`);
+    setOutput("outcome", outcome);
     if (process.env.GITHUB_STEP_SUMMARY) {
       try {
-        appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## DevAsign verification\n\n${doctor ? `> Setup needs attention: ${doctor.message}\n\n` : ""}${summaryTable(finalResults, plan)}\n\nVerdicts are judged by DevAsign and posted on the PR (check run "DevAsign · Verify").\n`);
+        appendFileSync(process.env.GITHUB_STEP_SUMMARY, `## DevAsign verification\n\n${doctor ? `> Setup needs attention: ${doctor.message}\n\n` : ""}${summaryTable(plan, finalResults)}\n\nVerdicts are judged by DevAsign and posted on the PR (check run "DevAsign · Verify").\n`);
       } catch {
         // best-effort
       }
     }
-    if (opts.failOn === "verdict" && api) {
+    if (failOn !== "never" && api) {
       const deadline = Date.now() + 10 * 60_000;
       while (Date.now() < deadline) {
         const view = await api.getRun(runId);
         if (view.terminal) {
           const fails = view.run.verdicts.filter((v) => v.verdict === "fail");
-          if (fails.length) {
-            log.error(`${fails.length} criteria failed verification: ${fails.map((f) => f.criterionId).join(", ")}`);
-            return 1;
-          }
-          return 0;
+          const unverified = failOn === "unverifiable" ? view.run.verdicts.filter((v) => v.verdict === "unverifiable") : [];
+          for (const v of unverified) log.error(`criterion ${v.criterionId} could not be verified: ${v.reason}${v.fixUrl ? ` — fix: ${v.fixUrl}` : ""}`);
+          if (fails.length) log.error(`${fails.length} criteria failed verification: ${fails.map((f) => f.criterionId).join(", ")}`);
+          return fails.length || unverified.length ? 1 : 0;
         }
         await sleep(5_000);
       }

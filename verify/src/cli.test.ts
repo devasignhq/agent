@@ -23,3 +23,10 @@ test("an unknown subcommand exits non-zero rather than hanging", async () => {
     (err: any) => err.code === 2 || err.code === 1
   );
 });
+
+test("an unknown --fail-on value is an error, never silently 'never'", async () => {
+  await assert.rejects(
+    () => run(process.execPath, ["--import", "tsx/esm", cli, "run", "--api-url", "http://127.0.0.1:9", "--fail-on", "sometimes"]),
+    (err: any) => err.code === 2 && /--fail-on must be never, verdict or unverifiable/.test(String(err.stderr))
+  );
+});

@@ -6,12 +6,23 @@ import { posix } from "node:path";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config } from "../config.js";
-import { completeWithMeta, currentUsageByModel, withModel, withUsage } from "../llm.js";
+import {
+  completeStructured,
+  currentUsageByModel,
+  retryStructured,
+  withModel,
+  withUsage,
+  type LLMMessage,
+  type StructuredAttempt,
+  type StructuredResult,
+  type StructuredTool,
+  type Validation,
+} from "../llm.js";
 import { modelForPlan } from "../billing/plans.js";
 import { ghText, repositoryDispatch } from "../github/app.js";
-import { fetchTree, type TreeEntry } from "../review/indexer.js";
-import { extractJSON } from "../review/parse.js";
-import { testPlannerSystemPrompt } from "../review/prompts.js";
+import { fetchTree, runPool, type TreeEntry } from "../review/indexer.js";
+import { testFileSystemPrompt, testPlannerSystemPrompt } from "../review/prompts.js";
+import { planManifestTool, planTestFileTool } from "../review/tools.js";
 import { withMaintainerInstructions } from "../review/decisions.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format.js";
@@ -32,8 +43,10 @@ const MAX_EXISTING_LISTED = 150;
 export const NO_BOOT_REASON = "no app start / login configured";
 export const NO_LEVEL_REASON = "planner could not produce a test at an allowed level";
 export const RETIRED_REASON = "could not produce a stable test (retired after repeated flakes)";
+export const PLAN_CUT_OFF_REASON = "the test plan was cut off before this criterion was covered";
+export const PLAN_UNUSABLE_REASON = "the planner did not return a usable test plan";
 
-export type PlannerLLM = (args: { system: string; user: string; maxTokens: number }) => Promise<{ text: string; stopReason: string | null }>;
+export type PlannerLLM = (args: { system: string; messages: LLMMessage[]; maxTokens: number; tool: StructuredTool }) => Promise<StructuredResult>;
 
 export type PlannerDeps = {
   llm?: PlannerLLM;
@@ -71,6 +84,7 @@ export type RawPlanTest = {
   origin: "existing" | "generated";
   runner: TestRunner;
   targetFiles: string[];
+  strategy?: string;
 };
 
 export function usageByProvider(): VerifyStageUsage {
@@ -90,8 +104,8 @@ export function usageByProvider(): VerifyStageUsage {
   return out;
 }
 
-const defaultLLM: PlannerLLM = async ({ system, user, maxTokens }) =>
-  completeWithMeta({ system, cacheSystem: true, maxTokens, messages: [{ role: "user", content: user }] });
+const defaultLLM: PlannerLLM = async ({ system, messages, maxTokens, tool }) =>
+  completeStructured({ system, cacheSystem: true, maxTokens, messages, tool });
 
 // Planning is mechanical next to review judgment — the ladder policy, path safety and
 // flake retirement are all enforced in code after the model — so it need not share the tier.
@@ -224,6 +238,11 @@ export function rebaseRelativeImports(
 }
 
 export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
+  return normalizeManifestTests(raw, knownIds, fallbackRunner).filter((t) => t.origin === "existing" || t.content);
+}
+
+// Manifest entries carry no content for generated tests; the authoring step fills it in.
+export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
   const list = (raw as { tests?: unknown })?.tests;
   if (!Array.isArray(list)) return [];
   const out: RawPlanTest[] = [];
@@ -236,7 +255,6 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
     const level = LEVELS.includes(o.level as TestLevel) ? (o.level as TestLevel) : "unit";
     const runner = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
     const content = typeof o.content === "string" && o.content.trim() ? o.content : null;
-    if (origin === "generated" && !content) continue;
     const moved = origin === "generated" ? normalizeGeneratedPath(path, runner) : null;
     const safe = origin === "generated" ? moved?.path : path.replace(/^\.\//, "");
     if (!safe || safe.split("/").includes("..")) continue;
@@ -250,6 +268,7 @@ export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackR
       origin,
       runner,
       targetFiles: Array.isArray(o.targetFiles) ? o.targetFiles.map(String).slice(0, 20) : [],
+      ...(typeof o.strategy === "string" && o.strategy.trim() ? { strategy: o.strategy.slice(0, 500) } : {}),
     });
   }
   return out;
@@ -324,8 +343,9 @@ export function mayEscalateToBrowser(t: RawPlanTest, policy: PlanPolicy): boolea
  * could have escalated. Only then is re-asking worth a second call.
  */
 export function hasUntriedRung(criterionId: string, policy: PlanPolicy): boolean {
-  if (!policy.e2eAllowed) return false;
   const cap = policy.maxLevel.get(criterionId);
+  // The component rung stays open with no boot config: a UI criterion can still be
+  // rendered and asserted on, so waving it off is worth one re-ask.
   return cap === "e2e" || (cap === "component" && !policy.apiOnly);
 }
 
@@ -425,7 +445,9 @@ function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup): 
   const hasPlaywright = setup.frameworks.some((f) => f.name === "playwright");
   return [
     ...ids.map((id) => `- [${id}]: max level ${policy.maxLevel.get(id)}`),
-    `- E2E allowed: ${policy.e2eAllowed ? "yes" : `no (${policy.e2ePolicy === "never" ? "e2e: never" : NO_BOOT_REASON})`}`,
+    policy.e2eAllowed
+      ? "- Browser (e2e) tests: available"
+      : `- Browser (e2e) tests: not available (${policy.e2ePolicy === "never" ? "e2e: never" : NO_BOOT_REASON}). UI criteria remain testable at component level: render the component with its real state and assert on the DOM. Mark a UI criterion unverifiable only if no component test could decide it.`,
     `- Diff scope: ${policy.apiOnly ? "api-only (no frontend files touched)" : "includes frontend files"}`,
     // Without this the model reads "Test frameworks: vitest" and rules the
     // browser out, even where the runner would have supplied one.
@@ -464,7 +486,7 @@ function replanHeader(r: ReplanCohorts): string {
   if (r.escalate.length)
     lines.push(
       `- [${r.escalate.join("], [")}]: you marked these unverifiable, but the Level policy below still allows a rung you did not attempt. ` +
-        "Plan a test at that rung, with a levelReason naming what the level beneath it cannot observe. Repeat the unverifiable entry only if no test at any allowed level could decide the criterion."
+        "Plan a test at the highest level the policy allows for it, with a levelReason naming what the level beneath it cannot observe. Repeat the unverifiable entry only if no test at any allowed level could decide the criterion."
     );
   // The criteria list follows immediately; without the break it reads as one list.
   return lines.join("\n") + "\n";
@@ -473,7 +495,6 @@ function replanHeader(r: ReplanCohorts): string {
 export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: ReplanCohorts } = {}): string {
   const replanIds = opts.replan ? [...opts.replan.level, ...opts.replan.escalate] : [];
   const target = opts.replan ? ctx.criteria.filter((c) => replanIds.includes(c.id)) : ctx.criteria;
-  const diff = formatRawDiff(truncateDiffAtHunkBoundary(ctx.diff, DIFF_CAP).text);
   const lines = [
     `# Test plan for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
     "",
@@ -498,12 +519,80 @@ export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: Replan
     "## Flake history",
     ...(ctx.flakeNotes.length ? ctx.flakeNotes : ["- none"]),
     "",
-    "## Diff",
-    "```diff",
-    diff,
-    "```",
+    renderDiff(ctx),
   ];
   return lines.join("\n");
+}
+
+const MANIFEST_BUDGETS = [8_000, 16_000];
+const BODY_BUDGETS = [12_000, 24_000];
+const PLAN_BODY_CONCURRENCY = 3;
+const BOOT_REASON_HINT = /app start|login|boot/i;
+
+type PlanManifest = { tests?: unknown; unverifiable?: unknown };
+type PlanAttempts = { manifest: StructuredAttempt[]; replan?: StructuredAttempt[]; bodies: Record<string, StructuredAttempt[]> };
+
+function validateManifest(input: unknown): Validation<PlanManifest> {
+  const o = input as PlanManifest | null;
+  if (!o || typeof o !== "object") return { ok: false, reason: "no plan object in the response" };
+  if (o.tests != null && !Array.isArray(o.tests)) return { ok: false, reason: "tests is not an array" };
+  if (o.unverifiable != null && !Array.isArray(o.unverifiable)) return { ok: false, reason: "unverifiable is not an array" };
+  return { ok: true, value: o };
+}
+const manifestRepair = (reason: string) => `Your previous answer could not be used: ${reason}. Call ${planManifestTool.name} now with the complete plan.`;
+
+function validateTestFile(input: unknown): Validation<{ content: string }> {
+  const content = (input as { content?: unknown } | null)?.content;
+  if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "content is empty" };
+  return { ok: true, value: { content } };
+}
+const testFileRepair = (reason: string) => `Your previous answer could not be used: ${reason}. Call ${planTestFileTool.name} now with the complete file contents.`;
+
+function askPlanner<T>(
+  llm: PlannerLLM,
+  system: string,
+  user: string,
+  tool: StructuredTool,
+  budgets: number[],
+  validate: (input: unknown) => Validation<T>,
+  repairPrompt: (reason: string) => string
+) {
+  return retryStructured<T>({
+    call: (maxTokens, messages) => llm({ system, messages, maxTokens, tool }),
+    messages: [{ role: "user", content: user }],
+    budgets,
+    validate,
+    repairPrompt,
+  });
+}
+
+function renderDiff(ctx: PlanContext): string {
+  return ["## Diff", "```diff", formatRawDiff(truncateDiffAtHunkBoundary(ctx.diff, DIFF_CAP).text), "```"].join("\n");
+}
+
+function renderSharedContext(ctx: PlanContext): string {
+  return ["# Shared context", "", "## Repository test setup", renderSetup(ctx.setup, ctx.yml), "", renderDiff(ctx)].join("\n");
+}
+
+export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strategyVersion?: number }): string {
+  const byId = new Map(ctx.criteria.map((c) => [c.id, c]));
+  return [
+    `# Write the test file for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
+    `- path: ${t.rebaseFrom ?? t.path}`,
+    `- runner: ${t.runner}`,
+    `- level: ${t.level}${t.levelReason ? ` (${t.levelReason})` : ""}`,
+    "- criteria:",
+    ...t.criterionIds.map((id) => `  - [${id}] ${byId.get(id)?.text ?? ""}`),
+    t.strategy ? `- strategy: ${t.strategy}` : "",
+    t.targetFiles.length ? `- targetFiles: ${t.targetFiles.join(", ")}` : "",
+    (t.strategyVersion ?? 1) > 1
+      ? `- strategy version: ${t.strategyVersion} — the previous version of this test was flaky; take a different approach (explicit state assertions, role/test-id selectors, isolated data).`
+      : "",
+    "",
+    `Write the complete file and submit it with ${planTestFileTool.name}.`,
+  ]
+    .filter(Boolean)
+    .join("\n");
 }
 
 async function gatherContext(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<PlanContext> {
@@ -635,11 +724,20 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const knownIds = new Set(ctx.criteria.map((c) => c.id));
         const fallbackRunner = fallbackRunnerFor(ctx.setup);
 
+        const attempts: PlanAttempts = { manifest: [], bodies: {} };
+        const cutOff = new Set<string>();
+        const unusable = new Set<string>();
+        const lose = (ids: Iterable<string>, stop: string | null) => {
+          for (const id of ids) (stop === "max_tokens" ? cutOff : unusable).add(id);
+        };
+
         const llmStartedAt = Date.now();
-        const first = await llm({ system, user: buildPlannerUserPrompt(ctx), maxTokens: 16_000 });
+        const first = await askPlanner<PlanManifest>(llm, system, buildPlannerUserPrompt(ctx), planManifestTool, MANIFEST_BUDGETS, validateManifest, manifestRepair);
         const firstLlmMs = Date.now() - llmStartedAt;
-        const parsed = extractJSON(first.text) ?? {};
-        let tests = normalizeRawTests(parsed, knownIds, fallbackRunner);
+        attempts.manifest = first.attempts;
+        if (!first.value) lose(knownIds, first.lastStopReason);
+        const parsed = first.value ?? {};
+        let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner);
         const unverifiable = new Map(normalizeUnverifiable(parsed, knownIds).map((u) => [u.criterionId, u.reason]));
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
         const dropped = violations.map((v) => `${v.test.path} (${v.reason})`);
@@ -653,21 +751,28 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const escapedIds = [...unverifiable.keys()].filter((id) => !covered.has(id) && hasUntriedRung(id, ctx.policy));
         const replanIds = [...violatedIds, ...escapedIds];
         let replanMs = 0;
+        let replanLost: string | null = null;
         if (replanIds.length) {
           const replanStartedAt = Date.now();
           const user = buildPlannerUserPrompt(ctx, { replan: { level: violatedIds, escalate: escapedIds } });
-          const second = await llm({ system, user, maxTokens: 12_000 });
+          const second = await askPlanner<PlanManifest>(llm, system, user, planManifestTool, MANIFEST_BUDGETS, validateManifest, manifestRepair);
           replanMs = Date.now() - replanStartedAt;
-          const secondJson = extractJSON(second.text) ?? {};
+          attempts.replan = second.attempts;
+          if (!second.value) {
+            lose(replanIds, second.lastStopReason);
+            replanLost = second.lastStopReason;
+          }
+          const secondJson = second.value ?? {};
           const replanKnown = new Set(replanIds);
-          const again = normalizeRawTests(secondJson, replanKnown, fallbackRunner);
+          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner);
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
           for (const u of normalizeUnverifiable(secondJson, replanKnown)) unverifiable.set(u.criterionId, u.reason);
           for (const v of enforced.violations) dropped.push(`${v.test.path} (${v.reason}, re-plan)`);
         }
 
-        // Signatures, quarantine strategy bumps, and retirement.
+        // Signatures, quarantine strategy bumps, and retirement — before any file
+        // is authored, so a retired test costs no body call.
         const critText = new Map(ctx.criteria.map((c) => [c.id, c.text]));
         const survivors: Array<RawPlanTest & { signature: string; strategyVersion: number }> = [];
         const retired = new Set<string>();
@@ -682,10 +787,40 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           const strategyVersion = t.origin === "generated" && isQuarantined(row) ? latestStrategyVersion(row) + 1 : latestStrategyVersion(row);
           survivors.push({ ...t, signature, strategyVersion });
         }
-        // Only here is the written set final — both planner batches, past policy
-        // and retirement — so a sibling redirect can only point at a file the
-        // runner actually writes. Any filter added after this reopens that bug.
-        const { tests: rebased, unresolved } = rebaseGeneratedContent(survivors);
+
+        // One call per generated file, so a cut costs that file alone.
+        const bodySystem = `${withMaintainerInstructions(testFileSystemPrompt(), wf.prompts?.verify)}\n\n${renderSharedContext(ctx)}`;
+        const authored = new Map<object, string>();
+        const bodyFailed: string[] = [];
+        const generated = survivors.filter((t) => t.origin === "generated");
+        const author = async (t: (typeof survivors)[number]) => {
+          try {
+            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t), planTestFileTool, BODY_BUDGETS, validateTestFile, testFileRepair);
+            attempts.bodies[t.path] = r.attempts;
+            if (r.value) return void authored.set(t, r.value.content);
+            bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
+            lose(t.criterionIds, r.lastStopReason);
+          } catch (err) {
+            bodyFailed.push(`${t.path} (${err instanceof Error ? err.message : String(err)})`.slice(0, 300));
+            lose(t.criterionIds, null);
+          }
+        };
+        const bodiesStartedAt = Date.now();
+        // The first file alone, so the shared-context cache write lands before the pool fans out.
+        if (generated.length) {
+          await author(generated[0]);
+          await runPool(generated.slice(1), PLAN_BODY_CONCURRENCY, author, "planner");
+        }
+        const bodiesMs = generated.length ? Date.now() - bodiesStartedAt : 0;
+        const withContent = survivors.flatMap((t) => {
+          if (t.origin !== "generated") return [t];
+          const content = authored.get(t);
+          return content ? [{ ...t, content }] : [];
+        });
+        // Only here is the written set final — both planner batches, past policy,
+        // retirement and authoring — so a sibling redirect can only point at a file
+        // the runner actually writes. Any filter added after this reopens that bug.
+        const { tests: rebased, unresolved } = rebaseGeneratedContent(withContent);
         // Minting the id here keeps buildCommands(finalTests) from ever running
         // against a stale array or ids that no longer exist.
         const finalTests: PlanTest[] = rebased.map((t) => ({
@@ -702,14 +837,21 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           targetFiles: t.targetFiles,
         }));
         const finalCovered = new Set(finalTests.flatMap((t) => t.criterionIds));
+        const fixUrl = `${config.webOrigin.replace(/\/+$/, "")}/workflow?repo=${repo.id}`;
         const planUnverifiable: VerifyPlan["unverifiable"] = [];
         for (const c of ctx.criteria) {
           if (finalCovered.has(c.id)) continue;
+          const isUi = (c.kind ?? "code") === "ui";
+          const noBoot = isUi && !ctx.policy.e2eAllowed && ctx.policy.e2ePolicy !== "never";
           if (retired.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: RETIRED_REASON });
-          else if (unverifiable.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: unverifiable.get(c.id)! });
-          else if ((c.kind ?? "code") === "ui" && !ctx.policy.e2eAllowed && ctx.policy.e2ePolicy !== "never")
-            planUnverifiable.push({ criterionId: c.id, reason: NO_BOOT_REASON, fixUrl: `${config.webOrigin.replace(/\/+$/, "")}/settings/verify?repo=${repo.id}` });
-          else if ((c.kind ?? "code") === "ui" && ctx.policy.e2ePolicy === "never")
+          else if (unverifiable.has(c.id)) {
+            const cited = unverifiable.get(c.id)!;
+            const reason = noBoot && BOOT_REASON_HINT.test(cited) ? NO_BOOT_REASON : cited;
+            planUnverifiable.push({ criterionId: c.id, reason, ...(reason === NO_BOOT_REASON ? { fixUrl } : {}) });
+          } else if (cutOff.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_CUT_OFF_REASON });
+          else if (unusable.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_UNUSABLE_REASON });
+          else if (noBoot) planUnverifiable.push({ criterionId: c.id, reason: NO_BOOT_REASON, fixUrl });
+          else if (isUi && ctx.policy.e2ePolicy === "never")
             planUnverifiable.push({ criterionId: c.id, reason: "end-to-end tests are disabled for this repo (e2e: never)" });
           else planUnverifiable.push({ criterionId: c.id, reason: NO_LEVEL_REASON });
         }
@@ -727,7 +869,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           createdAt: Date.now(),
         });
         const planFinishedAt = Date.now();
-        const generated = finalTests.filter((t) => t.origin === "generated").length;
+        const generatedCount = finalTests.filter((t) => t.origin === "generated").length;
         const updated = updateRun(run.id, {
           status: "awaiting_runner",
           planId: plan.id,
@@ -740,20 +882,41 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         else scheduleGiveUpRecheck(run, repo, install, deps);
         const queuedMs = planStartedAt - (run.timings.criteriaFinishedAt ?? run.timings.forkedAt);
         const totalMs = planFinishedAt - planStartedAt;
+        const lostLine = (what: string, stop: string | null, n: number) =>
+          `${stop === "max_tokens" ? "cut off" : "unusable"}: ${what} ${stop === "max_tokens" ? "stopped at max_tokens" : "returned no usable plan"} after ${n} attempt(s)`;
         db.insert("reviewLogs", {
           id: uuid(),
           reviewId: run.reviewId,
           kind: "verify",
           at: planFinishedAt,
-          action: `Test plan ready: ${generated} generated, ${finalTests.length - generated} existing, ${planUnverifiable.length} unverifiable`,
+          action: `Test plan ready: ${generatedCount} generated, ${finalTests.length - generatedCount} existing, ${planUnverifiable.length} unverifiable`,
           detail: [
-            `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""})`,
+            `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""}${bodiesMs ? `, bodies ${secs(bodiesMs)}` : ""})`,
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
+            ...(first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),
+            ...(attempts.replan && replanLost !== null ? [lostLine("re-plan", replanLost, attempts.replan.length)] : []),
+            ...bodyFailed.map((b) => `body failed: ${b}`),
             ...(dropped.length ? [`dropped: ${dropped.join("; ")}`] : []),
             ...(unresolved.length ? [`unresolved imports: ${unresolved.map((u) => `${u.path} → ${u.specifier} (${u.reason})`).join("; ")}`] : []),
           ].join("\n"),
-          meta: { runId: run.id, planId: plan.id, generated, existing: finalTests.length - generated, unverifiable: planUnverifiable.length, dropped, unresolvedImports: unresolved, apiOnly: ctx.policy.apiOnly, e2eAllowed: ctx.policy.e2eAllowed, prAuthoredTests: [...ctx.policy.prAuthoredTests], escalated: escapedIds, truncated: first.stopReason === "max_tokens", ms: { queued: queuedMs, gather: gatherMs, llm: firstLlmMs, replan: replanMs, total: totalMs } },
+          meta: {
+            runId: run.id,
+            planId: plan.id,
+            generated: generatedCount,
+            existing: finalTests.length - generatedCount,
+            unverifiable: planUnverifiable.length,
+            dropped,
+            unresolvedImports: unresolved,
+            apiOnly: ctx.policy.apiOnly,
+            e2eAllowed: ctx.policy.e2eAllowed,
+            prAuthoredTests: [...ctx.policy.prAuthoredTests],
+            escalated: escapedIds,
+            cutOff: [...cutOff].filter((id) => !finalCovered.has(id)),
+            bodyFailed,
+            attempts,
+            ms: { queued: queuedMs, gather: gatherMs, llm: firstLlmMs, replan: replanMs, bodies: bodiesMs, total: totalMs },
+          },
         });
         return await settle(updated);
       } catch (err) {

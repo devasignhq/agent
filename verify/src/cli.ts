@@ -5,7 +5,7 @@ import { preflight } from "./doctor.js";
 import { log } from "./log.js";
 import { actionsTokenSource, staticTokenSource } from "./oidc.js";
 import { run } from "./run.js";
-import { CLI_VERSION } from "./types.js";
+import { CLI_VERSION, type FailOn } from "./types.js";
 
 const HELP = `devasign-verify ${CLI_VERSION}
 
@@ -17,7 +17,9 @@ Usage: devasign-verify [run|detect|doctor] [options]
 
 Options:
   --api-url <url>          DevAsign API origin (env DEVASIGN_API_URL)
-  --fail-on never|verdict  Fail the job on a failed criterion (default never)
+  --fail-on <mode>         never (default): always exit 0; verdict: fail the job on a
+                           failed criterion; unverifiable: also fail when a criterion
+                           could not be verified. Unset: the repo's DevAsign setting
   --audience <aud>         OIDC audience (default devasign)
   --token <jwt>            Use this token instead of the Actions OIDC token (local runs)
   --pr <n> --sha <sha>     Override the PR number / head sha (local runs)
@@ -82,7 +84,12 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
     log.error("--api-url (or DEVASIGN_API_URL) is required");
     return 2;
   }
-  const failOn = values["fail-on"] === "verdict" ? "verdict" : "never";
+  const failOnValue = values["fail-on"];
+  if (failOnValue !== undefined && !["never", "verdict", "unverifiable"].includes(failOnValue)) {
+    log.error(`--fail-on must be never, verdict or unverifiable (got "${failOnValue}")`);
+    return 2;
+  }
+  const failOn = failOnValue as FailOn | undefined;
   const tokenValue = values.token || process.env.DEVASIGN_TOKEN;
   const token = tokenValue ? staticTokenSource(tokenValue) : actionsTokenSource(values.audience || process.env.DEVASIGN_OIDC_AUDIENCE || "devasign");
   try {

@@ -692,7 +692,17 @@ const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
             )}
           </div>
         )}
-        {v && v.reason && v.verdict !== "pending" && <div className="mute mono acv-reason">{v.reason}</div>}
+        {v && v.reason && v.verdict !== "pending" && (
+          <div className="mute mono acv-reason">
+            {v.reason}
+            {v.fixUrl && (
+              <>
+                {" · "}
+                <a href={v.fixUrl}>configure app start</a>
+              </>
+            )}
+          </div>
+        )}
         {v && v.recording && !v.flaky && (
           <RecordingBlock rec={v.recording} testName={v.test?.name || "recording"} durationMs={v.durationMs} initiallyOpen={expanded} onStale={onStale} />
         )}

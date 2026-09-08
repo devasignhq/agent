@@ -10,9 +10,9 @@ inputs:
     required: false
     default: "https://devasign-agent.onrender.com"
   fail-on:
-    description: "never (default) or verdict — fail this job when a criterion fails verification."
+    description: "never — always exit 0; verdict — fail this job when a criterion fails verification; unverifiable — also fail when a criterion could not be verified. Empty (default) uses the repository's DevAsign setting, which is never unless changed."
     required: false
-    default: "never"
+    default: ""
   version:
     description: "@devasign/verify version range to run."
     required: false
@@ -29,17 +29,30 @@ inputs:
     description: "Cache the Playwright browser download between runs. Set false to opt out."
     required: false
     default: "true"
+outputs:
+  run-id:
+    description: "The DevAsign verification run id, when a plan was resolved."
+    value: ${{ steps.verify.outputs.run-id }}
+  outcome:
+    description: "One-line summary of the test outcomes."
+    value: ${{ steps.verify.outputs.outcome }}
+  browsers:
+    description: "true when the run installed Playwright browsers."
+    value: ${{ steps.verify.outputs.browsers }}
 runs:
   using: "composite"
   steps:
     # Keyed on the exact @playwright/test version pinned in verify/package.json: a range
     # would keep hitting this key while serving a stale cache, so Chromium would
     # re-download every run and never re-save. Bump both together.
+    # Restore and save are split so the save only runs when browsers were actually
+    # installed; a run with no browser tests otherwise warns that the path is missing.
     # Negated on purpose: if the inputs context is ever unavailable here the
     # expression still enables the cache, rather than silently disabling it.
-    - name: Cache Playwright browsers
+    - name: Restore Playwright browsers
+      id: pw-cache
       if: inputs.cache-browsers != 'false'
-      uses: actions/cache@v4
+      uses: actions/cache/restore@v4
       with:
         # Playwright's own default per OS. Caching a single Linux-style path would
         # save and restore a directory Playwright never reads on macOS or Windows —
@@ -48,6 +61,7 @@ runs:
         path: ${{ runner.os == 'Windows' && '~/AppData/Local/ms-playwright' || runner.os == 'macOS' && '~/Library/Caches/ms-playwright' || '~/.cache/ms-playwright' }}
         key: devasign-playwright-1.55.0-${{ runner.os }}-${{ runner.arch }}
     - name: Run DevAsign verification
+      id: verify
       shell: bash
       working-directory: ${{ inputs.working-directory }}
       env:
@@ -59,8 +73,19 @@ runs:
         DEVASIGN_FAIL_ON: ${{ inputs.fail-on }}
         DEVASIGN_RESOLVE_TIMEOUT: ${{ inputs.resolve-timeout }}
       run: |
-        args=(run --fail-on "$DEVASIGN_FAIL_ON")
+        args=(run)
+        if [ -n "$DEVASIGN_FAIL_ON" ]; then
+          args+=(--fail-on "$DEVASIGN_FAIL_ON")
+        fi
         if [ -n "$DEVASIGN_RESOLVE_TIMEOUT" ]; then
           args+=(--resolve-timeout "$DEVASIGN_RESOLVE_TIMEOUT")
         fi
         npx --yes "@devasign/verify@$DEVASIGN_VERSION" "${args[@]}"
+    # !cancelled(): with fail-on set the verify step may exit 1, and the browsers
+    # it installed are still worth keeping for the next run.
+    - name: Save Playwright browsers
+      if: ${{ !cancelled() && inputs.cache-browsers != 'false' && steps.verify.outputs.browsers == 'true' && steps.pw-cache.outputs.cache-hit != 'true' }}
+      uses: actions/cache/save@v4
+      with:
+        path: ${{ runner.os == 'Windows' && '~/AppData/Local/ms-playwright' || runner.os == 'macOS' && '~/Library/Caches/ms-playwright' || '~/.cache/ms-playwright' }}
+        key: ${{ steps.pw-cache.outputs.cache-primary-key }}

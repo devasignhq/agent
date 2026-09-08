@@ -13,7 +13,8 @@ import { blastRadiusCriteria } from "../verify/blast-radius.js";
 import { formatVerificationSection, postVerifyCheckRun, type VerificationView } from "../verify/report.js";
 import { updateRun as updateVerifyRun } from "../verify/runs.js";
 import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
-import { complete, completeWithMeta, currentUsage, detectVideoProvider, summarizeLinearFile, summarizeVideo, withModel, withUsage, type VideoSummary } from "../llm.js";
+import { complete, completeStructured, completeWithMeta, currentUsage, detectVideoProvider, retryStructured, summarizeLinearFile, summarizeVideo, withModel, withUsage, type LLMMessage, type StructuredAttempt, type VideoSummary } from "../llm.js";
+import { reviewVerdictTool } from "./tools.js";
 import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview, pushNotification } from "../notifications.js";
@@ -2311,40 +2312,48 @@ async function reviewDiff(
       .slice(0, 6)
       .map((s) => `## ${s.kind}\n${s.text.slice(0, 2000)}`)
       .join("\n\n");
-  // A silently-truncated verdict is worse than a failed review: the old path
-  // parsed to `criteria: []`, the merge defaulted every criterion to met:null,
-  // and the PR got a confidently-wrong all-unmet comment. So: generous output
-  // budget, retry once bigger, and if the verdict is still truncated or doesn't
-  // cover the criteria we asked about, throw — runReviewJob's catch marks the
-  // review errored and posts the failure banner instead.
+  // An unusable verdict must fail the review, never post as all-unmet: the
+  // merge defaults every criterion it can't match to unmet.
   const expectedIds = criteria.map((c) => c.id);
-  const ATTEMPT_MAX_TOKENS = [16_384, 32_768];
-  let verdict: ReviewVerdict | null = null;
-  for (const [i, maxTokens] of ATTEMPT_MAX_TOKENS.entries()) {
-    const { text, stopReason } = await completeWithMeta({
-      system,
-      cacheSystem: true,
-      maxTokens,
-      messages: [{ role: "user", content: userText }],
-    });
-    verdict = stopReason === "max_tokens" ? null : parseReviewVerdict(text, expectedIds);
-    if (verdict) break;
-    if (i < ATTEMPT_MAX_TOKENS.length - 1) {
-      log(review.id, "review", "Review verdict truncated or unparseable — retrying with a larger output budget", {
-        detail: `stop_reason=${stopReason}; attempt ${i + 1} used max_tokens=${maxTokens}`,
-      });
-    }
-  }
-  if (!verdict) {
-    if (criteria.length > 0) {
-      throw new Error(
-        "PR review verdict was truncated or unparseable after retry; refusing to post an all-unmet verdict"
+  const messages: LLMMessage[] = [{ role: "user", content: userText }];
+  const { value, attempts } = await retryStructured<ReviewVerdict>({
+    call: (maxTokens, msgs) => completeStructured({ system, cacheSystem: true, maxTokens, messages: msgs, tool: reviewVerdictTool }),
+    messages,
+    budgets: [16_384, 32_768],
+    validate: (input) => {
+      const out = coerceReviewVerdict(input, expectedIds);
+      return "verdict" in out ? { ok: true, value: out.verdict } : { ok: false, reason: out.reason };
+    },
+    repairPrompt: (reason) =>
+      `Your previous answer could not be used: ${reason}. Call ${reviewVerdictTool.name} now with a complete verdict covering criteria ${expectedIds.join(", ")}.`,
+    onAttempt: (a) => {
+      if (a.reason == null) return;
+      const cut = a.stopReason === "max_tokens";
+      log(
+        review.id,
+        "review",
+        cut ? "Review verdict cut off — retrying with a larger output budget" : "Review verdict unusable — asking the model to re-emit it",
+        { detail: attemptDetail(a), meta: { ...a } }
       );
-    }
-    // Spec-less PR (no criteria to fail): keep the old lenient empty fallback.
-    verdict = { summary: "", criteria: [], comments: [], suggestions: [] };
+    },
+  });
+  if (value) return value;
+  if (criteria.length > 0) {
+    log(review.id, "error", "Review verdict unusable after retries", {
+      detail: attempts.map(attemptDetail).join("\n\n"),
+      meta: { attempts },
+    });
+    throw new Error("PR review verdict was truncated or unparseable after retry; refusing to post an all-unmet verdict");
   }
-  return verdict;
+  // Spec-less PR (no criteria to fail): keep the old lenient empty fallback.
+  return { summary: "", criteria: [], comments: [], suggestions: [] };
+}
+
+export function attemptDetail(a: StructuredAttempt): string {
+  const lines = [`attempt ${a.n} (${a.kind}): stop_reason=${a.stopReason}; max_tokens=${a.maxTokens}; ${a.reason ? `reason=${a.reason}` : "ok"}`];
+  if (a.head) lines.push("--- output head ---", a.head);
+  if (a.tail) lines.push("--- output tail ---", a.tail);
+  return lines.join("\n");
 }
 
 export type ReviewVerdict = {
@@ -2372,14 +2381,21 @@ export type ReviewVerdict = {
 // JSON extraction (parse.ts extractJSON) tolerates fences, surrounding prose,
 // and truncation (repairing the complete prefix of a cut-off object).
 export function parseReviewVerdict(raw: string, expectedIds: string[]): ReviewVerdict | null {
-  const parsed = extractJSON(raw) as any;
-  if (!parsed || typeof parsed !== "object") return null;
+  const out = coerceReviewVerdict(extractJSON(raw), expectedIds);
+  return "verdict" in out ? out.verdict : null;
+}
+
+export function coerceReviewVerdict(input: unknown, expectedIds: string[]): { verdict: ReviewVerdict } | { reason: string } {
+  const parsed = input as any;
+  if (!parsed || typeof parsed !== "object") return { reason: "no JSON object in the response" };
+  if (parsed.criteria != null && !Array.isArray(parsed.criteria)) return { reason: "criteria is not an array" };
   const criteria = Array.isArray(parsed.criteria) ? parsed.criteria : [];
   if (expectedIds.length > 0) {
     const norm = (id: unknown) => String(id ?? "").trim().toLowerCase();
     const expected = new Set(expectedIds.map(norm));
-    const anyMatch = criteria.some((c: any) => expected.has(norm(c?.id)));
-    if (!anyMatch) return null;
+    const seen = criteria.map((c: any) => norm(c?.id)).filter(Boolean);
+    const anyMatch = seen.some((id: string) => expected.has(id));
+    if (!anyMatch) return { reason: `criteria ids [${seen.join(", ")}] matched none of [${expectedIds.join(", ")}]` };
   }
   const severities = new Set(["blocker", "warn", "nit"]);
   const verdict: ReviewVerdict = {
@@ -2427,7 +2443,7 @@ export function parseReviewVerdict(raw: string, expectedIds: string[]): ReviewVe
   if (summaryFix.repaired && typeof summaryFix.text === "string") {
     verdict.summary = summaryFix.text;
   }
-  return verdict;
+  return { verdict };
 }
 
 // Markdown block inviting the maintainer to provide an end goal on a spec-less

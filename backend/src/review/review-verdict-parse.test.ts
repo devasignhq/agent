@@ -5,7 +5,7 @@
 //   node --import tsx/esm --test src/review/review-verdict-parse.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseReviewVerdict } from "./pipeline.js";
+import { coerceReviewVerdict, parseReviewVerdict } from "./pipeline.js";
 import { complete, completeWithMeta } from "../llm.js";
 
 const validVerdict = JSON.stringify({
@@ -221,4 +221,16 @@ test("code bleeding into a suggestion's rationale is truncated at the bleed", ()
   const v = parseReviewVerdict(raw, ["c1"]);
   assert.ok(v);
   assert.equal(v.suggestions[0].rationale, "Guard the empty case before the main path runs");
+});
+
+test("coerceReviewVerdict names why an input is unusable", () => {
+  assert.deepEqual(coerceReviewVerdict(null, ["1"]), { reason: "no JSON object in the response" });
+  assert.deepEqual(coerceReviewVerdict("text", ["1"]), { reason: "no JSON object in the response" });
+  assert.deepEqual(coerceReviewVerdict({ criteria: "nope" }, ["1"]), { reason: "criteria is not an array" });
+  assert.deepEqual(coerceReviewVerdict({ criteria: [{ id: "x", met: true }] }, ["1", "2"]), {
+    reason: "criteria ids [x] matched none of [1, 2]",
+  });
+  const ok = coerceReviewVerdict({ criteria: [{ id: " 1 ", met: true, evidence: "e" }] }, ["1"]);
+  assert.ok("verdict" in ok);
+  assert.equal(ok.verdict.criteria[0].id, " 1 ");
 });

@@ -1,6 +1,6 @@
 // Wire contract with the DevAsign API (/v1). Mirrors backend/src/verify/contract.ts;
 // additive changes only, kept in sync by hand.
-export const CLI_VERSION = "1.1.0";
+export const CLI_VERSION = "1.2.0";
 export const API_VERSION = 1;
 
 export type TestLevel = "unit" | "integration" | "component" | "e2e";
@@ -106,7 +106,12 @@ export type RunnerPlan = {
   playwright: { record: true; configFrom: string | null; installBrowsers: boolean } | null;
   retries: { generated: number; existing: number };
   uploadLimits: { maxFileBytes: number; maxTotalBytes: number; maxFiles: number };
+  // Optional: servers older than 1.2 send neither.
+  unverifiable?: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
+  failOn?: FailOn;
 };
+
+export type FailOn = "never" | "verdict" | "unverifiable";
 
 export type ResolveResponse =
   | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number; giveUpAfterMs?: number }
@@ -169,7 +174,7 @@ export type RunnerResults = {
 
 export type RunView = {
   ok: true;
-  run: { id: string; status: string; verdicts: Array<{ criterionId: string; verdict: "pass" | "fail" | "unverifiable"; reason: string }> };
+  run: { id: string; status: string; verdicts: Array<{ criterionId: string; verdict: "pass" | "fail" | "unverifiable"; reason: string; fixUrl?: string }> };
   terminal: boolean;
   runUrl?: string;
 };
