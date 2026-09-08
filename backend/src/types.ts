@@ -7,6 +7,7 @@ import type {
   PlanTest,
   RunnerResults,
 } from "./verify/contract.js";
+import type { ReviewItemCategory, ReviewStage } from "./review/items.js";
 
 export type User = {
   id: string;
@@ -84,6 +85,11 @@ export type RepoWorkflow = {
     deferrals: boolean; // self-admitted deferred/incomplete-work scan
     crossRepo: boolean; // sibling-repo breakage + feature-parity pass (Pro/Max)
     verify: boolean;    // generated-test verification in the customer's CI (parallel branch)
+    // Post each finding and acceptance criterion as its own inline review-comment
+    // thread, anchored to the code it concerns. Off = everything renders inside
+    // the summary comment instead; this is the rollback lever for the loudest
+    // change DevAsign makes to a pull request.
+    inlineThreads: boolean;
   };
   verdict: {
     blocking: boolean; // false = post advisory COMMENT, never REQUEST_CHANGES
@@ -591,6 +597,49 @@ export type Criterion = {
   notApplicable?: boolean;
 };
 
+// One inline review-comment thread DevAsign owns on a PR — the state that lets a
+// re-review edit the thread it already opened instead of posting a duplicate,
+// and lets a finding that stopped being reported be marked fixed in place.
+// Keyed by `key` (review/items.ts itemKey), which is stable across pushes.
+export type ReviewThread = {
+  key: string;
+  // GitHub review-comment id — PATCH /pulls/comments/{id}.
+  commentId: number;
+  // Whether the thread is still being reported, or has been marked fixed.
+  state: "open" | "resolved";
+  // What the item itself said last time: an unmet criterion that flips to "met"
+  // stays a live thread (the reader wants to see it passed) but counts as fixed
+  // on the card, which `state` alone cannot express.
+  itemState: "open" | "met";
+  // The item's title when we last wrote the thread, so the "Fixed" banner can
+  // name the finding without re-deriving it from the key's normalized slug.
+  title: string;
+  category: ReviewItemCategory;
+  severity: "blocker" | "warn" | "nit";
+  // Which pass produced the item. A thread whose stage did not run this time is
+  // left untouched rather than read as fixed — a toggled-off or thrown stage is
+  // not evidence that anything was resolved.
+  stage: ReviewStage;
+  path?: string;
+  line?: number;
+  anchor: "line" | "file";
+  firstSeenSha: string;
+  // Last head sha whose review still reported this item.
+  lastSeenSha: string;
+  missingSinceSha?: string;
+  // Consecutive qualifying runs that did not report the item.
+  missCount: number;
+  resolvedAtSha?: string;
+  resolvedAt?: number;
+  // Hash of the body we last wrote, so an unchanged thread costs no API call.
+  bodyHash: string;
+  // Rebuilt from the PR's comments after the stored rows were lost. Such a row
+  // knows its key and comment id but not which stage owns it, so it is never
+  // read as fixed until the item is reported again and the row is refreshed.
+  recovered?: boolean;
+  updatedAt: number;
+};
+
 export type PRReview = {
   id: string;
   repoId: string;
@@ -614,6 +663,17 @@ export type PRReview = {
   // still load.
   progressCommentId?: number | null;
   progressCommentSha?: string | null;
+  // GitHub issue-comment id for the separate "Tests by DevAsign" comment the
+  // verifier posts, and the head SHA it was posted for. Same one-per-commit
+  // contract as progressCommentId above. Lives on the review row rather than the
+  // run because several verify runs can share a sha (see bestRunForSha).
+  verifyCommentId?: number | null;
+  verifyCommentSha?: string | null;
+  // Inline review-comment threads DevAsign owns on this PR, one per review item.
+  // Reconciled on every run: still-reported items are edited in place, items that
+  // stopped being reported are marked fixed, new ones open a thread. Absent on
+  // rows written before per-item threads existed.
+  reviewThreads?: ReviewThread[];
   // Id of our latest bodyless APPROVE review on this PR. We never submit
   // REQUEST_CHANGES (its required body would render as an extra conversation
   // comment), so when a later commit fails we explicitly dismiss this approval

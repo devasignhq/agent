@@ -1,7 +1,8 @@
 // Offline end-to-end for the verify branch: fork after criteria, plan in
-// parallel (mock planner), join with a pending Verification section + a
-// "DevAsign · Verify" check run, then results → judgment → the section is
-// spliced into the SAME comment and the check run re-posted.
+// parallel (mock planner), join with a separate "Tests by DevAsign" comment + a
+// "DevAsign · Verify" check run, then results → judgment → that same tests
+// comment is edited in place and the check run re-posted. The review's own
+// summary card is never touched by verification.
 //   ANTHROPIC_API_KEY= GEMINI_API_KEY= DATABASE_URL= node --import tsx/esm --test src/review/pipeline-verify.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -19,7 +20,6 @@ config.github.appId = "123456";
 config.github.privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 }).privateKey.export({ type: "pkcs8", format: "pem" }).toString();
 
 type Call = { method: string; url: string; body: any; accept: string };
-const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/u;
 const DIFF = ["diff --git a/src/handler.ts b/src/handler.ts", "index 1111111..2222222 100644", "--- a/src/handler.ts", "+++ b/src/handler.ts", "@@ -1,2 +1,3 @@", " export function handler() {", "+  return doWork();", " }"].join("\n");
 const TREE = ["package.json", "package-lock.json", "src/handler.ts", "src/handler.test.ts"].map((path) => ({ path, type: "blob", sha: "s", size: 5 }));
 
@@ -46,9 +46,12 @@ function installFetchStub(headRepoFullName = "acme/widgets") {
     if (m && method === "PATCH") { comments.set(Number(m[1]), String(body?.body ?? "")); return ghResponse({}); }
     if (m && method === "GET") return ghResponse({ id: Number(m[1]), body: comments.get(Number(m[1])) ?? "" });
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET") return ghResponse([{ sha: "abc1234", commit: { message: "Add widget" } }]);
+    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST") return ghResponse({ id: 9000 + calls.length });
+    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse([]);
+    if (/\/pulls\/comments\/\d+$/.test(u)) return ghResponse({ body: "" });
     if (/\/pulls\/\d+$/.test(u) && method === "GET") {
       if (accept.includes("diff")) return ghResponse(DIFF);
-      return ghResponse({ title: "Add widget", body: "<!-- devasign:intent -->I added doWork to the handler.<!-- /devasign:intent -->", head: { sha: "abc1234", ref: "feature", repo: { full_name: headRepoFullName } }, base: { sha: "def5678" }, additions: 1, deletions: 0, changed_files: 1, commits: 1 });
+      return ghResponse({ title: "Add widget", body: "<!-- devasign:intent -->I added doWork to the handler.<!-- /devasign:intent -->", state: "open", head: { sha: "abc1234", ref: "feature", repo: { full_name: headRepoFullName } }, base: { sha: "def5678" }, additions: 1, deletions: 0, changed_files: 1, commits: 1 });
     }
     if (/\/git\/trees\//.test(u) && method === "GET") return ghResponse({ tree: TREE });
     if (/\/contents\/package\.json/.test(u)) return ghResponse('{"scripts":{"test":"node --test"}}');
@@ -66,7 +69,7 @@ function seedReview(workflow?: any) {
   return { install, repo, review };
 }
 
-test("fork after criteria, plan in parallel, join with a pending section + Verify check run; results → judged → spliced", async () => {
+test("fork after criteria, plan in parallel, Verify check run at the join; results → judged → a separate Tests comment", async () => {
   const { install, repo, review } = seedReview();
   const { calls, comments, restore } = installFetchStub();
   try {
@@ -90,18 +93,23 @@ test("fork after criteria, plan in parallel, join with a pending section + Verif
     assert.ok(plan.tests.filter((x) => x.origin === "generated").every((x) => x.path.startsWith(".devasign/tests/")));
     assert.ok(run.tokenUsage.plan, "plan usage recorded per provider");
 
+    // The review's card is comment 4242 and carries no verification detail.
     const patch = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/4242$/.test(c.url));
     const body = String(patch!.body?.body);
-    assert.match(body, /^## DevAsign review — changes requested/);
-    assert.ok(body.includes(VERIFICATION_START) && body.includes(VERIFICATION_END));
-    assert.match(body, /### Verification\nVerification isn't running yet — add the DevAsign verify workflow/);
-    assert.match(body, /— \*\*pending\*\*/);
-    assert.doesNotMatch(body, EMOJI);
+    assert.match(body, /^## DevAsign Code Review/);
+    assert.ok(!body.includes(VERIFICATION_START), "verification no longer lives in the review comment");
+
+    // Nothing has finished yet, so no tests comment — the check run carries the
+    // pending state instead of putting a nag on every PR.
+    assert.ok(
+      !calls.some((c) => c.method === "POST" && /Tests by DevAsign/.test(String(c.body?.body))),
+      "no tests comment before verification finishes"
+    );
     const checks = calls.filter((c) => c.method === "POST" && /\/check-runs$/.test(c.url)).map((c) => c.body).filter((c) => c.name !== "devasign/security");
     assert.deepEqual(checks.map((c) => c.name), ["DevAsign · End goal", "DevAsign · Verify"]);
     assert.equal(checks[1].conclusion, "neutral");
     assert.equal(checks[1].output.title, "Setup pending");
-    assert.equal(db.find("verifyRuns", (r) => r.id === run.id)?.report?.commentId, 4242);
+    assert.equal(db.find("prReviews", (r) => r.id === review.id)?.verifyCommentId, undefined);
 
     // Runner reports: first test passes, second fails on every attempt.
     const [first, second] = plan.tests;
@@ -129,13 +137,27 @@ test("fork after criteria, plan in parallel, join with a pending section + Verif
     assert.equal(byId.get(first.criterionIds[0]), "pass");
     assert.equal(byId.get(second.criterionIds[0]), "fail");
 
-    const final = comments.get(4242)!;
-    assert.match(final, /^## DevAsign review — changes requested/, "the rest of the comment is intact");
-    assert.match(final, /### Verification\n\d+ passed, 1 failed/);
-    assert.match(final, /— \*\*FAIL\*\* · \[mock\] fail per the recorded test outcome · unit `\.devasign\/tests\/criterion-2\.test\.ts`/);
+    // Verification finished, so now the tests comment appears — its own comment,
+    // not an edit of the review's card.
+    const testsCommentId = db.find("prReviews", (r) => r.id === review.id)!.verifyCommentId!;
+    assert.equal(db.find("verifyRuns", (r) => r.id === run.id)?.report?.commentId, testsCommentId);
+    const finalTests = comments.get(testsCommentId)!;
+    assert.match(finalTests, /^## Tests by DevAsign/);
+    assert.match(finalTests, /❌ `Failed \(1\)`/);
+    assert.match(finalTests, /### (✅|🟡|🔴) Test score: \d{1,3}\/100/);
+    assert.match(finalTests, /\*\*Verdict:\*\* FAIL/);
+    assert.match(finalTests, /\[mock\] fail per the recorded test outcome/);
+    assert.match(finalTests, /\*\*Test:\*\* `\.devasign\/tests\/criterion-2\.test\.ts`/);
+    assert.match(finalTests, /<summary>Prompt to fix all failing tests<\/summary>/);
+    assert.equal(finalTests.split(VERIFICATION_START).length, 2, "exactly one verification block");
     assert.match(String(judged!.verdicts.find((v) => v.verdict === "fail")?.reason), /\[mock\] fail/, "the judge's reason replaces the mechanical one for pass/fail");
-    assert.equal(final.split(VERIFICATION_START).length, 2, "exactly one verification block");
-    assert.doesNotMatch(final, EMOJI);
+    // Only one tests comment was ever created.
+    const testsPosts = calls.filter(
+      (c) => c.method === "POST" && /\/issues\/\d+\/comments$/.test(c.url) && /Tests by DevAsign/.test(String(c.body?.body))
+    );
+    assert.equal(testsPosts.length, 1, "exactly one tests comment for the run");
+    // The review's card is untouched by verification.
+    assert.ok(!comments.get(4242)!.includes(VERIFICATION_START));
     const verifyChecks = calls.filter((c) => c.method === "POST" && /\/check-runs$/.test(c.url) && c.body?.name === "DevAsign · Verify");
     assert.equal(verifyChecks.length, 2);
     assert.equal(verifyChecks[1].body.conclusion, "failure");
@@ -156,7 +178,13 @@ test("stages.verify=false → the branch is skipped, logged, and reported as dis
     const verify = calls.find((c) => c.method === "POST" && /\/check-runs$/.test(c.url) && c.body?.name === "DevAsign · Verify");
     assert.equal(verify?.body.output.title, "Verification disabled");
     const patch = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/\d+$/.test(c.url));
-    assert.match(String(patch!.body?.body), /Verification is turned off in this repo's workflow/);
+    // Nothing actionable to say, so no tests comment is posted; the check run
+    // carries the state instead.
+    assert.ok(
+      !calls.some((c) => c.method === "POST" && /Tests by DevAsign/.test(String(c.body?.body))),
+      "a disabled verify stage posts no tests comment"
+    );
+    assert.doesNotMatch(String(patch!.body?.body), /Verification is turned off/);
   } finally {
     restore();
   }
@@ -177,7 +205,11 @@ test("a PR from a fork is skipped up front instead of timing out an hour later",
     assert.ok(db.filter("reviewLogs", (l) => l.reviewId === review.id).some((l) => l.action === VERIFY_FORK_PR));
 
     const body = [...comments.values()].at(-1) ?? "";
-    assert.match(body, /Verification does not run on pull requests from forks/);
+    assert.ok(
+      !calls.some((c) => c.method === "POST" && /Tests by DevAsign/.test(String(c.body?.body))),
+      "a fork PR posts no tests comment"
+    );
+    assert.doesNotMatch(body, /Verification does not run on pull requests from forks/);
     assert.doesNotMatch(body, /did not report results/);
     const verify = calls.filter((c) => c.method === "POST" && /\/check-runs$/.test(c.url)).map((c) => c.body).find((c) => c.name === "DevAsign · Verify");
     assert.equal(verify.conclusion, "neutral");

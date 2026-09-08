@@ -24,6 +24,9 @@ test("effectiveWorkflow with no stored workflow reproduces prior behavior", () =
     deferrals: true,
     crossRepo: false,
     verify: true,
+    // The loudest surface change DevAsign makes to a PR, so it ships on but with
+    // a lever: turning it off puts every finding back inside the one comment.
+    inlineThreads: true,
   });
   assert.deepEqual(wf.trigger, { onSynchronize: true, skipDrafts: false, skipBots: false });
   assert.equal(wf.verdict.blocking, true);

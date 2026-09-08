@@ -433,8 +433,18 @@ function handlePullRequestReviewComment(event: any) {
     });
     // Inline comments are most useful when prefixed with their location so
     // the LLM analysis knows the comment is anchored to a specific line.
+    //
+    // When the reply lands inside one of DevAsign's own threads, the location
+    // alone is not enough — "that's wrong" reads as a bare assertion unless the
+    // finding it disputes travels with it. in_reply_to_id names the thread, so
+    // quote what we said there.
+    const repliedTo =
+      typeof event.comment?.in_reply_to_id === "number"
+        ? (review.reviewThreads ?? []).find((t) => t.commentId === event.comment!.in_reply_to_id)
+        : undefined;
+    const quoted = repliedTo ? `Replying to DevAsign's finding: "${repliedTo.title}"\n` : "";
     enqueueMaintainerFeedback(review.id, {
-      body: `On ${where}:\n${body}`,
+      body: `On ${where}:\n${quoted}${body}`,
       author,
       authorAssociation,
       sourceUrl: event.comment?.html_url || "",

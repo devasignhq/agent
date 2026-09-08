@@ -1,9 +1,17 @@
-// The verification surfaces: the "### Verification" section of the review
-// comment (marker-delimited so it can be spliced later) and the
-// "DevAsign · Verify" check run. Same data feeds GET /v1/runs/{id}.
+// The verification surfaces: the "## Tests by DevAsign" conversation comment,
+// the "DevAsign · Verify" check run, and the marker-delimited "### Verification"
+// section the comment is built around. Same data feeds GET /v1/runs/{id}.
+//
+// The section used to be spliced into the REVIEW comment; it now lives in its own
+// comment, so the two surfaces can land at different times (the verifier finishes
+// well after the review). spliceVerificationSection and its markers are kept: they
+// delimit the rows inside the new comment, and they are also what strips the
+// legacy block out of review comments written before this change.
 import { db } from "../db.js";
 import { config } from "../config.js";
-import { gh, updatePRComment } from "../github/app.js";
+import { gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { codeFence } from "../review/render.js";
+import { scoreHeader } from "../review/score.js";
 import type { Criterion, PRReview, Repository, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { RunnerResult } from "./contract.js";
 import { hasRunnerEvidence, updateRun } from "./runs.js";
@@ -341,7 +349,7 @@ export function bestRunForSha(run: VerifyRun): VerifyRun {
   return judged[0] ?? run;
 }
 
-/** Late update: re-post the check run and splice the section into the existing comment. */
+/** Late update: re-post the check run and the "Tests by DevAsign" comment. */
 export async function rerenderReport(runId: string): Promise<void> {
   const settled = db.find("verifyRuns", (r) => r.id === runId);
   if (!settled) return;
@@ -356,19 +364,237 @@ export async function rerenderReport(runId: string): Promise<void> {
   const view = buildVerificationView({ run, review, repo, criteria: review.criteria });
   // Always the run's own commit: review.headSha may already point at a newer push.
   await postVerifyCheckRun(install, repo, { headSha: run.sha }, view);
-  const commentId = review.progressCommentId;
-  if (commentId == null || review.progressCommentSha !== run.sha) return;
+  // Verification lives in its own comment now, so it no longer has to wait for
+  // the review comment to exist, and a stale-sha review comment no longer
+  // suppresses it. It is still keyed to the run's own sha.
+  await upsertVerifyComment({
+    install,
+    repo,
+    review,
+    sha: run.sha,
+    runId: run.id,
+    view,
+  });
+  // Reviews written before this change carry the old spliced block; strip it so
+  // the PR doesn't show verification twice.
+  if (review.progressCommentId != null) {
+    await stripLegacyVerificationSection(install.installationId, repo, review.progressCommentId);
+  }
+}
+
+// ─── The "Tests by DevAsign" comment ───────────────────────────────────────
+
+export const TESTS_COMMENT_TITLE = "## Tests by DevAsign";
+
+// Deterministic, like the review's merge score: a failed criterion is the real
+// signal, an unverifiable one is a gap rather than a defect, so it costs less.
+export function testScore(counts: VerificationView["counts"]): number {
+  const penalty = counts.fail * 20 + counts.unverifiable * 5 + counts.pending * 5;
+  return Math.max(0, Math.min(100, 100 - penalty));
+}
+
+function testChips(view: VerificationView): string {
+  const chips: string[] = [];
+  if (view.counts.pass) chips.push(`✅ \`Passed (${view.counts.pass})\``);
+  if (view.counts.fail) chips.push(`❌ \`Failed (${view.counts.fail})\``);
+  if (view.counts.unverifiable) chips.push(`⚠️ \`Unverifiable (${view.counts.unverifiable})\``);
+  if (view.counts.pending) chips.push(`⏳ \`Pending (${view.counts.pending})\``);
+  if (!chips.length) chips.push("⚠️ `Nothing to verify`");
+  return chips.join(" · ");
+}
+
+function verdictIcon(v: VerificationRowVerdict): string {
+  return v === "pass" ? "✅" : v === "fail" ? "❌" : v === "unverifiable" ? "⚠️" : "⏳";
+}
+
+// One paste that tells an agent what to fix. Only the failures — an unverifiable
+// criterion has no test to make pass, so asking for one would be noise.
+function buildTestFixPrompt(view: VerificationView, repoFullName: string): string | null {
+  const failed = view.rows.filter((r) => r.verdict === "fail");
+  if (!failed.length) return null;
+  const lines = [
+    `You are helping fix failing verification tests in ${repoFullName}. Each item below is an ` +
+      `acceptance criterion whose test ran and failed. Make the described behaviour hold, then ` +
+      `make the named test pass. Don't change the test to match the code — the test encodes the ` +
+      `requirement. Don't introduce changes beyond what's listed.`,
+    "",
+    "## Failing criteria",
+    "",
+  ];
+  failed.forEach((r, i) => {
+    lines.push(`### ${i + 1}. ${r.text} (${r.id})`);
+    if (r.testName) lines.push(`Test: \`${r.testName}\`${r.level ? ` (${r.level})` : ""}`);
+    if (r.reason) lines.push(`Why it failed: ${r.reason}`);
+    lines.push("");
+  });
+  lines.push("## Your task");
+  lines.push(
+    `Fix the ${failed.length} failing criteri${failed.length === 1 ? "on" : "a"} above, then run the ` +
+      `named tests to confirm they pass.`
+  );
+  return lines.join("\n");
+}
+
+// Same shape as the review's summary card: title, chips, a scored header, a short
+// summary, per-item detail, one copyable prompt. Per-test detail is a <details>
+// block rather than its own thread because a generated test file usually isn't
+// part of the PR's diff, so there is nothing to anchor a review comment to.
+export function formatTestsComment(view: VerificationView, repoFullName: string): string {
+  const lines: string[] = [TESTS_COMMENT_TITLE, "", testChips(view), ""];
+  if (view.state === "completed") {
+    lines.push(scoreHeader(testScore(view.counts), "Test score"), "");
+    // One line of arithmetic, not two: stateLine's own count sentence would say
+    // the same thing again directly underneath.
+    const tail = [
+      view.counts.fail ? `${view.counts.fail} failed` : "",
+      view.counts.unverifiable ? `${view.counts.unverifiable} unverifiable` : "",
+    ].filter(Boolean);
+    lines.push(
+      `${view.counts.pass} of ${view.rows.length} criteri${view.rows.length === 1 ? "on" : "a"} verified by tests` +
+        (tail.length ? `, ${tail.join(", ")}.` : ".") +
+        " Each verdict below links to its evidence."
+    );
+  } else {
+    lines.push(stateLine(view));
+  }
+  if (view.tests.prAuthored) {
+    lines.push(
+      `This PR adds or changes ${view.tests.prAuthored} test file${view.tests.prAuthored === 1 ? "" : "s"} of its own; ` +
+        `${view.tests.prAuthored === 1 ? "it was" : "they were"} not used as evidence.`
+    );
+  }
+
+  lines.push("", VERIFICATION_START);
+  for (const r of view.rows) {
+    lines.push("", "<details>", `<summary>${verdictIcon(r.verdict)} ${r.id} — ${r.text}</summary>`, "");
+    lines.push(`**Verdict:** ${verdictWord(r.verdict)}`);
+    if (r.reason) lines.push("", r.reason);
+    if (r.testName) {
+      lines.push("", `**Test:** \`${r.testName}\`${r.origin === "existing" ? " (existing)" : ""}${r.level ? ` · ${r.level}` : ""}`);
+    }
+    if (r.flaky && r.attempts) lines.push("", `Flaky — [all ${r.attempts} attempts](${r.deepLink})`);
+    const evidence = r.recording
+      ? r.recording.expired
+        ? `[recording expired](${r.deepLink})`
+        : `[▶ Watch recording](${r.deepLink})`
+      : `[details](${r.deepLink})`;
+    lines.push("", evidence, "", "</details>");
+  }
+  lines.push(VERIFICATION_END);
+
+  const prompt = buildTestFixPrompt(view, repoFullName);
+  if (prompt) {
+    const fence = codeFence(prompt);
+    lines.push(
+      "",
+      "<details>",
+      "<summary>Prompt to fix all failing tests</summary>",
+      "",
+      fence,
+      prompt,
+      fence,
+      "",
+      "</details>"
+    );
+  }
+  lines.push("", REPLY_LINE);
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+// Only once verification has actually finished — that is when there is something
+// to report. Everything else is carried by the "DevAsign · Verify" check run
+// instead: "pending"/"planning" would announce that nothing has happened yet, and
+// skipped/disabled/fork/setup_pending would put the same nag comment on every
+// pull request of a repo that has not enabled the runner.
+export function shouldPostTestsComment(view: VerificationView): boolean {
+  return (
+    view.state === "completed" ||
+    view.state === "failed" ||
+    view.state === "timed_out" ||
+    view.state === "lost"
+  );
+}
+
+// Serialises upserts per (review, sha). Verification can settle from several
+// places at once — the review pipeline's join and runVerifyPlan's settle can land
+// in the same tick — and without this each would see "no comment yet" and post
+// one, leaving two "Tests by DevAsign" comments on the PR.
+const upsertsInFlight = new Map<string, Promise<number | null>>();
+
+/**
+ * Post (or edit) the PR's "Tests by DevAsign" comment. One comment per head sha,
+ * mirroring the review comment's contract, so a late judge result edits rather
+ * than appends. Best-effort: returns the comment id, or null.
+ */
+export async function upsertVerifyComment(args: {
+  install: { installationId: number };
+  repo: Repository;
+  review: Pick<PRReview, "id" | "prNumber" | "verifyCommentId" | "verifyCommentSha">;
+  /** The RUN's sha — never review.headSha, which may already point at a newer push. */
+  sha: string;
+  runId: string | null;
+  view: VerificationView;
+}): Promise<number | null> {
+  if (!shouldPostTestsComment(args.view)) return null;
+  const key = `${args.review.id}:${args.sha}`;
+  const inFlight = upsertsInFlight.get(key);
+  if (inFlight) return inFlight;
+  const task = (async (): Promise<number | null> => {
+    const { install, repo, review, sha } = args;
+    const body = formatTestsComment(args.view, `${repo.owner}/${repo.name}`);
+    const reusable =
+      review.verifyCommentId != null && review.verifyCommentSha === sha ? review.verifyCommentId : null;
+    let id: number | null = null;
+    if (reusable !== null) {
+      const ok = await updatePRComment(install.installationId, repo.owner, repo.name, reusable, body);
+      if (ok) id = reusable;
+    }
+    if (id === null) {
+      id = await postPRCommentReturningId(
+        install.installationId,
+        repo.owner,
+        repo.name,
+        review.prNumber,
+        body
+      );
+      if (id !== null) {
+        db.update("prReviews", (r) => r.id === review.id, {
+          verifyCommentId: id,
+          verifyCommentSha: sha,
+        });
+      }
+    }
+    if (id !== null && args.runId) {
+      const run = db.find("verifyRuns", (r) => r.id === args.runId);
+      if (run) updateRun(run.id, { report: { ...(run.report || {}), commentId: id } });
+    }
+    return id;
+  })();
+  upsertsInFlight.set(key, task);
+  try {
+    return await task;
+  } finally {
+    upsertsInFlight.delete(key);
+  }
+}
+
+// One-shot migration: PRs reviewed before verification moved out of the review
+// comment still carry a spliced "### Verification" block. Left alone it would show
+// alongside the new comment, so strip it the first time we touch that comment.
+async function stripLegacyVerificationSection(
+  installationId: number,
+  repo: Repository,
+  commentId: number
+): Promise<void> {
   try {
     const current = await gh<{ body?: string }>(
-      install.installationId,
+      installationId,
       `/repos/${repo.owner}/${repo.name}/issues/comments/${commentId}`
     );
-    if (!current || typeof current.body !== "string") return;
-    const next = spliceVerificationSection(current.body, formatVerificationSection(view));
-    if (next === current.body) return;
-    const ok = await updatePRComment(install.installationId, repo.owner, repo.name, commentId, next);
-    if (ok) updateRun(run.id, { report: { ...(run.report || {}), commentId } });
+    if (typeof current?.body !== "string" || !current.body.includes(VERIFICATION_START)) return;
+    const next = spliceVerificationSection(current.body, "").trim();
+    await updatePRComment(installationId, repo.owner, repo.name, commentId, next);
   } catch (err) {
-    console.warn("[verify] failed to update the review comment:", err);
+    console.warn("[verify] failed to strip the legacy verification section:", err);
   }
 }
