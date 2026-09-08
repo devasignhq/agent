@@ -1237,6 +1237,8 @@ export type VerifyPlan = {
   tests: PlanTest[];
   commands: PlanCommand[];
   unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
+  // Test files the PR itself adds or changes — withheld from the planner as evidence.
+  prAuthoredTests?: string[];
   createdAt: number;
 };
 

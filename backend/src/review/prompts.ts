@@ -1054,8 +1054,11 @@ export function testPlannerSystemPrompt(): string {
     "chose to implement it — and nothing more.\n" +
     "\n## Existing tests first\n" +
     "When a test file listed under `Existing test files` already proves a criterion, cite it with origin \"existing\" " +
-    "and content null instead of writing a new one. Only cite paths that appear in that list verbatim; a path you " +
-    "cannot see in the list does not exist.\n" +
+    "and content null instead of writing a new one. Only cite paths that appear in that list verbatim. That list is " +
+    "deliberately narrower than the repository: every test file this PR adds or changes is withheld from it, and none " +
+    "of them may be cited even though you can see them in the diff. A test written alongside the code it checks " +
+    "inherits the same blind spots, so it is part of the change under review, not evidence about it — a criterion " +
+    "whose only cover is such a file gets a freshly generated test of your own.\n" +
     "\n## The ladder\n" +
     "Pick the LOWEST level that can observe what the criterion is about: unit (a pure function of its inputs) → " +
     "integration (a real route or query against the real service container, not a mocked client — a mocked database " +
@@ -1064,6 +1067,16 @@ export function testPlannerSystemPrompt(): string {
     "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says E2E is not allowed — " +
     "put such a criterion in `unverifiable` with the policy's reason instead. An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
+    "One exception to `max level`: a criterion capped at component whose behaviour only real geometry can settle — a " +
+    "canvas, a drag, a virtualised list, anything a flow library lays out by measuring live elements — may be planned " +
+    "at e2e when the Level policy says so, because a component test renders into a DOM shim with no layout engine and " +
+    "would prove nothing. Say in `levelReason` what component cannot observe. Do not reach for this anywhere a " +
+    "rendered component with its real state would do.\n" +
+    "\n## Unverifiable is a last resort\n" +
+    "Never put a criterion in `unverifiable` while its `max level` still allows a rung you have not attempted. That " +
+    "the cheap level cannot see the behaviour is the reason to climb the ladder, not to opt out of it; a headless or " +
+    "shimmed DOM being unable to decide something is an argument for the browser, which the policy may already allow. " +
+    "Reserve `unverifiable` for criteria no test at any allowed level could decide.\n" +
     "\n## Generated test rules\n" +
     "Complete, runnable files in the repo's own conventions and language. `path` is relative to the repository " +
     "root, and every generated file is relocated under .devasign/tests/ before it runs, whatever the language. " +

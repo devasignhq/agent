@@ -56,7 +56,7 @@ export type VerificationView = {
   error?: string | null;
   rows: VerificationRow[];
   counts: { pass: number; fail: number; unverifiable: number; pending: number };
-  tests: { generated: number; existing: number };
+  tests: { generated: number; existing: number; prAuthored: number };
 };
 
 export function runDeepLink(reviewId: string, runId: string | null, criterionId?: string): string {
@@ -180,6 +180,7 @@ export function buildVerificationView(args: {
     tests: {
       generated: plan?.tests.filter((t) => t.origin === "generated").length ?? 0,
       existing: plan?.tests.filter((t) => t.origin === "existing").length ?? 0,
+      prAuthored: plan?.prAuthoredTests?.length ?? 0,
     },
   };
 }
@@ -213,7 +214,14 @@ function verdictWord(v: VerificationRowVerdict): string {
 }
 
 export function formatVerificationSection(view: VerificationView): string {
-  const lines: string[] = [VERIFICATION_START, "### Verification", stateLine(view), ""];
+  const lines: string[] = [VERIFICATION_START, "### Verification", stateLine(view)];
+  // A test that ships inside the change cannot be evidence for it; say so rather
+  // than let the count of verified criteria imply more independence than there is.
+  if (view.tests.prAuthored)
+    lines.push(
+      `This PR adds or changes ${view.tests.prAuthored} test file${view.tests.prAuthored === 1 ? "" : "s"} of its own; ${view.tests.prAuthored === 1 ? "it was" : "they were"} not used as evidence.`
+    );
+  lines.push("");
   for (const r of view.rows) {
     const parts = [`**${r.id}.** ${r.text} — **${verdictWord(r.verdict)}**`];
     if (r.reason) parts.push(r.reason);
