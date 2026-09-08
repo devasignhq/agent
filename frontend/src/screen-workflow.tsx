@@ -12,6 +12,7 @@
 // ADVANCED (Pro/Max): free users see them locked with an upgrade nudge. Saves
 // are optimistic and persist per repo via PUT /api/repositories/:id/workflow.
 import React from "react";
+import { useSearchParams } from "react-router-dom";
 import {
   ReactFlow,
   Background,
@@ -854,7 +855,9 @@ const VerifySetupPanel = ({ repo }) => {
     ob.state === "pr_open" ? `setup PR #${ob.prNumber} open` :
     ob.state === "pr_closed" ? `setup PR #${ob.prNumber} was closed` : "not set up";
   const workflows = setup.detected?.existingWorkflows || [];
-  const boot = setup.devasignYml?.start ? ` · boots with ${setup.devasignYml.start}` : " · no app start configured (UI criteria unverifiable)";
+  const boot = setup.devasignYml?.start
+    ? ` · boots with ${setup.devasignYml.start}`
+    : " · no app start configured — set verify.start and verify.url in .devasign.yml to enable browser tests (UI criteria are otherwise checked at component level or reported unverifiable)";
   return (
     <div className="wf-verify-setup" onClick={(e) => e.stopPropagation()}>
       <div className="mono mute" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>verification setup</div>
@@ -899,8 +902,10 @@ const VerifySetupPanel = ({ repo }) => {
 
 const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) => void } = {}) => {
   const { user } = useAuth();
+  const [params, setParams] = useSearchParams();
   const [repos, setRepos] = React.useState<Repository[]>([]);
-  const [repoId, setRepoId] = React.useState<string>("");
+  // `?repo=<id>` preselects a repo (the fix link on an unverifiable criterion lands here).
+  const [repoId, setRepoId] = React.useState<string>(params.get("repo") || "");
   const [wf, setWf] = React.useState<RepoWorkflow | null>(null);
   const [selectedId, setSelectedId] = React.useState<NodeId>("trigger");
   const [advancedLocked, setAdvancedLocked] = React.useState(
@@ -932,7 +937,7 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
       .then((rs) => {
         if (!alive) return;
         setRepos(rs);
-        setRepoId((cur) => cur || rs[0]?.id || "");
+        setRepoId((cur) => (cur && rs.some((r) => r.id === cur) ? cur : rs[0]?.id || ""));
         if (rs.length === 0) setLoading(false);
       })
       .catch(() => alive && setLoading(false));
@@ -1125,7 +1130,10 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
               <div
                 key={r.id}
                 className={`pr-card ${r.id === repoId ? "picked" : ""}`}
-                onClick={() => setRepoId(r.id)}
+                onClick={() => {
+                  setRepoId(r.id);
+                  setParams({ repo: r.id }, { replace: true });
+                }}
                 title={`${r.owner}/${r.name}`}
               >
                 <div className="pr-card-row">

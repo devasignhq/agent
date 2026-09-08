@@ -15,6 +15,7 @@ import {
   devasignDocsSystemPrompt,
   contractDeltaSystemPrompt,
   crossRepoSystemPrompt,
+  testFileSystemPrompt,
   testPlannerSystemPrompt,
   verificationJudgmentSystemPrompt,
   verificationFeedbackSystemPrompt,
@@ -32,6 +33,7 @@ const CASES: Array<[string, string, string]> = [
   [devasignDocsSystemPrompt(), "You are DevAsign's DEVASIGN.md guidance step.", "DEVASIGN.md guidance"],
   [contractDeltaSystemPrompt(), "You are DevAsign's contract-delta extraction step.", "contract-delta extraction"],
   [crossRepoSystemPrompt(), "You are DevAsign's cross-repo impact step.", "cross-repo impact step"],
+  [testFileSystemPrompt(), "You are DevAsign's test file authoring step.", "test file authoring"],
   [testPlannerSystemPrompt(), "You are DevAsign's test planning step.", "test planning"],
   [verificationJudgmentSystemPrompt(), "You are DevAsign's verification judgment step.", "verification judgment"],
   [verificationFeedbackSystemPrompt(), "You are DevAsign's verification feedback step.", "verification feedback"],
@@ -39,7 +41,7 @@ const CASES: Array<[string, string, string]> = [
 
 // Every key mockComplete dispatches on, in source order.
 const MOCK_KEYS = [
-  "bounty criteria evaluation", "criteria synthesis", "test planning", "verification judgment", "verification feedback", "Linear issue matching",
+  "bounty criteria evaluation", "criteria synthesis", "test file authoring", "test planning", "verification judgment", "verification feedback", "Linear issue matching",
   "contract-delta extraction", "cross-repo impact step", "PR review",
   "bug-fix synthesis", "maintainer-feedback goal refinement", "maintainer-dispute re-evaluation",
   "implementation guide synthesis", "file summarisation", "file security audit", "security audit agent",

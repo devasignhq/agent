@@ -16,6 +16,7 @@ import type {
   VerifySkipReason,
 } from "../types.js";
 import type { RunnerPlan, RunView, RunViewArtifact } from "./contract.js";
+import { effectiveWorkflow } from "../review/workflow.js";
 import { artifactStorage, UPLOAD_LIMITS } from "./storage.js";
 
 export const TERMINAL_STATUSES: ReadonlySet<VerifyRunStatus> = new Set([
@@ -213,7 +214,15 @@ export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository
       : null,
     retries: { generated: 2, existing: 0 },
     uploadLimits: { ...UPLOAD_LIMITS },
+    unverifiable: plan.unverifiable,
+    failOn: failOnFor(repo),
   };
+}
+
+// Stored workflows are merged raw, so an old or hand-edited value is checked here.
+function failOnFor(repo: Repository): RunnerPlan["failOn"] {
+  const stored = effectiveWorkflow(repo).verify?.failOn;
+  return stored === "verdict" || stored === "unverifiable" ? stored : "never";
 }
 
 export async function buildRunView(run: VerifyRun, opts: { includeUsage: boolean }): Promise<RunView> {

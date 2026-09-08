@@ -104,7 +104,7 @@ export type RepoWorkflow = {
   // Verifier policy. `.devasign.yml` in the repo overrides `e2e` per repo.
   verify?: {
     e2e: "auto" | "always" | "never";
-    failOn: "never" | "verdict";
+    failOn: "never" | "verdict" | "unverifiable";
   };
   // Optional "Run GitHub Action" step (ADVANCED): when enabled, dispatch a
   // chosen GitHub Actions workflow after a review. `runWhen` gates dispatch on
@@ -1120,6 +1120,7 @@ export type CriterionVerdict = {
   evidenceRefs: Array<{ artifactId?: string; testId?: string; resultId?: string }>;
   flaky?: boolean;
   retired?: boolean;
+  fixUrl?: string;
 };
 
 export type VerifyStageUsage = Partial<Record<"anthropic" | "gemini", TokenUsage>>;

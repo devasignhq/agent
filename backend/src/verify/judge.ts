@@ -50,7 +50,7 @@ export function computeVerdicts(args: {
   artifacts: VerifyArtifact[];
 }): CriterionVerdict[] {
   const out: CriterionVerdict[] = [];
-  const planned = new Map((args.plan?.unverifiable ?? []).map((u) => [u.criterionId, u.reason]));
+  const planned = new Map((args.plan?.unverifiable ?? []).map((u) => [u.criterionId, u]));
   for (const c of args.criteria) {
     if (!isVerifiable(c)) continue;
     const covering = args.results.filter((r) => r.criterionIds.includes(c.id));
@@ -61,7 +61,8 @@ export function computeVerdicts(args: {
       continue;
     }
     if (!covering.length) {
-      out.push({ criterionId: c.id, verdict: "unverifiable", reason: planned.get(c.id) ?? "no test ran for this criterion", evidenceRefs: [] });
+      const p = planned.get(c.id);
+      out.push({ criterionId: c.id, verdict: "unverifiable", reason: p?.reason ?? "no test ran for this criterion", evidenceRefs: [], ...(p?.fixUrl ? { fixUrl: p.fixUrl } : {}) });
       continue;
     }
     const flaky = covering.filter((r) => r.status === "flaky");

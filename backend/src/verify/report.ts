@@ -31,6 +31,7 @@ export type VerificationRow = {
   attempts?: number;
   flaky?: boolean;
   retired?: boolean;
+  fixUrl?: string;
   evidence: Array<{ artifactId: string; kind: VerifyArtifact["kind"]; expired: boolean }>;
   deepLink: string;
 };
@@ -127,6 +128,7 @@ export function buildVerificationView(args: {
       .filter((a): a is VerifyArtifact => !!a)
       .map((a) => ({ artifactId: a.id, kind: a.kind, expired: a.state === "expired" || a.expiresAt <= now }));
     const video = evidence.find((e) => e.kind === "video");
+    const planned = plan?.unverifiable.find((u) => u.criterionId === c.id);
     let verdict: VerificationRowVerdict = "pending";
     let reason = "";
     if (v) {
@@ -136,18 +138,16 @@ export function buildVerificationView(args: {
       verdict = "unverifiable";
       reason =
         state === "completed"
-          ? "no test ran for this criterion"
+          ? planned?.reason ?? "no test ran for this criterion"
           : run?.error || (state === "timed_out" ? "the runner did not report results" : "the run did not finish");
     } else if (state === "skipped" || state === "disabled" || state === "fork") {
       verdict = "unverifiable";
       reason = state === "disabled" ? "verification is turned off for this repo" : state === "fork" ? "not run on fork pull requests" : "not verifiable in CI";
-    } else {
-      const planned = plan?.unverifiable.find((u) => u.criterionId === c.id);
-      if (planned) {
-        verdict = "unverifiable";
-        reason = planned.reason;
-      }
+    } else if (planned) {
+      verdict = "unverifiable";
+      reason = planned.reason;
     }
+    const fixUrl = verdict === "unverifiable" ? v?.fixUrl ?? planned?.fixUrl : undefined;
     const primary = tests[0];
     rows.push({
       id: c.id,
@@ -162,6 +162,7 @@ export function buildVerificationView(args: {
       attempts: crs.reduce((m, r) => Math.max(m, r.attempts.length), 0) || undefined,
       flaky: v?.flaky,
       retired: v?.retired,
+      ...(fixUrl ? { fixUrl } : {}),
       evidence,
       deepLink: runDeepLink(review.id, runId, c.id),
     });
@@ -225,6 +226,7 @@ export function formatVerificationSection(view: VerificationView): string {
   for (const r of view.rows) {
     const parts = [`**${r.id}.** ${r.text} — **${verdictWord(r.verdict)}**`];
     if (r.reason) parts.push(r.reason);
+    if (r.fixUrl) parts.push(`[configure app start](${r.fixUrl})`);
     if (r.testName) parts.push(`${r.level ?? "test"}${r.origin === "existing" ? " (existing)" : ""} \`${r.testName}\``);
     if (r.recording) parts.push(r.recording.expired ? `[recording expired](${r.deepLink})` : `[▶ Watch recording](${r.deepLink})`);
     if (r.flaky && r.attempts) parts.push(`[all ${r.attempts} attempts](${r.deepLink})`);
@@ -282,6 +284,7 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
       const bits = [`${verdictWord(r.verdict)} — ${r.id}. ${r.text}`];
       if (r.testName) bits.push(`test: ${r.testName}`);
       if (r.reason) bits.push(r.reason);
+      if (r.fixUrl) bits.push(`[configure app start](${r.fixUrl})`);
       bits.push(r.recording ? `[watch recording](${r.deepLink})` : `[details](${r.deepLink})`);
       return `- ${bits.join(" · ")}`;
     }),

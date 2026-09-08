@@ -4,6 +4,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { config, isGeminiLive, isLLMLive } from "./config.js";
 import { hostMatches } from "./ssrf.js";
+import { extractJSON } from "./review/parse.js";
 
 const client = isLLMLive() ? new Anthropic({ apiKey: config.llm.apiKey }) : null;
 
@@ -145,16 +146,22 @@ export async function complete(opts: {
 // can otherwise still "parse" via a smaller embedded object).
 export type LLMImage = { mediaType: string; base64: string };
 
-export async function completeWithMeta(opts: {
+type CompleteOpts = {
   system?: string;
   messages: LLMMessage[];
   maxTokens?: number;
   cacheSystem?: boolean;
   model?: string;
   images?: LLMImage[]; // attached to the last message as image blocks (evidence screenshots)
-}): Promise<CompletionResult> {
-  if (!client) return { text: mockComplete(opts), stopReason: "end_turn" };
+};
 
+export type StructuredTool = { name: string; description: string; inputSchema: Record<string, unknown> };
+
+// `input` is the tool call's parsed arguments, or null when the model produced
+// no usable call; `raw` is what the log excerpts quote.
+export type StructuredResult = { input: unknown | null; text: string; stopReason: string | null; raw: string };
+
+async function sendMessages(opts: CompleteOpts, tool?: StructuredTool): Promise<Anthropic.Message> {
   const sys = opts.system
     ? opts.cacheSystem
       ? [{ type: "text" as const, text: opts.system, cache_control: { type: "ephemeral" as const } }]
@@ -162,7 +169,7 @@ export async function completeWithMeta(opts: {
     : undefined;
 
   const model = opts.model || modelContext.getStore() || config.llm.model;
-  const resp = await client.messages.create({
+  const resp = await client!.messages.create({
     model,
     max_tokens: opts.maxTokens ?? 2048,
     system: sys as any,
@@ -180,6 +187,12 @@ export async function completeWithMeta(opts: {
           }
         : { role: m.role, content: m.content }
     ),
+    ...(tool
+      ? {
+          tools: [{ name: tool.name, description: tool.description, input_schema: tool.inputSchema as any }],
+          tool_choice: { type: "tool" as const, name: tool.name },
+        }
+      : {}),
   });
 
   // The API returns cache_*_input_tokens at runtime, but the pinned SDK's Usage
@@ -196,12 +209,132 @@ export async function completeWithMeta(opts: {
     cacheReadTokens: usage?.cache_read_input_tokens,
     cacheCreationTokens: usage?.cache_creation_input_tokens,
   });
+  return resp;
+}
 
-  const text = resp.content
+function textOf(resp: Anthropic.Message): string {
+  return resp.content
     .filter((b): b is Anthropic.TextBlock => b.type === "text")
     .map((b) => b.text)
     .join("\n");
-  return { text, stopReason: resp.stop_reason ?? null };
+}
+
+export async function completeWithMeta(opts: CompleteOpts): Promise<CompletionResult> {
+  if (!client) return { text: mockComplete(opts), stopReason: "end_turn" };
+  const resp = await sendMessages(opts);
+  return { text: textOf(resp), stopReason: resp.stop_reason ?? null };
+}
+
+function rejectsTools(err: unknown): boolean {
+  const e = err as { status?: number; message?: string } | null;
+  return e?.status === 400 && /tool/i.test(e?.message ?? "");
+}
+
+// Forces the model to answer by calling `tool`, so the payload is API-validated
+// JSON instead of prose to parse. A call cut at max_tokens is never accepted.
+export async function completeStructured(opts: CompleteOpts & { tool: StructuredTool }): Promise<StructuredResult> {
+  if (!client) {
+    const text = mockComplete(opts);
+    let input: unknown | null = null;
+    try {
+      input = JSON.parse(text);
+    } catch {
+      input = null;
+    }
+    return { input, text, stopReason: "tool_use", raw: text };
+  }
+  let resp: Anthropic.Message;
+  try {
+    resp = await sendMessages(opts, opts.tool);
+  } catch (err) {
+    // A model that rejects forced tool_choice still answers in text; parse that
+    // instead of taking every review down with it.
+    if (!rejectsTools(err)) throw err;
+    const plain = await sendMessages(opts);
+    const text = textOf(plain);
+    const stopReason = plain.stop_reason ?? null;
+    return { input: stopReason === "max_tokens" ? null : extractJSON(text), text, stopReason, raw: text };
+  }
+  const stopReason = resp.stop_reason ?? null;
+  const call = resp.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use" && b.name === opts.tool.name);
+  const text = textOf(resp);
+  const input = stopReason === "max_tokens" || !call ? null : call.input;
+  const raw = call ? JSON.stringify(call.input) : text;
+  return { input, text, stopReason, raw };
+}
+
+export type StructuredAttempt = {
+  n: number;
+  kind: "initial" | "budget" | "repair";
+  maxTokens: number;
+  stopReason: string | null;
+  reason: string | null;
+  head: string;
+  tail: string;
+};
+
+const EXCERPT = 500;
+
+export type Validation<T> = { ok: true; value: T } | { ok: false; reason: string };
+
+// Retry that matches the failure: a max_tokens cut gets the next budget with the
+// same messages; a complete-but-unusable answer gets one repair pass instead.
+export async function retryStructured<T>(args: {
+  call: (maxTokens: number, messages: LLMMessage[]) => Promise<StructuredResult>;
+  messages: LLMMessage[];
+  budgets: number[];
+  validate: (input: unknown) => Validation<T>;
+  repairPrompt: (reason: string) => string;
+  maxCalls?: number;
+  onAttempt?: (attempt: StructuredAttempt) => void;
+}): Promise<{ value: T | null; attempts: StructuredAttempt[]; lastStopReason: string | null }> {
+  const maxCalls = args.maxCalls ?? 3;
+  const attempts: StructuredAttempt[] = [];
+  let budgetIndex = 0;
+  let messages = args.messages;
+  let kind: StructuredAttempt["kind"] = "initial";
+  let repaired = false;
+  let lastStopReason: string | null = null;
+  while (attempts.length < maxCalls) {
+    const maxTokens = args.budgets[budgetIndex];
+    const res = await args.call(maxTokens, messages);
+    lastStopReason = res.stopReason;
+    const cut = res.stopReason === "max_tokens";
+    const check = cut ? null : res.input == null ? null : args.validate(res.input);
+    if (check?.ok) {
+      const a: StructuredAttempt = { n: attempts.length + 1, kind, maxTokens, stopReason: res.stopReason, reason: null, head: "", tail: "" };
+      attempts.push(a);
+      args.onAttempt?.(a);
+      return { value: check.value, attempts, lastStopReason };
+    }
+    const reason = cut ? `output cut at max_tokens=${maxTokens}` : check ? check.reason : "no tool call in the response";
+    const a: StructuredAttempt = {
+      n: attempts.length + 1,
+      kind,
+      maxTokens,
+      stopReason: res.stopReason,
+      reason,
+      head: res.raw.slice(0, EXCERPT),
+      tail: res.raw.length > EXCERPT ? res.raw.slice(-EXCERPT) : "",
+    };
+    attempts.push(a);
+    args.onAttempt?.(a);
+    if (cut) {
+      if (budgetIndex + 1 >= args.budgets.length) break;
+      budgetIndex += 1;
+      kind = "budget";
+      continue;
+    }
+    if (repaired) break;
+    repaired = true;
+    kind = "repair";
+    messages = [
+      ...args.messages,
+      { role: "assistant", content: res.raw || "(empty response)" },
+      { role: "user", content: args.repairPrompt(reason) },
+    ];
+  }
+  return { value: null, attempts, lastStopReason };
 }
 
 // What the mock was last handed. Offline tests use it to assert on the prompt a
@@ -241,6 +374,21 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     });
   }
 
+  // Test file authoring: one body per request, shaped by the runner named in it.
+  // Sits ahead of "test planning" because its system prompt quotes the diff.
+  if (system?.includes("test file authoring")) {
+    const path = /^- path: (.+)$/m.exec(last)?.[1]?.trim() ?? ".devasign/tests/generated.test.ts";
+    const runner = /^- runner: (.+)$/m.exec(last)?.[1]?.trim();
+    const crits = [...last.matchAll(/^  - \[([^\]]+)\] (.+)$/gm)].map((m) => ({ id: m[1], text: m[2] }));
+    const ids = crits.map((c) => c.id).join(", ");
+    const title = (crits[0]?.text ?? "generated").replace(/"/g, "'");
+    const content =
+      runner === "playwright"
+        ? `import { test, expect } from "@playwright/test";\n// DevAsign generated test — criterion ${ids}\ntest("${title}", async ({ page }) => {\n  await page.goto("/");\n  await expect(page.getByRole("main")).toBeVisible();\n});\n`
+        : `import { test } from "node:test";\nimport assert from "node:assert/strict";\n// DevAsign generated test — criterion ${ids}\ntest("${title}", () => {\n  assert.equal(1 + 1, 2);\n});\n`;
+    return JSON.stringify({ path, content });
+  }
+
   // Test planner: one generated test per criterion (Playwright for `ui`), citing
   // the first listed existing test for the first criterion when the prompt lists
   // any. Honors the prompt's per-criterion "max level" lines.
@@ -260,15 +408,15 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
       if (c.kind === "ui" && maxLevel.get(c.id) === "e2e") {
         tests.push({
           path: `.devasign/tests/e2e/criterion-${c.id}.spec.ts`,
-          content: `import { test, expect } from "@playwright/test";\n// DevAsign generated test — criterion ${c.id}\ntest("${c.text.replace(/"/g, "'")}", async ({ page }) => {\n  await page.goto("/");\n  await expect(page.getByRole("main")).toBeVisible();\n});\n`,
           criterionIds: [c.id], level: "e2e", levelReason: "[mock] observable only in the rendered UI", origin: "generated", runner: "playwright", targetFiles: ["src/app.tsx"],
+          strategy: "[mock] open the app and assert the main region renders",
         });
         continue;
       }
       tests.push({
         path: `.devasign/tests/criterion-${c.id}.test.ts`,
-        content: `import { test } from "node:test";\nimport assert from "node:assert/strict";\n// DevAsign generated test — criterion ${c.id}\ntest("${c.text.replace(/"/g, "'")}", () => {\n  assert.equal(1 + 1, 2);\n});\n`,
         criterionIds: [c.id], level: "unit", levelReason: "[mock] the behaviour is a pure function of its inputs", origin: "generated", runner: "node-test", targetFiles: ["src/handler.ts"],
+        strategy: "[mock] call the handler and assert its return value",
       });
     }
     return JSON.stringify({ tests, unverifiable: crits.filter((c) => c.kind === "unverifiable").map((c) => ({ criterionId: c.id, reason: "[mock] not checkable in CI" })) });

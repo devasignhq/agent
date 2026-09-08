@@ -1,6 +1,8 @@
 {
   "planId": "plan-fixture",
   "criteriaRevision": 1,
+  "unverifiable": [],
+  "failOn": "never",
   "criteria": [
     { "id": "1", "text": "The total is formatted as US currency", "kind": "code" },
     { "id": "2", "text": "The refunds line is visible on the revenue page", "kind": "ui" },

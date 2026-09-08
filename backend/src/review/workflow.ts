@@ -82,7 +82,7 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
   const vf = (o.verify || {}) as Record<string, any>;
   const verify: NonNullable<RepoWorkflow["verify"]> = {
     e2e: vf.e2e === "always" || vf.e2e === "never" ? vf.e2e : "auto",
-    failOn: vf.failOn === "verdict" ? "verdict" : "never",
+    failOn: vf.failOn === "verdict" || vf.failOn === "unverifiable" ? vf.failOn : "never",
   };
   return {
     version: 1,

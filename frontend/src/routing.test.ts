@@ -125,3 +125,9 @@ test("the matcher is case-insensitive", () => {
   assert.equal(match("/AGENT").path, "/agent");
   assert.equal(match("/Security/Gate").path, "/security/gate");
 });
+
+test("the workflow route accepts the repo preselection query the fix link uses", () => {
+  const m = match("/workflow?repo=abc");
+  assert.equal(m.path, "/workflow");
+  assert.equal(new URL("http://x/workflow?repo=abc").searchParams.get("repo"), "abc");
+});

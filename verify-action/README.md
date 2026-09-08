@@ -32,13 +32,15 @@ How it behaves:
 - Every Playwright test is recorded (video + trace + screenshot) under a generated config that extends yours.
 - A failing generated test is retried twice; a test that passes on retry is reported as flaky, never as a failure.
 - A repository with no test framework still works: the runner brings its own.
-- The step exits 0 regardless of the verdict — the `DevAsign · Verify` check run carries it. Set `fail-on: verdict` to fail the job on a failed criterion.
-- Set `verify.start` / `verify.url` in `.devasign.yml` so end-to-end tests can boot your app; without them, UI criteria are reported as unverifiable, not failed.
+- The step exits 0 regardless of the verdict — the `DevAsign · Verify` check run carries it. Set `fail-on: verdict` to fail the job on a failed criterion, or `fail-on: unverifiable` to also fail when a criterion could not be verified.
+- Every criterion the plan could not cover is announced as a workflow warning with its reason, and the step summary lists all criteria with their test or the reason none ran.
+- Set `verify.start` / `verify.url` in `.devasign.yml` so end-to-end tests can boot your app; without them, UI criteria are checked at component level where possible and otherwise reported as unverifiable, not failed.
+- Outputs: `run-id`, `outcome`, and `browsers` (`true` when Playwright browsers were installed, which is when the browser cache is saved).
 
 | Input | Default | Meaning |
 |---|---|---|
 | `api-url` | `https://devasign-agent.onrender.com` | DevAsign API origin |
-| `fail-on` | `never` | `verdict` fails the job on a failed criterion |
+| `fail-on` | repo setting (`never`) | `verdict` fails the job on a failed criterion; `unverifiable` also fails when a criterion could not be verified |
 | `version` | `1` | `@devasign/verify` version range |
 | `working-directory` | `.` | checkout directory to verify |
 | `resolve-timeout` | CLI default | seconds to wait for a test plan; DevAsign may shorten this and re-run the workflow once the plan is ready |

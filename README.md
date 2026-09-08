@@ -161,7 +161,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: devasignhq/verify-action@v1
         # with:
-        #   fail-on: verdict   # opt in to blocking; default never fails the job
+        #   fail-on: verdict   # opt in to blocking (or `unverifiable`); default never fails the job
 ```
 
 or run the CLI directly with `npx @devasign/verify run`. Either way the runner
@@ -184,7 +184,12 @@ How a run works:
 Deliberate properties:
 
 - **Not a merge gate.** The Action's `fail-on` defaults to `never`, so
-  verification reports evidence without blocking your merges until you opt in.
+  verification reports evidence without blocking your merges until you opt in
+  with `verdict` (fail on a failed criterion) or `unverifiable` (also fail when
+  a criterion could not be verified).
+- **Nothing is silent.** A criterion no test could cover is announced as a CI
+  warning with its reason and a fix link; the step summary lists every
+  criterion, not just the tests that ran.
 - **Flakes aren't failures.** A failing generated test is retried twice;
   pass-after-retry is recorded as `flaky`, never `fail`. Your own tests are
   never retried.

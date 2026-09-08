@@ -145,3 +145,32 @@ test("a run with no verdicts never displaces a judged run for the same commit", 
     db.remove("verifyRuns", (r) => r.reviewId === reviewId);
   }
 });
+
+test("completed: an unverifiable row keeps the planner's reason and renders its fix link in the comment and check run", () => {
+  const plan = { id: "p", schemaVersion: 1, runId: "run1", repoId: "repo", criteriaRevision: 1, commands: [], tests: [], createdAt: 0, unverifiable: [
+    { criterionId: "1", reason: "no app start / login configured", fixUrl: "https://app/workflow?repo=repo" },
+    { criterionId: "2", reason: "the test plan was cut off before this criterion was covered" },
+  ] } as any;
+  // No verdict rows at all: the terminal branch used to say "no test ran for this criterion".
+  const bare = buildVerificationView({ run: baseRun({ status: "completed", timings: { forkedAt: 1, resolvedAt: 2 } }), review, repo, criteria, plan, results: [], artifacts: [] });
+  assert.equal(bare.rows[0].reason, "no app start / login configured");
+  assert.equal(bare.rows[0].fixUrl, "https://app/workflow?repo=repo");
+  assert.equal(bare.rows[1].reason, "the test plan was cut off before this criterion was covered");
+  assert.equal(bare.rows[1].fixUrl, undefined);
+  // With judged verdicts, the verdict's own link wins and reaches both renderings.
+  const run = baseRun({
+    status: "completed",
+    timings: { forkedAt: 1, resolvedAt: 2 },
+    verdicts: [
+      { criterionId: "1", verdict: "unverifiable", reason: "No app start was configured.", evidenceRefs: [], fixUrl: "https://app/workflow?repo=repo" },
+      { criterionId: "2", verdict: "pass", reason: "the test passed", evidenceRefs: [] },
+    ],
+  });
+  const view = buildVerificationView({ run, review, repo, criteria, plan, results: [], artifacts: [] });
+  const section = formatVerificationSection(view);
+  assert.match(section, /\*\*1\.\*\* Refunds line shows when refunds > 0 — \*\*unverifiable\*\* · No app start was configured\. · \[configure app start\]\(https:\/\/app\/workflow\?repo=repo\)/);
+  assert.doesNotMatch(section, /\*\*2\.\*\*[^\n]*configure app start/);
+  const check = verifyCheckRunPayload(view, "abc");
+  assert.match(check.output.text, /unverifiable — 1\. Refunds line[^\n]*\[configure app start\]\(https:\/\/app\/workflow\?repo=repo\)/);
+  assert.equal(check.conclusion, "neutral");
+});

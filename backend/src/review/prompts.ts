@@ -518,7 +518,7 @@ export function reviewSystemPrompt(): string {
     "criterion verdict against the deep-verification rules: any \"met\" whose evidence merely observes that code " +
     "is present or unchanged must be re-examined.\n" +
     "\n## Output contract\n" +
-    "Emit ONLY JSON: " +
+    "Answer only by calling the `submit_review_verdict` tool; its input is " +
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
     "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string, " +
     "\"evidenceCode\": {\"path\": string, \"startLine\": number, \"language\": string | null, \"code\": string} | null, " +
@@ -1044,17 +1044,18 @@ export function devasignDocsSystemPrompt(): string {
 export function testPlannerSystemPrompt(): string {
   return (
     "You are DevAsign's test planning step. For each acceptance criterion, choose the cheapest test that can prove " +
-    "it, write that test as a complete file, and emit a JSON object: {\"tests\": [{\"path\": string, \"content\": " +
-    "string|null, \"criterionIds\": [string], \"level\": \"unit\"|\"integration\"|\"component\"|\"e2e\", " +
-    "\"levelReason\": string, \"origin\": \"existing\"|\"generated\", \"runner\": \"vitest\"|\"jest\"|\"pytest\"|" +
-    "\"playwright\"|\"go\"|\"node-test\"|\"bundled\", \"targetFiles\": [string]}], \"unverifiable\": " +
-    "[{\"criterionId\": string, \"reason\": string}]}.\n" +
+    "it and submit the plan by calling the `submit_test_plan` tool with {\"tests\": [{\"path\": string, " +
+    "\"criterionIds\": [string], \"level\": \"unit\"|\"integration\"|\"component\"|\"e2e\", \"levelReason\": string, " +
+    "\"origin\": \"existing\"|\"generated\", \"runner\": \"vitest\"|\"jest\"|\"pytest\"|\"playwright\"|\"go\"|" +
+    "\"node-test\"|\"bundled\", \"targetFiles\": [string], \"strategy\": string}], \"unverifiable\": " +
+    "[{\"criterionId\": string, \"reason\": string}]}. Do not write file contents here: a separate step authors " +
+    "each generated file from your `strategy`, one or two sentences on what the file will set up and assert.\n" +
     "\nYour tests run inside the customer's own CI against the PR head and their outcomes become per-criterion " +
     "verdicts, so a test must prove exactly its criterion — from the ticket's intent, independently of how the diff " +
     "chose to implement it — and nothing more.\n" +
     "\n## Existing tests first\n" +
     "When a test file listed under `Existing test files` already proves a criterion, cite it with origin \"existing\" " +
-    "and content null instead of writing a new one. Only cite paths that appear in that list verbatim. That list is " +
+    "instead of writing a new one. Only cite paths that appear in that list verbatim. That list is " +
     "deliberately narrower than the repository: every test file this PR adds or changes is withheld from it, and none " +
     "of them may be cited even though you can see them in the diff. A test written alongside the code it checks " +
     "inherits the same blind spots, so it is part of the change under review, not evidence about it — a criterion " +
@@ -1064,8 +1065,9 @@ export function testPlannerSystemPrompt(): string {
     "integration (a real route or query against the real service container, not a mocked client — a mocked database " +
     "proves the mock was called, not that the SQL is right) → component (a rendered component with its real state) → " +
     "e2e (a browser flow, Playwright). Escalate only when the level below cannot observe the behaviour. Never exceed " +
-    "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says E2E is not allowed — " +
-    "put such a criterion in `unverifiable` with the policy's reason instead. An API-only diff normally gets no e2e; " +
+    "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says browser tests are not " +
+    "available — plan that criterion at component level instead, and only when no component test could decide it " +
+    "put it in `unverifiable` with the policy's reason. An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
     "One exception to `max level`: a criterion capped at component whose behaviour only real geometry can settle — a " +
     "canvas, a drag, a virtualised list, anything a flow library lays out by measuring live elements — may be planned " +
@@ -1077,23 +1079,36 @@ export function testPlannerSystemPrompt(): string {
     "the cheap level cannot see the behaviour is the reason to climb the ladder, not to opt out of it; a headless or " +
     "shimmed DOM being unable to decide something is an argument for the browser, which the policy may already allow. " +
     "Reserve `unverifiable` for criteria no test at any allowed level could decide.\n" +
-    "\n## Generated test rules\n" +
-    "Complete, runnable files in the repo's own conventions and language. `path` is relative to the repository " +
-    "root, and every generated file is relocated under .devasign/tests/ before it runs, whatever the language. " +
-    "For JavaScript and TypeScript, import the code under test with paths relative to the `path` you give and " +
-    "that relocation is re-anchored for you. In every other language import the code under test the way the " +
-    "repo's own suite does, by package or module name, never by a path relative to your file — nothing " +
-    "re-anchors those. Never read files relative to the test's own location — no " +
-    "__dirname, import.meta.url or readFileSync of a fixture; inline any fixture data. " +
-    "Deterministic; no network; seed data isolated per test; one criterion's " +
-    "behaviour per assertion group; the first line is a comment naming the criterion ids it proves. Playwright " +
-    "tests: role/test-id selectors over text, explicit state assertions instead of fixed waits, relative URLs " +
-    "against baseURL, no login unless the setup provides a login strategy. `targetFiles` lists the repo files the " +
-    "test exercises. Honour every `Flake history` instruction: a quarantined signature must be regenerated with a " +
-    "different strategy; a retired one must not be generated at all.\n" +
+    "\n## Generated tests\n" +
+    "`path` is relative to the repository root, and every generated file is relocated under .devasign/tests/ " +
+    "before it runs. `targetFiles` lists the repo files the test exercises. Honour every `Flake history` " +
+    "instruction: a quarantined signature must be regenerated with a different strategy; a retired one must not " +
+    "be generated at all.\n" +
     "\n## Output\n" +
-    "Exactly the JSON object above — no markdown, no commentary, no code fences around the object (file contents " +
-    "are JSON strings). Never use emoji in any text you output."
+    "Only the tool call. Never use emoji in any text you output."
+  );
+}
+
+export function testFileSystemPrompt(): string {
+  return (
+    "You are DevAsign's test file authoring step. You write one complete, runnable test file that proves the " +
+    "acceptance criteria named in the request, in the repo's own conventions and language, and submit it by calling " +
+    "the `submit_test_file` tool with {\"path\": string, \"content\": string}. The plan step already chose the " +
+    "path, runner, level and strategy; your job is the file itself.\n" +
+    "\n## Rules\n" +
+    "The file is relocated under .devasign/tests/ before it runs, whatever the language. For JavaScript and " +
+    "TypeScript, import the code under test with paths relative to the given `path` and that relocation is " +
+    "re-anchored for you. In every other language import the code under test the way the repo's own suite does, " +
+    "by package or module name, never by a path relative to your file — nothing re-anchors those. Never read " +
+    "files relative to the test's own location — no __dirname, import.meta.url or readFileSync of a fixture; " +
+    "inline any fixture data. Deterministic; no network; seed data isolated per test; one criterion's behaviour " +
+    "per assertion group; the first line is a comment naming the criterion ids it proves. Component tests render " +
+    "the component with its real state and assert on the DOM. Playwright tests: role/test-id selectors over text, " +
+    "explicit state assertions instead of fixed waits, relative URLs against baseURL, no login unless the setup " +
+    "provides a login strategy. A request carrying a strategy version above 1 must take a different approach " +
+    "from the flaky version before it.\n" +
+    "\n## Output\n" +
+    "Only the tool call; `content` is the whole file. Never use emoji in any text you output."
   );
 }
 

@@ -122,6 +122,10 @@ export type RunnerPlan = {
   playwright: { record: true; configFrom: string | null; installBrowsers: boolean } | null;
   retries: { generated: number; existing: number };
   uploadLimits: { maxFileBytes: number; maxTotalBytes: number; maxFiles: number };
+  // Criteria no test covers, with the reason and (when a config change fixes it) a link.
+  unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
+  // The repo's configured default for the CLI's --fail-on; the flag overrides it.
+  failOn: "never" | "verdict" | "unverifiable";
 };
 
 export type ResolveEmptyReason =

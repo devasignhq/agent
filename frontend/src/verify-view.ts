@@ -59,6 +59,7 @@ export type CriterionVerification = {
   criterionId: string;
   verdict: "pass" | "fail" | "unverifiable" | "pending";
   reason: string;
+  fixUrl: string | null;
   flaky: boolean;
   retired: boolean;
   test: { id: string; name: string; level: string; origin: "existing" | "generated" } | null;
@@ -96,10 +97,13 @@ export function verificationForCriterion(view: RunView | null, criterionId: stri
   const attemptRecordings = videos.map(toRecording);
   const primary = tests[0] ?? null;
   const terminal = ["completed", "failed", "lost", "timed_out", "skipped"].includes(view.run.status);
+  const planned = view.plan?.unverifiable?.find((u) => u.criterionId === criterionId) ?? null;
+  const verdict = v?.verdict ?? (terminal ? "unverifiable" : "pending");
   return {
     criterionId,
-    verdict: v?.verdict ?? (terminal ? "unverifiable" : "pending"),
-    reason: v?.reason ?? (terminal ? "no verdict recorded" : ""),
+    verdict,
+    reason: v?.reason ?? planned?.reason ?? (terminal ? "no verdict recorded" : ""),
+    fixUrl: verdict === "unverifiable" ? v?.fixUrl ?? planned?.fixUrl ?? null : null,
     flaky: !!v?.flaky,
     retired: !!v?.retired,
     test: primary ? { id: primary.id, name: primary.path, level: primary.level, origin: primary.origin } : null,

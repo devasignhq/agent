@@ -171,3 +171,12 @@ test("a doctor diagnosis only clouds the criteria whose own tests could not run"
   assert.equal(by.get("4")?.verdict, "unverifiable");
   assert.match(by.get("4")!.reason, /setup needs attention/);
 });
+
+test("a planned fix link rides on the no-result verdict and survives the model's reason rewrite", () => {
+  const plan = { unverifiable: [{ criterionId: "1", reason: "no app start / login configured", fixUrl: "https://app/workflow?repo=r" }] } as unknown as VerifyPlan;
+  const code = computeVerdicts({ criteria: [crit("1", "ui")], results: [], plan, doctor: null, artifacts: [] });
+  assert.equal(code[0].fixUrl, "https://app/workflow?repo=r");
+  const merged = mergeModelVerdicts(code, [{ criterionId: "1", verdict: "unverifiable", reason: "No app start was configured, so the pill was never exercised.", evidenceArtifactIds: [] }], []);
+  assert.equal(merged[0].reason, "No app start was configured, so the pill was never exercised.");
+  assert.equal(merged[0].fixUrl, "https://app/workflow?repo=r");
+});

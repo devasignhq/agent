@@ -115,3 +115,26 @@ test("helpers: tones, deep links, durations, flake rate, stale URLs, trace viewe
   assert.deepEqual(rows[0].changes, ["1 criteria synthesized"]);
   assert.deepEqual(rows[1].changes, ['reworded 1: "old" → "new"', "added 5: total formatted as currency"]);
 });
+
+test("verificationForCriterion: a fix link comes from the verdict, else from the plan, and only while unverifiable", () => {
+  const withPlan = view({
+    run: { id: "run1", status: "completed", createdAt: NOW, verdicts: [] } as unknown as RunView["run"],
+    plan: { tests: [], unverifiable: [{ criterionId: "1", reason: "no app start / login configured", fixUrl: "https://app/workflow?repo=r" }] } as unknown as RunView["plan"],
+    results: [],
+    artifacts: [],
+  });
+  const planned = verificationForCriterion(withPlan, "1", NOW)!;
+  assert.equal(planned.verdict, "unverifiable");
+  assert.equal(planned.reason, "no app start / login configured");
+  assert.equal(planned.fixUrl, "https://app/workflow?repo=r");
+
+  const judged = view({
+    run: { id: "run1", status: "completed", createdAt: NOW, verdicts: [{ criterionId: "1", verdict: "unverifiable", reason: "No app start was configured.", evidenceRefs: [], fixUrl: "https://app/workflow?repo=v" }] } as RunView["run"],
+    plan: { tests: [], unverifiable: [{ criterionId: "1", reason: "planned", fixUrl: "https://app/workflow?repo=r" }] } as unknown as RunView["plan"],
+    results: [],
+    artifacts: [],
+  });
+  assert.equal(verificationForCriterion(judged, "1", NOW)!.fixUrl, "https://app/workflow?repo=v");
+
+  assert.equal(verificationForCriterion(view(), "1", NOW)!.fixUrl, null, "a failed criterion carries no fix link");
+});
