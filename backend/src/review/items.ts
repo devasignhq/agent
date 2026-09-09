@@ -6,6 +6,7 @@
 // Pure — no db / network / LLM:
 //   node --import tsx/esm --test src/review/items.test.ts
 import { normalizeSlug } from "../security/fingerprint.js";
+import { sameFinding, type FindingIdentity } from "./identity.js";
 import type { Criterion, EvidenceCode, SecuritySeverity, SuggestedChange } from "../types.js";
 import { splitForComment, type PriorVerdict } from "./criteria-format.js";
 import type { ScoreKind } from "./score.js";
@@ -245,11 +246,44 @@ export function buildReviewItems(args: {
     });
   }
 
-  // Two stages can surface the same bug under different buckets; keyed identity
-  // is what makes that one thread instead of two. First writer wins, which is
-  // the FINDING_BUCKETS order — most severe category first.
+  // Two stages can surface the same bug under different buckets and in different
+  // words. The exact key catches the identical-wording case cheaply; identity.ts
+  // catches the rest. Merging is by CLUSTER, not pairwise against the survivor:
+  // on verify-demo#5 the regression and the nit on line 45 didn't share enough
+  // vocabulary to match each other, but both matched the bug between them.
+  // First member wins, which is the FINDING_BUCKETS order — most severe first.
   const seen = new Set<string>();
-  return items.filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)));
+  const unique = items.filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)));
+  const clusters: ReviewItem[][] = [];
+  const out: ReviewItem[] = [];
+  for (const item of unique) {
+    if (item.category === "criterion") {
+      out.push(item);
+      continue;
+    }
+    const id = identityOf(item);
+    const cluster = clusters.find((c) => c.some((m) => sameFinding(identityOf(m), id)));
+    if (cluster) {
+      cluster.push(item);
+      continue;
+    }
+    clusters.push([item]);
+    out.push(item);
+  }
+  return out;
+}
+
+/** The wording-independent view of an item that identity.ts matches on. */
+export function identityOf(
+  i: Pick<ReviewItem, "path" | "line" | "concern" | "suggestedChange" | "defectClass">
+): FindingIdentity {
+  return {
+    path: i.path,
+    line: i.line,
+    concern: i.concern,
+    original: i.suggestedChange?.original || undefined,
+    defectClass: i.defectClass,
+  };
 }
 
 // Chips on the summary card. Order is display order; a category maps to exactly

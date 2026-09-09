@@ -26,7 +26,8 @@ import {
   parseResolvedMarker,
   type ThreadBodyOpts,
 } from "./comment.js";
-import type { ReviewItem, ReviewItemCategory, ReviewStage } from "./items.js";
+import { identityOf, type ReviewItem, type ReviewItemCategory, type ReviewStage } from "./items.js";
+import { bestMatch, type FindingIdentity } from "./identity.js";
 
 // Lifetime ceiling on threads for one PR, and the per-run write budget. GitHub's
 // secondary limit is ~80 content-creating requests a minute and 500 an hour, and
@@ -122,6 +123,28 @@ export function bodyHash(body: string): string {
   return createHash("sha256").update(body).digest("hex").slice(0, 32);
 }
 
+const MATCH_CONCERN_CAP = 600;
+const MATCH_ORIGINAL_CAP = 300;
+
+// What a thread remembers about its item for wording-independent matching.
+function matchFor(item: ReviewItem): NonNullable<ReviewThread["match"]> {
+  return {
+    concern: item.concern.slice(0, MATCH_CONCERN_CAP),
+    original: item.suggestedChange?.original?.slice(0, MATCH_ORIGINAL_CAP) || undefined,
+    defectClass: item.defectClass,
+  };
+}
+
+function threadIdentity(t: ReviewThread): FindingIdentity {
+  return {
+    path: t.path,
+    line: t.line,
+    concern: t.match?.concern ?? t.title,
+    original: t.match?.original,
+    defectClass: t.match?.defectClass,
+  };
+}
+
 function anchorFor(item: ReviewItem, index: LineIndex): Anchor {
   return resolveAnchor({ path: item.path, line: item.line }, index);
 }
@@ -162,6 +185,30 @@ export function planReconciliation(args: {
   const maxOpen = args.maxOpen ?? MAX_OPEN_THREADS_PER_PR;
 
   const byKey = new Map(items.map((i) => [i.key, i]));
+  // A finding the model re-described has a new key but is the same finding. Pair
+  // orphaned threads with loose items by identity before anything is judged
+  // missing or new, so the thread is edited in place (and takes the new key)
+  // rather than announced fixed while a duplicate opens beside it. Open threads
+  // get first pick; a resolved one pairing means the finding came back. Stage is
+  // deliberately not a gate here — the same bug seen by a different stage this
+  // run is still the same bug. Recovered rows carry only a title and can't match.
+  const threadKeys = new Set(threads.map((t) => t.key));
+  const paired = new Map<string, ReviewItem>();
+  {
+    const loose = items.filter((i) => i.category !== "criterion" && !threadKeys.has(i.key));
+    const claimed = new Set<string>();
+    const orphaned = threads
+      .filter((t) => !byKey.has(t.key) && !t.recovered && t.category !== "criterion")
+      .sort((a, b) => (a.state === b.state ? 0 : a.state === "open" ? -1 : 1));
+    for (const t of orphaned) {
+      const m = bestMatch(threadIdentity(t), loose.filter((i) => !claimed.has(i.key)), identityOf);
+      if (m) {
+        paired.set(t.key, m);
+        claimed.add(m.key);
+      }
+    }
+    for (const k of claimed) threadKeys.add(k); // claimed items are not "new"
+  }
   const ops: ThreadOp[] = [];
   const openForCounting: Array<Pick<ReviewItem, "category" | "state">> = items.map((i) => ({
     category: i.category,
@@ -171,7 +218,7 @@ export function planReconciliation(args: {
 
   // ── Existing threads ────────────────────────────────────────────────────
   for (const thread of threads) {
-    const item = byKey.get(thread.key);
+    const item = byKey.get(thread.key) ?? paired.get(thread.key);
     if (item) {
       const anchor = anchorFor(item, index);
       // A criterion that just flipped to met is a fix, even though its thread
@@ -245,7 +292,7 @@ export function planReconciliation(args: {
   }
 
   // ── New items ───────────────────────────────────────────────────────────
-  const known = new Set(threads.map((t) => t.key));
+  const known = threadKeys;
   const perCategory = new Map<ReviewItemCategory, number>();
   for (const t of threads) {
     if (t.state === "open") perCategory.set(t.category, (perCategory.get(t.category) ?? 0) + 1);
@@ -299,6 +346,7 @@ function threadFrom(
     stage: item.stage,
     itemState: item.state,
     title: item.title,
+    match: matchFor(item),
     path: anchor.kind === "none" ? undefined : anchor.path,
     line: anchor.kind === "line" ? anchor.line : undefined,
     anchor: anchor.kind === "line" ? "line" : "file",
@@ -320,6 +368,18 @@ export type ReconcileResult = {
   aborted: boolean;
 };
 
+export type ThreadClient = {
+  create: typeof createPRReviewComment;
+  update: typeof updatePRReviewComment;
+  get: typeof getPRReviewComment;
+};
+
+const liveClient: ThreadClient = {
+  create: createPRReviewComment,
+  update: updatePRReviewComment,
+  get: getPRReviewComment,
+};
+
 export async function reconcileThreads(args: {
   installationId: number;
   owner: string;
@@ -327,8 +387,11 @@ export async function reconcileThreads(args: {
   prNumber: number;
   headSha: string;
   plan: ReconciliationPlan;
+  // Tests hand in fakes; production uses the GitHub client.
+  client?: ThreadClient;
 }): Promise<ReconcileResult> {
   const { installationId, owner, name, prNumber, headSha, plan } = args;
+  const client = args.client ?? liveClient;
   const out: ReviewThread[] = [];
   let created = 0;
   let updated = 0;
@@ -357,15 +420,17 @@ export async function reconcileThreads(args: {
         if (!op.changed) {
           out.push({
             ...op.thread,
+            key: op.item.key,
             itemState: op.item.state,
             title: op.item.title,
+            match: op.thread.match ?? matchFor(op.item),
             lastSeenSha: headSha,
             missCount: 0,
             updatedAt: Date.now(),
           });
           break;
         }
-        const res = await updatePRReviewComment(
+        const res = await client.update(
           installationId,
           owner,
           name,
@@ -376,9 +441,13 @@ export async function reconcileThreads(args: {
         if (res === "ok") updated++;
         out.push({
           ...op.thread,
+          // A paired re-report brings a new key; the thread takes it so the
+          // next run matches exactly instead of by identity again.
+          key: op.item.key,
           state: "open",
           itemState: op.item.state,
           title: op.item.title,
+          match: matchFor(op.item),
           category: op.item.category,
           severity: op.item.severity,
           stage: op.item.stage,
@@ -397,7 +466,7 @@ export async function reconcileThreads(args: {
         // Read the thread back so the "What this was" block collapses the real
         // detail rather than a reconstruction — the item is gone from this run,
         // so its body exists only on GitHub.
-        const current = await getPRReviewComment(installationId, owner, name, op.thread.commentId);
+        const current = await client.get(installationId, owner, name, op.thread.commentId);
         if (current === "gone") break;
         const body = formatResolvedThreadBody({
           item: { key: op.thread.key, title: op.thread.title, category: op.thread.category },
@@ -405,7 +474,7 @@ export async function reconcileThreads(args: {
           sha: op.sha,
           attribution: op.attribution,
         });
-        const res = await updatePRReviewComment(
+        const res = await client.update(
           installationId,
           owner,
           name,
@@ -432,7 +501,7 @@ export async function reconcileThreads(args: {
           op.anchor.kind === "line"
             ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
             : { kind: "file", path: op.anchor.path };
-        let res = await createPRReviewComment(installationId, owner, name, prNumber, {
+        let res = await client.create(installationId, owner, name, prNumber, {
           body: op.body,
           commitId: headSha,
           anchor,
@@ -441,7 +510,7 @@ export async function reconcileThreads(args: {
         // file level, which is legal for any file still in the PR; never retry
         // the same payload.
         if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
-          res = await createPRReviewComment(installationId, owner, name, prNumber, {
+          res = await client.create(installationId, owner, name, prNumber, {
             body: op.body,
             commitId: headSha,
             anchor: { kind: "file", path: anchor.path },
