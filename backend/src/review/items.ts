@@ -6,6 +6,7 @@
 // Pure — no db / network / LLM:
 //   node --import tsx/esm --test src/review/items.test.ts
 import { normalizeSlug } from "../security/fingerprint.js";
+import { sameFinding, type FindingIdentity } from "./identity.js";
 import type { Criterion, EvidenceCode, SecuritySeverity, SuggestedChange } from "../types.js";
 import { splitForComment, type PriorVerdict } from "./criteria-format.js";
 import type { ScoreKind } from "./score.js";
@@ -72,7 +73,14 @@ const TITLE_CAP = 100;
 
 function clip(text: string, cap = TITLE_CAP): string {
   const t = (text || "").trim().replace(/\s+/g, " ");
-  return t.length <= cap ? t : `${t.slice(0, cap - 1).trimEnd()}…`;
+  if (t.length <= cap) return t;
+  let cut = t.slice(0, cap - 1);
+  // Never end inside an inline code span: an odd number of backticks leaves the
+  // heading's opening backtick unclosed, and GitHub renders it literally (seen
+  // on verify-demo#5, a deferral quoting a long TODO). Back up to before it.
+  const ticks = (cut.match(/`/g) ?? []).length;
+  if (ticks % 2 === 1) cut = cut.slice(0, cut.lastIndexOf("`"));
+  return `${cut.trimEnd()}…`;
 }
 
 // Thread identity. Deliberately NOT findingKey: that normalizes the path too,
@@ -245,11 +253,44 @@ export function buildReviewItems(args: {
     });
   }
 
-  // Two stages can surface the same bug under different buckets; keyed identity
-  // is what makes that one thread instead of two. First writer wins, which is
-  // the FINDING_BUCKETS order — most severe category first.
+  // Two stages can surface the same bug under different buckets and in different
+  // words. The exact key catches the identical-wording case cheaply; identity.ts
+  // catches the rest. Merging is by CLUSTER, not pairwise against the survivor:
+  // on verify-demo#5 the regression and the nit on line 45 didn't share enough
+  // vocabulary to match each other, but both matched the bug between them.
+  // First member wins, which is the FINDING_BUCKETS order — most severe first.
   const seen = new Set<string>();
-  return items.filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)));
+  const unique = items.filter((i) => (seen.has(i.key) ? false : (seen.add(i.key), true)));
+  const clusters: ReviewItem[][] = [];
+  const out: ReviewItem[] = [];
+  for (const item of unique) {
+    if (item.category === "criterion") {
+      out.push(item);
+      continue;
+    }
+    const id = identityOf(item);
+    const cluster = clusters.find((c) => c.some((m) => sameFinding(identityOf(m), id)));
+    if (cluster) {
+      cluster.push(item);
+      continue;
+    }
+    clusters.push([item]);
+    out.push(item);
+  }
+  return out;
+}
+
+/** The wording-independent view of an item that identity.ts matches on. */
+export function identityOf(
+  i: Pick<ReviewItem, "path" | "line" | "concern" | "suggestedChange" | "defectClass">
+): FindingIdentity {
+  return {
+    path: i.path,
+    line: i.line,
+    concern: i.concern,
+    original: i.suggestedChange?.original || undefined,
+    defectClass: i.defectClass,
+  };
 }
 
 // Chips on the summary card. Order is display order; a category maps to exactly

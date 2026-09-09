@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { commentableLines } from "./anchor.js";
 import { formatThreadBody } from "./comment.js";
 import { buildReviewItems, type ReviewItem, type ReviewStage } from "./items.js";
-import { bodyHash, planReconciliation, type ThreadOp } from "./threads.js";
+import { bodyHash, planReconciliation, reconcileThreads, type ThreadClient, type ThreadOp } from "./threads.js";
 import { EMPTY_HOLISTIC, type HolisticFinding } from "./verdict-types.js";
 import type { PriorVerdict } from "./criteria-format.js";
 import type { Criterion, ReviewThread } from "../types.js";
@@ -229,9 +229,12 @@ test("a criterion already met last run is not counted as newly fixed again", () 
 // ─── the running-count contract the card depends on ────────────────────────
 
 test("fix two bugs and introduce one: the open set is 1 and the fixed count is 2", () => {
-  const a = defectItems({ path: "src/a.ts", concern: "first bug" })[0];
-  const b = defectItems({ path: "src/a.ts", concern: "second bug" })[0];
-  const c = defectItems({ path: "src/a.ts", concern: "third bug, freshly introduced" })[0];
+  // Three genuinely different findings. Identity is by evidence, not key, so
+  // terse fixtures like "first bug" / "third bug" would read as one finding —
+  // real concerns don't share their vocabulary like that.
+  const a = defectItems({ path: "src/a.ts", concern: "Missing await on flush() — the handler returns before the write lands." })[0];
+  const b = defectItems({ path: "src/a.ts", concern: "The retry loop never backs off, so a failing provider is hammered." })[0];
+  const c = defectItems({ path: "src/a.ts", concern: "Null check on items is inverted, returning the empty payload for a populated list." })[0];
   const p = plan({ items: [c], threads: [threadFor(a, { commentId: 1 }), threadFor(b, { commentId: 2 })] });
   assert.equal(p.fixedCount, 2);
   assert.equal(opsOf(p.ops, "resolve").length, 2);
@@ -332,4 +335,105 @@ test("a finding far outside every hunk still lands, at file level", () => {
   const p = plan({ items: [item] });
   const create = opsOf(p.ops, "create")[0] as Extract<ThreadOp, { op: "create" }>;
   assert.deepEqual(create.anchor, { kind: "file", path: "src/a.ts" });
+});
+
+// ─── identity across runs: a reworded finding is the same finding ──────────
+
+
+const DEFERRAL_RUN1 =
+  "Incidental: The added comment `// TODO: honour the pagination params from the ticket (page, pageSize) before shipping.` admits that pagination params (page, pageSize) from the ticket are not yet honoured. This work is deferred, but the PR description explicitly discloses pagination as a follow-up.";
+const DEFERRAL_RUN2 =
+  'Incidental: Undercuts PR description\'s pagination follow-up note (explicitly disclosed, not part of the three acceptance criteria). Verbatim admission: "// TODO: honour the pagination params from the ticket (page, pageSize) before shipping." The pagination params (page, pageSize) are not honoured.';
+
+const deferralItems = (concern: string) =>
+  items({ holistic: { ...EMPTY_HOLISTIC, deferrals: [finding({ line: 11, concern, severity: "warn" })] } });
+
+test("a reworded re-report updates its thread and takes the new key — no phantom fix, no duplicate", () => {
+  // Exactly what happened on verify-demo#5: the model re-described the same TODO
+  // on the next push, the key changed, and the old thread was announced fixed
+  // while a new one opened beside it.
+  const [before] = deferralItems(DEFERRAL_RUN1);
+  const [after] = deferralItems(DEFERRAL_RUN2);
+  assert.notEqual(before.key, after.key, "the wording-derived keys really do differ");
+  const p = plan({ items: [after], threads: [threadFor(before, { match: { concern: before.concern } })] });
+  assert.equal(opsOf(p.ops, "resolve").length, 0, "not a fix");
+  assert.equal(opsOf(p.ops, "create").length, 0, "not a new finding");
+  assert.equal(p.fixedCount, 0);
+  const update = opsOf(p.ops, "update")[0] as Extract<ThreadOp, { op: "update" }>;
+  assert.equal(update.item.key, after.key);
+  assert.equal(update.changed, true, "the new wording is written to the existing thread");
+});
+
+test("rows written before matching existed fall back to the title and still pair", () => {
+  const [before] = deferralItems(DEFERRAL_RUN1);
+  const [after] = deferralItems(DEFERRAL_RUN2);
+  // A legacy row as prod actually holds them: no `match`, and a title clipped the
+  // old way — a flat 99 characters, which keeps most of the concern's vocabulary.
+  // (The current clip stops before an inline code span, which would starve a
+  // title-only fallback; new rows always carry `match`, so that never happens.)
+  const legacy = threadFor(before, { title: `${before.concern.slice(0, 99)}…` });
+  delete (legacy as any).match;
+  const p = plan({ items: [after], threads: [legacy] });
+  assert.equal(opsOf(p.ops, "update").length, 1);
+  assert.equal(opsOf(p.ops, "resolve").length, 0);
+});
+
+test("a finding that comes back reworded after being marked fixed reopens its own thread", () => {
+  const [before] = deferralItems(DEFERRAL_RUN1);
+  const [after] = deferralItems(DEFERRAL_RUN2);
+  const resolved = threadFor(before, { state: "resolved", resolvedAtSha: SHA_OLD, match: { concern: before.concern } });
+  const p = plan({ items: [after], threads: [resolved] });
+  assert.equal(opsOf(p.ops, "create").length, 0);
+  const update = opsOf(p.ops, "update")[0] as Extract<ThreadOp, { op: "update" }>;
+  assert.match(update.body, /\*\*Reopened\*\*/);
+});
+
+test("an open thread gets first pick over a resolved one for the same re-report", () => {
+  const [before] = deferralItems(DEFERRAL_RUN1);
+  const [after] = deferralItems(DEFERRAL_RUN2);
+  const open = threadFor(before, { commentId: 1, match: { concern: before.concern } });
+  const done = threadFor(before, { commentId: 2, key: before.key + "-old", state: "resolved", match: { concern: before.concern } });
+  const p = plan({ items: [after], threads: [done, open] });
+  const updates = opsOf(p.ops, "update") as Extract<ThreadOp, { op: "update" }>[];
+  assert.equal(updates.length, 1);
+  assert.equal(updates[0].thread.commentId, 1);
+  assert.equal(opsOf(p.ops, "carry").length, 1, "the resolved twin is left alone");
+});
+
+test("a genuinely different finding on the same line still opens its own thread", () => {
+  const [bug] = defectItems({ line: 45, concern: "The catch block rethrows, so a failed audit write fails the whole list request." });
+  const [other] = defectItems({ line: 45, concern: "The warning message interpolates the raw error object, which prints [object Object] in the structured logger." });
+  const p = plan({ items: [other], threads: [threadFor(bug, { match: { concern: bug.concern } })] });
+  assert.equal(opsOf(p.ops, "create").length, 1);
+  assert.equal(opsOf(p.ops, "resolve").length, 1, "the bug really is gone this run");
+});
+
+test("applying a paired update migrates the stored key and match, so the next run matches exactly", async () => {
+  const [before] = deferralItems(DEFERRAL_RUN1);
+  const [after] = deferralItems(DEFERRAL_RUN2);
+  const p = plan({ items: [after], threads: [threadFor(before, { match: { concern: before.concern } })] });
+  const calls: string[] = [];
+  const client: ThreadClient = {
+    create: async () => ({ id: 999 }),
+    update: async (_i, _o, _n, id, body) => {
+      calls.push(`update#${id}:${body.split("\n")[1]}`);
+      return "ok";
+    },
+    get: async () => "",
+  };
+  const result = await reconcileThreads({
+    installationId: 1, owner: "o", name: "n", prNumber: 1, headSha: SHA_NEW, plan: p, client,
+  });
+  assert.equal(result.updated, 1);
+  assert.equal(result.created, 0);
+  assert.equal(result.threads.length, 1);
+  assert.equal(result.threads[0].key, after.key, "the thread now carries the new key");
+  assert.equal(result.threads[0].match?.concern, after.concern);
+  assert.equal(result.threads[0].commentId, 500, "same GitHub comment");
+  assert.match(calls[0], /^update#500:### 🚧 Deferred work/);
+
+  // And a third run with the run-2 wording is now an exact-key match: no pairing needed.
+  const again = plan({ items: [after], threads: result.threads });
+  const update = opsOf(again.ops, "update")[0] as Extract<ThreadOp, { op: "update" }>;
+  assert.equal(update.changed, false, "identical body — no API call");
 });

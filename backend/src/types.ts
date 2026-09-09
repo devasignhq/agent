@@ -614,6 +614,11 @@ export type ReviewThread = {
   // The item's title when we last wrote the thread, so the "Fixed" banner can
   // name the finding without re-deriving it from the key's normalized slug.
   title: string;
+  // What the item said, so a re-report of the same finding in different words
+  // is matched to this thread instead of read as a fix plus a new finding
+  // (review/identity.ts). Optional: rows written before matching existed fall
+  // back to `title`, which is the concern clipped to a heading.
+  match?: { concern: string; original?: string; defectClass?: string };
   category: ReviewItemCategory;
   severity: "blocker" | "warn" | "nit";
   // Which pass produced the item. A thread whose stage did not run this time is

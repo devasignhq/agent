@@ -243,3 +243,75 @@ test("chip counts cover every open category and exclude met criteria", () => {
     open
   );
 });
+
+// ─── identity by evidence, not wording ─────────────────────────────────────
+
+const LINE45 = {
+  regression:
+    "The catch block previously swallowed audit-write failures (logged a warning and continued to return the list). The diff adds `throw err;` inside the catch, so any failure of `store.put(\"audit\", ...)` now propagates out of `listHandler`, converting a previously non-fatal audit side-effect into a hard failure of the entire list operation.",
+  bug: "The catch block now logs the audit-write failure and then rethrows it with `throw err;`. This propagates the audit failure out of listHandler, causing the entire list request to fail whenever the audit `store.put` throws, even though the audit write is a non-essential side effect.",
+  nit: "This `throw err;` re-propagates the audit-write failure out of `listHandler`, so a failed audit write makes the entire list request fail. Remove the throw so the handler still returns its successful response after logging.",
+};
+
+test("the same bug described by three stages collapses to one item, keeping the most severe category", () => {
+  // As seen on verify-demo#5 after the fix push: holistic called it a regression,
+  // the defect pass a bug, the review pass left a note — one rethrow, three threads.
+  const items = build({
+    holistic: {
+      ...EMPTY_HOLISTIC,
+      regressions: [finding({ line: 45, concern: LINE45.regression })],
+      defects: [finding({ line: 45, concern: LINE45.bug, defectClass: "error-handling" })],
+    },
+    lineNotes: [{ path: "src/a.ts", line: 45, body: LINE45.nit }],
+  });
+  assert.equal(items.length, 1);
+  assert.equal(items[0].category, "regression");
+});
+
+test("merging clusters transitively: a nit that only matches the bug still joins the regression's cluster", () => {
+  // The nit and the regression don't share enough words to match each other
+  // directly; pairwise-against-the-survivor would have kept two threads.
+  const items = build({
+    holistic: {
+      ...EMPTY_HOLISTIC,
+      regressions: [finding({ line: 45, concern: LINE45.regression })],
+      defects: [finding({ line: 45, concern: LINE45.bug })],
+    },
+    lineNotes: [{ path: "src/a.ts", line: 45, body: LINE45.nit }],
+  });
+  assert.equal(items.length, 1);
+});
+
+test("distinct concerns on the same line stay distinct items", () => {
+  const items = build({
+    holistic: {
+      ...EMPTY_HOLISTIC,
+      defects: [
+        finding({ line: 45, concern: LINE45.bug }),
+        finding({ line: 45, concern: "The warning message interpolates the raw error object, which prints [object Object] in the structured logger." }),
+      ],
+    },
+  });
+  assert.equal(items.length, 2);
+});
+
+test("identity merging never touches criteria", () => {
+  const items = build({
+    criteria: [
+      crit({ id: "1", text: "Audit writes carry a source field." }),
+      crit({ id: "2", text: "Audit writes carry a source field and a timestamp." }),
+    ],
+  });
+  assert.equal(items.length, 2);
+});
+
+test("a title is never clipped inside an inline code span", () => {
+  const concern =
+    "Incidental: The added comment `// TODO: honour the pagination params from the ticket (page, pageSize) before shipping.` admits the work is deferred.";
+  const items = build({ holistic: { ...EMPTY_HOLISTIC, deferrals: [finding({ concern, severity: "warn" })] } });
+  const title = items[0].title;
+  assert.ok(title.length <= 100);
+  assert.match(title, /…$/);
+  assert.equal((title.match(/`/g) ?? []).length % 2, 0, `unbalanced backtick in: ${title}`);
+  assert.equal(title, "Incidental: The added comment…");
+});
