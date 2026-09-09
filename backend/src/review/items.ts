@@ -73,7 +73,14 @@ const TITLE_CAP = 100;
 
 function clip(text: string, cap = TITLE_CAP): string {
   const t = (text || "").trim().replace(/\s+/g, " ");
-  return t.length <= cap ? t : `${t.slice(0, cap - 1).trimEnd()}…`;
+  if (t.length <= cap) return t;
+  let cut = t.slice(0, cap - 1);
+  // Never end inside an inline code span: an odd number of backticks leaves the
+  // heading's opening backtick unclosed, and GitHub renders it literally (seen
+  // on verify-demo#5, a deferral quoting a long TODO). Back up to before it.
+  const ticks = (cut.match(/`/g) ?? []).length;
+  if (ticks % 2 === 1) cut = cut.slice(0, cut.lastIndexOf("`"));
+  return `${cut.trimEnd()}…`;
 }
 
 // Thread identity. Deliberately NOT findingKey: that normalizes the path too,

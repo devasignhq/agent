@@ -304,3 +304,14 @@ test("identity merging never touches criteria", () => {
   });
   assert.equal(items.length, 2);
 });
+
+test("a title is never clipped inside an inline code span", () => {
+  const concern =
+    "Incidental: The added comment `// TODO: honour the pagination params from the ticket (page, pageSize) before shipping.` admits the work is deferred.";
+  const items = build({ holistic: { ...EMPTY_HOLISTIC, deferrals: [finding({ concern, severity: "warn" })] } });
+  const title = items[0].title;
+  assert.ok(title.length <= 100);
+  assert.match(title, /…$/);
+  assert.equal((title.match(/`/g) ?? []).length % 2, 0, `unbalanced backtick in: ${title}`);
+  assert.equal(title, "Incidental: The added comment…");
+});
