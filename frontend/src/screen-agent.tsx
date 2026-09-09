@@ -29,11 +29,15 @@ import {
   recentFlag,
   verdictBadge,
 } from "./review-status";
+import { matchesReviewTerms, reviewSearchTerms } from "./review-search";
 
 // Backstop cadence for the review queue. The stream is the primary path; this
 // only has to catch a wedged connection, so it matches the notification
 // stream's own fallback rather than the 3s/6s poll it replaced.
 const FALLBACK_REFRESH_MS = 60_000;
+// Matches live-bus.ts DEBOUNCE_MS. Only the network waits; the local filter is
+// instant, so the delay is invisible.
+const SEARCH_DEBOUNCE_MS = 250;
 
 // Per-PR event templates
 const EVENTS_BY_PR = {
@@ -284,21 +288,35 @@ const RepoSelect = ({ value, onChange, options }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // PR queue (left rail)
 // ────────────────────────────────────────────────────────────────────────────
-const PRQueue = ({ pickedId, onPick, reviews = [], workspace = "—", repoFilter, onRepoChange, repoOptions = [] }) => {
-  const active = reviews.filter((p) => p.status === "reviewing").length;
-  const queued = reviews.filter((p) => p.status === "queued").length;
+const PRQueue = ({ pickedId, onPick, reviews = [], repoFilter, onRepoChange, repoOptions = [], query = "", onQueryChange, searchBusy = false }) => {
+  const searching = query.trim() !== "";
   return (
 <div className="pr-queue">
     <div className="pr-queue-head">
-      <div className="flex justify-between items-center">
-        <h3 className="card-title">Review queue</h3>
-        <div className="flex gap-2 items-center">
-          <span className="pill running"><i className="dot pulse"></i> {active} running</span>
+      <h3 className="card-title">Review queue</h3>
+      {onQueryChange && (
+        <div className="prq-search">
+          <Icon name="search" size={13} />
+          <input
+            className="input bare"
+            type="search"
+            placeholder="Search PRs, repos, #number…"
+            aria-label="Search review history"
+            value={query}
+            onChange={(e) => onQueryChange(e.target.value)}
+          />
+          {query !== "" && (
+            <button
+              className="prq-search-x"
+              aria-label="Clear search"
+              title="Clear search"
+              onClick={() => onQueryChange("")}
+            >
+              <Icon name="x" size={11} />
+            </button>
+          )}
         </div>
-      </div>
-      <div className="mute mono" style={{ fontSize: 11, marginTop: 6 }}>
-        {reviews.length} total · {queued} queued · {workspace}
-      </div>
+      )}
       {onRepoChange && (
         <RepoSelect value={repoFilter} onChange={onRepoChange} options={repoOptions} />
       )}
@@ -308,12 +326,17 @@ const PRQueue = ({ pickedId, onPick, reviews = [], workspace = "—", repoFilter
       {reviews.length === 0 && (
         <div style={{ flex: 1, display: "grid", placeItems: "center", padding: 24 }}>
           <div style={{ textAlign: "center", maxWidth: 280 }}>
-            <Icon name="git" size={20} color="var(--fg-mute)" />
+            <Icon name={searching ? "search" : "git"} size={20} color="var(--fg-mute)" />
             <div className="mono" style={{ fontSize: 13, marginTop: 10 }}>
-              No open PRs to review
+              {!searching ? "No open PRs to review" : searchBusy ? "Searching…" : "No matching reviews"}
             </div>
             <div className="mute" style={{ fontSize: 12, marginTop: 6, lineHeight: 1.6 }}>
-              No open PRs found on connected repos. Open a PR on GitHub to start a review.
+              {!searching
+                ? "No open PRs found on connected repos. Open a PR on GitHub to start a review."
+                : searchBusy
+                  ? "Looking through your review history."
+                  /* Sliced so a pasted paragraph can't blow out the 280px column. */
+                  : `Nothing matches “${query.trim().slice(0, 40)}”. Try a PR title, a repo name, or a PR number.`}
             </div>
           </div>
         </div>
@@ -1519,6 +1542,11 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   const [userEvents, setUserEvents] = React.useState({});
   // Repo filter for the queue. "all" → no filter; otherwise the "owner/name" label.
   const [repoFilter, setRepoFilter] = React.useState("all");
+  // Queue search. Deliberately not persisted or URL-synced: it must start empty
+  // so the first auto-select below runs normally.
+  const [queueQuery, setQueueQuery] = React.useState("");
+  const [searchHits, setSearchHits] = React.useState([]); // backend PRReview[] from ?q=
+  const [searchBusy, setSearchBusy] = React.useState(false);
 
   // Live state
   const [repos, setRepos] = React.useState([]);
@@ -1600,6 +1628,23 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     };
   }, [refreshList]);
 
+  // Server-side search over the whole history, behind the instant local filter.
+  // Aborting on cleanup is what makes a superseded response unable to land late.
+  const trimmedQuery = queueQuery.trim();
+  React.useEffect(() => {
+    if (trimmedQuery === "") { setSearchHits([]); setSearchBusy(false); return; }
+    const ctl = new AbortController();
+    setSearchBusy(true);
+    const timer = setTimeout(() => {
+      api.reviews(undefined, { q: trimmedQuery, signal: ctl.signal })
+        .then((rows) => { setSearchHits(rows); setSearchBusy(false); })
+        // No banner: the local filter already covers the loaded queue, so a
+        // search outage degrades to filtering what we have.
+        .catch(() => { if (!ctl.signal.aborted) { setSearchHits([]); setSearchBusy(false); } });
+    }, SEARCH_DEBOUNCE_MS);
+    return () => { clearTimeout(timer); ctl.abort(); };
+  }, [trimmedQuery]);
+
   // Relative labels ("2m ago") used to re-render as a side effect of the poll
   // replacing the array every few seconds. With the poll gone they would freeze,
   // so drive them off a clock instead — same visible granularity, no network.
@@ -1610,10 +1655,20 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     return () => clearInterval(t);
   }, []);
 
+  // Live queue plus any rows only the server's ?q= turned up. Live rows win on
+  // id, so a search can never stale out what the queue refresh just wrote.
+  const knownReviews = React.useMemo(() => {
+    if (searchHits.length === 0) return liveReviews;
+    const seen = new Set(liveReviews.map((r) => r.id));
+    const extra = searchHits.filter((r) => !seen.has(r.id));
+    if (extra.length === 0) return liveReviews;
+    return [...liveReviews, ...extra].sort((a, b) => b.updatedAt - a.updatedAt);
+  }, [liveReviews, searchHits]);
+
   // Is the selected review still in flight? Read from the queue's live list
   // (kept fresh by the queue poll), so it flips to false the moment the review
   // reaches a terminal status — and back to true if a Re-run re-queues it.
-  const pickedLive = liveReviews.some(
+  const pickedLive = knownReviews.some(
     (r) => r.id === pickedId && (r.status === "queued" || r.status === "reviewing")
   );
 
@@ -1657,7 +1712,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   );
 
   // Map live PRReview[] → the queue-card shape the existing PRQueue renders.
-  const mappedReviews = React.useMemo(() => liveReviews.map((r) => {
+  const mappedReviews = React.useMemo(() => knownReviews.map((r) => {
     const repo = repoById[r.repoId];
     const repoLabel = repo ? `${repo.owner}/${repo.name}` : r.repoId.slice(0, 8);
     const blockers = r.criteria.filter((c) => c.met === false).length;
@@ -1689,7 +1744,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     // nowTick is a dependency purely so the RELATIVE() labels above re-evaluate
     // on the clock. It replaces the identity churn the old 3-6s poll produced as
     // a side effect — same effect at 60s instead, and without a request.
-  }), [liveReviews, repoById, nowTick]);
+  }), [knownReviews, repoById, nowTick]);
 
   // All connected repos, each with its PR count in the queue. Sourced from
   // /api/repositories so repos with zero open PRs still appear in the filter.
@@ -1716,11 +1771,12 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     }
   }, [repoFilter, repoOptions]);
 
-  const filteredReviews = React.useMemo(() => (
-    repoFilter === "all"
-      ? mappedReviews
-      : mappedReviews.filter((r) => r.repo === repoFilter)
-  ), [mappedReviews, repoFilter]);
+  // Hoisted so the split/lowercase runs once per keystroke, not once per row.
+  const searchTerms = React.useMemo(() => reviewSearchTerms(queueQuery), [queueQuery]);
+  const filteredReviews = React.useMemo(() => mappedReviews.filter((r) =>
+    (repoFilter === "all" || r.repo === repoFilter) &&
+    matchesReviewTerms({ title: r.title, repo: r.repo, prNumber: r.uiId }, searchTerms)
+  ), [mappedReviews, repoFilter, searchTerms]);
 
   // Keep the selection in sync with the visible (filtered) queue. This is the
   // only writer of pickedId-from-the-list: it auto-selects the first visible
@@ -1736,10 +1792,13 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
   // self-trigger when the filtered queue is already empty.
   React.useEffect(() => {
     if (routeReviewId) return; // the URL owns the selection
+    // A search shrinks the list on every keystroke; re-selecting its head each
+    // time would fire a review/verify/revisions fetch per character.
+    if (trimmedQuery !== "") return;
     if (pickedId && filteredReviews.some((r) => r.id === pickedId)) return;
     const next = filteredReviews[0]?.id ?? null;
     if (next !== pickedId) setPickedId(next);
-  }, [filteredReviews, pickedId, routeReviewId]);
+  }, [filteredReviews, pickedId, routeReviewId, trimmedQuery]);
 
   // Verification (verdicts, evidence, signed URLs) for the picked review. Fresh
   // URLs on every fetch; refetched on the live "verify" signal and when a
@@ -2011,10 +2070,12 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           pickedId={pickedId}
           onPick={handlePick}
           reviews={filteredReviews}
-          workspace={repos[0] ? repos[0].owner : "no repos yet"}
           repoFilter={repoFilter}
           onRepoChange={setRepoFilter}
           repoOptions={repoOptions}
+          query={queueQuery}
+          onQueryChange={setQueueQuery}
+          searchBusy={searchBusy}
         />
 
         <div className="agent-pane">

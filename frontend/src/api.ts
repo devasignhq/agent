@@ -12,6 +12,8 @@
 // required instead, and validated at build time in vite.config.ts, because Vite
 // INLINES it into the bundle: once built, it cannot be corrected at runtime.
 
+import { reviewsQuery } from "./review-search.ts";
+
 const RAW_API_BASE = (import.meta as any).env?.VITE_API_BASE as string | undefined;
 
 if ((import.meta as any).env?.PROD && !RAW_API_BASE) {
@@ -902,8 +904,11 @@ export const api = {
     ),
 
   // reviews
-  reviews: (status?: PRReviewStatus) =>
-    request<PRReview[]>(`/api/reviews${status ? `?status=${status}` : ""}`),
+  reviews: (status?: PRReviewStatus, opts?: { q?: string; signal?: AbortSignal }) =>
+    request<PRReview[]>(
+      `/api/reviews${reviewsQuery({ status, q: opts?.q })}`,
+      opts?.signal ? { signal: opts.signal } : {}
+    ),
   review: (id: string) =>
     request<{ review: PRReview; logs: ReviewLogEntry[]; task: Task | null }>(
       `/api/reviews/${id}`
