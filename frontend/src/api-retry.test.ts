@@ -130,3 +130,13 @@ test("an aborted request is NOT retried and propagates untouched", async () => {
     restore();
   }
 });
+
+test("a search query reaches the wire percent-encoded, not interpolated", async () => {
+  const { calls, restore } = scriptFetch([json([])]);
+  try {
+    await api.reviews(undefined, { q: "acme #48" });
+    assert.match(calls[0].url, /\/api\/reviews\?q=acme\+%2348$/);
+  } finally {
+    restore();
+  }
+});

@@ -36,6 +36,7 @@ import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMI
 import { shouldAutoReviewOpenedPR } from "../review/eligibility.js";
 import { acceptsMaintainerFeedback } from "../review/decisions.js";
 import { needsPrStateBackfill, reconcilePrState } from "../review/pr-state.js";
+import { REVIEW_SEARCH_LIMIT, reviewMatchesTerms, reviewSearchTerms } from "../review/search.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -1200,10 +1201,15 @@ api.get("/repositories/:id/actions/workflows", async (req, res) => {
 
 // --- PR Reviews (the agent's queue) ---
 
-api.get("/reviews", (req, res) => {
+// Exported so the auth, plan and ?q= scoping are covered directly in
+// review-list-search.test.ts.
+export function listReviewsHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const status = req.query.status as string | undefined;
+  // qs yields an array for ?q=a&q=b and an object for ?q[x]=1; either would
+  // throw in reviewSearchTerms, so anything non-string is no query at all.
+  const terms = reviewSearchTerms(typeof req.query.q === "string" ? req.query.q : "");
   const installs = installationsForUser(user.id);
   // Plan-based visibility: free (and lapsed) users only see public-repo reviews;
   // paid plans see public + private. Same private-repo entitlement as the review
@@ -1216,9 +1222,18 @@ api.get("/reviews", (req, res) => {
   const repoIds = new Set(repos.map((r) => r.id));
   let reviews = db.filter("prReviews", (r) => repoIds.has(r.repoId));
   if (status) reviews = reviews.filter((r) => r.status === status);
+  if (terms.length > 0) {
+    // prReviews carries repoId, not a full name — the owner/name match needs the
+    // already plan-scoped repos above, so ?q= can't route around the gate.
+    const labels = new Map(repos.map((r) => [r.id, `${r.owner}/${r.name}`]));
+    reviews = reviews.filter((r) => reviewMatchesTerms(r, labels.get(r.repoId) ?? "", terms));
+  }
   reviews.sort((a, b) => b.updatedAt - a.updatedAt);
-  res.json(reviews);
-});
+  // Only the search path is capped; the plain list is what the queue renders and
+  // stays uncapped exactly as before.
+  res.json(terms.length > 0 ? reviews.slice(0, REVIEW_SEARCH_LIMIT) : reviews);
+}
+api.get("/reviews", listReviewsHandler);
 
 // Owner-scoped: 401 if signed out, 404 if the id is unknown, 403 if the review
 // exists but its repo isn't under one of this user's installs. Exported so the

@@ -920,6 +920,26 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   padding: 12px 14px;
   border-bottom: 1px solid var(--line);
 }
+/* Queue search. Same shell as .vln-search but without its 240px minimum — the
+   rail is a fixed 300px column, so it flexes from 0 instead. */
+.prq-search {
+  display: flex; align-items: center; gap: 7px; padding: 0 9px; height: 28px;
+  margin-top: 10px; min-width: 0;
+  border: 1px solid var(--line); background: var(--bg);
+}
+.prq-search:focus-within { border-color: var(--line-2); }
+.prq-search > svg { color: var(--fg-mute); flex-shrink: 0; }
+.prq-search .input.bare {
+  height: 100%; font-family: var(--mono); font-size: 11.5px; min-width: 0; flex: 1;
+}
+/* Kill the browser's own clear affordance — we draw our own. */
+.prq-search .input.bare::-webkit-search-cancel-button { display: none; }
+.prq-search-x {
+  display: inline-flex; align-items: center; justify-content: center;
+  border: none; background: transparent; color: var(--fg-faint);
+  padding: 0; cursor: pointer; flex-shrink: 0;
+}
+.prq-search-x:hover { color: var(--fg-dim); }
 .pr-queue-list {
   flex: 1;
   overflow-y: auto;
