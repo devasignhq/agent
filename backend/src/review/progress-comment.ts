@@ -51,6 +51,8 @@ export function verdictCommentBody(args: {
         : "## DevAsign review — all acceptance criteria met"
       : status === "changes_requested"
       ? "## DevAsign review — changes requested"
+      : status === "blocked"
+      ? "## DevAsign review — blocked"
       : "## DevAsign review — complete";
 
   return [headline, "", reviewBody].join("\n").trim();

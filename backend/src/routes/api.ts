@@ -34,6 +34,8 @@ import { cancelScheduledChange, changePlan, createCheckoutSession, createPortalS
 import { defaultDeletionDeps, purgeAccount, type DeletionDeps } from "../account.js";
 import { chargeForNewPRReview, effectivePlan, intervalOf, planForUser, PLAN_LIMITS, type Interval } from "../billing/plans.js";
 import { shouldAutoReviewOpenedPR } from "../review/eligibility.js";
+import { acceptsMaintainerFeedback } from "../review/decisions.js";
+import { needsPrStateBackfill, reconcilePrState } from "../review/pr-state.js";
 import {
   markAllRead,
   notificationsForUser,
@@ -482,14 +484,14 @@ api.get("/repositories", (req, res) => {
   const installIds = new Set(installs.map((i) => i.id));
   const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
   // Attach per-repo review counts for the Workflow rail cards. One pass over the
-  // user's reviews: approved = "passed", blocked = "changes_requested".
+  // user's reviews: approved = "passed"; blocked counts "changes_requested" + "blocked".
   const repoIds = new Set(repos.map((r) => r.id));
   const stats = new Map<string, { total: number; approved: number; blocked: number }>();
   for (const rv of db.filter("prReviews", (r) => repoIds.has(r.repoId))) {
     const s = stats.get(rv.repoId) || { total: 0, approved: 0, blocked: 0 };
     s.total++;
     if (rv.status === "passed") s.approved++;
-    else if (rv.status === "changes_requested") s.blocked++;
+    else if (rv.status === "changes_requested" || rv.status === "blocked") s.blocked++;
     stats.set(rv.repoId, s);
   }
   const flake = repoFlakeRates(repoIds);
@@ -1233,6 +1235,9 @@ export function getReviewHandler(req: Request, res: Response) {
   }
   const logs = db.filter("reviewLogs", (l) => l.reviewId === review.id).sort((a, b) => a.at - b.at);
   const task = review.taskId ? db.find("tasks", (t) => t.id === review.taskId) : null;
+  // Rows written before prState existed learn their fate here, off the response
+  // path. Only ever fires once per row — see needsPrStateBackfill.
+  if (needsPrStateBackfill(review)) void reconcilePrState(review);
   res.json({ review, logs, task });
 }
 api.get("/reviews/:id", getReviewHandler);
@@ -1443,6 +1448,8 @@ api.post("/reviews/sync", expensiveLimiter, async (req, res) => {
         headSha: newSha,
         baseSha: pr.base?.sha || "",
         status: "queued" as const,
+        // Discovered from the state=open listing, so it is open by construction.
+        prState: "open" as const,
         verdict: null,
         criteria: [],
         taskId: null,
@@ -1517,6 +1524,15 @@ export function addTaskAttachmentHandler(req: Request, res: Response) {
   if (!owns) return void res.status(403).json({ error: "forbidden" });
   const { kind, note } = req.body || {};
   if (!kind) return void res.status(400).json({ error: "kind_required" });
+  // A merged/closed PR takes no more agent messages. Gate BEFORE persisting, or
+  // the note would be stored and echoed back as though the agent had heard it.
+  // Only `text` — attaching context still re-runs the review, which stays open.
+  if (kind === "text") {
+    const latest = [...linkedReviews].sort((a, b) => b.updatedAt - a.updatedAt)[0];
+    if (latest && !acceptsMaintainerFeedback(latest.prState)) {
+      return void res.status(409).json({ error: "pr_not_open", prState: latest.prState });
+    }
+  }
   // `url` is optional — a `kind: "text"` message from the composer carries only
   // a note. When one IS present it gets stored, echoed back to the agent page,
   // and rendered there as a link, so it has to clear the same bar as a guidance

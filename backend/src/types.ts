@@ -132,7 +132,8 @@ export type Repository = {
   // Per-repo review workflow (optional; defaults applied by effectiveWorkflow).
   workflow?: RepoWorkflow;
   // Per-repo review counts, attached by GET /api/repositories for the rail
-  // cards (not persisted). approved = "passed", blocked = "changes_requested".
+  // cards (not persisted). approved = "passed"; blocked counts both
+  // "changes_requested" and "blocked".
   reviewStats?: { total: number; approved: number; blocked: number };
   // Repo-index state. Optional so DB rows written before the indexer existed
   // still load — treat undefined as "none" at every branch site.
@@ -540,7 +541,12 @@ export type PRReviewStatus =
   | "reviewing"
   | "passed"
   | "changes_requested"
+  | "blocked"
   | "errored";
+
+// Where the PR itself ended up, independent of the review verdict. Absent on
+// rows written before this existed — treat undefined as "open" everywhere.
+export type PRState = "open" | "merged" | "closed";
 
 // A concrete code replacement attached to a finding or an unmet criterion.
 // `original` is the verbatim current text starting at `startLine` (new-file
@@ -599,6 +605,9 @@ export type PRReview = {
   headSha: string;
   baseSha: string;
   status: PRReviewStatus;
+  // The PR's own lifecycle, orthogonal to `status` — a merged PR keeps the
+  // verdict it earned. Absent on legacy rows; read it as "open".
+  prState?: PRState;
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;

@@ -4200,6 +4200,14 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   box-shadow: 0 0 0 3px rgba(255,122,61,0.12);
   animation: pulse 1.6s ease-in-out infinite;
 }
+/* Merged/closed PR: the channel is shut. Scoped rather than global because the
+   app has no global .btn:disabled rule (see the note above .vln-pol). */
+.composer.is-locked { opacity: .55; }
+.composer.is-locked .composer-head-bar { background: var(--fg-faint); }
+.composer.is-locked .composer-head-target::before { animation: none; background: var(--fg-faint); }
+.composer-dot.off { background: var(--fg-faint); box-shadow: none; animation: none; }
+.composer-tool:disabled { opacity: .3; cursor: default; }
+.composer .btn:disabled { opacity: .4; cursor: default; }
 .composer-send-kbd {
   margin-left: 6px;
   padding: 1px 5px;

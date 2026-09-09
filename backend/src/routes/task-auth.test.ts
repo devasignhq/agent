@@ -66,7 +66,7 @@ function seed() {
   // Linear task: owned directly via userId, with no linked review.
   db.insert("tasks", { id: linearTaskId, source: "linear", externalId: uuid(), title: "t", endGoal: null, attachments: [{ id: linearAtt, kind: "text", note: "n", createdAt: Date.now() }], createdAt: Date.now(), userId: ownerId } as any);
 
-  return { ownerId, strangerId, ghTaskId, linearTaskId, ghAtt, linearAtt };
+  return { ownerId, strangerId, ghTaskId, linearTaskId, ghAtt, linearAtt, reviewId };
 }
 
 const attCount = (id: string) =>
@@ -314,4 +314,61 @@ test("DELETE /tasks/:taskId/attachments/:id: owner removes from a review-less Li
   assert.equal(res.statusCode, 200);
   assert.equal(res.body.removed.id, linearAtt);
   assert.equal(attCount(linearTaskId), 0);
+});
+
+// --- POST /tasks/:id/attachments: the PR-lifecycle gate ---
+// A merged or closed PR takes no more agent messages. The gate runs before any
+// persistence, so a rejected message is never stored and echoed back to the
+// Agent page as though the agent had heard it.
+const setPrState = (reviewId: string, prState: string | undefined) =>
+  db.update("prReviews", (r) => r.id === reviewId, { prState } as any);
+
+test("POST attachments: a text message on a merged PR is refused with 409", () => {
+  const { ownerId, ghTaskId, reviewId } = seed();
+  setPrState(reviewId, "merged");
+  const before = attCount(ghTaskId);
+  const res = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), res);
+  assert.equal(res.statusCode, 409);
+  assert.equal(res.body.error, "pr_not_open");
+  assert.equal(attCount(ghTaskId), before, "nothing is persisted for a refused message");
+});
+
+test("POST attachments: a text message on a closed PR is refused too", () => {
+  const { ownerId, ghTaskId, reviewId } = seed();
+  setPrState(reviewId, "closed");
+  const res = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), res);
+  assert.equal(res.statusCode, 409);
+});
+
+test("POST attachments: a text message on an open PR still goes through", () => {
+  const { ownerId, ghTaskId, reviewId } = seed();
+  setPrState(reviewId, "open");
+  const before = attCount(ghTaskId);
+  const res = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), res);
+  assert.equal(res.statusCode, 200);
+  assert.equal(attCount(ghTaskId), before + 1);
+});
+
+// Rows written before prState existed must keep behaving exactly as before.
+test("POST attachments: a legacy review with no prState still accepts messages", () => {
+  const { ownerId, ghTaskId } = seed();
+  const res = fakeRes();
+  addTaskAttachmentHandler(authedReq(ownerId, { id: ghTaskId }, { kind: "text", note: "hi" }), res);
+  assert.equal(res.statusCode, 200);
+});
+
+// Attaching context re-runs the review, which stays available on a merged PR —
+// only the message channel closes.
+test("POST attachments: a link on a merged PR is still accepted", () => {
+  const { ownerId, ghTaskId, reviewId } = seed();
+  setPrState(reviewId, "merged");
+  const res = fakeRes();
+  addTaskAttachmentHandler(
+    authedReq(ownerId, { id: ghTaskId }, { kind: "link", url: "https://example.com/doc", note: "d" }),
+    res
+  );
+  assert.equal(res.statusCode, 200);
 });

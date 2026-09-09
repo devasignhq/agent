@@ -21,6 +21,9 @@ const { privateKey } = crypto.generateKeyPairSync("rsa", {
 });
 config.github.appId = "123456";
 config.github.privateKey = privateKey as string;
+// verifySignature fails CLOSED when no webhook secret is configured, so an
+// unsigned test delivery is rejected before any handler runs. Opt in explicitly.
+config.github.allowUnsignedWebhooks = true;
 
 // Stub GitHub: hand back an installation token and a minimal PR object so
 // ensurePRReview can materialize a row without touching the network.

@@ -187,12 +187,12 @@ test("the defect pass emits a finding carrying its failure scenario", async () =
   assert.ok(meta.fixPrompt, "every defect carries a copyable fix prompt");
 });
 
-test("a blocking defect flips the verdict to changes_requested", async () => {
+test("a blocking defect flips the verdict to blocked", async () => {
   const { review } = await run();
   assert.equal(
     review.status,
-    "changes_requested",
-    "a blocker-severity defect must gate the merge on its own"
+    "blocked",
+    "a blocker-severity defect is the severe tier — it gates the merge on its own"
   );
 });
 

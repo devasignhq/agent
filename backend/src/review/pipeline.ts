@@ -59,7 +59,7 @@ import {
 } from "./criteria-format.js";
 import { effectiveWorkflow } from "./workflow.js";
 import { buildGuidanceSection } from "./guidance.js";
-import { resolveReviewEvent, withMaintainerInstructions } from "./decisions.js";
+import { prStateOf, resolveReviewEvent, resolveVerdictStatus, withMaintainerInstructions } from "./decisions.js";
 import {
   criteriaSynthesisSystemPrompt,
   reviewSystemPrompt,
@@ -607,7 +607,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         suggestedChange: m?.met === false ? m?.suggestedChange ?? null : null,
       };
     });
-    const allMet = filledCriteria.filter((c) => !isRetiredCriterion(c)).every((c) => c.met === true);
+    const liveCriteria = filledCriteria.filter((c) => !isRetiredCriterion(c));
+    const allMet = liveCriteria.every((c) => c.met === true);
     // Criteria an earlier commit satisfied that this diff broke — persisted and
     // rendered as "previously met, now broken" so the developer sees the
     // regression instead of it being lumped in with never-met criteria.
@@ -990,7 +991,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       log: (action, extra) => log(review.id, "verify", action, extra),
     });
 
-    const status: PRReviewStatus = allMet && !hasBlocker ? "passed" : "changes_requested";
+    const status: PRReviewStatus = resolveVerdictStatus({
+      allMet,
+      hasBlocker,
+      liveCount: liveCriteria.length,
+      scoredCount: liveCriteria.filter((c) => c.met === true || c.met === false).length,
+      metCount: liveCriteria.filter((c) => c.met === true).length,
+    });
     setStatus(review.id, {
       criteria: filledCriteria,
       verdict: verdict.summary,
@@ -1037,7 +1044,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     }
 
     const verdictAction =
-      status !== "passed"
+      status === "blocked"
+        ? "Blocked"
+        : status !== "passed"
         ? "Changes requested"
         : specless
         ? "No issues found (no linked spec)"
@@ -1055,9 +1064,11 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       },
     });
     // App notification: analysis is complete. `review` → "passed" (blue dot),
-    // `blocker` → "changes_requested" (red dot). Click navigates to detail.
+    // `blocker` → any non-pass (red dot). Click navigates to detail.
     const notifyTitle =
-      status !== "passed"
+      status === "blocked"
+        ? `PR #${review.prNumber} — Blocked`
+        : status !== "passed"
         ? `PR #${review.prNumber} — Changes requested`
         : specless
         ? `PR #${review.prNumber} — No issues found${includeEndGoalCTA ? "; end goal requested" : ""}`
@@ -1420,20 +1431,26 @@ async function ingestContext(
       const nextAdditions = typeof pr.additions === "number" ? pr.additions : review.additions;
       const nextDeletions = typeof pr.deletions === "number" ? pr.deletions : review.deletions;
       const nextChangedFiles = typeof pr.changed_files === "number" ? pr.changed_files : review.changedFiles;
+      // The same fetch tells us whether the PR is still open, so rows that
+      // missed a webhook self-heal here at no extra API cost.
+      const nextPrState = prStateOf(pr);
       if (
         nextAdditions !== review.additions ||
         nextDeletions !== review.deletions ||
-        nextChangedFiles !== review.changedFiles
+        nextChangedFiles !== review.changedFiles ||
+        nextPrState !== review.prState
       ) {
         db.update("prReviews", (r) => r.id === review.id, {
           additions: nextAdditions,
           deletions: nextDeletions,
           changedFiles: nextChangedFiles,
+          prState: nextPrState,
         });
         // Keep the local reference in sync for downstream logic in this call.
         review.additions = nextAdditions;
         review.deletions = nextDeletions;
         review.changedFiles = nextChangedFiles;
+        review.prState = nextPrState;
       }
       // Fetch unified diff
       diff = await ghText(
@@ -3277,6 +3294,8 @@ async function postGithubOutput(
               ? specless
                 ? "No issues found — add an end goal for acceptance-criteria review"
                 : "All acceptance criteria met"
+              : status === "blocked"
+              ? "Blocked"
               : "Changes requested",
           summary: args.summary || "",
         },
@@ -4401,12 +4420,30 @@ export async function runMaintainerFeedbackJob(
   if (refined.disputed.length) {
     const live = criteria.filter((c) => !isRetiredCriterion(c));
     const allMet = live.length > 0 && live.every((c) => c.met === true);
-    let status: PRReviewStatus = "changes_requested";
+    // detectIntroducedBlockers costs real LLM calls, so it stays gated on allMet
+    // as before. When criteria are still outstanding we can't re-derive the
+    // blocker set, so an existing `blocked` verdict is preserved rather than
+    // silently demoted to yellow by a dispute that never re-verified it.
+    let status: PRReviewStatus;
     let blockerSummary = "";
     if (allMet) {
       const blockers = await detectIntroducedBlockers({ review, repo, diff: diffSlice, holistic });
       blockerSummary = blockers.summary;
-      status = blockers.hasBlocker ? "changes_requested" : "passed";
+      status = resolveVerdictStatus({
+        allMet: true,
+        hasBlocker: blockers.hasBlocker,
+        liveCount: live.length,
+        scoredCount: live.length,
+        metCount: live.length,
+      });
+    } else {
+      status = resolveVerdictStatus({
+        allMet: false,
+        hasBlocker: review.status === "blocked",
+        liveCount: live.length,
+        scoredCount: live.filter((c) => c.met === true || c.met === false).length,
+        metCount: live.filter((c) => c.met === true).length,
+      });
     }
     setStatus(review.id, { criteria, status });
     if (status === "passed") {

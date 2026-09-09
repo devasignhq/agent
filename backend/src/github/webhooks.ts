@@ -20,8 +20,9 @@ import { effectiveSecurityPolicy } from "../security/policy.js";
 import type { SecurityScanRun } from "../types.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { installationWantsCrossRepo } from "../review/cross-repo/job.js";
-import { triggerOutcome } from "../review/decisions.js";
+import { acceptsMaintainerFeedback, prStateOf, triggerOutcome } from "../review/decisions.js";
 import { notifyForReview } from "../notifications.js";
+import { notifyUser } from "../notifications-stream.js";
 import {
   PLAN_LIMITS,
   chargeForNewPRReview,
@@ -210,11 +211,19 @@ function handleIssueComment(event: any) {
   void (async () => {
     const existing = findPRReview(repoFullName, prNumber);
     if (existing) {
+      // A merged/closed PR is done — a comment on it must not spend review
+      // quota re-running the agent.
+      if (!acceptsMaintainerFeedback(existing.prState)) {
+        console.log(
+          `[webhook] issue_comment: ${repoFullName}#${prNumber} is ${existing.prState} — feedback ignored`
+        );
+        return;
+      }
       // PR already in scope → any maintainer comment is feedback to fold into
       // the review. Immediate log so the Agent page surfaces the comment within
       // ~3s of arrival, independent of how many jobs sit ahead in the worker.
-      // The review's status is irrelevant — even a "passed" PR should reflect
-      // that a maintainer commented.
+      // The VERDICT is irrelevant — even a "passed" PR should reflect that a
+      // maintainer commented; only the PR's lifecycle closes the channel.
       db.insert("reviewLogs", {
         id: uuid(),
         reviewId: existing.id,
@@ -334,6 +343,12 @@ function handlePullRequestReview(event: any) {
       );
       return;
     }
+    if (!acceptsMaintainerFeedback(review.prState)) {
+      console.log(
+        `[webhook] pull_request_review: ${repoFullName}#${prNumber} is ${review.prState} — feedback ignored`
+      );
+      return;
+    }
     // Same immediate-log pattern as issue_comment: surface the review
     // submission on the Agent page before the worker dequeues the analysis
     // job.
@@ -409,6 +424,12 @@ function handlePullRequestReviewComment(event: any) {
     if (!review) {
       console.log(
         `[webhook] pull_request_review_comment: ${repoFullName}#${prNumber} not under review — feedback ignored`
+      );
+      return;
+    }
+    if (!acceptsMaintainerFeedback(review.prState)) {
+      console.log(
+        `[webhook] pull_request_review_comment: ${repoFullName}#${prNumber} is ${review.prState} — feedback ignored`
       );
       return;
     }
@@ -576,6 +597,7 @@ export async function ensurePRReview(
     headSha: pr.head?.sha || "",
     baseSha: pr.base?.sha || "",
     status: "queued" as const,
+    prState: prStateOf(pr),
     verdict: null,
     criteria: [],
     taskId: null,
@@ -906,9 +928,25 @@ function handlePullRequest(event: any) {
   if (event.action === "closed") {
     const pullReq = event.pull_request;
     {
-      // Our own onboarding PR closing (merged or not) moves the repo's setup state.
       const r = db.find("repositories", (x) => x.owner === owner && x.name === name);
+      // Our own onboarding PR closing (merged or not) moves the repo's setup state.
       if (r && pullReq?.number) noteOnboardingPrClosed(r.id, pullReq.number, !!pullReq.merged);
+      // Stamp the PR's fate on its review BEFORE the merged-only early exit below —
+      // a closed-unmerged PR must record its state too. The verdict is untouched.
+      if (r && pullReq?.number) {
+        // The action already says closed, so don't depend on payload `state`.
+        const prState = pullReq.merged ? "merged" : "closed";
+        const updated = db.update(
+          "prReviews",
+          (rv) => rv.repoId === r.id && rv.prNumber === pullReq.number,
+          { prState, updatedAt: Date.now() }
+        );
+        if (updated) {
+          const install = db.find("installations", (i) => i.id === r.installationId);
+          // Push the queue so the card greys out now, not on the 60s backstop.
+          if (install?.userId) notifyUser(install.userId);
+        }
+      }
     }
     if (!pullReq?.merged) return;
     // Bounty payout: if this merged PR delivers a delegated bounty, release the
@@ -1145,6 +1183,7 @@ function handlePullRequest(event: any) {
       db.update("prReviews", (r) => r.id === existing.id, {
         headSha: newSha,
         status: "queued",
+        prState: "open",
         additions: null,
         deletions: null,
         changedFiles: null,
@@ -1209,6 +1248,7 @@ function handlePullRequest(event: any) {
       headSha: newSha,
       baseSha: pullReq.base.sha,
       status: "queued",
+      prState: "open",
       additions: typeof pullReq.additions === "number" ? pullReq.additions : null,
       deletions: typeof pullReq.deletions === "number" ? pullReq.deletions : null,
       changedFiles: typeof pullReq.changed_files === "number" ? pullReq.changed_files : null,
@@ -1281,6 +1321,7 @@ function handlePullRequest(event: any) {
     headSha: newSha,
     baseSha: pullReq.base.sha,
     status: "queued" as const,
+    prState: "open" as const,
     verdict: null,
     criteria: [],
     taskId: null,

@@ -21,120 +21,19 @@ import {
   verificationCounts,
   verificationForCriterion,
 } from "./verify-view";
+import {
+  canMessageAgent,
+  composerLockPlaceholder,
+  composerLockReason,
+  queueBadge,
+  recentFlag,
+  verdictBadge,
+} from "./review-status";
 
 // Backstop cadence for the review queue. The stream is the primary path; this
 // only has to catch a wedged connection, so it matches the notification
 // stream's own fallback rather than the 3s/6s poll it replaced.
 const FALLBACK_REFRESH_MS = 60_000;
-
-const PR_REVIEWS = [
-{
-  id: 482, repo: "acme/pay", title: "Multi-chain USDC withdraw",
-  branch: "feat/usdc-withdraw-multichain",
-  diff: { add: 247, del: 38, files: 9 },
-  author: "@maya", model: "sonnet-4.5",
-  status: "running", progress: 0.62, stage: "diff.analyze",
-  issueId: "ENG-1284",
-  eta: "12s left",
-  blockers: 2, nits: 4, met: 7, total: 9,
-  goal: {
-    title: "Multi-chain USDC withdraw",
-    ticket: { id: "ENG-1284", url: "linear://ENG-1284", source: "Linear",
-      summary: "Allow users to withdraw USDC across all supported chains. User selects chain → amount → confirms in modal → success toast.",
-      assignee: "@maya", reporter: "@dre" },
-    loom: { url: "loom.com/share/8f2a4cd1", duration: "0:36",
-      transcript: "Maya walks through the desired UX: chain dropdown appears first, then amount input enables only after a chain is selected. Confirm modal must show network fees. Success toast persists 4s.",
-      frames: 4,
-      keyMoments: [
-      { t: "0:04", note: "Chain dropdown appears BEFORE amount input" },
-      { t: "0:12", note: "Amount field disabled until chain picked" },
-      { t: "0:21", note: 'Confirm modal copy: "Confirm withdrawal"' },
-      { t: "0:29", note: "Toast says “Withdrawal sent · check email”" }]
-    },
-    images: [
-    { name: "Withdraw / 04 — figma frame", strings: 14, spec: "spinner inside CTA while pending" },
-    { name: "Withdraw / 05 — error state", strings: 6, spec: "inline error red #FF5A5F" }],
-
-    docs: [{ path: "docs/usdc.md", sections: 3 }],
-    acceptance: [
-    { id: 1, text: "Chain dropdown lists all supported networks", met: true },
-    { id: 2, text: "Amount field disabled until chain is selected", met: true },
-    { id: 3, text: "Confirm modal displays network fee in USD + native", met: true },
-    { id: 4, text: "Invalid chain id falls back to default + toast", met: false, note: "Blocker — no validation in WithdrawForm.tsx:142" },
-    { id: 5, text: "Submit disabled while wallet check in flight", met: false, note: "Nit — race in useUSDC.ts:88" },
-    { id: 6, text: "Success toast persists 4s", met: true },
-    { id: 7, text: "Failure toast offers retry CTA", met: true },
-    { id: 8, text: "Telemetry event withdraw.confirm fired", met: true },
-    { id: 9, text: "Locale-aware decimal formatting", met: true }],
-
-    constraints: [
-    "USDC only — reject other tokens",
-    "Round-trip latency budget < 1.2s on success path",
-    "Chain list pulled from /api/chains, not hardcoded"]
-
-  }
-},
-{
-  id: 1142, repo: "acme/admin", title: "Role-based access for orgs",
-  branch: "feat/rbac-orgs",
-  diff: { add: 412, del: 84, files: 14 },
-  author: "@kev", model: "opus-4.1",
-  status: "running", progress: 0.34, stage: "docs.read",
-  issueId: "SEC-204",
-  eta: "1m 40s left",
-  blockers: 0, nits: 2, met: 11, total: 14
-},
-{
-  id: 479, repo: "acme/pay", title: "Stellar deposit memo parsing",
-  branch: "fix/stellar-memo",
-  diff: { add: 38, del: 12, files: 2 },
-  author: "@sara", model: "sonnet-4.5",
-  status: "queued", progress: 0, stage: "queued",
-  issueId: "ENG-1255",
-  eta: "queued · #2",
-  blockers: 0, nits: 0, met: 0, total: 5
-},
-{
-  id: 88, repo: "acme/mobile", title: "Receipt PDF download",
-  branch: "feat/receipt-pdf",
-  diff: { add: 184, del: 9, files: 5 },
-  author: "@otis", model: "gemini-2.5",
-  status: "review_ready", progress: 1, stage: "summary",
-  issueId: "ENG-1271",
-  eta: "12m ago",
-  blockers: 0, nits: 3, met: 8, total: 8
-},
-{
-  id: 1139, repo: "acme/admin", title: "Refactor dashboard charts",
-  branch: "chore/charts-refactor",
-  diff: { add: 612, del: 588, files: 22 },
-  author: "@meilin", model: "sonnet-4.5",
-  status: "approved", progress: 1, stage: "summary",
-  issueId: "ENG-1240",
-  eta: "5h ago",
-  blockers: 0, nits: 0, met: 6, total: 6
-},
-{
-  id: 411, repo: "acme/infra", title: "Migrate Postgres extension to RDS",
-  branch: "infra/pg-rds",
-  diff: { add: 92, del: 4, files: 3 },
-  author: "@devonk", model: "opus-4.1",
-  status: "blocked", progress: 1, stage: "summary",
-  issueId: "INF-88",
-  eta: "32m ago",
-  blockers: 3, nits: 1, met: 4, total: 8
-}];
-
-
-// (live counts come from props now)
-
-const STATUS_PILL = {
-  running: { cls: "info", label: "running", dot: true, pulse: true },
-  queued: { cls: "", label: "queued", dot: true, pulse: false },
-  review_ready: { cls: "warn", label: "review ready", dot: true, pulse: false },
-  approved: { cls: "ok", label: "approved", dot: true, pulse: false },
-  blocked: { cls: "danger", label: "blocked", dot: true, pulse: false }
-};
 
 // Per-PR event templates
 const EVENTS_BY_PR = {
@@ -385,8 +284,8 @@ const RepoSelect = ({ value, onChange, options }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // PR queue (left rail)
 // ────────────────────────────────────────────────────────────────────────────
-const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", repoFilter, onRepoChange, repoOptions = [] }) => {
-  const active = reviews.filter((p) => p.status === "running").length;
+const PRQueue = ({ pickedId, onPick, reviews = [], workspace = "—", repoFilter, onRepoChange, repoOptions = [] }) => {
+  const active = reviews.filter((p) => p.status === "reviewing").length;
   const queued = reviews.filter((p) => p.status === "queued").length;
   return (
 <div className="pr-queue">
@@ -420,7 +319,7 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", re
         </div>
       )}
       {reviews.map((pr) => {
-      const s = STATUS_PILL[pr.status];
+      const s = queueBadge(pr.status, pr.prState);
       const isPicked = pr.id === pickedId;
       return (
         <div key={pr.id} className={`pr-card ${isPicked ? "picked" : ""}`} onClick={() => onPick(pr.id)}>
@@ -435,7 +334,7 @@ const PRQueue = ({ pickedId, onPick, reviews = PR_REVIEWS, workspace = "—", re
               </span>
               <span className="mono mute" style={{ fontSize: 11 }}>{pr.eta}</span>
             </div>
-            {pr.status === "running" &&
+            {pr.status === "reviewing" &&
           <div className="progress" style={{ marginTop: 8 }}>
                 <i style={{ width: `${pr.progress * 100}%` }}></i>
               </div>
@@ -1174,7 +1073,7 @@ const nowHMS = () => {
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
 };
 
-const AgentComposer = ({ onSend, disabled }) => {
+const AgentComposer = ({ onSend, disabled, lockedReason = null, lockedPlaceholder = null }) => {
   const ref = React.useRef(null);
   const [empty, setEmpty] = React.useState(true);
 
@@ -1222,6 +1121,7 @@ const AgentComposer = ({ onSend, disabled }) => {
   };
 
   const insertLink = () => {
+    if (disabled) return;
     const raw = prompt("Paste a URL (Loom, doc, or any link):");
     if (!raw) return;
     const url = safeUrl(raw);
@@ -1244,6 +1144,7 @@ const AgentComposer = ({ onSend, disabled }) => {
   };
 
   const handleSend = () => {
+    if (disabled) return;
     const el = ref.current;
     if (!el) return;
     const text = el.innerText.trim();
@@ -1257,6 +1158,7 @@ const AgentComposer = ({ onSend, disabled }) => {
   };
 
   const onKey = (e) => {
+    if (disabled) return;
     if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
       e.preventDefault();
       handleSend();
@@ -1285,30 +1187,30 @@ const AgentComposer = ({ onSend, disabled }) => {
   const [focused, setFocused] = React.useState(false);
 
   return (
-    <div className={`composer${focused ? " is-focused" : ""}${empty ? "" : " has-content"}`}>
+    <div className={`composer${focused ? " is-focused" : ""}${empty ? "" : " has-content"}${disabled ? " is-locked" : ""}`}>
       <div className="composer-head">
         <span className="composer-head-bar"></span>
         <span className="composer-head-label mono">message agent</span>
         <span className="composer-head-sep">·</span>
-        <span className="composer-head-target mono">live channel</span>
+        <span className="composer-head-target mono">{lockedReason ? "channel closed" : "live channel"}</span>
         <span style={{ flex: 1 }}></span>
-        <span className="composer-head-kbd mono">⌘ ↵ send</span>
+        {!lockedReason && <span className="composer-head-kbd mono">⌘ ↵ send</span>}
       </div>
       <div className="composer-toolbar">
-        <button className="composer-tool" title="Bold (⌘B)"
+        <button className="composer-tool" disabled={disabled} title="Bold (⌘B)"
                 onMouseDown={(e) => { e.preventDefault(); exec("bold"); }}>
           <b>B</b>
         </button>
-        <button className="composer-tool" title="Italic (⌘I)"
+        <button className="composer-tool" disabled={disabled} title="Italic (⌘I)"
                 onMouseDown={(e) => { e.preventDefault(); exec("italic"); }}>
           <i>I</i>
         </button>
-        <button className="composer-tool" title="Code (wraps selection, or opens a block)"
+        <button className="composer-tool" disabled={disabled} title="Code (wraps selection, or opens a block)"
                 onMouseDown={(e) => { e.preventDefault(); insertCode(); }}>
           <span style={{ fontFamily: "var(--mono)", fontSize: 11 }}>{"</>"}</span>
         </button>
         <span className="composer-sep"></span>
-        <button className="composer-tool" title="Insert link (Loom, doc, …)"
+        <button className="composer-tool" disabled={disabled} title="Insert link (Loom, doc, …)"
                 onMouseDown={(e) => { e.preventDefault(); insertLink(); }}>
           <Icon name="link" size={12}/>
         </button>
@@ -1320,10 +1222,11 @@ const AgentComposer = ({ onSend, disabled }) => {
         <div
           ref={ref}
           className="composer-input"
-          contentEditable
+          contentEditable={!disabled}
+          aria-disabled={disabled || undefined}
           suppressContentEditableWarning
           data-empty={empty}
-          data-placeholder="Type a command, paste a video link (Loom, YouTube, Vimeo…), or drop a doc URL…"
+          data-placeholder={lockedPlaceholder || "Type a command, paste a video link (Loom, YouTube, Vimeo…), or drop a doc URL…"}
           onInput={onInput}
           onKeyDown={onKey}
           onPaste={onPaste}
@@ -1333,7 +1236,7 @@ const AgentComposer = ({ onSend, disabled }) => {
       </div>
       <div className="composer-foot">
         <span className="mono mute" style={{ fontSize: 11, display: "inline-flex", alignItems: "center", gap: 6 }}>
-          <i className="composer-dot"></i> ready for input
+          <i className={`composer-dot${disabled ? " off" : ""}`}></i> {lockedReason || "ready for input"}
         </span>
         <button
           className="btn sm primary"
@@ -1350,19 +1253,6 @@ const AgentComposer = ({ onSend, disabled }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // Live-data mapping helpers
 // ────────────────────────────────────────────────────────────────────────────
-
-// Map backend PRReview.status → the UI status taxonomy the existing components
-// already render (running / queued / approved / blocked / review_ready).
-function mapStatus(s) {
-  switch (s) {
-    case "reviewing":          return "running";
-    case "queued":             return "queued";
-    case "passed":             return "approved";
-    case "changes_requested":  return "blocked";
-    case "errored":            return "blocked";
-    default:                   return "queued";
-  }
-}
 
 const RELATIVE = (ts) => {
   const diff = Math.max(0, Date.now() - ts);
@@ -1785,7 +1675,8 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       },
       author: "",
       model: repo?.defaultModel || "—",
-      status: mapStatus(r.status),
+      status: r.status,
+      prState: r.prState,
       progress: r.status === "reviewing" ? 0.5 : r.status === "queued" ? 0 : 1,
       stage: r.status,
       issueId: r.taskId ? r.taskId.slice(0, 8) : "—",
@@ -1887,9 +1778,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     if (!user?.id) return;
     const card = mappedReviews.find((m) => m.id === id);
     if (!card) return;
-    const flag =
-      card.status === "blocked" || card.blockers > 0 ? "blocker" :
-      card.status === "review_ready" ? "review" : "ok";
+    const flag = recentFlag(card.status, card.prState);
     pushRecent(user.id, {
       id: card.id,
       uiId: card.uiId,
@@ -1991,7 +1880,15 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
       try {
         await api.addAttachment(taskId, { kind: "text", note: text });
       } catch (err) {
-        console.warn("[agent] attach text failed", err);
+        // Swallowing this used to leave the message sitting in the timeline as
+        // though it had reached the agent.
+        const closed = err?.message === "pr_not_open";
+        updateUserEvent(id, key, {
+          flavor: "danger",
+          detail: closed
+            ? <>This pull request is closed — the review agent is no longer taking messages.</>
+            : <>Message not delivered: {String(err?.message || err)}</>,
+        });
       }
     }
   };
@@ -2044,7 +1941,9 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
     else wow = null; // "—" when there's no data either week
     const openReviews = liveReviews.filter((r) => r.status === "reviewing" || r.status === "queued").length;
     const passed = liveReviews.filter((r) => r.status === "passed").length;
-    const requestedChanges = liveReviews.filter((r) => r.status === "changes_requested").length;
+    const requestedChanges = liveReviews.filter(
+      (r) => r.status === "changes_requested" || r.status === "blocked"
+    ).length;
     return { tasksTotal, thisWeek, lastWeek, wow, openReviews, passed, requestedChanges };
   }, [liveReviews]);
 
@@ -2122,7 +2021,18 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           <div className="agent-pane-head">
             <div className="flex gap-3 items-center">
               <h3 className="card-title">Review log{pr ? ` · ${pr.repo}#${pr.id}` : ""}</h3>
-              {pr?.status === "running" && <span className="pill info"><i className="dot pulse"></i> live</span>}
+              {pr?.status === "reviewing" && <span className="pill info"><i className="dot pulse"></i> live</span>}
+              {pr && pr.prState !== "open" && pr.prState && (
+                <span className={`pill ${queueBadge(pr.status, pr.prState).cls}`}>
+                  <i className="dot"></i> {queueBadge(pr.status, pr.prState).label}
+                </span>
+              )}
+              {/* The queue card goes gray on merge; the verdict it earned lives here. */}
+              {pr && pr.status !== "reviewing" && pr.status !== "queued" && (
+                <span className={`pill ${verdictBadge(pr.status).cls}`}>
+                  <i className="dot"></i> {verdictBadge(pr.status).label}
+                </span>
+              )}
             </div>
           </div>
           <div
@@ -2141,9 +2051,19 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
             )}
             {pickedId && <TimelineFor events={events} runningStageIdx={showRunning} />}
           </div>
-          {events.length > 0 && (
-            <AgentComposer onSend={handleComposerSend} disabled={!pickedId} />
-          )}
+          {events.length > 0 && (() => {
+            // The detail row is authoritative — it is what the lazy reconcile
+            // refreshes — and falls back to the queue card before it loads.
+            const prState = detail?.review?.prState ?? pr?.prState;
+            return (
+              <AgentComposer
+                onSend={handleComposerSend}
+                disabled={!pickedId || !canMessageAgent(prState)}
+                lockedReason={composerLockReason(prState)}
+                lockedPlaceholder={composerLockPlaceholder(prState)}
+              />
+            );
+          })()}
         </div>
 
         <GoalPanel

@@ -2,7 +2,37 @@
 // in pipeline.ts / webhooks.ts; extracting them lets the workflow→behavior wiring
 // be tested deterministically and offline (see decisions.test.ts) without
 // changing what the agent does. Keep this module pure — no db / network / LLM.
-import type { PRReviewStatus, RepoWorkflow } from "../types.js";
+import type { PRReviewStatus, PRState, RepoWorkflow } from "../types.js";
+
+// The verdict a finished run lands on. `blocked` (red) is deliberately narrow:
+// a blocker-severity finding the diff introduced, or an "absolute deviation" —
+// every live criterion was judged and not one was met, across at least two of
+// them. One unmet criterion is an ordinary changes_requested, not a blocker.
+// Callers pass counts, not Criterion[], to keep this module a leaf.
+export function resolveVerdictStatus(args: {
+  allMet: boolean;
+  hasBlocker: boolean;
+  liveCount: number;
+  scoredCount: number;
+  metCount: number;
+}): PRReviewStatus {
+  const { allMet, hasBlocker, liveCount, scoredCount, metCount } = args;
+  const absoluteDeviation = scoredCount >= 2 && scoredCount === liveCount && metCount === 0;
+  if (hasBlocker || absoluteDeviation) return "blocked";
+  return allMet ? "passed" : "changes_requested";
+}
+
+// A merged or closed PR is done: comments on it must not spend review quota
+// re-running the agent. Undefined = a row that predates prState, i.e. open.
+export function acceptsMaintainerFeedback(prState?: PRState): boolean {
+  return prState !== "merged" && prState !== "closed";
+}
+
+// The PR object GitHub hands us (webhook payload or REST) → our lifecycle field.
+export function prStateOf(pr: { merged?: boolean; merged_at?: string | null; state?: string }): PRState {
+  if (pr.merged || pr.merged_at) return "merged";
+  return pr.state === "closed" ? "closed" : "open";
+}
 
 export type ReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 
