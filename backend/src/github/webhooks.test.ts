@@ -22,6 +22,10 @@ import { queueSnapshot } from "../queue.js";
 config.github.appId = "";
 config.github.privateKey = "";
 config.stripe.secretKey = "";
+// verifySignature fails CLOSED when no webhook secret is configured, so an
+// unsigned test delivery is rejected before any handler runs. Opt in explicitly,
+// the same way local dev does.
+config.github.allowUnsignedWebhooks = true;
 
 let repoSeq = 0;
 function seedRepo() {
@@ -402,4 +406,102 @@ test("github_app_authorization: a non-revoked action is ignored", async () => {
   await flush();
 
   assert.equal(db.filter("users", (u) => u.id === userId).length, 1, "account untouched");
+});
+
+// ── PR lifecycle (prState) ──────────────────────────────────────────────────
+// A merged/closed PR must record its fate on the review row: it drives the gray
+// badge and switches off the "message agent" composer. Before this, a non-merge
+// close was a total no-op and a merged PR kept showing its old verdict forever.
+function seedReviewRow(repo: any, extra: Record<string, unknown> = {}) {
+  return db.insert("prReviews", {
+    id: uuid(),
+    repoId: repo.id,
+    prNumber: 7,
+    prTitle: "Add widget",
+    headSha: "abc1234",
+    baseSha: "def5678",
+    status: "changes_requested",
+    verdict: null,
+    criteria: [],
+    taskId: null,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    ...extra,
+  } as any);
+}
+
+test("pull_request closed unmerged: the review row records prState closed", () => {
+  const repo = seedRepo();
+  const review = seedReviewRow(repo);
+  deliver(prEvent(repo, "closed", { merged: false }));
+  const row = db.find("prReviews", (r) => r.id === review.id)!;
+  assert.equal(row.prState, "closed");
+  assert.equal(row.status, "changes_requested", "the verdict it earned is preserved");
+});
+
+test("pull_request merged: prState merged, verdict untouched", () => {
+  const repo = seedRepo();
+  const review = seedReviewRow(repo, { status: "passed" });
+  // base.ref != defaultBranch so the merge path returns before the re-index.
+  deliver(prEvent(repo, "closed", { merged: true, base: { sha: "def5678", ref: "release" } }));
+  const row = db.find("prReviews", (r) => r.id === review.id)!;
+  assert.equal(row.prState, "merged");
+  assert.equal(row.status, "passed");
+});
+
+test("reopening a closed PR puts it back to prState open", () => {
+  const repo = seedRepo();
+  const review = seedReviewRow(repo);
+  deliver(prEvent(repo, "closed", { merged: false }));
+  assert.equal(db.find("prReviews", (r) => r.id === review.id)?.prState, "closed");
+  deliver(prEvent(repo, "reopened"));
+  assert.equal(db.find("prReviews", (r) => r.id === review.id)?.prState, "open");
+});
+
+test("a closed PR belonging to another repo is left alone", () => {
+  const mine = seedRepo();
+  const theirs = seedRepo();
+  const untouched = seedReviewRow(theirs);
+  seedReviewRow(mine);
+  deliver(prEvent(mine, "closed", { merged: false }));
+  assert.equal(db.find("prReviews", (r) => r.id === untouched.id)?.prState, undefined);
+});
+
+// ── comment ingestion stops at the end of a PR's life ───────────────────────
+test("issue_comment on a merged PR does not enqueue feedback or log it", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+  const review = seedReviewRow(repo, { status: "passed", prState: "merged" });
+  const before = queueSnapshot().reviews;
+  deliver(
+    commentEvent(repo, { body: "one more thing", authorLogin: "carol", authorAssociation: "COLLABORATOR" }),
+    { type: "issue_comment" }
+  );
+  assert.equal(queueSnapshot().reviews, before, "no review job for a shipped PR");
+  assert.equal(
+    db.filter("reviewLogs", (l) => l.reviewId === review.id && l.action === "comment.received").length,
+    0
+  );
+});
+
+test("issue_comment on a closed PR is ignored too", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+  seedReviewRow(repo, { prState: "closed" });
+  const before = queueSnapshot().reviews;
+  deliver(
+    commentEvent(repo, { body: "reviving this?", authorLogin: "carol", authorAssociation: "COLLABORATOR" }),
+    { type: "issue_comment" }
+  );
+  assert.equal(queueSnapshot().reviews, before);
+});
+
+// Legacy rows carry no prState at all; they must keep working exactly as before.
+test("issue_comment on a legacy row with no prState still enqueues", () => {
+  const { repo } = seedLinkedRepo({ plan: "free", ownerLogin: "alice" });
+  seedReviewRow(repo, { status: "passed" });
+  const before = queueSnapshot().reviews;
+  deliver(
+    commentEvent(repo, { body: "please check the error path", authorLogin: "carol", authorAssociation: "COLLABORATOR" }),
+    { type: "issue_comment" }
+  );
+  assert.equal(queueSnapshot().reviews, before + 1);
 });

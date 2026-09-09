@@ -31,6 +31,35 @@ export function progressCommentBody(): string {
   ].join("\n");
 }
 
+// The full verdict the placeholder is edited into when the run finishes. This one
+// comment IS the review the developer reads: an outcome headline followed by the
+// complete review body (end goal, criteria, suggestions, feedback) built by the
+// pipeline's formatReviewBody. `specless` distinguishes a clean pass with no
+// acceptance criteria from one where every criterion was met. No emoji anywhere —
+// the words carry the verdict (product decision: emoji-free PR comments).
+export function verdictCommentBody(args: {
+  status: PRReviewStatus;
+  specless: boolean;
+  // The full review body (formatReviewBody output): end goal, criteria, and any
+  // suggestions/feedback. No trailing prose recap — the outcome headline below
+  // and the criteria sections carry the verdict, so the body doesn't repeat it.
+  reviewBody: string;
+}): string {
+  const { status, specless, reviewBody } = args;
+  const headline =
+    status === "passed"
+      ? specless
+        ? "## DevAsign review — no issues found"
+        : "## DevAsign review — all acceptance criteria met"
+      : status === "changes_requested"
+      ? "## DevAsign review — changes requested"
+      : status === "blocked"
+      ? "## DevAsign review — blocked"
+      : "## DevAsign review — complete";
+
+  return [headline, "", reviewBody].join("\n").trim();
+}
+
 // Replaces the placeholder when a run throws, so the comment never stays stuck on
 // "in progress". The pipeline re-runs on the next push, so we say so.
 export function reviewFailedCommentBody(): string {

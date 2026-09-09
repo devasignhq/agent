@@ -534,6 +534,59 @@ seedScan({
 });
 console.log("[ephemeral] seeded security findings + scan runs for ephemeral-repo-1");
 
+// ── Agent page seed ─────────────────────────────────────────────────────────
+// One review per badge state so the queue, the detail pane and the composer
+// lock can all be checked at a glance: approved (green), change requested
+// (amber), blocked (red), errored (red), merged and closed (both gray).
+const seedReview = (over: Record<string, unknown>) => {
+  const id = `ephemeral-review-${String(over.prNumber)}`;
+  const taskId = `ephemeral-task-${String(over.prNumber)}`;
+  db.insert("tasks", {
+    id: taskId,
+    source: "github",
+    externalId: id,
+    title: String(over.prTitle),
+    endGoal: "Ship the change described in the PR.",
+    attachments: [],
+    createdAt: now - HOUR,
+  } as never);
+  db.insert("prReviews", {
+    id,
+    repoId: "ephemeral-repo-1",
+    prNumber: over.prNumber,
+    prTitle: over.prTitle,
+    headSha: "8c1a2f0",
+    baseSha: "1b2c3d4",
+    verdict: "Mock verdict for local verification.",
+    criteria: [
+      { id: "c1", text: "The payout route rejects unauthenticated callers", met: true, evidence: null },
+      { id: "c2", text: "Ledger export parameterises its SQL", met: false, evidence: null },
+    ],
+    taskId,
+    additions: 84,
+    deletions: 12,
+    changedFiles: 5,
+    createdAt: now - HOUR,
+    updatedAt: now - HOUR,
+    ...over,
+  } as never);
+  db.insert("reviewLogs", {
+    id: `${id}-log`,
+    reviewId: id,
+    kind: "verdict",
+    at: now - HOUR,
+    action: "Review complete",
+    detail: "Seeded for local verification.",
+  } as never);
+};
+seedReview({ prNumber: 501, prTitle: "Add instant payout rail", status: "passed", prState: "open" });
+seedReview({ prNumber: 502, prTitle: "Parameterise the ledger export", status: "changes_requested", prState: "open" });
+seedReview({ prNumber: 503, prTitle: "Rewrite the auth middleware", status: "blocked", prState: "open" });
+seedReview({ prNumber: 504, prTitle: "Bump the pinned toolchain", status: "errored", prState: "open" });
+seedReview({ prNumber: 505, prTitle: "Cache the repo index", status: "passed", prState: "merged" });
+seedReview({ prNumber: 506, prTitle: "Drop the legacy webhook", status: "changes_requested", prState: "closed" });
+console.log("[ephemeral] seeded 6 reviews (one per badge state) for ephemeral-repo-1");
+
 // EPHEMERAL_VERIFY_ASSETS=<dir of a kept @devasign/verify fixture run> seeds a
 // reviewed PR with a completed verification run on the ephemeral install, so
 // the run page (recordings, badges, revisions) can be checked in a browser.
