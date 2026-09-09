@@ -46,6 +46,12 @@ export function parseDiffHunksByFile(diff: string): Map<string, DiffHunk[]> {
   const byFile = new Map<string, DiffHunk[]>();
   let current: DiffHunk[] | null = null;
   for (const line of diff.split("\n")) {
+    // Reset on every file header: a binary or mode-only entry carries no "+++"
+    // line, and without this its (absent) hunks would attach to the previous file.
+    if (line.startsWith("diff --git ")) {
+      current = null;
+      continue;
+    }
     if (line.startsWith("+++ ")) {
       const target = line.slice(4).trim();
       if (target === "/dev/null") {

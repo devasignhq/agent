@@ -10,9 +10,9 @@ import { contributorNotifyTarget } from "../users.js";
 import { dismissPRReview, dispatchWorkflow, gh, ghText, postPRCommentReturningId, updatePRComment } from "../github/app.js";
 import { joinVerifyBranch, startVerifyBranch, type VerifyBranch } from "../verify/branch.js";
 import { blastRadiusCriteria } from "../verify/blast-radius.js";
-import { formatVerificationSection, postVerifyCheckRun, type VerificationView } from "../verify/report.js";
+import { postVerifyCheckRun, upsertVerifyComment, type VerificationView } from "../verify/report.js";
 import { updateRun as updateVerifyRun } from "../verify/runs.js";
-import { progressCommentBody, reviewFailedCommentBody, verdictCommentBody } from "./progress-comment.js";
+import { progressCommentBody, reviewFailedCommentBody } from "./progress-comment.js";
 import { complete, completeStructured, completeWithMeta, currentUsage, detectVideoProvider, retryStructured, summarizeLinearFile, summarizeVideo, withModel, withUsage, type LLMMessage, type StructuredAttempt, type VideoSummary } from "../llm.js";
 import { reviewVerdictTool } from "./tools.js";
 import { track } from "../statsig.js";
@@ -35,9 +35,60 @@ import {
   type DevasignDoc,
   type DevasignScope,
 } from "./devasign.js";
-import type { Bounty, Criterion, EvidenceCode, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, SecurityFinding, SecuritySeverity, SuggestedChange, Task, User, Vulnerability } from "../types.js";
+import type { Bounty, Criterion, EvidenceCode, Installation, Integration, PRReview, PRReviewStatus, RepoIndexEntry, Repository, ReviewLogEntry, ReviewLogKind, ReviewThread, SecurityFinding, SecuritySeverity, SuggestedChange, Task, User, Vulnerability } from "../types.js";
 import { normalizeSeverity, severityToLegacy } from "../security/severity.js";
 import { normalizeSlug } from "../security/fingerprint.js";
+import { commentableLines } from "./anchor.js";
+import {
+  CARD_TITLE,
+  formatSummaryCard,
+} from "./comment.js";
+import {
+  buildReviewItems,
+  suggestionsForCriterion,
+  type ReviewItem,
+  type ReviewStage,
+} from "./items.js";
+import { mergeScore } from "./score.js";
+import {
+  loadThreadsFromGitHub,
+  planReconciliation,
+  reconcileThreads,
+  type FixAttribution,
+} from "./threads.js";
+import {
+  appendCodeBlock,
+  appendDefectGroup,
+  appendEvidenceBlock,
+  appendFixPrompt,
+  appendHolisticGroup,
+  appendPatchBlock,
+  codeFence,
+  fenceLang,
+  findingWhere,
+  patchToDiff,
+  reasonOrFallback,
+} from "./render.js";
+import {
+  dedupeAndCapFindings,
+  EMPTY_HOLISTIC,
+  findingKey,
+  type HolisticFinding,
+  type HolisticVerdict,
+  type ReviewSuggestion,
+  type ReviewVerdict,
+} from "./verdict-types.js";
+// Re-exported so existing import sites (tests, security/, cross-repo/) keep
+// importing the verdict shapes from pipeline.js after the split.
+export {
+  dedupeAndCapFindings,
+  EMPTY_HOLISTIC,
+  findingKey,
+  type HolisticFinding,
+  type HolisticVerdict,
+  type ReviewSuggestion,
+  type ReviewVerdict,
+};
 import { ACTIVE_STATES as SECURITY_ACTIVE_STATES } from "../security/policy.js";
 import { publishGateForPR } from "../security/gate.js";
 import { resolveBountyForPR } from "../bounties/prlink.js";
@@ -502,11 +553,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // original criteria are unchanged. Skipped on first reviews, same-sha reruns,
     // and when the delta can't be fetched (force-push / API failure).
     let commitIntent: CommitIntentReview | null = null;
+    // Reused after the verdict to attribute a resolved thread to a commit. Only
+    // populated when the incremental delta was fetched anyway — never worth an
+    // extra compare call of its own.
+    let deltaCommits: Array<{ sha: string; message: string }> | null = null;
     if (
       install &&
       shouldReviewNewCommits({ startedNewCommit, lastReviewedSha, headSha: review.headSha, priorCriteriaCount })
     ) {
       const delta = await fetchIncrementalDelta(install.installationId, repo, lastReviewedSha!, review.headSha);
+      if (delta) deltaCommits = delta.commits;
       if (delta && delta.commits.length) {
         commitIntent = await reviewNewCommits({
           review,
@@ -622,6 +678,10 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // walk finishes). In either gap, the criteria verdict still stands and the
     // security backstop in c.1a below keeps security covered.
     let holisticVerdict: HolisticVerdict = EMPTY_HOLISTIC;
+    // Which passes actually produced a result this run. Read by the thread
+    // reconciler: a finding that vanished because its stage never ran is not
+    // evidence of a fix, and must not flip its thread to "fixed".
+    const stagesRun = new Set<ReviewStage>(["criteria"]);
     const holisticRan = wf.stages.holistic && (holistic.entries.length > 0 || holistic.manifest.length > 0);
     if (!holisticRan && wf.stages.holistic) {
       // The workflow-disabled case already logs at gather time; this covers the
@@ -634,6 +694,10 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       });
     }
     if (holisticRan) {
+      stagesRun.add("holistic");
+      // The holistic pass owns security when it runs; the backstop below covers
+      // the other branch, so exactly one of them claims the stage.
+      stagesRun.add("security");
       holisticVerdict = await reviewAgainstRepo({ review, diff: context.diff, holistic, extraInstructions: wf.prompts?.holistic });
       const holisticBlocked = [
         ...holisticVerdict.regressions,
@@ -668,6 +732,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // pass above already owns security when it ran, so this only fires in the
     // gap, keeping security analyzed exactly once.
     if (!holisticRan && context.diff) {
+      stagesRun.add("security");
       const sec = await reviewDiffSecurity({
         review,
         diff: context.diff,
@@ -775,6 +840,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // renders in the GitHub comment. Advisory: it does NOT feed hasBlocker — any
     // gating from the new commits happens through the criteria appended above.
     if (commitIntent) {
+      stagesRun.add("commitIntent");
       holisticVerdict = {
         ...holisticVerdict,
         commitIntentFindings: commitIntent.intentFindings,
@@ -793,6 +859,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     if (!wf.stages.defects) {
       log(review.id, "holistic", DEFECT_STAGE_DISABLED);
     } else if (context.diff) {
+      stagesRun.add("defects");
       const { defects: rawDefects, summary: defectSummary } = await reviewDiffDefects({
         review,
         diff: context.diff,
@@ -853,6 +920,9 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // punt on time. Runs after both the spec'd and spec-less review paths since
     // an agent can quietly defer work regardless of whether the PR had a spec.
     const deferralCandidates = wf.stages.deferrals ? scanDeferralCandidates(context.diff) : [];
+    // The regex pre-gate is the stage: no candidates is a genuine "nothing was
+    // deferred", not a stage that failed to look.
+    if (wf.stages.deferrals && context.diff) stagesRun.add("deferrals");
     if (deferralCandidates.length) {
       const promise = buildPromiseText(endGoal || "", filledCriteria, context);
       const deferrals = await detectDeferredWork({
@@ -863,7 +933,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       });
       // Spread into a fresh object — holisticVerdict may still be the shared
       // EMPTY_HOLISTIC const (spec'd PR with no repo index), which must not be
-      // mutated. formatReviewBody reads deferrals off the verdict below.
+      // mutated. buildReviewItems reads deferrals off the verdict below.
       holisticVerdict = { ...holisticVerdict, deferrals };
       for (const f of deferrals) emitFindingLog(review.id, "deferral", f);
       log(
@@ -897,6 +967,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
           changedPaths
         );
         if (scopes.length) {
+          stagesRun.add("docs");
           const devasign = await reviewAgainstDevasignDocs({
             review,
             diff: context.diff,
@@ -960,6 +1031,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
           extraInstructions: wf.prompts?.crossRepo,
           log: (action, extra) => log(review.id, "holistic", action, extra),
         });
+        stagesRun.add("crossRepo");
         holisticVerdict = {
           ...holisticVerdict,
           crossRepoImpacts: cross.impacts,
@@ -1108,8 +1180,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       }
     }
 
-    // d. Output: GitHub Check Run + the single verdict comment (+ bodyless
-    //    approval / stale-approval dismissal) + broadcast
+    // d. Output: GitHub Check Runs + the summary card + one inline review-comment
+    //    thread per item (+ bodyless approval / stale-approval dismissal) + broadcast
     const { verdictPosted } = await postGithubOutput(review, repo, install, status, {
       endGoal: endGoal || "",
       criteria: filledCriteria,
@@ -1124,6 +1196,10 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       progressCommentId,
       prior: priorVerdicts,
       verification,
+      stagesRun,
+      inlineThreads: wf.stages.inlineThreads,
+      deltaCommits,
+      lastReviewedSha,
     });
     // The verdict comment is now written. Clear the local id so a later
     // non-critical failure (broadcastVerdict / dispatchWorkflow) can't hit the
@@ -2222,35 +2298,6 @@ async function refineGoalFromVideos(args: {
 
 // --- Review ---
 
-type ReviewSuggestion = {
-  criterionId: string;
-  title: string;
-  rationale: string;
-  // Repo-relative file path / 1-based new-file line the suggestion anchors to,
-  // for the "path/to/file.ts (Line N)" heading in the verdict comment.
-  path?: string;
-  line?: number;
-  // Runtime-impact severity of the finding behind the suggestion. Parsed
-  // leniently; absent on legacy rows and when the model omits it → "warn".
-  severity?: "blocker" | "warn" | "nit";
-  // Structured before/after patch — the current prompt's contract. Rendered as
-  // a composed ```diff block in the verdict comment.
-  patch?: SuggestedChange;
-  // LEGACY: unified-diff-style snippet of the PROPOSED edit (+/- lines). The
-  // current prompt requests the structured `patch` instead; kept so stored log
-  // rows and old-model responses still parse/render.
-  suggestedChange?: string;
-  // LEGACY: complete updated function/block. The structured `patch` supersedes
-  // it; kept for stored rows and old-model responses.
-  codeExample?: string;
-  // GitHub-flavored-markdown language identifier for `codeExample`.
-  language?: string;
-  // Self-contained prompt the user can paste into an external AI coding agent
-  // (Cursor / Claude Code / Codex) to land the fix. Includes the relevant
-  // diff hunk inline so the prompt is actionable without repo access.
-  fixPrompt?: string;
-};
-
 // Lenient coercion of a model-emitted structured patch / evidence excerpt.
 // Malformed shapes coerce to null — never a parse failure — and gutter
 // artifacts are stripped from every code field (the prompt forbids them; this
@@ -2373,19 +2420,6 @@ export function attemptDetail(a: StructuredAttempt): string {
   return lines.join("\n");
 }
 
-export type ReviewVerdict = {
-  summary: string;
-  criteria: Array<{
-    id: string;
-    met: boolean;
-    evidence: string;
-    evidenceCode?: EvidenceCode | null;
-    suggestedChange?: SuggestedChange | null;
-  }>;
-  comments: Array<{ path: string; line: number; body: string }>;
-  suggestions: ReviewSuggestion[];
-};
-
 // Parse the review model's JSON verdict. Returns null — rather than a lenient
 // empty fallback — when the text has no parseable JSON object, or when
 // `expectedIds` is non-empty and NONE of the returned criteria ids match it
@@ -2481,398 +2515,6 @@ function buildEndGoalRequestCTA(): string {
   ].join("\n");
 }
 
-// The reason a criterion failed (or a regressed one broke), for the verdict
-// comment and the consolidated fix prompt. `evidence` is the review step's
-// explanation; the prompt now requires it to be non-empty, but older records
-// (and the rare blank result) would otherwise render a bare "not met" item with
-// no "why". Fall back to a neutral sentence so the reader always gets a reason.
-function reasonOrFallback(evidence: string | null | undefined): string {
-  const text = (evidence || "").trim();
-  return text || "The current diff doesn't yet show this requirement being satisfied.";
-}
-
-// Build the markdown body of the single verdict comment. The shape is
-// intentionally scannable: end goal, then a criteria list with per-criterion
-// evidence, then concrete suggestions the developer can apply in a follow-up
-// commit. For a spec-less PR (no acceptance criteria) it leads with a neutral
-// status instead of a synthesised end goal so we never present invented
-// requirements. `lineNotes` are the LLM's line-anchored annotations — with no
-// formal-review body to carry them as native inline comments, they render here
-// as a "Line notes" section so everything lives in this one comment. Emoji-free
-// throughout (product decision).
-export function formatReviewBody(
-  endGoal: string,
-  filledCriteria: Criterion[],
-  suggestions: ReviewSuggestion[],
-  holistic: HolisticVerdict = EMPTY_HOLISTIC,
-  context?: { prTitle: string; repoFullName: string; endGoalCTA?: boolean },
-  prior: Map<string, PriorVerdict> = new Map(),
-  lineNotes: Array<{ path: string; line: number; body: string }> = [],
-  verification: VerificationView | null = null
-): string {
-  const lines: string[] = [];
-  const specless = filledCriteria.length === 0;
-  // Defects count here too — otherwise the spec-less "no blocking bugs surfaced"
-  // copy below would print directly above a list of bugs.
-  const holisticItemCount =
-    holistic.regressions.length +
-    holistic.criticalErrors.length +
-    holistic.securityFindings.length +
-    holistic.defects.length;
-  if (specless) {
-    // The outcome header is supplied by verdictCommentBody, which embeds this
-    // body beneath it — so we lead with just the explanatory paragraph to avoid
-    // two near-identical headers stacked on top of each other.
-    if (holisticItemCount === 0) {
-      lines.push(
-        "No blocking bugs, regressions, or security concerns surfaced in this diff. This PR has no linked issue or spec, so it was reviewed for correctness only — no acceptance criteria were checked.",
-        ""
-      );
-    } else {
-      lines.push(
-        "This PR has no linked issue or spec, so no acceptance criteria were checked. The concerns below come from a whole-repo correctness pass.",
-        ""
-      );
-    }
-  } else if (endGoal) {
-    lines.push("### End goal", endGoal, "");
-  }
-
-  // Lead with what needs attention. `splitForComment` (using the previous run's
-  // verdicts) separates criteria a later commit broke (regressed) from still-open
-  // ones (unmet) and the satisfied ones (met). Regressions and unmet are surfaced
-  // prominently; met criteria are NOT re-listed inline on every run — they
-  // collapse into a count header + a <details> block — so a re-review that only
-  // added new criteria doesn't read as "all of them failed" when most already passed.
-  const { regressed, unmet, met } = splitForComment(filledCriteria, prior);
-  if (regressed.length) {
-    lines.push("### Previously met — now broken");
-    lines.push(
-      "These acceptance criteria were satisfied by an earlier commit in this PR, but a later change broke them:",
-      ""
-    );
-    for (const c of regressed) {
-      lines.push(`- **${c.id} — Regressed**`);
-      lines.push(`  - Required: ${c.text}`);
-      lines.push(`  - What broke: ${reasonOrFallback(c.evidence)}`);
-    }
-    lines.push("");
-  }
-  // Suggestions rendered inline under an unmet criterion below are "consumed" —
-  // they must not repeat in the residual "Suggested changes" section. Regressed
-  // criteria keep their brief format above, so their suggestions stay residual.
-  const consumed = new Set<ReviewSuggestion>();
-  if (unmet.length) {
-    lines.push("### Acceptance criteria not met");
-    lines.push(
-      "These requirements aren't satisfied by the current diff yet — each shows what was required, why it isn't met, and a suggested fix.",
-      ""
-    );
-    unmet.forEach((c, i) => {
-      const matched = suggestionsForCriterion(c.id, suggestions);
-      for (const s of matched) consumed.add(s);
-      // met:null means the model returned no verdict for this criterion (as
-      // opposed to positively judging it unmet) — say that honestly instead of
-      // asserting a failure we have no evidence for. It still blocks approval.
-      const status = c.met === null ? "Could not be evaluated" : "Not met";
-      const why =
-        c.met === null
-          ? (c.evidence || "").trim() ||
-            "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it)."
-          : reasonOrFallback(c.evidence);
-      // Heading anchors on the first suggestion's file location + title when we
-      // have them; the criterion id + status always follow on the status line.
-      const anchor = matched[0];
-      if (anchor && anchor.path) {
-        const where = `**${anchor.path}**${anchor.line ? ` (Line ${anchor.line})` : ""}`;
-        lines.push(`#### ${i + 1}. ${where}${anchor.title ? ` — ${anchor.title}` : ""}`);
-      } else if (anchor && anchor.title) {
-        lines.push(`#### ${i + 1}. ${anchor.title}`);
-      } else {
-        lines.push(`#### ${i + 1}. ${c.id} — ${status}`);
-      }
-      lines.push("");
-      lines.push(`**${c.id} — ${status}.** Required: ${c.text}`);
-      lines.push("");
-      if (matched.length === 0) {
-        lines.push(`**Reasoning:** ${why}`);
-        lines.push("");
-      }
-      // Structured evidence/fix from the criterion verdict itself (the current
-      // prompt's contract). The criterion-level patch renders once, up front;
-      // an identical patch echoed on a matched suggestion is skipped below.
-      if (c.evidenceCode) appendEvidenceBlock(lines, c.evidenceCode);
-      if (c.suggestedChange) appendPatchBlock(lines, c.suggestedChange);
-      matched.forEach((s, j) => {
-        // First suggestion's rationale joins the criterion's evidence in one
-        // Reasoning paragraph; later ones stand on their own rationale.
-        const reasoning = [j === 0 ? why : "", s.rationale || ""]
-          .filter(Boolean)
-          .join(" ");
-        if (reasoning) {
-          lines.push(`**Reasoning:** ${reasoning}`);
-          lines.push("");
-        }
-        const samePatch =
-          s.patch &&
-          c.suggestedChange &&
-          s.patch.path === c.suggestedChange.path &&
-          s.patch.suggested === c.suggestedChange.suggested;
-        if (s.patch && !samePatch) {
-          appendPatchBlock(lines, s.patch);
-        } else if (s.suggestedChange) {
-          lines.push("**Suggested Change:**");
-          lines.push("");
-          // Hard-code the diff language tag — the LLM's `language` field
-          // describes `codeExample`, not this snippet.
-          appendCodeBlock(lines, s.suggestedChange, "diff");
-          lines.push("");
-        }
-        if (s.codeExample) {
-          lines.push("**Full Code:**");
-          lines.push("");
-          appendCodeBlock(lines, s.codeExample, s.language);
-          lines.push("");
-        }
-      });
-    });
-    lines.push("");
-  }
-  if (met.length) {
-    const header =
-      unmet.length === 0 && regressed.length === 0
-        ? `### All ${met.length} acceptance criteria met`
-        : `### ${met.length} of ${filledCriteria.length} acceptance criteria met`;
-    // Collapsed by default: the developer already saw these pass, so they're here
-    // for reference, not re-litigation. The blank line after </summary> is what
-    // lets GitHub render the list inside the <details>.
-    lines.push(header, "", "<details><summary>Show met criteria</summary>", "");
-    for (const c of met) {
-      lines.push(`- **${c.id}** — ${c.text}`);
-    }
-    lines.push("", "</details>", "");
-  }
-
-  // New commits since the last review — the intent-vs-implementation assessment.
-  // Shown whenever a re-review ingested new commits (even when criteria are
-  // unchanged and nothing was flagged), so the developer always gets fresh
-  // feedback on what the latest push actually did. The summary carries the
-  // narrative; any findings are advisory (gating rides the appended criteria).
-  if (holistic.commitIntentSummary || holistic.commitIntentFindings.length) {
-    lines.push("### New commits since last review");
-    if (holistic.commitIntentSummary) lines.push(holistic.commitIntentSummary, "");
-    if (holistic.commitIntentFindings.length) {
-      appendHolisticGroup(lines, "Intent check", holistic.commitIntentFindings);
-      lines.push("");
-    }
-  }
-
-  // Correctness/robustness bugs in the changed code, independent of the criteria.
-  // Placed directly under the criteria verdict because this is the section that
-  // can fail an otherwise-passing PR: a diff can satisfy every requirement and
-  // still be wrong. Each finding states the concrete failure it produces, and
-  // blocker-severity ones gate the merge.
-  if (holistic.defects.length) {
-    const blocking = holistic.defects.filter((f) => f.severity === "blocker").length;
-    lines.push("### Bugs and correctness issues");
-    lines.push(
-      "Found by reviewing the changed code for correctness, independent of the acceptance criteria" +
-        (blocking
-          ? `. ${blocking} of these block${blocking === 1 ? "s" : ""} the merge:`
-          : ". None of these block the merge:"),
-      ""
-    );
-    appendDefectGroup(lines, holistic.defects);
-    lines.push("");
-  }
-
-  // Self-admitted deferred / incomplete work the diff's own comments concede.
-  // Advisory (never blocks the merge) but surfaced prominently right under the
-  // criteria — this is the "the agent quietly punted part of the design" signal
-  // the author needs to see before merging. Rendered for both spec'd and
-  // spec-less PRs; each item carries its own copyable fix prompt.
-  if (holistic.deferrals.length) {
-    lines.push("### Deferred / incomplete work");
-    lines.push(
-      "The diff's own comments concede that parts were deferred, stubbed, or only partially implemented. " +
-        "These don't block the merge — confirm each was intentional, or use the prompt to finish it:",
-      ""
-    );
-    appendHolisticGroup(lines, "Deferred", holistic.deferrals);
-    lines.push("");
-  }
-
-  // Only suggestions NOT already rendered under an unmet criterion above land
-  // here (spec-less PRs, suggestions for met/regressed criteria, mismatched
-  // ids). No inline per-suggestion prompts — the consolidated dropdown at the
-  // bottom carries the copyable AI-agent prompt.
-  const residual = suggestions.filter((s) => !consumed.has(s));
-  if (residual.length) {
-    lines.push("### Suggested changes");
-    for (const s of residual) {
-      const heading = s.criterionId
-        ? `#### For ${s.criterionId} — ${s.title}`
-        : `#### ${s.title}`;
-      // Severity chip on the heading line (blocker/warn/nit from the review
-      // sweep); absent on legacy rows.
-      lines.push(s.severity ? `${heading} (${s.severity})` : heading);
-      if (s.rationale) lines.push(s.rationale);
-      if (s.patch) {
-        lines.push("");
-        appendPatchBlock(lines, s.patch);
-      } else if (s.suggestedChange) {
-        lines.push("");
-        appendCodeBlock(lines, s.suggestedChange, "diff");
-      }
-      if (s.codeExample) {
-        lines.push("");
-        appendCodeBlock(lines, s.codeExample, s.language);
-      }
-      lines.push("");
-    }
-  }
-
-  // Line-anchored annotations from the review step. With no formal-review body to
-  // carry them as native inline comments, they live here so the whole verdict
-  // stays in this single comment.
-  if (lineNotes.length) {
-    lines.push("### Line notes");
-    for (const n of lineNotes) {
-      lines.push(`- \`${n.path}:${n.line}\` — ${n.body}`);
-    }
-    lines.push("");
-  }
-
-  const holisticItems =
-    holistic.regressions.length + holistic.criticalErrors.length + holistic.securityFindings.length;
-  if (holisticItems) {
-    lines.push("### Repo-wide concerns");
-    if (holistic.summary) lines.push(holistic.summary, "");
-    appendHolisticGroup(lines, "Regressions", holistic.regressions);
-    appendHolisticGroup(lines, "Critical errors", holistic.criticalErrors);
-    // Security detail deliberately does NOT render in the PR comment — it
-    // lives on the Security page. The comment carries only the count + a
-    // pointer; a critical finding still gates the verdict (REQUEST_CHANGES),
-    // so the merge can't proceed silently.
-    if (holistic.securityFindings.length) {
-      const critical = holistic.securityFindings.filter(
-        (f) => (f.securitySeverity ?? "medium") === "critical"
-      ).length;
-      const counts =
-        `${holistic.securityFindings.length} security finding${holistic.securityFindings.length === 1 ? "" : "s"}` +
-        (critical ? ` (${critical} critical — blocks this PR)` : "");
-      lines.push(
-        `**Security:** this PR introduces ${counts}. Details and remediation are on the ` +
-          `[Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}).`
-      );
-    }
-    lines.push("");
-  }
-
-  // Pre-existing security findings in files this PR touches: pointer only —
-  // the Security page owns the detail. Advisory; never blocks the merge.
-  if (holistic.preexistingVulns.length) {
-    lines.push(
-      `**Security:** ${holistic.preexistingVulns.length} pre-existing security finding${holistic.preexistingVulns.length === 1 ? "" : "s"} ` +
-        `touch${holistic.preexistingVulns.length === 1 ? "es" : ""} files in this PR (not introduced by it) — ` +
-        `[view on the Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}).`,
-      ""
-    );
-  }
-
-  // Pre-existing findings this PR resolved (re-verified against the PR head):
-  // one positive line; the findings flip to "fix ready" on the Security page.
-  if (holistic.resolvedPreexisting.length) {
-    lines.push(
-      `**Security:** this PR fixes ${holistic.resolvedPreexisting.length} previously-flagged security finding${holistic.resolvedPreexisting.length === 1 ? "" : "s"} — ` +
-        `confirmed against this commit; ${holistic.resolvedPreexisting.length === 1 ? "it resolves" : "they resolve"} on the ` +
-        `[Security page](${config.webOrigin}/security${context ? `?repo=${encodeURIComponent(context.repoFullName)}` : ""}) when merged.`,
-      ""
-    );
-  }
-
-  // DEVASIGN.md nits (advisory). Convention violations the diff newly introduced
-  // and DEVASIGN.md statements the diff made outdated. Never block the merge —
-  // surfaced as nitpicks, each with its own copyable fix prompt.
-  const devasignItems = holistic.conventionFindings.length + holistic.docDriftFindings.length;
-  if (devasignItems) {
-    lines.push("### DEVASIGN.md");
-    lines.push(
-      "Checked against your repo's DEVASIGN.md conventions. These are nits — they don't block the merge:",
-      ""
-    );
-    appendHolisticGroup(lines, "Convention nits", holistic.conventionFindings);
-    appendHolisticGroup(lines, "Docs to update", holistic.docDriftFindings);
-    lines.push("");
-  }
-
-  // Cross-repo impact (advisory). Sits last of the finding sections because it is
-  // the only one not about code in this diff — it is about other repositories.
-  const crossRepoItems = holistic.crossRepoImpacts.length + holistic.parityNotes.length;
-  if (crossRepoItems) {
-    lines.push("### Cross-repo impact");
-    lines.push(
-      "Checked other repositories in your organization for code that consumes what this " +
-        "PR changes. Advisory — none of this blocks the merge:",
-      ""
-    );
-    appendHolisticGroup(lines, "Breaks a sibling repo", holistic.crossRepoImpacts);
-    appendHolisticGroup(lines, "Feature parity", holistic.parityNotes);
-    lines.push("");
-  }
-
-  // Consolidated "fix everything in one paste" prompt for an external AI
-  // coding agent (Claude Code, Cursor, Aider, Codex). Only included when
-  // there's anything to fix — at least one unmet criterion or one review
-  // finding (any category or severity). The per-suggestion fixPrompts above
-  // stay too, for users who want to fix one item at a time.
-  //
-  // The outer fence adapts to the content (codeFence) so per-suggestion
-  // fixPrompts — which themselves contain ```diff fences — can't accidentally
-  // close it. GitHub renders 4+-backtick fences as code blocks with a copy
-  // button, so the user gets one-click copy of the whole prompt. A blank line
-  // separates the </summary> from the fence so GitHub renders the markdown
-  // inside <details> instead of treating it as raw HTML.
-  // Verification: per-criterion verdicts from tests that actually ran (or the
-  // pending/setup state). Marker-delimited so a later result update can splice
-  // this block without re-rendering the rest of the comment.
-  if (verification) {
-    lines.push(...formatVerificationSection(verification).split("\n"), "");
-  }
-
-  const findings = collectConsolidatedFindings(holistic);
-  if (context && (unmet.length > 0 || findings.length > 0)) {
-    const prompt = buildConsolidatedFixPrompt({
-      prTitle: context.prTitle,
-      repoFullName: context.repoFullName,
-      endGoal,
-      unmetCriteria: unmet,
-      suggestions,
-      findings,
-    });
-    const fence = codeFence(prompt);
-    lines.push("");
-    lines.push("---");
-    lines.push("");
-    lines.push("<details>");
-    lines.push("<summary>One prompt to fix all of this — paste into your AI coding agent</summary>");
-    lines.push("");
-    lines.push(fence);
-    lines.push(prompt);
-    lines.push(fence);
-    lines.push("");
-    lines.push("</details>");
-  }
-
-  // Spec-less PRs: invite an end goal (posted once; gated in runReviewJob).
-  if (context?.endGoalCTA) {
-    lines.push("");
-    lines.push(buildEndGoalRequestCTA());
-  }
-
-  return lines.join("\n").trim() || "DevAsign review.";
-}
-
 // Flatten every category of the holistic verdict into one labelled list for
 // the consolidated fix prompt. Array order doubles as display priority (most
 // severe categories first, advisory nits last). Partitioning by category key
@@ -2918,7 +2560,7 @@ const CONSOLIDATED_FINDING_GROUPS: Array<{
   { key: "crossRepoImpacts", label: "Cross-repo — the consumer is in the named repo" },
 ];
 
-function collectConsolidatedFindings(
+export function collectConsolidatedFindings(
   holistic: HolisticVerdict
 ): Array<{ label: string; finding: HolisticFinding }> {
   const out: Array<{ label: string; finding: HolisticFinding }> = [];
@@ -2933,23 +2575,7 @@ function collectConsolidatedFindings(
 // `fixPrompt`s the LLM already produces (each carries File / Symbol / Issue
 // / Suggested approach / Relevant diff) so we incur no extra LLM cost; this
 // is pure string composition.
-// Match suggestions to a criterion by NORMALIZED id (trim + lowercase),
-// mirroring the verdict→criterion merge in runReviewJob. The review LLM can
-// echo `criterionId` in a different case/whitespace than the criterion's id
-// ("C1" vs "c1"); a strict === would drop the patch and fall back to the
-// generic fallbacks. Normalize at the comparison only — not on the stored
-// suggestion — so rendered headings keep the LLM's original casing.
-function suggestionsForCriterion(
-  id: unknown,
-  suggestions: ReviewSuggestion[]
-): ReviewSuggestion[] {
-  const cid = String(id ?? "").trim().toLowerCase();
-  return suggestions.filter(
-    (s) => String(s.criterionId ?? "").trim().toLowerCase() === cid
-  );
-}
-
-function buildConsolidatedFixPrompt(args: {
+export function buildConsolidatedFixPrompt(args: {
   prTitle: string;
   repoFullName: string;
   endGoal: string;
@@ -3042,136 +2668,6 @@ function buildConsolidatedFixPrompt(args: {
   return lines.join("\n").trimEnd();
 }
 
-// Defect findings render like holistic ones but carry two extra fields the
-// generic renderer has no slot for: the bug class (as a leading tag) and the
-// failure scenario (the thing that makes a finding actionable rather than an
-// assertion). Kept separate rather than branching inside appendHolisticGroup so
-// every other caller's output is byte-identical to before.
-// The "path/to/file.ts:42 — " location label for a finding: gutter-derived
-// line number appended when the stage supplied one.
-function findingWhere(f: HolisticFinding): string {
-  return f.path ? `\`${f.path}${f.line ? `:${f.line}` : ""}\` — ` : "";
-}
-
-// Structured before/after patch on a finding, indented to sit under its bullet.
-function appendFindingPatch(lines: string[], f: HolisticFinding) {
-  if (!f.suggestedChange) return;
-  lines.push("");
-  appendPatchBlock(lines, f.suggestedChange, "  ");
-}
-
-function appendDefectGroup(lines: string[], findings: HolisticFinding[]) {
-  if (!findings.length) return;
-  for (const f of findings) {
-    const sev =
-      f.severity === "blocker" ? "**Blocker**" : f.severity === "nit" ? "Nit" : "Warn";
-    const cls = f.defectClass ? `\`${f.defectClass}\` — ` : "";
-    lines.push(`- ${sev} — ${findingWhere(f)}${cls}${f.concern}`);
-    if (f.failureScenario) {
-      lines.push(`  - **How it fails:** ${f.failureScenario}`);
-    }
-    appendFindingPatch(lines, f);
-    appendFixPrompt(lines, f.fixPrompt, /* indented */ true);
-  }
-}
-
-function appendHolisticGroup(
-  lines: string[],
-  label: string,
-  findings: HolisticFinding[]
-) {
-  if (!findings.length) return;
-  lines.push(`#### ${label}`);
-  for (const f of findings) {
-    const sev = f.severity === "blocker" ? "**Blocker**" : f.severity === "nit" ? "Nit" : "Warn";
-    lines.push(`- ${sev} — ${findingWhere(f)}${f.concern}`);
-    appendFindingPatch(lines, f);
-    appendFixPrompt(lines, f.fixPrompt, /* indented */ true);
-  }
-  lines.push("");
-}
-
-// Pick a code-fence backtick run strictly longer than the longest run of
-// backticks already inside `content`. The fixPrompt template mandates an
-// inner ```diff fence (see reviewDiff's system prompt), so a naive 3-backtick
-// wrapper would be closed early by that inner fence — leaking the rest of the
-// comment out as broken markdown. GitHub renders any fence of 3+ backticks;
-// 4+ also keeps the one-click copy button. Minimum 3 so empty content still
-// fences cleanly.
-function codeFence(content: string): string {
-  let longest = 0;
-  for (const run of content.match(/`+/g) || []) longest = Math.max(longest, run.length);
-  return "`".repeat(Math.max(3, longest + 1));
-}
-
-// Validate an LLM-supplied code-fence language token. GitHub/Linguist apply
-// syntax coloring only when the opening fence carries a language (typescript,
-// ts, py, bash, json, diff…); a bare fence renders as uncolored monospace.
-// Reject anything with whitespace/backticks/junk so a malformed value can't
-// corrupt the fence info string; "" means "no language" (bare fence, unchanged
-// behavior).
-function fenceLang(language?: string): string {
-  const t = (language || "").trim().toLowerCase();
-  return /^[a-z0-9+#.-]{1,20}$/.test(t) ? t : "";
-}
-
-// Push a fenced code block (opening fence tagged with the sanitized language so
-// GitHub colors it, bare closing fence) onto a markdown line buffer. The fence
-// length adapts to the content (codeFence) so inner backtick runs can't close
-// it early; `pad` indents the whole block to sit under a list item. Mirrors the
-// appendFixPrompt helper.
-function appendCodeBlock(lines: string[], code: string, language?: string, pad = "") {
-  const fence = codeFence(code);
-  lines.push(`${pad}${fence}${fenceLang(language)}`);
-  for (const ln of code.split("\n")) lines.push(`${pad}${ln}`);
-  lines.push(`${pad}${fence}`);
-}
-
-// Compose a structured before/after patch into a plain unified-diff-style
-// snippet (removed lines "-", added lines "+", no hunk headers) for rendering
-// inside a ```diff fence.
-function patchToDiff(p: SuggestedChange): string {
-  const orig = p.original ? p.original.split("\n").map((l) => `-${l}`) : [];
-  const sugg = p.suggested.split("\n").map((l) => `+${l}`);
-  return [...orig, ...sugg].join("\n");
-}
-
-// Renders a structured suggestedChange as a labeled before/after diff block
-// anchored to its file location.
-function appendPatchBlock(lines: string[], patch: SuggestedChange, pad = "") {
-  lines.push(`${pad}**Suggested change** (\`${patch.path}:${patch.startLine}\`):`);
-  lines.push("");
-  appendCodeBlock(lines, patchToDiff(patch), "diff", pad);
-  lines.push("");
-}
-
-// Renders a criterion's decisive evidence excerpt with its file anchor.
-function appendEvidenceBlock(lines: string[], ec: EvidenceCode, pad = "") {
-  lines.push(`${pad}**Evidence** (\`${ec.path}:${ec.startLine}\`):`);
-  lines.push("");
-  appendCodeBlock(lines, ec.code, ec.language ?? undefined, pad);
-  lines.push("");
-}
-
-// Renders the per-finding "prompt for your AI agent" block. The prompt sits in
-// a fenced code block so GitHub's built-in copy button picks it up — no
-// client-side wiring needed for the GitHub surface. The fence length adapts
-// to the content (codeFence) so the fixPrompt's own ```diff hunk can't close
-// the wrapper. The optional indent variant keeps list-rendered findings
-// (holistic) readable; the 2-space pad aligns the block with the list item's
-// content column so GitHub still parses it as belonging to the bullet.
-function appendFixPrompt(lines: string[], fixPrompt: string | undefined, indented = false) {
-  if (!fixPrompt) return;
-  const pad = indented ? "  " : "";
-  const fence = codeFence(fixPrompt);
-  lines.push("");
-  lines.push(`${pad}**Prompt for your AI agent:**`);
-  lines.push("");
-  lines.push(`${pad}${fence}`);
-  for (const ln of fixPrompt.split("\n")) lines.push(`${pad}${ln}`);
-  lines.push(`${pad}${fence}`);
-}
-
 // GitHub rejects an entire review batch if any inline comment references a
 // file that isn't actually in the diff. Cheap pre-filter against the file
 // paths we see in the unified diff so the verdict still lands even when the
@@ -3188,6 +2684,86 @@ function diffFilePaths(diff: string): Set<string> {
 
 // --- Output ---
 
+// Cap on stored thread state. Every prReviews row is held in memory, so an
+// abandoned long-lived PR must not grow one without bound. Resolved threads go
+// first: they are history, and their comments survive on GitHub regardless.
+const THREAD_STATE_CAP = 200;
+
+function capThreads(threads: ReviewThread[]): ReviewThread[] {
+  if (threads.length <= THREAD_STATE_CAP) return threads;
+  const open = threads.filter((t) => t.state === "open");
+  const resolved = threads
+    .filter((t) => t.state === "resolved")
+    .sort((a, b) => (b.resolvedAt ?? b.updatedAt) - (a.resolvedAt ?? a.updatedAt));
+  return [...open, ...resolved].slice(0, THREAD_STATE_CAP);
+}
+
+// Which commit to name when a thread stops being reported. Uses the delta the
+// new-commit stage already fetched — attributing further would mean a compare
+// call per resolved finding, and the compare payload only gives a union of
+// changed files anyway, so picking one commit out of several would be a guess.
+function fixAttribution(
+  repo: { owner: string; name: string },
+  headSha: string,
+  deltaCommits: Array<{ sha: string; message: string }> | null,
+  lastReviewedSha: string | null | undefined
+): FixAttribution {
+  const base = `https://github.com/${repo.owner}/${repo.name}`;
+  if (deltaCommits?.length === 1) {
+    const c = deltaCommits[0];
+    return {
+      kind: "commit",
+      sha: c.sha,
+      url: `${base}/commit/${c.sha}`,
+      message: (c.message || "").split("\n")[0].trim() || undefined,
+    };
+  }
+  if (deltaCommits && deltaCommits.length > 1 && lastReviewedSha) {
+    return {
+      kind: "range",
+      base: lastReviewedSha,
+      head: headSha,
+      url: `${base}/compare/${lastReviewedSha}...${headSha}`,
+      count: deltaCommits.length,
+    };
+  }
+  return { kind: "head", sha: headSha, url: `${base}/commit/${headSha}` };
+}
+
+// Trailing pointers on the card for the things that deliberately don't get a
+// thread: pre-existing security (not introduced by this PR) and the tests
+// comment (its own conversation comment, posted by the verifier).
+export function cardNotes(args: {
+  holistic: HolisticVerdict;
+  repoFullName: string;
+  verification: VerificationView | null;
+}): string[] {
+  const notes: string[] = [];
+  const securityLink = `[Security page](${config.webOrigin}/security?repo=${encodeURIComponent(args.repoFullName)})`;
+  const pre = args.holistic.preexistingVulns.length;
+  if (pre) {
+    notes.push(
+      `**Security:** ${pre} pre-existing security finding${pre === 1 ? "" : "s"} ` +
+        `touch${pre === 1 ? "es" : ""} files in this PR (not introduced by it) — view on the ${securityLink}.`
+    );
+  }
+  const resolved = args.holistic.resolvedPreexisting.length;
+  if (resolved) {
+    notes.push(
+      `**Security:** this PR fixes ${resolved} previously-flagged security finding${resolved === 1 ? "" : "s"} — ` +
+        `confirmed against this commit; ${resolved === 1 ? "it resolves" : "they resolve"} on the ${securityLink} when merged.`
+    );
+  }
+  const v = args.verification;
+  if (v && v.state === "completed") {
+    notes.push(
+      `**Tests:** ${v.counts.pass} passed, ${v.counts.fail} failed, ${v.counts.unverifiable} unverifiable — ` +
+        `see the "Tests by DevAsign" comment.`
+    );
+  }
+  return notes;
+}
+
 async function postGithubOutput(
   review: PRReview,
   repo: { owner: string; name: string },
@@ -3201,87 +2777,65 @@ async function postGithubOutput(
     comments: Array<{ path: string; line: number; body: string }>;
     diff: string;
     holistic: HolisticVerdict;
-    // Verdict routing (resolveReviewEvent). The conversation footprint is the
-    // single verdict comment, so the "review event" maps to invisible timeline
-    // actions only: APPROVE → bodyless approval; REQUEST_CHANGES → dismiss our
-    // stale approval (GitHub requires a body — i.e. a visible comment block — on
-    // a REQUEST_CHANGES review, so we never submit one); COMMENT → nothing.
+    // Verdict routing (resolveReviewEvent). APPROVE -> bodyless approval;
+    // REQUEST_CHANGES -> dismiss our stale approval (GitHub requires a body on a
+    // REQUEST_CHANGES review, which would render as a second conversation block,
+    // so we never submit one); COMMENT -> nothing.
     event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
-    // When false, only the Check Run is (re)posted — used on repeat reviews of
-    // a still-spec-less PR where we've already asked for an end goal.
+    // When false, no fresh conversation comment is posted — used on repeat
+    // reviews of a still-spec-less PR where we've already asked for an end goal.
+    // Threads are still reconciled: a stale finding must not be left shouting.
     postConversationReview: boolean;
-    // Append the "provide an end goal" call-to-action to the review body.
+    // Append the "provide an end goal" call-to-action to the card.
     endGoalCTA: boolean;
     // Id of this run's "review in progress" placeholder comment, if one was
-    // posted (runReviewJob). We edit it into the verdict; null → post a fresh
-    // verdict comment instead.
+    // posted (runReviewJob). We edit it into the card; null -> post a fresh one.
     progressCommentId: number | null;
-    // Per-criterion verdict from the PREVIOUS run, so the comment body can tell a
-    // criterion that's still-open from one an earlier commit met but a later
-    // commit broke (a regression). Empty on a first review.
+    // Per-criterion verdict from the PREVIOUS run, so a criterion an earlier
+    // commit met and a later one broke reads as a regression rather than as
+    // something that was never done. Empty on a first review.
     prior: Map<string, PriorVerdict>;
-    // The verify branch's state at the join — rendered as the "Verification"
-    // section and the "DevAsign · Verify" check run.
+    // The verify branch's state at the join — drives the "DevAsign · Verify"
+    // check run and the separate "Tests by DevAsign" comment.
     verification?: VerificationView | null;
+    // Passes that actually produced a result this run. A thread whose stage did
+    // not run is never read as fixed.
+    stagesRun: Set<ReviewStage>;
+    // Per-repo rollback lever (workflow.stages.inlineThreads). Off = no threads
+    // are created or edited, and every item renders inside the card instead.
+    inlineThreads: boolean;
+    // Commits since the last reviewed sha, when the new-commit stage fetched
+    // them — used to name the commit that resolved a finding.
+    deltaCommits: Array<{ sha: string; message: string }> | null;
+    lastReviewedSha: string | null | undefined;
   }
 ): Promise<{ verdictPosted: boolean }> {
   if (!install) return { verdictPosted: false }; // dev: nothing to post to
-  const installationId = install.installationId; // captured so the closure below keeps the non-null narrowing
+  const installationId = install.installationId; // captured so the closures below keep the non-null narrowing
   const conclusion = status === "passed" ? "success" : "action_required";
   const specless = args.criteria.length === 0;
+  const repoFullName = `${repo.owner}/${repo.name}`;
 
-  // The LLM's line-anchored annotations. With no formal-review body to carry
-  // them as native inline comments, they render inside the verdict comment as a
-  // "Line notes" section. Keep the diff-path filter so a hallucinated `path`
-  // doesn't put junk in the comment.
-  const validPaths = diffFilePaths(args.diff);
+  // Everything the review has to say, as one list. The line index decides what
+  // can be anchored: GitHub only accepts a review comment on a line that is part
+  // of the diff, so a hallucinated path or an out-of-hunk line degrades to a
+  // file-level comment or to the card rather than 422-ing.
+  const index = commentableLines(args.diff);
   const lineNotes = (args.comments || []).filter(
-    (c) => c.path && c.body && Number.isFinite(c.line) && validPaths.has(c.path)
+    (c) => c.path && c.body && Number.isFinite(c.line) && index.has(c.path)
   );
-
-  // The single editable conversation comment IS the review the developer reads:
-  // the full body (end goal, criteria, suggestions, line notes, feedback) under
-  // an outcome headline. We edit this run's "review in progress" placeholder
-  // into it (or post a fresh comment if we never captured a placeholder id).
-  const fullBody = formatReviewBody(
-    args.endGoal,
-    args.criteria,
-    args.suggestions,
-    args.holistic,
-    { prTitle: review.prTitle, repoFullName: `${repo.owner}/${repo.name}`, endGoalCTA: args.endGoalCTA },
-    args.prior,
+  const items = buildReviewItems({
+    criteria: args.criteria,
+    prior: args.prior,
+    suggestions: args.suggestions,
+    holistic: args.holistic,
     lineNotes,
-    args.verification ?? null
-  );
-  const commentBody = verdictCommentBody({ status, specless, reviewBody: fullBody });
-  // Write the verdict into the conversation comment; returns whether it landed.
-  // `editOnly` skips posting a fresh comment when there's no placeholder to edit
-  // — used on the refresh-only path, where a brand-new standalone comment each
-  // run would just be noise. Best-effort: a commenting hiccup must never abort
-  // the review.
-  const writeVerdictComment = async (editOnly = false): Promise<boolean> => {
-    if (args.progressCommentId !== null) {
-      const ok = await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
-      if (ok && args.verification?.runId) {
-        const run = db.find("verifyRuns", (r) => r.id === args.verification!.runId);
-        if (run) updateVerifyRun(run.id, { report: { ...(run.report || {}), commentId: args.progressCommentId! } });
-      }
-      return ok;
-    }
-    if (editOnly) return false;
-    const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
-    if (id !== null) {
-      // Persist so a same-sha rerun reuses this comment even though the
-      // placeholder POST at run start failed.
-      setStatus(review.id, { progressCommentId: id, progressCommentSha: review.headSha });
-    }
-    return id !== null;
-  };
+  });
 
-  // Check Run is keyed to head_sha, so it's always (re)posted — it updates the
-  // commit status without adding conversation noise.
+  // 1. Check Runs first. These are the merge gate; they must never wait on a
+  // thread hiccup or a rate-limit stall. Keyed to head_sha, so always reposted.
   try {
-    await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
+    await gh(installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
       method: "POST",
       body: JSON.stringify({
         name: "DevAsign · End goal",
@@ -3307,61 +2861,225 @@ async function postGithubOutput(
   }
   if (args.verification) {
     await postVerifyCheckRun(install, repo, review, args.verification);
-  }
-
-  // Already asked for an end goal on a prior pass: refresh only the Check Run and
-  // update the verdict comment in place (no fresh conversation comment). Edit-only
-  // so a still-spec-less re-review doesn't post a brand-new comment each run.
-  if (!args.postConversationReview) {
-    return { verdictPosted: await writeVerdictComment(true) };
-  }
-
-  // Review-event routing — timeline-only signals, never a comment block:
-  // - APPROVE: bodyless approval (GitHub renders just "approved these changes").
-  //   Store its id so a later failing commit can withdraw it.
-  // - REQUEST_CHANGES: never submitted (its required body would render as an
-  //   extra conversation comment). Instead, dismiss our earlier approval so the
-  //   merge gate (branch protection + the action_required Check Run) stays
-  //   honest after a regression.
-  // - COMMENT (spec-less pass / advisory downgrade): nothing to submit.
-  // Best-effort: a failure here must not block the verdict comment below.
-  if (args.event === "APPROVE") {
-    try {
-      const res = await gh<{ id?: number }>(
-        install.installationId,
-        `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`,
-        {
-          method: "POST",
-          body: JSON.stringify({ event: "APPROVE" }),
-          headers: { "Content-Type": "application/json" },
-        }
-      );
-      if (typeof res?.id === "number") {
-        setStatus(review.id, { approveReviewId: res.id });
-      }
-    } catch (err) {
-      console.warn("[review] failed to post approval:", err);
-    }
-  } else if (args.event === "REQUEST_CHANGES" && review.approveReviewId != null) {
-    const dismissed = await dismissPRReview(
-      install.installationId,
-      repo.owner,
-      repo.name,
-      review.prNumber,
-      review.approveReviewId,
-      "A newer commit did not pass the DevAsign review; the earlier approval no longer applies."
-    );
-    if (dismissed) {
-      setStatus(review.id, { approveReviewId: null });
-      log(review.id, "verdict", "Withdrew earlier approval", {
-        detail: "A newer commit did not pass review; the stale approval was dismissed.",
+    // Verification gets its own conversation comment rather than a section of the
+    // review's. It can land here (results were ready at the join) or later from
+    // runVerifyJudge; upsertVerifyComment is keyed on (review, sha) so both paths
+    // converge on one comment.
+    const repoRow = db.find("repositories", (r) => r.id === review.repoId);
+    if (repoRow) {
+      await upsertVerifyComment({
+        install,
+        repo: repoRow,
+        review,
+        sha: review.headSha,
+        runId: args.verification.runId,
+        view: args.verification,
       });
     }
   }
 
-  // Edit the placeholder into the full verdict (or post it fresh if we never
-  // captured a placeholder id).
-  return { verdictPosted: await writeVerdictComment() };
+  // 2. Approval routing — timeline-only signals, before the threads for the same
+  // reason as the check runs. Best-effort; a failure here must not stop the card.
+  if (args.postConversationReview) {
+    if (args.event === "APPROVE") {
+      try {
+        const res = await gh<{ id?: number }>(
+          installationId,
+          `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}/reviews`,
+          {
+            method: "POST",
+            body: JSON.stringify({ event: "APPROVE" }),
+            headers: { "Content-Type": "application/json" },
+          }
+        );
+        if (typeof res?.id === "number") {
+          setStatus(review.id, { approveReviewId: res.id });
+        }
+      } catch (err) {
+        console.warn("[review] failed to post approval:", err);
+      }
+    } else if (args.event === "REQUEST_CHANGES" && review.approveReviewId != null) {
+      const dismissed = await dismissPRReview(
+        installationId,
+        repo.owner,
+        repo.name,
+        review.prNumber,
+        review.approveReviewId,
+        "A newer commit did not pass the DevAsign review; the earlier approval no longer applies."
+      );
+      if (dismissed) {
+        setStatus(review.id, { approveReviewId: null });
+        log(review.id, "verdict", "Withdrew earlier approval", {
+          detail: "A newer commit did not pass review; the stale approval was dismissed.",
+        });
+      }
+    }
+  }
+
+  // 3. Inline threads: one per item, edited in place across pushes, marked fixed
+  // when an item stops being reported. Wrapped whole — if any of this fails the
+  // card still renders every item inline, which is what makes it safe to ship.
+  let openForCounting: Array<Pick<ReviewItem, "category" | "state">> = items.map((i) => ({
+    category: i.category,
+    state: i.state,
+  }));
+  let fixedCount = 0;
+  let unanchorable: ReviewItem[] = [];
+  let overflowed: ReviewItem[] = [];
+  const metItems = items.filter((i) => i.state === "met");
+  let threadedKeys = new Set<string>();
+  try {
+    // A closed or merged PR doesn't need new threads, and a head that moved mid-
+    // run means our line numbers describe a superseded tree. One GET answers both
+    // — skipped entirely when threads are turned off for this repo.
+    const pr = args.inlineThreads
+      ? await gh<{ state?: string; head?: { sha?: string } }>(
+          installationId,
+          `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}`
+        )
+      : null;
+    const prOpen = pr?.state === "open";
+    const headMoved = typeof pr?.head?.sha === "string" && pr.head.sha !== review.headSha;
+    if (!args.inlineThreads) {
+      unanchorable = items;
+    } else if (!prOpen) {
+      log(review.id, "comment", "Inline threads skipped — the pull request is closed");
+      unanchorable = items;
+    } else if (args.diff === "") {
+      // With no diff every item looks gone; reconciling would announce a PR-wide
+      // set of phantom fixes.
+      log(review.id, "comment", "Inline threads skipped — no diff to anchor against");
+      unanchorable = items;
+    } else {
+      let threads = review.reviewThreads ?? [];
+      // Stored rows lost but we have reviewed before, so threads should exist:
+      // rebuild from the markers rather than posting a duplicate of each one.
+      if (threads.length === 0 && review.lastReviewedSha) {
+        const recovered = await loadThreadsFromGitHub({
+          installationId,
+          owner: repo.owner,
+          name: repo.name,
+          prNumber: review.prNumber,
+          headSha: review.headSha,
+        });
+        if (recovered?.length) {
+          threads = recovered;
+          log(review.id, "comment", `Rebuilt ${recovered.length} thread(s) from the pull request`);
+        }
+      }
+      const plan = planReconciliation({
+        items,
+        threads,
+        index,
+        headSha: review.headSha,
+        // A head that moved mid-run makes an absence untrustworthy, so no stage
+        // counts as having run: existing threads still get their bodies
+        // refreshed, but nothing is resolved and nothing new is created.
+        stagesRun: headMoved ? new Set<ReviewStage>() : args.stagesRun,
+        attribution: fixAttribution(repo, review.headSha, args.deltaCommits, args.lastReviewedSha),
+        commitUrl: (sha) => `https://github.com/${repo.owner}/${repo.name}/commit/${sha}`,
+        budget: headMoved ? 0 : undefined,
+      });
+      const result = await reconcileThreads({
+        installationId,
+        owner: repo.owner,
+        name: repo.name,
+        prNumber: review.prNumber,
+        headSha: review.headSha,
+        plan,
+      });
+      setStatus(review.id, { reviewThreads: capThreads(result.threads) });
+      openForCounting = plan.openForCounting;
+      fixedCount = plan.fixedCount;
+      unanchorable = plan.unanchorable;
+      overflowed = plan.overflowed;
+      threadedKeys = new Set(result.threads.map((t) => t.key));
+      if (result.aborted) {
+        log(review.id, "comment", "Stopped opening threads — GitHub rate limit", {
+          detail: "The remaining findings are listed on the review comment instead.",
+        });
+      }
+      if (result.created || result.updated || result.resolved) {
+        log(
+          review.id,
+          "comment",
+          `Threads: ${result.created} opened, ${result.updated} updated, ${result.resolved} marked fixed`
+        );
+      }
+    }
+  } catch (err) {
+    console.warn("[review] thread reconciliation failed:", err);
+    log(review.id, "error", "Inline threads failed — findings listed on the review comment instead", {
+      detail: err instanceof Error ? err.message : String(err),
+    });
+    unanchorable = items;
+  }
+
+  // 4. The summary card, last: its chip counts and its overflow sections are
+  // outputs of step 3, and leaving the placeholder on "in progress" until the
+  // very end preserves the crash semantics (a thrown run leaves the comment
+  // saying it is running, and the next push re-runs it).
+  const findings = collectConsolidatedFindings(args.holistic);
+  const unmetCriteria = splitForComment(args.criteria, args.prior).unmet;
+  const fixPrompt =
+    unmetCriteria.length > 0 || findings.length > 0
+      ? buildConsolidatedFixPrompt({
+          prTitle: review.prTitle,
+          repoFullName,
+          endGoal: args.endGoal,
+          unmetCriteria,
+          suggestions: args.suggestions,
+          findings,
+        })
+      : null;
+  const scored = openForCounting.filter((i) => i.state === "open");
+  const score = mergeScore(
+    items
+      .filter((i) => i.state === "open")
+      .map((i) => ({
+        scoreKind: i.scoreKind,
+        severity: i.severity,
+        securitySeverity: i.securitySeverity,
+      }))
+  );
+  const commentBody = formatSummaryCard({
+    open: openForCounting,
+    fixedCount,
+    score,
+    specless,
+    criteriaTotal: items.filter((i) => i.category === "criterion").length,
+    criteriaMet: metItems.length,
+    summary: args.summary,
+    fixPrompt,
+    unanchored: unanchorable,
+    overflow: overflowed,
+    // Only the met criteria that never got a thread need listing here; the rest
+    // are visible as their own "criterion met" threads.
+    metWithoutThread: metItems.filter((i) => !threadedKeys.has(i.key)),
+    notes: cardNotes({ holistic: args.holistic, repoFullName, verification: args.verification ?? null }),
+    cta: args.endGoalCTA ? buildEndGoalRequestCTA() : null,
+  });
+  void scored;
+
+  // `editOnly` skips posting a fresh comment when there's no placeholder to edit
+  // — used on the refresh-only path, where a brand-new standalone comment each
+  // run would just be noise. Best-effort: a commenting hiccup must never abort
+  // the review.
+  const writeVerdictComment = async (editOnly = false): Promise<boolean> => {
+    if (args.progressCommentId !== null) {
+      return updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
+    }
+    if (editOnly) return false;
+    const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
+    if (id !== null) {
+      // Persist so a same-sha rerun reuses this comment even though the
+      // placeholder POST at run start failed.
+      setStatus(review.id, { progressCommentId: id, progressCommentSha: review.headSha });
+    }
+    return id !== null;
+  };
+
+  return { verdictPosted: await writeVerdictComment(!args.postConversationReview) };
 }
 
 // Lightweight "changes requested" signal that blocks the merge WITHOUT re-running
@@ -4106,8 +3824,8 @@ async function postApprovalAfterCorrection(
 // The comment DevAsign posts after re-checking a maintainer's dispute. When the
 // re-review confirmed the maintainer (the finding was a false positive) it reads
 // as an acknowledgement plus the verifying evidence; when it could not, it
-// explains what was checked and what still stands. No emoji, matching the other
-// review-comment steps.
+// explains what was checked and what still stands. Plain text: this is a reply in
+// a conversation, not a status surface, so it carries none of the card's icons.
 function formatDisputeResolutionComment(args: {
   cleared: Array<{ id: string; text: string; evidence: string }>;
   stillUnmet: Criterion[];
@@ -4555,111 +4273,6 @@ function tryParseJSON<T>(raw: string, fallback: T): T {
 // a critical edge, or introduce a security flaw? Runs in addition to the
 // acceptance-criteria check; a blocker-severity finding flips status to
 // changes_requested even when every criterion is otherwise met.
-
-export type HolisticFinding = {
-  path?: string;
-  concern: string;
-  // "nit" sits below "warn": purely advisory DEVASIGN.md findings that never
-  // gate the merge and render as nitpicks. Only "blocker" gates (see the status
-  // gate in runReviewJob).
-  severity: "blocker" | "warn" | "nit";
-  // 4-tier severity for SECURITY findings only (the Security page's model).
-  // The legacy 2-tier field above is derived from it (critical → "blocker",
-  // everything else → "warn") so every renderer and the verdict gate keep
-  // working — and "blocker gates" now means exactly "critical gates".
-  securitySeverity?: SecuritySeverity;
-  // Defect pass only (reviewDiffDefects): taxonomy tag for the bug class —
-  // "null-deref", "unhandled-error", "race-condition", "resource-leak",
-  // "api-misuse", "data-loss", etc. Display only; nothing branches on it.
-  defectClass?: string;
-  // Defect pass only: concrete inputs/state -> the wrong outcome that follows.
-  // REQUIRED by that pass — normaliseDefectFindings DROPS any finding without
-  // one, mirroring the security agent's "no 3-step exploit narrative, no
-  // finding" rule (security/agent.ts). A model that can't say what actually
-  // goes wrong is speculating, and speculation must not gate a merge.
-  failureScenario?: string;
-  // Self-contained prompt the user can paste into an external AI coding agent
-  // to land the fix. Includes the relevant diff hunk inline.
-  fixPrompt?: string;
-  // 1-based NEW-file line the finding anchors to, read from the diff's
-  // pre-computed "N | " gutter. Absent when not tied to a single line.
-  line?: number;
-  // Structured before/after patch for the finding, when a single-site
-  // replacement exists. Rendered as a composed ```diff block.
-  suggestedChange?: SuggestedChange | null;
-};
-
-type HolisticVerdict = {
-  regressions: HolisticFinding[];
-  criticalErrors: HolisticFinding[];
-  securityFindings: HolisticFinding[];
-  // General correctness/robustness bugs the diff introduces (reviewDiffDefects).
-  // Runs on EVERY review, independent of the repo index and of whether the PR
-  // has acceptance criteria — the criteria pass only judges what was asked for,
-  // and a diff that satisfies every requirement can still be wrong. Gating:
-  // blocker-severity defects feed hasBlocker exactly like regressions and
-  // criticalErrors do (and so respect the repo's advisory-verdict mode).
-  defects: HolisticFinding[];
-  // Legacy advisory bucket for codebase-consistency deviations. No pass
-  // currently populates it (the former spec-less pass was removed); kept so the
-  // verdict shape and its renderers stay stable. Always empty today.
-  consistencyFindings: HolisticFinding[];
-  // Self-admitted "deferred / incomplete work" the diff's own comments concede
-  // — TODOs, stubs, "for now", "deferred to a follow-up", NotImplemented, etc.
-  // Detected by a separate regex-gated pass (detectDeferredWork) on both the
-  // spec'd and spec-less paths. Advisory — surfaced prominently but never
-  // blocks a merge (forced severity "warn"), like consistencyFindings.
-  deferrals: HolisticFinding[];
-  // DEVASIGN.md guidance pass (reviewAgainstDevasignDocs). `conventionFindings`
-  // are rules the diff newly violates; `docDriftFindings` are DEVASIGN.md
-  // statements the diff makes outdated (docs need updating). Both advisory —
-  // forced severity "nit", never gate a merge. Empty when the repo has no
-  // applicable DEVASIGN.md.
-  conventionFindings: HolisticFinding[];
-  docDriftFindings: HolisticFinding[];
-  // Vulnerabilities that ALREADY exist in files this PR touches or depends on,
-  // read from the repo index's stored security audit (not introduced by this
-  // diff). Advisory — forced severity "warn", never gate the merge. Surfaced so
-  // the author sees latent risk in the code they're working near.
-  preexistingVulns: HolisticFinding[];
-  // Pre-existing vulnerabilities this PR RESOLVED: stored vulns in files the PR
-  // modifies that re-verification against the PR head confirmed are gone. Positive
-  // confirmation that the agent saw the fix — advisory, never gates, no fixPrompt.
-  // Empty when nothing was re-verified or nothing was fixed.
-  resolvedPreexisting: HolisticFinding[];
-  // New-commit intent review (reviewNewCommits, re-reviews only): per-commit
-  // notes on whether the delta diff matches each new commit's stated intent.
-  // Advisory (forced "warn") — gating happens via criteria synthesized from that
-  // intent. `commitIntentSummary` is the narrative shown even when no criteria
-  // changed and no findings surfaced. Empty/"" on first reviews and same-sha reruns.
-  commitIntentFindings: HolisticFinding[];
-  commitIntentSummary: string;
-  // Cross-repo stage (Pro/Max, off by default). `crossRepoImpacts` are sibling
-  // repositories this change breaks; `parityNotes` are capabilities it adds that
-  // siblings lack. Both advisory — severity is forced at normalisation, and
-  // neither feeds hasBlocker.
-  crossRepoImpacts: HolisticFinding[];
-  parityNotes: HolisticFinding[];
-  summary: string;
-};
-
-export const EMPTY_HOLISTIC: HolisticVerdict = {
-  regressions: [],
-  criticalErrors: [],
-  securityFindings: [],
-  defects: [],
-  consistencyFindings: [],
-  deferrals: [],
-  conventionFindings: [],
-  docDriftFindings: [],
-  preexistingVulns: [],
-  resolvedPreexisting: [],
-  commitIntentFindings: [],
-  commitIntentSummary: "",
-  crossRepoImpacts: [],
-  parityNotes: [],
-  summary: "",
-};
 
 type HolisticContext = {
   entries: RepoIndexEntry[];      // [...touched, ...dependents]
@@ -5131,38 +4744,6 @@ async function reverifyTouchedPreexistingVulns(args: {
     });
   }
   return partitioned;
-}
-
-// Wording-tolerant identity for a finding: same file, same substance. Two
-// passes that spot the same bug phrase it differently ("returns before the
-// write lands" vs "Returns before the write lands."), so raw string equality
-// under-dedupes. normalizeSlug drops case and punctuation; the prefix keeps a
-// shared opening clause from collapsing genuinely different findings.
-function findingKey(f: Pick<HolisticFinding, "path" | "concern">): string {
-  return `${normalizeSlug(f.path ?? "")}::${normalizeSlug(f.concern).slice(0, 80)}`;
-}
-
-// Dedupe HolisticFindings by normalized path+concern and cap the count. Two
-// callers: merging the re-verified touched-file vulns with the index-driven
-// dependent-file ones (reproducing collectPreexistingVulns' single-source
-// dedupe+cap), and dropping defect-pass findings the holistic pass already
-// reported. `against` seeds the seen-set with findings that are already being
-// rendered elsewhere, so the returned list only contains what's genuinely new.
-export function dedupeAndCapFindings(
-  findings: HolisticFinding[],
-  cap: number,
-  against: HolisticFinding[] = []
-): HolisticFinding[] {
-  const out: HolisticFinding[] = [];
-  const seen = new Set<string>(against.map(findingKey));
-  for (const f of findings) {
-    const key = findingKey(f);
-    if (seen.has(key)) continue;
-    seen.add(key);
-    out.push(f);
-    if (out.length >= cap) break;
-  }
-  return out;
 }
 
 // ─── New-commit intent review ───────────────────────────────────────────────

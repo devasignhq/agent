@@ -1,23 +1,25 @@
-// Body builders for the editable PR conversation comment that DevAsign posts when
-// a review run starts ("PR Review In Progress") and edits into the full verdict
-// once the background review finishes. Pure — no db / network / LLM — so the exact
-// copy is unit-testable offline (mirrors criteria-format.ts / decisions.ts).
+// Body builders for the two states of the editable PR conversation comment that
+// DevAsign posts: the "review in progress" placeholder posted the moment a run
+// starts, and the failure copy if the run throws. The finished state — the
+// summary card — is built by comment.ts's formatSummaryCard.
 //
-// This single comment is the whole conversation footprint of a review run: the
-// formal GitHub review is reduced to a bodyless APPROVE (or an approval dismissal
-// on a later failure), so no other comment block ever appears. All copy here is
-// emoji-free by product decision.
-import type { PRReviewStatus } from "../types.js";
+// All three share the "## DevAsign Code Review" title so the comment keeps one
+// identity as it is edited through the run; only what sits under the title
+// changes. Pure — no db / network / LLM:
+//   node --import tsx/esm --test src/review/progress-comment.test.ts
+import { CARD_TITLE } from "./comment.js";
 
-// The "running…" placeholder, posted the moment a review run starts. Mirrors the
-// product screenshot: a heading, a divider, the "currently running / will update
-// automatically" line, a "What's happening?" list, and a hang-tight note.
+// The "running…" placeholder. Deliberately short: it is replaced within a minute
+// or two, and a long checklist would only make the eventual edit jarring.
 export function progressCommentBody(): string {
   return [
-    "## PR Review In Progress",
+    CARD_TITLE,
+    "",
+    "⏳ `Review in progress`",
     "",
     "A review of this pull request has been triggered and is currently running. " +
-      "This comment will be updated automatically once the analysis is complete.",
+      "This comment will be updated automatically once the analysis is complete, " +
+      "and any findings will appear as review comments on the lines they concern.",
     "",
     "**What's happening?**",
     "",
@@ -62,7 +64,9 @@ export function verdictCommentBody(args: {
 // "in progress". The pipeline re-runs on the next push, so we say so.
 export function reviewFailedCommentBody(): string {
   return [
-    "## DevAsign review failed",
+    CARD_TITLE,
+    "",
+    "🔴 `Review failed`",
     "",
     "DevAsign hit an error and couldn't complete this review run. " +
       "It will automatically retry the next time you push to this PR.",

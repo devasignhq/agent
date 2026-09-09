@@ -61,6 +61,7 @@ function ghResponse(body: any) {
 function installFetchStub() {
   const original = globalThis.fetch;
   let nextCommentId = 5000;
+  let nextThreadId = 6000;
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url);
     const method = String(init.method || "GET").toUpperCase();
@@ -71,6 +72,11 @@ function installFetchStub() {
     if (/\/issues\/\d+\/comments$/.test(u) && method === "POST")
       return ghResponse({ id: nextCommentId++ });
     if (/\/issues\/comments\/\d+$/.test(u) && method === "PATCH") return ghResponse({});
+    // Inline review-comment threads — where per-finding detail now lives.
+    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST")
+      return ghResponse({ id: nextThreadId++ });
+    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse([]);
+    if (/\/pulls\/comments\/\d+$/.test(u)) return ghResponse({ body: "" });
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET")
       return ghResponse([{ sha: "abc1234", commit: { message: "Add list handler" } }]);
     if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") return ghResponse({ id: 99 });
@@ -79,6 +85,7 @@ function installFetchStub() {
       return ghResponse({
         title: "Add list handler",
         body: "",
+        state: "open",
         head: { sha: "abc1234", ref: "feature" },
         base: { sha: "def5678" },
         additions: 5,
@@ -203,16 +210,22 @@ test("bug detection runs with no repo index built — the gap it closes", async 
   assert.equal(defects.length, 1, "bug detection must not depend on the repo index");
 });
 
-test("the defect section reaches the posted PR comment", async () => {
+test("a defect reaches the PR as its own thread, and is counted on the card", async () => {
   const id = seedReview(MET_CRITERION);
-  const bodies: string[] = [];
+  const cards: string[] = [];
+  const threads: Array<{ body: string; path?: string; line?: number }> = [];
   const original = globalThis.fetch;
   const stub = installFetchStub();
   const wrapped = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
-    if (typeof init.body === "string" && /\/issues\/comments\/\d+$/.test(String(url))) {
+    const u = String(url);
+    if (typeof init.body === "string") {
       try {
-        bodies.push(JSON.parse(init.body).body);
+        const parsed = JSON.parse(init.body);
+        if (/\/issues\/comments\/\d+$/.test(u)) cards.push(parsed.body);
+        if (/\/pulls\/\d+\/comments$/.test(u) && String(init.method).toUpperCase() === "POST") {
+          threads.push({ body: parsed.body, path: parsed.path, line: parsed.line });
+        }
       } catch {
         /* not JSON — ignore */
       }
@@ -225,10 +238,20 @@ test("the defect section reaches the posted PR comment", async () => {
     globalThis.fetch = original;
     stub.restore();
   }
-  const verdictBody = bodies.find((b) => /Bugs and correctness issues/.test(b));
-  assert.ok(verdictBody, "the verdict comment should carry the defect section");
-  assert.match(verdictBody!, /1 of these blocks the merge/);
-  assert.match(verdictBody!, /\*\*How it fails:\*\*/);
+
+  // The finding's detail is on its own thread, anchored to the code it concerns.
+  const defectThread = threads.find((t) => /### 🐞 Bug \(blocker\) —/.test(t.body));
+  assert.ok(defectThread, "the defect should open its own review-comment thread");
+  assert.match(defectThread!.body, /### 🐞 Bug \(blocker\) —/);
+  assert.match(defectThread!.body, /\*\*How it fails:\*\*/);
+  assert.match(defectThread!.body, /<summary>Prompt to fix with AI<\/summary>/);
+  assert.ok(defectThread!.path, "the thread anchors to a file");
+
+  // The card carries the count and the gate, not the prose.
+  const card = cards.at(-1);
+  assert.ok(card, "the conversation comment should have been edited into the card");
+  assert.match(card!, /🐞 `Bugs \(1\)`/);
+  assert.doesNotMatch(card!, /Bugs and correctness issues/, "detail belongs on the thread");
 });
 
 test("control: with the stage off, the same PR passes — proving the gate is the defect pass", async () => {

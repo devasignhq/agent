@@ -99,6 +99,24 @@ export async function uninstallApp(installationId: number): Promise<void> {
   installTokens.delete(installationId);
 }
 
+// A failed GitHub call, carrying the status as a field instead of only inside
+// the message. Callers need to branch on it — a 422 from a review-comment create
+// means "that line isn't in the diff, fall back to file level", a 403 means
+// "secondary rate limit, stop for this run" — and sniffing the message with
+// /422/ false-positives on PR #422 or a sha starting "422". `message` is
+// byte-identical to the string this used to throw, so existing callers that do
+// sniff it keep working.
+export class GitHubApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly url: string,
+    readonly bodyText: string
+  ) {
+    super(`GitHub ${status} on ${url}: ${bodyText}`);
+    this.name = "GitHubApiError";
+  }
+}
+
 export async function gh<T>(
   installationId: number,
   pathOrUrl: string,
@@ -117,7 +135,7 @@ export async function gh<T>(
     },
   });
   if (!res.ok) {
-    throw new Error(`GitHub ${res.status} on ${url}: ${await res.text()}`);
+    throw new GitHubApiError(res.status, url, await res.text());
   }
   return (await res.json()) as T;
 }
@@ -143,7 +161,7 @@ export async function ghPaged<T>(
     },
   });
   if (!res.ok) {
-    throw new Error(`GitHub ${res.status} on ${url}: ${await res.text()}`);
+    throw new GitHubApiError(res.status, url, await res.text());
   }
   const body = (await res.json()) as T;
   return { body, nextUrl: parseNextLink(res.headers.get("link")) };

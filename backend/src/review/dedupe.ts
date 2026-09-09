@@ -7,7 +7,8 @@
 //
 // Runs once at boot, after initDb loads the snapshot. The most recently
 // updated row survives; pointers the survivor is missing (taskId, the GitHub
-// progress-comment id, the approval id) are inherited from the freshest dupe
+// progress-comment id, the verify-comment id, the approval id, the inline
+// review threads) are inherited from the freshest dupe
 // that has them, and reviewLogs/notifications are reassigned so history and
 // notification links keep working after the merge.
 
@@ -49,6 +50,23 @@ export function dedupePRReviews(): number {
         loser.approveReviewId != null
       ) {
         patch.approveReviewId = loser.approveReviewId;
+      }
+      if (
+        survivor.verifyCommentId == null &&
+        patch.verifyCommentId === undefined &&
+        loser.verifyCommentId != null
+      ) {
+        patch.verifyCommentId = loser.verifyCommentId;
+        patch.verifyCommentSha = loser.verifyCommentSha;
+      }
+      // Without this the merged PR orphans every inline thread the loser opened:
+      // the comments stay on GitHub but nothing can edit or resolve them again.
+      if (
+        (survivor.reviewThreads?.length ?? 0) === 0 &&
+        patch.reviewThreads === undefined &&
+        (loser.reviewThreads?.length ?? 0) > 0
+      ) {
+        patch.reviewThreads = loser.reviewThreads;
       }
     }
     if (Object.keys(patch).length > 0) {

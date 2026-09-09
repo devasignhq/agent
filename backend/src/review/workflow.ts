@@ -29,7 +29,7 @@ const WORKFLOW_NAME_CAP = 200;
 export const WORKFLOW_DEFAULTS: RepoWorkflow = {
   version: 1,
   trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
-  stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: false, verify: true },
+  stages: { holistic: true, defects: true, docs: true, deferrals: true, crossRepo: false, verify: true, inlineThreads: true },
   verdict: { blocking: true },
   prompts: {},
   actions: { enabled: false, workflow: "", runWhen: "passed" },
@@ -98,6 +98,7 @@ export function normalizeWorkflow(input: unknown): RepoWorkflow {
       deferrals: b(s.deferrals, WORKFLOW_DEFAULTS.stages.deferrals),
       crossRepo: b(s.crossRepo, WORKFLOW_DEFAULTS.stages.crossRepo),
       verify: b(s.verify, WORKFLOW_DEFAULTS.stages.verify),
+      inlineThreads: b(s.inlineThreads, WORKFLOW_DEFAULTS.stages.inlineThreads),
     },
     verdict: { blocking: b(v.blocking, WORKFLOW_DEFAULTS.verdict.blocking) },
     prompts,
