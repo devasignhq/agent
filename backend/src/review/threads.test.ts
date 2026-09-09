@@ -414,9 +414,10 @@ test("applying a paired update migrates the stored key and match, so the next ru
   const p = plan({ items: [after], threads: [threadFor(before, { match: { concern: before.concern } })] });
   const calls: string[] = [];
   const client: ThreadClient = {
+    createReview: async () => ({ reviewId: 1, comments: [] }),
     create: async () => ({ id: 999 }),
     update: async (_i, _o, _n, id, body) => {
-      calls.push(`update#${id}:${body.split("\n")[1]}`);
+      calls.push(`update#${id}:${body.split("\n")[2]}`);
       return "ok";
     },
     get: async () => "",
@@ -430,10 +431,196 @@ test("applying a paired update migrates the stored key and match, so the next ru
   assert.equal(result.threads[0].key, after.key, "the thread now carries the new key");
   assert.equal(result.threads[0].match?.concern, after.concern);
   assert.equal(result.threads[0].commentId, 500, "same GitHub comment");
-  assert.match(calls[0], /^update#500:### 🚧 Deferred work/);
+  assert.match(calls[0], /^update#500:<summary>🚧 Deferred work/);
 
   // And a third run with the run-2 wording is now an exact-key match: no pairing needed.
   const again = plan({ items: [after], threads: result.threads });
   const update = opsOf(again.ops, "update")[0] as Extract<ThreadOp, { op: "update" }>;
   assert.equal(update.changed, false, "identical body — no API call");
+});
+// ─── applying the plan: one batched review per run ─────────────────────────
+
+type ClientCall = { fn: keyof ThreadClient; args: any };
+
+// Records every call and answers with whatever the test scripted.
+function fakeClient(script: {
+  batch?:
+    | Awaited<ReturnType<ThreadClient["createReview"]>>
+    | ((args: any) => Awaited<ReturnType<ThreadClient["createReview"]>>);
+  single?: Awaited<ReturnType<ThreadClient["create"]>>;
+}) {
+  const calls: ClientCall[] = [];
+  let nextId = 900;
+  const client: ThreadClient = {
+    async createReview(_i, _o, _n, _p, args) {
+      calls.push({ fn: "createReview", args });
+      if (typeof script.batch === "function") return script.batch(args);
+      if (script.batch) return script.batch;
+      // Echoed back in REVERSE order: ids must be matched by marker, never by
+      // position.
+      const comments = [...args.comments]
+        .reverse()
+        .map((c) => ({ id: nextId++, body: c.body, path: c.path }));
+      return { reviewId: 42, comments };
+    },
+    async create(_i, _o, _n, _p, args) {
+      calls.push({ fn: "create", args });
+      return script.single ?? { id: nextId++ };
+    },
+    async update(_i, _o, _n, commentId, body) {
+      calls.push({ fn: "update", args: { commentId, body } });
+      return "ok";
+    },
+    async get(_i, _o, _n, commentId) {
+      calls.push({ fn: "get", args: { commentId } });
+      return `<!-- devasign:item v1 k=x -->\n### old\n\nold detail`;
+    },
+  };
+  return { client, calls };
+}
+
+const apply = (p: ReturnType<typeof plan>, client: ThreadClient) =>
+  reconcileThreads({
+    installationId: 1,
+    owner: "acme",
+    name: "widgets",
+    prNumber: 1,
+    headSha: SHA_NEW,
+    plan: p,
+    client,
+  });
+
+// Concerns deliberately share no vocabulary: buildReviewItems clusters findings
+// by identity, and three thin ones would merge into a single item.
+const threeItems = () =>
+  items({
+    holistic: {
+      ...EMPTY_HOLISTIC,
+      defects: [
+        finding({
+          line: 11,
+          concern: "The catch block rethrows, so a failed audit write fails the whole list request.",
+        }),
+        finding({
+          line: 12,
+          concern:
+            "The warning message interpolates the raw error object, which prints [object Object] in the structured logger.",
+        }),
+        finding({
+          line: 13,
+          concern:
+            "The retry loop has no ceiling, so a permanently rejected payload spins until the job times out.",
+        }),
+      ],
+    },
+  });
+
+test("new line-anchored threads go up as ONE review, ids matched back by marker", async () => {
+  const p = plan({ items: threeItems() });
+  const { client, calls } = fakeClient({});
+  const result = await apply(p, client);
+
+  const batches = calls.filter((c) => c.fn === "createReview");
+  assert.equal(batches.length, 1, "exactly one review for the run");
+  assert.equal(calls.filter((c) => c.fn === "create").length, 0);
+  assert.equal(batches[0].args.commitId, SHA_NEW);
+  assert.deepEqual(
+    batches[0].args.comments.map((c: any) => [c.path, c.line, c.side]),
+    [
+      ["src/a.ts", 11, "RIGHT"],
+      ["src/a.ts", 12, "RIGHT"],
+      ["src/a.ts", 13, "RIGHT"],
+    ]
+  );
+  assert.equal(result.created, 3);
+  assert.equal(result.threads.length, 3);
+  assert.equal(result.fellBack, false);
+  assert.equal(result.recoveryNeeded, false);
+  // The fake answered in reverse order; each thread must still own the id whose
+  // body carries its own marker.
+  const comments: Array<{ id: number; body: string }> = [...batches[0].args.comments]
+    .reverse()
+    .map((c: any, i: number) => ({ id: 900 + i, body: c.body }));
+  for (const t of result.threads) {
+    const match = comments.find((c) => parseItemMarker(c.body) === t.key);
+    assert.equal(t.commentId, match?.id, `thread ${t.key} owns the comment carrying its marker`);
+  }
+});
+
+test("file-level anchors cannot ride in the batch and stay separate posts, after it", async () => {
+  const [lineItem] = defectItems({ line: 11 });
+  const [farItem] = defectItems({ line: 400, concern: "Far away." });
+  const p = plan({ items: [lineItem, farItem] });
+  const { client, calls } = fakeClient({});
+  const result = await apply(p, client);
+  assert.deepEqual(
+    calls.map((c) => c.fn),
+    ["createReview", "create"]
+  );
+  assert.equal(calls[1].args.anchor.kind, "file");
+  assert.equal(result.created, 2);
+  assert.equal(result.threads.find((t) => t.key === farItem.key)?.anchor, "file");
+});
+
+test("a refused batch (bad anchor) falls back to one thread at a time", async () => {
+  const p = plan({ items: threeItems() });
+  const { client, calls } = fakeClient({ batch: { error: "anchor" } });
+  const result = await apply(p, client);
+  assert.equal(calls.filter((c) => c.fn === "create").length, 3);
+  assert.equal(result.created, 3);
+  assert.equal(result.fellBack, true);
+  assert.equal(result.recoveryNeeded, false);
+});
+
+test("a rate-limited batch aborts the run: nothing persisted, file-level posts skipped", async () => {
+  const [lineItem] = defectItems({ line: 11 });
+  const [farItem] = defectItems({ line: 400, concern: "Far away." });
+  const p = plan({ items: [lineItem, farItem] });
+  const { client, calls } = fakeClient({ batch: { error: "rate_limit" } });
+  const result = await apply(p, client);
+  assert.equal(result.aborted, true);
+  assert.equal(result.created, 0);
+  assert.equal(result.threads.length, 0);
+  assert.equal(calls.filter((c) => c.fn === "create").length, 0);
+});
+
+test("an unknown batch outcome persists nothing and asks the next run to rebuild ids", async () => {
+  const p = plan({ items: threeItems() });
+  const { client, calls } = fakeClient({ batch: { error: "other", reviewId: 42 } });
+  const result = await apply(p, client);
+  assert.equal(result.recoveryNeeded, true);
+  assert.equal(result.aborted, false);
+  assert.equal(result.threads.length, 0, "no ids to persist — a guess would be a duplicate later");
+  assert.equal(calls.filter((c) => c.fn === "create").length, 0, "never re-posted blind");
+});
+
+test("a listing that misses one marker keeps the others and flags recovery", async () => {
+  const p = plan({ items: threeItems() });
+  const { client } = fakeClient({
+    batch: (args) => ({
+      reviewId: 42,
+      comments: args.comments
+        .slice(1)
+        .map((c: any, i: number) => ({ id: 700 + i, body: c.body, path: c.path })),
+    }),
+  });
+  const result = await apply(p, client);
+  assert.equal(result.threads.length, 2);
+  assert.equal(result.recoveryNeeded, true);
+});
+
+test("updates and resolves still go one PATCH at a time, before the batch", async () => {
+  const [before] = defectItems();
+  const [after] = defectItems({ failureScenario: "Two writers land in the same tick." });
+  const [fresh] = defectItems({ line: 12, concern: "Brand new." });
+  const p = plan({ items: [after, fresh], threads: [threadFor(before)] });
+  const { client, calls } = fakeClient({});
+  const result = await apply(p, client);
+  assert.deepEqual(
+    calls.map((c) => c.fn),
+    ["update", "createReview"]
+  );
+  assert.equal(result.updated, 1);
+  assert.equal(result.created, 1);
+  assert.equal(result.threads.length, 2);
 });

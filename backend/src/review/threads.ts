@@ -376,16 +376,21 @@ export type ReconcileResult = {
 };
 
 export type ThreadClient = {
+  createReview: typeof createPRReview;
   create: typeof createPRReviewComment;
   update: typeof updatePRReviewComment;
   get: typeof getPRReviewComment;
 };
 
 const liveClient: ThreadClient = {
+  createReview: createPRReview,
   create: createPRReviewComment,
   update: updatePRReviewComment,
   get: getPRReviewComment,
 };
+
+type CreateOp = Extract<ThreadOp, { op: "create" }>;
+type LineCreateOp = CreateOp & { anchor: Extract<Anchor, { kind: "line" }> };
 
 export async function reconcileThreads(args: {
   installationId: number;
@@ -406,7 +411,7 @@ export async function reconcileThreads(args: {
   let aborted = false;
   let fellBack = false;
   let recoveryNeeded = false;
-  const lineCreates: CreateOp[] = [];
+  const lineCreates: LineCreateOp[] = [];
   const fileCreates: CreateOp[] = [];
 
   for (const op of plan.ops) {
@@ -501,54 +506,30 @@ export async function reconcileThreads(args: {
         });
         break;
       }
-      case "create": {
-        if (op.anchor.kind === "none") break;
-        const anchor: ReviewCommentAnchor =
-          op.anchor.kind === "line"
-            ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
-            : { kind: "file", path: op.anchor.path };
-        let res = await client.create(installationId, owner, name, prNumber, {
-          body: op.body,
-          commitId: headSha,
-          anchor,
-        });
-        // The anchor lost a race with the diff we planned against. One retry at
-        // file level, which is legal for any file still in the PR; never retry
-        // the same payload.
-        if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
-          res = await client.create(installationId, owner, name, prNumber, {
-            body: op.body,
-            commitId: headSha,
-            anchor: { kind: "file", path: anchor.path },
-          });
-        }
-        if ("error" in res) {
-          if (res.error === "rate_limit") aborted = true;
-          break;
-        }
-        created++;
-        out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
+      case "create":
+        if (op.anchor.kind === "line") lineCreates.push({ ...op, anchor: op.anchor });
+        else if (op.anchor.kind === "file") fileCreates.push(op);
         break;
       case "overflow":
         break;
     }
   }
 
-  // One comment at a time, with a file-level retry when the anchor lost a race
-  // with the diff we planned against. Never retries the same payload.
   const createOne = async (op: CreateOp): Promise<void> => {
     if (op.anchor.kind === "none" || aborted) return;
     const anchor: ReviewCommentAnchor =
       op.anchor.kind === "line"
         ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
         : { kind: "file", path: op.anchor.path };
-    let res = await io.createPRReviewComment(installationId, owner, name, prNumber, {
+    let res = await client.create(installationId, owner, name, prNumber, {
       body: op.body,
       commitId: headSha,
       anchor,
     });
+    // The anchor lost a race with the diff we planned against. One retry at file
+    // level, which is legal for any file still in the PR; never the same payload.
     if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
-      res = await io.createPRReviewComment(installationId, owner, name, prNumber, {
+      res = await client.create(installationId, owner, name, prNumber, {
         body: op.body,
         commitId: headSha,
         anchor: { kind: "file", path: anchor.path },
@@ -562,16 +543,16 @@ export async function reconcileThreads(args: {
     out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
   };
 
-  // New line-anchored threads go up as one review so the timeline shows a single
-  // "reviewed" event. Comment ids come back from a listing, matched by marker.
+  // One review for the whole run, so the timeline shows a single "reviewed"
+  // event instead of one per finding. Ids come back by marker, never by index.
   if (lineCreates.length) {
     const comments: BatchedReviewComment[] = lineCreates.map((op) => ({
-      path: (op.anchor as Extract<Anchor, { kind: "line" }>).path,
-      line: (op.anchor as Extract<Anchor, { kind: "line" }>).line,
+      path: op.anchor.path,
+      line: op.anchor.line,
       side: "RIGHT",
       body: op.body,
     }));
-    const res = await io.createPRReview(installationId, owner, name, prNumber, {
+    const res = await client.createReview(installationId, owner, name, prNumber, {
       commitId: headSha,
       comments,
     });
@@ -582,6 +563,8 @@ export async function reconcileThreads(args: {
       } else if (res.error === "rate_limit") {
         aborted = true;
       } else {
+        // It may have posted. Persisting nothing and rebuilding next run is the
+        // only branch that cannot duplicate every thread.
         recoveryNeeded = true;
       }
     } else {
@@ -593,7 +576,9 @@ export async function reconcileThreads(args: {
       for (const op of lineCreates) {
         const id = byKey.get(op.item.key);
         if (id == null) {
-          console.warn(`[review] batched review ${res.reviewId} returned no comment for ${op.item.key}`);
+          console.warn(
+            `[review] batched review ${res.reviewId} returned no comment for ${op.item.key}`
+          );
           recoveryNeeded = true;
           continue;
         }
