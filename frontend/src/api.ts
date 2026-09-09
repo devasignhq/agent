@@ -352,7 +352,10 @@ export type PRReviewStatus =
   | "reviewing"
   | "passed"
   | "changes_requested"
+  | "blocked"
   | "errored";
+
+export type PRState = "open" | "merged" | "closed";
 
 export type Criterion = {
   id: string;
@@ -437,6 +440,7 @@ export type PRReview = {
   headSha: string;
   baseSha: string;
   status: PRReviewStatus;
+  prState?: PRState;
   verdict: string | null;
   criteria: Criterion[];
   taskId: string | null;

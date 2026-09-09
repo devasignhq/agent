@@ -18,6 +18,10 @@ import {
   attributedUserFor,
 } from "./installations.js";
 
+// verifySignature fails CLOSED when no webhook secret is configured, so an
+// unsigned test delivery is rejected before any handler runs. Opt in explicitly.
+config.github.allowUnsignedWebhooks = true;
+
 let seq = 0;
 
 function seedUser(githubId: number, login: string, plan = "pro") {

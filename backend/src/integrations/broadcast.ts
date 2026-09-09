@@ -86,6 +86,8 @@ export async function broadcastVerdict(
           ? "reviewed it and all acceptance criteria passed"
           : status === "changes_requested"
           ? "reviewed it and requested changes"
+          : status === "blocked"
+          ? "reviewed it and blocked the merge"
           : "reviewed it";
       const body =
         `🔎 **DevAsign** ${outcome} on [${repo.owner}/${repo.name}#${review.prNumber}](${prUrl}), ` +
@@ -100,7 +102,7 @@ export async function broadcastVerdict(
 }
 
 function statusEmoji(status: PRReviewStatus) {
-  return status === "passed" ? "✅" : status === "changes_requested" ? "⚠️" : "❌";
+  return status === "passed" ? "✅" : status === "changes_requested" ? "⚠️" : status === "blocked" ? "⛔" : "❌";
 }
 
 async function postSlack(

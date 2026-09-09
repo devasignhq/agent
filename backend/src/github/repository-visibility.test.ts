@@ -13,6 +13,9 @@ import type { RepoTopology } from "../types.js";
 
 config.github.appId = "";
 config.github.privateKey = "";
+// verifySignature fails CLOSED when no webhook secret is configured, so an
+// unsigned test delivery is rejected before any handler runs. Opt in explicitly.
+config.github.allowUnsignedWebhooks = true;
 
 function deliver(event: any) {
   const raw = Buffer.from(JSON.stringify(event));
