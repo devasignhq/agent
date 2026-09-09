@@ -674,6 +674,9 @@ export type PRReview = {
   // stopped being reported are marked fixed, new ones open a thread. Absent on
   // rows written before per-item threads existed.
   reviewThreads?: ReviewThread[];
+  // Set when a batched review may have posted without its comment ids being
+  // captured; the next run rebuilds from GitHub before planning.
+  threadsNeedRecovery?: boolean;
   // Id of our latest bodyless APPROVE review on this PR. We never submit
   // REQUEST_CHANGES (its required body would render as an extra conversation
   // comment), so when a later commit fails we explicitly dismiss this approval

@@ -5,9 +5,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { commentableLines } from "./anchor.js";
-import { formatThreadBody } from "./comment.js";
+import { formatThreadBody, parseItemMarker } from "./comment.js";
 import { buildReviewItems, type ReviewItem, type ReviewStage } from "./items.js";
-import { bodyHash, planReconciliation, type ThreadOp } from "./threads.js";
+import {
+  bodyHash,
+  planReconciliation,
+  reconcileThreads,
+  type ThreadIO,
+  type ThreadOp,
+} from "./threads.js";
 import { EMPTY_HOLISTIC, type HolisticFinding } from "./verdict-types.js";
 import type { PriorVerdict } from "./criteria-format.js";
 import type { Criterion, ReviewThread } from "../types.js";
@@ -216,7 +222,7 @@ test("a criterion that flips to met keeps its thread, counts as fixed, and names
   assert.equal(opsOf(p.ops, "resolve").length, 0, "a passing criterion is still worth showing");
   assert.equal(p.fixedCount, 1);
   const update = opsOf(p.ops, "update")[0] as Extract<ThreadOp, { op: "update" }>;
-  assert.match(update.body, /### ✅ Acceptance criterion met — C1/);
+  assert.match(update.body, /<summary>✅ Acceptance criterion met — C1/);
   assert.match(update.body, /Fixed in \[`9f2c1ab`\]/);
 });
 
@@ -332,4 +338,165 @@ test("a finding far outside every hunk still lands, at file level", () => {
   const p = plan({ items: [item] });
   const create = opsOf(p.ops, "create")[0] as Extract<ThreadOp, { op: "create" }>;
   assert.deepEqual(create.anchor, { kind: "file", path: "src/a.ts" });
+});
+
+// ─── applying the plan: one batched review per run ─────────────────────────
+
+type IOCall = { fn: keyof ThreadIO; args: any };
+
+// A fake IO layer: records every call and answers with whatever the test scripted.
+function fakeIO(script: {
+  batch?: Awaited<ReturnType<ThreadIO["createPRReview"]>> | ((c: any) => Awaited<ReturnType<ThreadIO["createPRReview"]>>);
+  single?: Awaited<ReturnType<ThreadIO["createPRReviewComment"]>>;
+}) {
+  const calls: IOCall[] = [];
+  let nextId = 900;
+  const io: ThreadIO = {
+    async createPRReview(_i, _o, _n, _p, args) {
+      calls.push({ fn: "createPRReview", args });
+      if (typeof script.batch === "function") return script.batch(args);
+      if (script.batch) return script.batch;
+      // Echo the comments back with ids, in REVERSE order: ids must be matched
+      // by marker, never by position.
+      const comments = [...args.comments].reverse().map((c) => ({ id: nextId++, body: c.body, path: c.path }));
+      return { reviewId: 42, comments };
+    },
+    async createPRReviewComment(_i, _o, _n, _p, args) {
+      calls.push({ fn: "createPRReviewComment", args });
+      return script.single ?? { id: nextId++ };
+    },
+    async updatePRReviewComment(_i, _o, _n, commentId, body) {
+      calls.push({ fn: "updatePRReviewComment", args: { commentId, body } });
+      return "ok";
+    },
+    async getPRReviewComment(_i, _o, _n, commentId) {
+      calls.push({ fn: "getPRReviewComment", args: { commentId } });
+      return `<!-- devasign:item v1 k=x -->\n<details>\n<summary>old</summary>\n\nold detail\n\n</details>`;
+    },
+  };
+  return { io, calls };
+}
+
+const apply = (p: ReturnType<typeof plan>, io: ThreadIO) =>
+  reconcileThreads(
+    { installationId: 1, owner: "acme", name: "widgets", prNumber: 1, headSha: SHA_NEW, plan: p },
+    io
+  );
+
+const threeItems = () =>
+  items({
+    holistic: {
+      ...EMPTY_HOLISTIC,
+      defects: [
+        finding({ line: 11, concern: "First finding." }),
+        finding({ line: 12, concern: "Second finding." }),
+        finding({ line: 13, concern: "Third finding." }),
+      ],
+    },
+  });
+
+test("new line-anchored threads go up as ONE review, ids matched back by marker", async () => {
+  const list = threeItems();
+  const p = plan({ items: list });
+  const { io, calls } = fakeIO({});
+  const result = await apply(p, io);
+
+  const batches = calls.filter((c) => c.fn === "createPRReview");
+  assert.equal(batches.length, 1, "exactly one review for the run");
+  assert.equal(calls.filter((c) => c.fn === "createPRReviewComment").length, 0);
+  assert.equal(batches[0].args.commitId, SHA_NEW);
+  assert.deepEqual(
+    batches[0].args.comments.map((c: any) => [c.path, c.line, c.side]),
+    [["src/a.ts", 11, "RIGHT"], ["src/a.ts", 12, "RIGHT"], ["src/a.ts", 13, "RIGHT"]]
+  );
+  assert.equal(result.created, 3);
+  assert.equal(result.threads.length, 3);
+  assert.equal(result.fellBack, false);
+  assert.equal(result.recoveryNeeded, false);
+  // The fake answered in reverse order; each thread must still own the id whose
+  // body carries its own marker.
+  const comments: Array<{ id: number; body: string }> = [...batches[0].args.comments]
+    .reverse()
+    .map((c: any, i: number) => ({ id: 900 + i, body: c.body }));
+  for (const t of result.threads) {
+    const match = comments.find((c) => parseItemMarker(c.body) === t.key);
+    assert.equal(t.commentId, match?.id, `thread ${t.key} owns the comment carrying its marker`);
+  }
+});
+
+test("file-level anchors cannot ride in the batch and stay separate posts, after it", async () => {
+  const [lineItem] = defectItems({ line: 11 });
+  const [farItem] = defectItems({ line: 400, concern: "Far away." });
+  const p = plan({ items: [lineItem, farItem] });
+  const { io, calls } = fakeIO({});
+  const result = await apply(p, io);
+  assert.deepEqual(
+    calls.map((c) => c.fn),
+    ["createPRReview", "createPRReviewComment"]
+  );
+  assert.equal(calls[1].args.anchor.kind, "file");
+  assert.equal(result.created, 2);
+  assert.equal(result.threads.find((t) => t.key === farItem.key)?.anchor, "file");
+});
+
+test("a refused batch (bad anchor) falls back to one thread at a time", async () => {
+  const p = plan({ items: threeItems() });
+  const { io, calls } = fakeIO({ batch: { error: "anchor" } });
+  const result = await apply(p, io);
+  assert.equal(calls.filter((c) => c.fn === "createPRReviewComment").length, 3);
+  assert.equal(result.created, 3);
+  assert.equal(result.fellBack, true);
+  assert.equal(result.recoveryNeeded, false);
+});
+
+test("a rate-limited batch aborts the run: nothing persisted, file-level posts skipped", async () => {
+  const [lineItem] = defectItems({ line: 11 });
+  const [farItem] = defectItems({ line: 400, concern: "Far away." });
+  const p = plan({ items: [lineItem, farItem] });
+  const { io, calls } = fakeIO({ batch: { error: "rate_limit" } });
+  const result = await apply(p, io);
+  assert.equal(result.aborted, true);
+  assert.equal(result.created, 0);
+  assert.equal(result.threads.length, 0);
+  assert.equal(calls.filter((c) => c.fn === "createPRReviewComment").length, 0);
+});
+
+test("an unknown batch outcome persists nothing and asks the next run to rebuild ids", async () => {
+  const p = plan({ items: threeItems() });
+  const { io, calls } = fakeIO({ batch: { error: "other", reviewId: 42 } });
+  const result = await apply(p, io);
+  assert.equal(result.recoveryNeeded, true);
+  assert.equal(result.aborted, false);
+  assert.equal(result.threads.length, 0, "no ids to persist — a guess would be a duplicate later");
+  assert.equal(calls.filter((c) => c.fn === "createPRReviewComment").length, 0, "never re-posted blind");
+});
+
+test("a listing that misses one marker keeps the others and flags recovery", async () => {
+  const list = threeItems();
+  const p = plan({ items: list });
+  const { io } = fakeIO({
+    batch: (args) => ({
+      reviewId: 42,
+      comments: args.comments.slice(1).map((c: any, i: number) => ({ id: 700 + i, body: c.body, path: c.path })),
+    }),
+  });
+  const result = await apply(p, io);
+  assert.equal(result.threads.length, 2);
+  assert.equal(result.recoveryNeeded, true);
+});
+
+test("updates and resolves still go one PATCH at a time, before the batch", async () => {
+  const [before] = defectItems();
+  const [after] = defectItems({ failureScenario: "Two writers land in the same tick." });
+  const [fresh] = defectItems({ line: 12, concern: "Brand new." });
+  const p = plan({ items: [after, fresh], threads: [threadFor(before)] });
+  const { io, calls } = fakeIO({});
+  const result = await apply(p, io);
+  assert.deepEqual(
+    calls.map((c) => c.fn),
+    ["updatePRReviewComment", "createPRReview"]
+  );
+  assert.equal(result.updated, 1);
+  assert.equal(result.created, 1);
+  assert.equal(result.threads.length, 2);
 });

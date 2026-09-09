@@ -43,7 +43,10 @@ const DIFF = [
   "index 1111111..2222222 100644",
   "--- a/src/handler.ts",
   "+++ b/src/handler.ts",
-  "@@ -1,2 +1,3 @@",
+  // Hunk placed where the mock's findings point (line 42, evidence at 40), so
+  // some items anchor to a line and ride in the batched review while the ones
+  // further away (52) degrade to file level and are posted one at a time.
+  "@@ -40,2 +40,3 @@",
   " export function handler() {",
   "+  return doWork();",
   " }",
@@ -55,6 +58,8 @@ function ghResponse(body: any) {
     status: 200,
     json: async () => body,
     text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
+    // ghPaged reads the Link header; none means a single page.
+    headers: { get: () => null },
   } as any;
 }
 
@@ -76,6 +81,9 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
   // Bodies the pipeline wrote, so a later read-back (the "what this was" block on
   // a resolved thread) sees what it actually posted.
   const threadBodies = new Map<number, string>();
+  // Comments carried by each batched review, served back by the listing.
+  const reviewComments = new Map<number, Array<Record<string, unknown>>>();
+  let nextReviewId = 99;
   const original = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url);
@@ -117,8 +125,20 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
       return ghResponse({ body: threadBodies.get(Number(u.split("/").pop())) ?? "<!-- prior body -->" });
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET")
       return ghResponse([{ sha: "abc1234", commit: { message: "Add widget" } }]);
-    if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST")
-      return ghResponse({ id: 99, html_url: "https://github.com/acme/widgets/pull/1#pullrequestreview-99" });
+    if (/\/pulls\/\d+\/reviews\/\d+\/comments(\?|$)/.test(u) && method === "GET") {
+      const rid = Number(/\/reviews\/(\d+)\/comments/.exec(u)![1]);
+      return ghResponse(reviewComments.get(rid) ?? []);
+    }
+    if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") {
+      const rid = nextReviewId++;
+      const comments = (Array.isArray(body?.comments) ? body.comments : []).map((c: any) => {
+        const id = nextThreadId++;
+        threadBodies.set(id, String(c.body));
+        return { id, body: c.body, path: c.path, line: c.line ?? null };
+      });
+      reviewComments.set(rid, comments);
+      return ghResponse({ id: rid, html_url: `https://github.com/acme/widgets/pull/1#pullrequestreview-${rid}` });
+    }
     if (/\/pulls\/\d+$/.test(u) && method === "GET") {
       if (accept.includes("diff")) return ghResponse(DIFF);
       return ghResponse({
@@ -213,29 +233,52 @@ test("placeholder → summary card, with every finding as its own inline thread"
   assert.doesNotMatch(card, /### Acceptance criteria not met/, "detail belongs on the threads now");
   assert.doesNotMatch(card, /### Line notes/);
 
-  // 4. The detail is on inline threads instead, each carrying its item marker.
-  const threads = calls.filter((c) => c.method === "POST" && /\/pulls\/1\/comments$/.test(c.url));
-  assert.ok(threads.length > 0, "findings must land as inline review comments");
-  for (const t of threads) {
-    assert.match(String(t.body?.body), /^<!-- devasign:item v1 k=/, "every thread is identifiable");
-    assert.equal(t.body?.commit_id, "abc1234", "threads anchor to the reviewed commit");
-    assert.ok(t.body?.path, "every thread names a file");
+  // 4. The detail is on inline threads instead: every line-anchored one rides
+  //    in ONE review (a single "reviewed" event in the timeline), each carrying
+  //    its item marker and collapsed under its heading.
+  const reviews = calls.filter((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
+  assert.equal(reviews.length, 1, "all line-anchored threads must ride in one review");
+  const review = reviews[0];
+  assert.equal(review.body?.event, "COMMENT");
+  assert.equal(review.body?.body ?? "", "", "the review itself renders no conversation block");
+  assert.equal(review.body?.commit_id, "abc1234", "threads anchor to the reviewed commit");
+  const batched: any[] = review.body?.comments ?? [];
+  assert.ok(batched.length > 0, "findings must land as inline review comments");
+  for (const t of batched) {
+    assert.match(String(t.body), /^<!-- devasign:item v1 k=/, "every thread is identifiable");
+    assert.match(String(t.body), /^<details>\n<summary>/m, "every thread is collapsed by default");
+    assert.ok(t.path, "every thread names a file");
+    assert.equal(typeof t.line, "number");
+    assert.equal(t.side, "RIGHT");
   }
-  // The mock's line note points past the diff, so it degrades to a file-level
-  // comment rather than 422-ing.
-  const noteThread = threads.find((t) => String(t.body?.body).includes("src/handler.ts"));
+  // comments[] cannot carry a file-level anchor, so those stay separate posts.
+  const singles = calls.filter((c) => c.method === "POST" && /\/pulls\/1\/comments$/.test(c.url));
+  for (const t of singles) {
+    assert.equal(t.body?.subject_type, "file", "only file-level threads are posted one at a time");
+    assert.match(String(t.body?.body), /^<!-- devasign:item v1 k=/);
+    assert.equal(t.body?.commit_id, "abc1234");
+  }
+  const noteThread = [...batched, ...singles.map((c) => c.body)].find((t) =>
+    String(t.body).includes("src/handler.ts")
+  );
   assert.ok(noteThread, "the line-anchored note reached a thread");
 
-  // 5. Thread state is persisted so the next push can edit rather than duplicate.
+  // 5. Thread state is persisted — with the ids the batched review's listing
+  //    reported — so the next push can edit rather than duplicate.
   const stored = db.find("prReviews", (r) => r.id === id)?.reviewThreads ?? [];
-  assert.equal(stored.length, threads.length);
+  assert.equal(stored.length, batched.length + singles.length);
   assert.ok(stored.every((t) => t.state === "open" && t.commentId >= 900));
-
-  // 6. NO formal PR review is submitted, and with no stored approval there is
-  //    nothing to dismiss.
   assert.ok(
-    !calls.some((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url)),
-    "no formal PR review may be posted"
+    calls.some((c) => c.method === "GET" && /\/pulls\/1\/reviews\/\d+\/comments/.test(c.url)),
+    "comment ids come from the review's listing"
+  );
+  assert.equal(db.find("prReviews", (r) => r.id === id)?.threadsNeedRecovery, undefined);
+
+  // 6. The only review is the COMMENT one carrying the threads — no approval or
+  //    change request — and with no stored approval there is nothing to dismiss.
+  assert.ok(
+    reviews.every((c) => c.body?.event === "COMMENT"),
+    "no APPROVE / REQUEST_CHANGES review may be posted"
   );
   assert.ok(!calls.some((c) => c.method === "PUT" && /\/dismissals$/.test(c.url)));
 
@@ -245,7 +288,7 @@ test("placeholder → summary card, with every finding as its own inline thread"
   assert.ok(check, "check run must be (re)posted");
   assert.equal(check!.body?.conclusion, "action_required");
   assert.ok(
-    calls.indexOf(check!) < calls.indexOf(threads[0]),
+    calls.indexOf(check!) < calls.indexOf(review),
     "the merge gate must not wait on inline threads"
   );
 });
@@ -267,8 +310,12 @@ test("a failing run dismisses the stored stale approval", async () => {
     null,
     "the dismissed approval id is cleared"
   );
-  // Still no formal review POST.
-  assert.ok(!calls.some((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url)));
+  // Still no approval / change-request review — only the COMMENT one carrying threads.
+  assert.ok(
+    !calls.some(
+      (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.event !== "COMMENT"
+    )
+  );
 });
 
 test("rerun on the same commit reuses the comment; a new commit gets a fresh one", async () => {
@@ -304,6 +351,12 @@ test("rerun on the same commit reuses the comment; a new commit gets a fresh one
   assert.ok(
     !stub.calls.some((c) => c.method === "POST" && /\/pulls\/1\/comments$/.test(c.url)),
     "a same-sha rerun must not open duplicate threads"
+  );
+  assert.ok(
+    !stub.calls.some(
+      (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.comments?.length
+    ),
+    "a same-sha rerun must not post a batched review either"
   );
   assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, 5000);
 
@@ -358,6 +411,12 @@ test("across a push, threads are edited in place and a vanished finding is marke
   assert.ok(
     !stub.calls.some((c) => c.method === "POST" && /\/pulls\/1\/comments$/.test(c.url)),
     "an unchanged finding must reuse its thread, not open a second one"
+  );
+  assert.ok(
+    !stub.calls.some(
+      (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.comments?.length
+    ),
+    "nor ride in a new batched review"
   );
   const afterSecond = db.find("prReviews", (r) => r.id === id)?.reviewThreads ?? [];
   assert.deepEqual(
@@ -414,9 +473,9 @@ test("across a push, threads are edited in place and a vanished finding is marke
   assert.ok(resolvePatch, "the vanished finding's thread must be edited, not left shouting");
   const resolvedBody = String(resolvePatch!.body?.body);
   assert.match(resolvedBody, /devasign:resolved sha=ccc8888/);
-  assert.match(resolvedBody, /### ✅ Fixed —/);
+  assert.match(resolvedBody, /<summary>✅ Fixed —/);
   assert.match(resolvedBody, /no longer appears in the review of `ccc8888`/);
-  assert.match(resolvedBody, /<summary>What this was<\/summary>/);
+  assert.match(resolvedBody, /\*\*What this was\*\*/);
 
   const finalThreads = db.find("prReviews", (r) => r.id === id)?.reviewThreads ?? [];
   const gone = finalThreads.find((t) => t.commentId === 4321);

@@ -9,11 +9,13 @@
 //   node --import tsx/esm --test src/review/threads.test.ts
 import { createHash } from "node:crypto";
 import {
+  createPRReview,
   createPRReviewComment,
   deletePRReviewComment,
   getPRReviewComment,
   listPRReviewComments,
   updatePRReviewComment,
+  type BatchedReviewComment,
   type ReviewCommentAnchor,
 } from "../github/review-comments.js";
 import type { ReviewThread } from "../types.js";
@@ -318,29 +320,50 @@ export type ReconcileResult = {
   // True when GitHub told us to stop writing (secondary rate limit). The caller
   // renders the remainder on the summary card rather than half-spraying threads.
   aborted: boolean;
+  // The batched review was refused and its threads were opened one at a time.
+  fellBack: boolean;
+  // The batch's outcome is unknown (it may have posted); the next run must
+  // rebuild thread ids from GitHub before creating anything.
+  recoveryNeeded: boolean;
 };
 
-export async function reconcileThreads(args: {
-  installationId: number;
-  owner: string;
-  name: string;
-  prNumber: number;
-  headSha: string;
-  plan: ReconciliationPlan;
-}): Promise<ReconcileResult> {
+export type ThreadIO = Pick<
+  typeof import("../github/review-comments.js"),
+  "createPRReview" | "createPRReviewComment" | "updatePRReviewComment" | "getPRReviewComment"
+>;
+
+const defaultIO: ThreadIO = {
+  createPRReview,
+  createPRReviewComment,
+  updatePRReviewComment,
+  getPRReviewComment,
+};
+
+type CreateOp = Extract<ThreadOp, { op: "create" }>;
+
+export async function reconcileThreads(
+  args: {
+    installationId: number;
+    owner: string;
+    name: string;
+    prNumber: number;
+    headSha: string;
+    plan: ReconciliationPlan;
+  },
+  io: ThreadIO = defaultIO
+): Promise<ReconcileResult> {
   const { installationId, owner, name, prNumber, headSha, plan } = args;
   const out: ReviewThread[] = [];
   let created = 0;
   let updated = 0;
   let resolved = 0;
   let aborted = false;
+  let fellBack = false;
+  let recoveryNeeded = false;
+  const lineCreates: CreateOp[] = [];
+  const fileCreates: CreateOp[] = [];
 
   for (const op of plan.ops) {
-    if (aborted) {
-      // Preserve state for everything we didn't get to; the next run retries.
-      if (op.op !== "create" && op.op !== "overflow") out.push(op.thread);
-      continue;
-    }
     switch (op.op) {
       case "carry":
         out.push(op.thread);
@@ -365,7 +388,7 @@ export async function reconcileThreads(args: {
           });
           break;
         }
-        const res = await updatePRReviewComment(
+        const res = await io.updatePRReviewComment(
           installationId,
           owner,
           name,
@@ -397,7 +420,7 @@ export async function reconcileThreads(args: {
         // Read the thread back so the "What this was" block collapses the real
         // detail rather than a reconstruction — the item is gone from this run,
         // so its body exists only on GitHub.
-        const current = await getPRReviewComment(installationId, owner, name, op.thread.commentId);
+        const current = await io.getPRReviewComment(installationId, owner, name, op.thread.commentId);
         if (current === "gone") break;
         const body = formatResolvedThreadBody({
           item: { key: op.thread.key, title: op.thread.title, category: op.thread.category },
@@ -405,7 +428,7 @@ export async function reconcileThreads(args: {
           sha: op.sha,
           attribution: op.attribution,
         });
-        const res = await updatePRReviewComment(
+        const res = await io.updatePRReviewComment(
           installationId,
           owner,
           name,
@@ -426,40 +449,87 @@ export async function reconcileThreads(args: {
         });
         break;
       }
-      case "create": {
-        if (op.anchor.kind === "none") break;
-        const anchor: ReviewCommentAnchor =
-          op.anchor.kind === "line"
-            ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
-            : { kind: "file", path: op.anchor.path };
-        let res = await createPRReviewComment(installationId, owner, name, prNumber, {
-          body: op.body,
-          commitId: headSha,
-          anchor,
-        });
-        // The anchor lost a race with the diff we planned against. One retry at
-        // file level, which is legal for any file still in the PR; never retry
-        // the same payload.
-        if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
-          res = await createPRReviewComment(installationId, owner, name, prNumber, {
-            body: op.body,
-            commitId: headSha,
-            anchor: { kind: "file", path: anchor.path },
-          });
-        }
-        if ("error" in res) {
-          if (res.error === "rate_limit") aborted = true;
-          break;
-        }
-        created++;
-        out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
+      case "create":
+        if (op.anchor.kind === "line") lineCreates.push(op);
+        else if (op.anchor.kind === "file") fileCreates.push(op);
         break;
-      }
       case "overflow":
         break;
     }
   }
-  return { threads: out, created, updated, resolved, aborted };
+
+  // One comment at a time, with a file-level retry when the anchor lost a race
+  // with the diff we planned against. Never retries the same payload.
+  const createOne = async (op: CreateOp): Promise<void> => {
+    if (op.anchor.kind === "none" || aborted) return;
+    const anchor: ReviewCommentAnchor =
+      op.anchor.kind === "line"
+        ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
+        : { kind: "file", path: op.anchor.path };
+    let res = await io.createPRReviewComment(installationId, owner, name, prNumber, {
+      body: op.body,
+      commitId: headSha,
+      anchor,
+    });
+    if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
+      res = await io.createPRReviewComment(installationId, owner, name, prNumber, {
+        body: op.body,
+        commitId: headSha,
+        anchor: { kind: "file", path: anchor.path },
+      });
+    }
+    if ("error" in res) {
+      if (res.error === "rate_limit") aborted = true;
+      return;
+    }
+    created++;
+    out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
+  };
+
+  // New line-anchored threads go up as one review so the timeline shows a single
+  // "reviewed" event. Comment ids come back from a listing, matched by marker.
+  if (lineCreates.length) {
+    const comments: BatchedReviewComment[] = lineCreates.map((op) => ({
+      path: (op.anchor as Extract<Anchor, { kind: "line" }>).path,
+      line: (op.anchor as Extract<Anchor, { kind: "line" }>).line,
+      side: "RIGHT",
+      body: op.body,
+    }));
+    const res = await io.createPRReview(installationId, owner, name, prNumber, {
+      commitId: headSha,
+      comments,
+    });
+    if ("error" in res) {
+      if (res.error === "anchor") {
+        fellBack = true;
+        for (const op of lineCreates) await createOne(op);
+      } else if (res.error === "rate_limit") {
+        aborted = true;
+      } else {
+        recoveryNeeded = true;
+      }
+    } else {
+      const byKey = new Map<string, number>();
+      for (const c of res.comments) {
+        const key = parseItemMarker(c.body);
+        if (key) byKey.set(key, c.id);
+      }
+      for (const op of lineCreates) {
+        const id = byKey.get(op.item.key);
+        if (id == null) {
+          console.warn(`[review] batched review ${res.reviewId} returned no comment for ${op.item.key}`);
+          recoveryNeeded = true;
+          continue;
+        }
+        created++;
+        out.push(threadFrom(op.item, op.anchor, id, op.body, headSha));
+      }
+    }
+  }
+  // File-level anchors cannot ride in comments[]; they stay separate posts.
+  for (const op of fileCreates) await createOne(op);
+
+  return { threads: out, created, updated, resolved, aborted, fellBack, recoveryNeeded };
 }
 
 // Rebuild thread state from the PR itself. Only worth doing when the stored rows

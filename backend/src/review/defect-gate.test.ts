@@ -55,6 +55,7 @@ function ghResponse(body: any) {
     status: 200,
     json: async () => body,
     text: async () => (typeof body === "string" ? body : JSON.stringify(body)),
+    headers: { get: () => null },
   } as any;
 }
 
@@ -62,9 +63,18 @@ function installFetchStub() {
   const original = globalThis.fetch;
   let nextCommentId = 5000;
   let nextThreadId = 6000;
+  const reviewComments: Array<{ id: number; body: string; path: string }> = [];
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url);
     const method = String(init.method || "GET").toUpperCase();
+    let body: any;
+    if (typeof init.body === "string") {
+      try {
+        body = JSON.parse(init.body);
+      } catch {
+        body = undefined;
+      }
+    }
     const headers = init.headers || {};
     const accept = String(headers.Accept || headers.accept || "");
     if (u.includes("/access_tokens") && method === "POST")
@@ -79,7 +89,11 @@ function installFetchStub() {
     if (/\/pulls\/comments\/\d+$/.test(u)) return ghResponse({ body: "" });
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET")
       return ghResponse([{ sha: "abc1234", commit: { message: "Add list handler" } }]);
-    if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") return ghResponse({ id: 99 });
+    if (/\/pulls\/\d+\/reviews\/99\/comments/.test(u) && method === "GET") return ghResponse(reviewComments);
+    if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") {
+      for (const c of body?.comments ?? []) reviewComments.push({ id: nextThreadId++, body: c.body, path: c.path });
+      return ghResponse({ id: 99 });
+    }
     if (/\/pulls\/\d+$/.test(u) && method === "GET") {
       if (accept.includes("diff")) return ghResponse(DIFF);
       return ghResponse({
@@ -226,6 +240,10 @@ test("a defect reaches the PR as its own thread, and is counted on the card", as
         if (/\/pulls\/\d+\/comments$/.test(u) && String(init.method).toUpperCase() === "POST") {
           threads.push({ body: parsed.body, path: parsed.path, line: parsed.line });
         }
+        // Line-anchored threads ride together in one batched review.
+        if (/\/pulls\/\d+\/reviews$/.test(u) && String(init.method).toUpperCase() === "POST") {
+          for (const c of parsed.comments ?? []) threads.push({ body: c.body, path: c.path, line: c.line });
+        }
       } catch {
         /* not JSON — ignore */
       }
@@ -240,9 +258,9 @@ test("a defect reaches the PR as its own thread, and is counted on the card", as
   }
 
   // The finding's detail is on its own thread, anchored to the code it concerns.
-  const defectThread = threads.find((t) => /### 🐞 Bug \(blocker\) —/.test(t.body));
+  const defectThread = threads.find((t) => /<summary>🐞 Bug \(blocker\) —/.test(t.body));
   assert.ok(defectThread, "the defect should open its own review-comment thread");
-  assert.match(defectThread!.body, /### 🐞 Bug \(blocker\) —/);
+  assert.match(defectThread!.body, /<summary>🐞 Bug \(blocker\) —/);
   assert.match(defectThread!.body, /\*\*How it fails:\*\*/);
   assert.match(defectThread!.body, /<summary>Prompt to fix with AI<\/summary>/);
   assert.ok(defectThread!.path, "the thread anchors to a file");

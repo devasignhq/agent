@@ -10,6 +10,8 @@ import {
   stripFixPromptBlock,
   formatThreadBody,
   itemMarker,
+  summaryText,
+  unwrapThreadBody,
   parseItemMarker,
   parseResolvedMarker,
 } from "./comment.js";
@@ -90,7 +92,7 @@ test("unmet criterion: heading, requirement and the reason it isn't met", () => 
   const body = formatThreadBody(
     critItem({ evidence: "linkInstallationHandler links without comparing account.id." })
   );
-  assert.match(body, /^### 📋 Acceptance criterion not met — C1$/m);
+  assert.match(body, /^<summary>📋 Acceptance criterion not met — C1<\/summary>$/m);
   assert.match(body, /\*\*Required:\*\* Personal claims succeed when account\.id/);
   assert.match(body, /\*\*Why it isn't met:\*\* linkInstallationHandler links without comparing/);
 });
@@ -102,7 +104,7 @@ test("unmet criterion without evidence still gets a reason, never a bare 'not me
 
 test("met === null reads 'could not be evaluated', not an asserted failure", () => {
   const body = formatThreadBody(critItem({ met: null }));
-  assert.match(body, /### 📋 Acceptance criterion could not be evaluated — C1/);
+  assert.match(body, /<summary>📋 Acceptance criterion could not be evaluated — C1/);
   assert.match(body, /\*\*Why:\*\* The reviewer could not evaluate this requirement/);
   assert.doesNotMatch(body, /not met/);
 });
@@ -113,13 +115,13 @@ test("a regressed criterion says what broke, not that it was never met", () => {
     prior: new Map([["C1", { met: true, evidence: null } as PriorVerdict]]),
   })[0];
   const body = formatThreadBody(item);
-  assert.match(body, /### ⚠️ Acceptance criterion regressed — C1/);
+  assert.match(body, /<summary>⚠️ Acceptance criterion regressed — C1/);
   assert.match(body, /\*\*What broke:\*\* a later commit dropped the check/);
 });
 
 test("a met criterion gets a thread with its evidence and no fix prompt", () => {
   const body = formatThreadBody(critItem({ met: true, evidence: "the handler compares account.id" }));
-  assert.match(body, /### ✅ Acceptance criterion met — C1/);
+  assert.match(body, /<summary>✅ Acceptance criterion met — C1/);
   assert.match(body, /\*\*How it's satisfied:\*\* the handler compares account\.id/);
   assert.doesNotMatch(body, /Prompt to fix with AI/);
 });
@@ -176,7 +178,7 @@ test("a defect renders severity, class and the concrete failure", () => {
     findingItem({ defectClass: "race-condition", failureScenario: "Two writers land in the same tick." })
   );
   // The heading carries the title AND the severity; the body doesn't repeat it.
-  assert.match(body, /### 🐞 Bug \(blocker\) — Missing await on flush/);
+  assert.match(body, /<summary>🐞 Bug \(blocker\) — Missing await on flush/);
   assert.equal(body.match(/Missing await on flush/g)!.length, 1, "the concern is stated once");
   assert.match(body, /\*\*Class:\*\* `race-condition`/);
   assert.match(body, /\*\*How it fails:\*\* Two writers land in the same tick\./);
@@ -194,7 +196,7 @@ test("a security finding shows its 4-tier severity and carries the full fix prom
       "securityFindings"
     )
   );
-  assert.match(body, /### 🔒 Security \(high\) — User input reaches the query unescaped\./);
+  assert.match(body, /<summary>🔒 Security \(high\) — User input reaches the query unescaped\./);
   assert.match(body, /\*\*Suggested change\*\* \(`src\/a\.ts:3`\)/);
   assert.match(body, /<summary>Prompt to fix with AI<\/summary>/);
   assert.match(body, /Fix: parameterise the query/);
@@ -211,18 +213,18 @@ test("advisory categories carry their own heading, with severity only when notab
   const conv = formatThreadBody(
     findingItem({ concern: "Uses var instead of const.", severity: "nit" }, "conventionFindings")
   );
-  assert.match(conv, /### 📝 Convention \(nit\) — Uses var instead of const\./);
+  assert.match(conv, /<summary>📝 Convention \(nit\) — Uses var instead of const\./);
 
   const parity = formatThreadBody(
     findingItem({ concern: "The Go SDK lacks this.", severity: "nit" }, "parityNotes")
   );
-  assert.match(parity, /### 🔗 Feature parity \(nit\) — The Go SDK lacks this\./);
+  assert.match(parity, /<summary>🔗 Feature parity \(nit\) — The Go SDK lacks this\./);
 
   // "warn" is the unremarkable middle, so it stays out of the heading entirely.
   const deferred = formatThreadBody(
     findingItem({ concern: "Stubbed the retry path for now.", severity: "warn" }, "deferrals")
   );
-  assert.match(deferred, /### 🚧 Deferred work — Stubbed the retry path for now\./);
+  assert.match(deferred, /<summary>🚧 Deferred work — Stubbed the retry path for now\./);
 });
 
 // ─── anchoring notes ───────────────────────────────────────────────────────
@@ -261,7 +263,7 @@ test("a fixed thread keeps one item marker, adds a resolved marker, and collapse
   assert.equal(body.match(/devasign:item/g)!.length, 1, "exactly one item marker survives");
   assert.equal(parseResolvedMarker(body), "9f2c1ab");
   assert.equal(parseItemMarker(body), findingItem().key);
-  assert.match(body, /<summary>What this was<\/summary>/);
+  assert.match(body, /\*\*What this was\*\*/);
   assert.match(body, /Missing await on flush/);
 });
 
@@ -282,7 +284,7 @@ test("a fixed thread keeps the diagnosis but drops the prompt to fix it", () => 
   assert.doesNotMatch(body, /Prompt to fix with AI/);
   assert.doesNotMatch(body, /Fix: await the flush/);
   assert.match(body, /\*\*How it fails:\*\*/);
-  assert.equal(body.match(/<details>/g)!.length, 1, "only the 'What this was' block remains");
+  assert.equal(body.match(/<details>/g)!.length, 1, "only the outer collapsed block remains");
   assert.equal(body.match(/<\/details>/g)!.length, 1);
 });
 
@@ -296,9 +298,9 @@ test("stripping the prompt survives a prompt whose code block contains a closing
   const stripped = stripFixPromptBlock(openBody);
   assert.doesNotMatch(stripped, /Prompt to fix with AI/);
   assert.doesNotMatch(stripped, /escape the template/);
-  assert.equal(stripped.match(/<details>/g), null, "no orphaned opening tag");
-  assert.equal(stripped.match(/<\/details>/g), null, "no orphaned closing tag");
-  assert.match(stripped, /### 🐞 Bug/, "the finding itself is untouched");
+  assert.equal(stripped.match(/<details>/g)!.length, 1, "only the outer wrapper's opening tag");
+  assert.equal(stripped.match(/<\/details>/g)!.length, 1, "only the outer wrapper's closing tag");
+  assert.match(stripped, /<summary>🐞 Bug/, "the finding itself is untouched");
 });
 
 test("stripping is a no-op on a body with no prompt, and never truncates a malformed one", () => {
@@ -311,7 +313,7 @@ test("stripping is a no-op on a body with no prompt, and never truncates a malfo
 
 test("wording stays honest: it reports our own output, not a claim about the author", () => {
   const body = resolved({ kind: "commit", sha: "9f2c1abdeadbeef", url: "https://gh/c/9f2c1ab" });
-  assert.match(body, /### ✅ Fixed — Missing await on flush/);
+  assert.match(body, /<summary>✅ Fixed — Missing await on flush/);
   assert.match(body, /This no longer appears in the review of `9f2c1ab`\./);
 });
 
@@ -348,7 +350,7 @@ test("a file that left the PR gets its own wording, with no claim of a fix", () 
     sha: "9f2c1abdeadbeef",
     url: "https://gh/c/9f2c1ab",
   });
-  assert.match(body, /### ✅ No longer in this PR — Missing await on flush/);
+  assert.match(body, /<summary>✅ No longer in this PR — Missing await on flush/);
   assert.match(body, /`src\/a\.ts` is no longer part of this pull request's changes/);
   assert.doesNotMatch(body, /Fixed in/);
   assert.doesNotMatch(body, /Fixed somewhere/);
@@ -358,7 +360,7 @@ test("a criterion that flips to met keeps its thread and names the fixing commit
   const body = formatThreadBody(critItem({ met: true, evidence: "the check is now in place" }), {
     fixedIn: attributionLine({ kind: "commit", sha: "9f2c1abdeadbeef", url: "https://gh/c/9f2c1ab" })!,
   });
-  assert.match(body, /### ✅ Acceptance criterion met — C1/);
+  assert.match(body, /<summary>✅ Acceptance criterion met — C1/);
   assert.match(body, /Fixed in \[`9f2c1ab`\]\(https:\/\/gh\/c\/9f2c1ab\)\./);
   assert.match(body, /\*\*How it's satisfied:\*\* the check is now in place/);
 });
@@ -366,6 +368,72 @@ test("a criterion that flips to met keeps its thread and names the fixing commit
 test("a concern too long for the heading is still stated in full in the body", () => {
   const long = "Missing await on flush(). " + "The handler returns before the write lands. ".repeat(4);
   const body = formatThreadBody(findingItem({ concern: long }));
-  assert.match(body, /### 🐞 Bug \(blocker\) — Missing await on flush\(\)\..*…$/m, "the heading is clipped");
+  assert.match(body, /<summary>🐞 Bug \(blocker\) — Missing await on flush\(\)\..*…<\/summary>$/m, "the heading is clipped");
   assert.ok(body.includes(long.trim()), "the full concern survives in the body");
+});
+
+// ─── collapsed wrapper ─────────────────────────────────────────────────────
+
+test("a thread body is one collapsed block: marker, then <details> with the heading as summary", () => {
+  const body = formatThreadBody(findingItem({ fixPrompt: "Fix: await it\n\n```diff\n-a\n+b\n```" }));
+  const lines = body.split("\n");
+  assert.match(lines[0], /^<!-- devasign:item/);
+  assert.equal(lines[1], "<details>");
+  assert.match(lines[2], /^<summary>🐞 Bug \(blocker\) — /);
+  assert.equal(lines[3], "", "markdown inside <details> needs a blank line after </summary>");
+  assert.equal(lines[lines.length - 1], "</details>");
+  assert.equal(lines[lines.length - 2], "");
+  assert.equal(body.match(/<details>/g)!.length, 2, "outer wrapper + fix prompt");
+  assert.equal(body.match(/<\/details>/g)!.length, 2);
+});
+
+test("summary text is HTML-escaped so a title like <Props> is not swallowed as a tag", () => {
+  const item = findingItem({
+    concern: "Missing null check on <Props> & friends.",
+    failureScenario: "Rendering <Props> without data & throws.",
+  });
+  assert.equal(summaryText(item), "🐞 Bug (blocker) — Missing null check on &lt;Props&gt; &amp; friends.");
+  const body = formatThreadBody(item);
+  assert.match(body, /<summary>🐞 Bug \(blocker\) — Missing null check on &lt;Props&gt; &amp; friends\.<\/summary>/);
+  assert.match(body, /Rendering <Props> without data & throws\./, "the body keeps raw text");
+});
+
+test("unwrapThreadBody removes the marker and the outer wrapper, leaving the detail", () => {
+  const item = findingItem({
+    failureScenario: "Two writers land in the same tick.",
+    fixPrompt: "Fix: escape the template\n\n```html\n</details>\n<details>\n```",
+  });
+  const inner = unwrapThreadBody(formatThreadBody(item));
+  assert.doesNotMatch(inner, /devasign:item/);
+  assert.doesNotMatch(inner, /^<details>/, "the outer wrapper is gone");
+  assert.doesNotMatch(inner, /<summary>🐞 Bug/);
+  assert.match(inner, /^\*\*How it fails:\*\* Two writers/m);
+  // The fix prompt (with its literal tags) is untouched: only first/last lines are dropped.
+  assert.match(inner, /<summary>Prompt to fix with AI<\/summary>/);
+  assert.match(inner, /```html\n<\/details>\n<details>\n```/);
+  assert.match(inner, /<\/details>$/, "the fix prompt's own closing tag survives");
+});
+
+test("unwrapThreadBody leaves a body written before the wrapper existed unchanged", () => {
+  const legacy = `${itemMarker("k")}\n### 🐞 Bug — old style\n\n**How it fails:** boom`;
+  assert.equal(unwrapThreadBody(legacy), "### 🐞 Bug — old style\n\n**How it fails:** boom");
+});
+
+test("a resolved body nests the original detail once, not a collapsed block inside a collapsed block", () => {
+  const item = findingItem({ failureScenario: "Two writers land in the same tick." });
+  const body = formatResolvedThreadBody({
+    item,
+    openBody: formatThreadBody(item),
+    sha: "9f2c1abdeadbeef",
+    attribution: { kind: "commit", sha: "9f2c1abdeadbeef", url: "https://gh/c/9f2c1ab" },
+  });
+  const lines = body.split("\n");
+  assert.match(lines[0], /devasign:item/);
+  assert.match(lines[1], /devasign:resolved/);
+  assert.equal(lines[2], "<details>");
+  assert.match(lines[3], /^<summary>✅ Fixed — Missing await on flush/);
+  assert.equal(lines[4], "");
+  assert.equal(body.match(/<details>/g)!.length, 1);
+  assert.match(body, /\*\*What this was\*\*\n\n\*\*How it fails:\*\*/, "the detail follows the label directly");
+  assert.doesNotMatch(body, /<summary>🐞 Bug/, "the open body's own wrapper was unwrapped");
 });
