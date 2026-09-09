@@ -9,11 +9,13 @@
 //   node --import tsx/esm --test src/review/threads.test.ts
 import { createHash } from "node:crypto";
 import {
+  createPRReview,
   createPRReviewComment,
   deletePRReviewComment,
   getPRReviewComment,
   listPRReviewComments,
   updatePRReviewComment,
+  type BatchedReviewComment,
   type ReviewCommentAnchor,
 } from "../github/review-comments.js";
 import type { ReviewThread } from "../types.js";
@@ -366,19 +368,29 @@ export type ReconcileResult = {
   // True when GitHub told us to stop writing (secondary rate limit). The caller
   // renders the remainder on the summary card rather than half-spraying threads.
   aborted: boolean;
+  // The batched review was refused and its threads were opened one at a time.
+  fellBack: boolean;
+  // The batch's outcome is unknown (it may have posted); the next run must
+  // rebuild thread ids from GitHub before creating anything.
+  recoveryNeeded: boolean;
 };
 
 export type ThreadClient = {
+  createReview: typeof createPRReview;
   create: typeof createPRReviewComment;
   update: typeof updatePRReviewComment;
   get: typeof getPRReviewComment;
 };
 
 const liveClient: ThreadClient = {
+  createReview: createPRReview,
   create: createPRReviewComment,
   update: updatePRReviewComment,
   get: getPRReviewComment,
 };
+
+type CreateOp = Extract<ThreadOp, { op: "create" }>;
+type LineCreateOp = CreateOp & { anchor: Extract<Anchor, { kind: "line" }> };
 
 export async function reconcileThreads(args: {
   installationId: number;
@@ -397,13 +409,12 @@ export async function reconcileThreads(args: {
   let updated = 0;
   let resolved = 0;
   let aborted = false;
+  let fellBack = false;
+  let recoveryNeeded = false;
+  const lineCreates: LineCreateOp[] = [];
+  const fileCreates: CreateOp[] = [];
 
   for (const op of plan.ops) {
-    if (aborted) {
-      // Preserve state for everything we didn't get to; the next run retries.
-      if (op.op !== "create" && op.op !== "overflow") out.push(op.thread);
-      continue;
-    }
     switch (op.op) {
       case "carry":
         out.push(op.thread);
@@ -495,40 +506,91 @@ export async function reconcileThreads(args: {
         });
         break;
       }
-      case "create": {
-        if (op.anchor.kind === "none") break;
-        const anchor: ReviewCommentAnchor =
-          op.anchor.kind === "line"
-            ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
-            : { kind: "file", path: op.anchor.path };
-        let res = await client.create(installationId, owner, name, prNumber, {
-          body: op.body,
-          commitId: headSha,
-          anchor,
-        });
-        // The anchor lost a race with the diff we planned against. One retry at
-        // file level, which is legal for any file still in the PR; never retry
-        // the same payload.
-        if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
-          res = await client.create(installationId, owner, name, prNumber, {
-            body: op.body,
-            commitId: headSha,
-            anchor: { kind: "file", path: anchor.path },
-          });
-        }
-        if ("error" in res) {
-          if (res.error === "rate_limit") aborted = true;
-          break;
-        }
-        created++;
-        out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
+      case "create":
+        if (op.anchor.kind === "line") lineCreates.push({ ...op, anchor: op.anchor });
+        else if (op.anchor.kind === "file") fileCreates.push(op);
         break;
-      }
       case "overflow":
         break;
     }
   }
-  return { threads: out, created, updated, resolved, aborted };
+
+  const createOne = async (op: CreateOp): Promise<void> => {
+    if (op.anchor.kind === "none" || aborted) return;
+    const anchor: ReviewCommentAnchor =
+      op.anchor.kind === "line"
+        ? { kind: "line", path: op.anchor.path, line: op.anchor.line, side: "RIGHT" }
+        : { kind: "file", path: op.anchor.path };
+    let res = await client.create(installationId, owner, name, prNumber, {
+      body: op.body,
+      commitId: headSha,
+      anchor,
+    });
+    // The anchor lost a race with the diff we planned against. One retry at file
+    // level, which is legal for any file still in the PR; never the same payload.
+    if ("error" in res && res.error === "anchor" && anchor.kind === "line") {
+      res = await client.create(installationId, owner, name, prNumber, {
+        body: op.body,
+        commitId: headSha,
+        anchor: { kind: "file", path: anchor.path },
+      });
+    }
+    if ("error" in res) {
+      if (res.error === "rate_limit") aborted = true;
+      return;
+    }
+    created++;
+    out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
+  };
+
+  // One review for the whole run, so the timeline shows a single "reviewed"
+  // event instead of one per finding. Ids come back by marker, never by index.
+  if (lineCreates.length) {
+    const comments: BatchedReviewComment[] = lineCreates.map((op) => ({
+      path: op.anchor.path,
+      line: op.anchor.line,
+      side: "RIGHT",
+      body: op.body,
+    }));
+    const res = await client.createReview(installationId, owner, name, prNumber, {
+      commitId: headSha,
+      comments,
+    });
+    if ("error" in res) {
+      if (res.error === "anchor") {
+        fellBack = true;
+        for (const op of lineCreates) await createOne(op);
+      } else if (res.error === "rate_limit") {
+        aborted = true;
+      } else {
+        // It may have posted. Persisting nothing and rebuilding next run is the
+        // only branch that cannot duplicate every thread.
+        recoveryNeeded = true;
+      }
+    } else {
+      const byKey = new Map<string, number>();
+      for (const c of res.comments) {
+        const key = parseItemMarker(c.body);
+        if (key) byKey.set(key, c.id);
+      }
+      for (const op of lineCreates) {
+        const id = byKey.get(op.item.key);
+        if (id == null) {
+          console.warn(
+            `[review] batched review ${res.reviewId} returned no comment for ${op.item.key}`
+          );
+          recoveryNeeded = true;
+          continue;
+        }
+        created++;
+        out.push(threadFrom(op.item, op.anchor, id, op.body, headSha));
+      }
+    }
+  }
+  // File-level anchors cannot ride in comments[]; they stay separate posts.
+  for (const op of fileCreates) await createOne(op);
+
+  return { threads: out, created, updated, resolved, aborted, fellBack, recoveryNeeded };
 }
 
 // Rebuild thread state from the PR itself. Only worth doing when the stored rows

@@ -107,8 +107,25 @@ export type ThreadBodyOpts = {
   reopened?: boolean;
 };
 
+// <summary> on the same line as its tag is an HTML block, so a title containing
+// "<Props>" would be swallowed as markup. Escape it; markdown is inert there anyway.
+function escapeSummary(text: string): string {
+  return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function summaryText(item: ReviewItem): string {
+  return escapeSummary(heading(item).replace(/^### /, ""));
+}
+
+function openCollapsed(lines: string[], summary: string) {
+  lines.push("<details>", `<summary>${summary}</summary>`, "");
+}
+
+// Every thread body is one collapsed block: marker, then <details> whose summary
+// is the heading. Threads render expanded in GitHub's timeline otherwise.
 export function formatThreadBody(item: ReviewItem, opts: ThreadBodyOpts = {}): string {
-  const lines: string[] = [itemMarker(item.key), heading(item), ""];
+  const lines: string[] = [itemMarker(item.key)];
+  openCollapsed(lines, summaryText(item));
 
   if (opts.reopened) {
     lines.push("**Reopened** — this came back in the latest review.", "");
@@ -181,10 +198,24 @@ export function formatThreadBody(item: ReviewItem, opts: ThreadBodyOpts = {}): s
   }
 
   appendPromptDetails(lines, item.fixPrompt, FIX_PROMPT_SUMMARY);
+  lines.push("", "</details>");
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
 const FIX_PROMPT_SUMMARY = "Prompt to fix with AI";
+
+// Drop the marker and the outer collapsed wrapper, leaving the detail. Bodies
+// written before the wrapper existed come back unchanged.
+export function unwrapThreadBody(body: string): string {
+  const lines = body.replace(MARKER_RE, "").trim().split("\n");
+  const wrapped =
+    lines.length >= 3 &&
+    lines[0].trim() === "<details>" &&
+    lines[1].trim().startsWith("<summary>") &&
+    lines[lines.length - 1].trim() === "</details>";
+  if (!wrapped) return lines.join("\n").trim();
+  return lines.slice(2, -1).join("\n").trim();
+}
 
 // Remove the collapsed fix-prompt block from a thread body. Used when a thread is
 // marked fixed: the original detail is worth keeping for reference, but a prompt
@@ -253,34 +284,22 @@ export function formatResolvedThreadBody(args: {
   const lines: string[] = [itemMarker(item.key), `<!-- devasign:resolved sha=${short} -->`];
 
   if (attribution.kind === "gone") {
+    openCollapsed(lines, escapeSummary(`✅ No longer in this PR — ${item.title}`));
     lines.push(
-      `### ✅ No longer in this PR — ${item.title}`,
-      "",
       `\`${attribution.path}\` is no longer part of this pull request's changes as of ` +
         `[\`${attribution.sha.slice(0, 7)}\`](${attribution.url}), so this finding no longer applies.`
     );
   } else {
-    lines.push(
-      `### ✅ Fixed — ${item.title}`,
-      "",
-      `This no longer appears in the review of \`${short}\`.`
-    );
+    openCollapsed(lines, escapeSummary(`✅ Fixed — ${item.title}`));
+    lines.push(`This no longer appears in the review of \`${short}\`.`);
   }
 
   const where = attributionLine(attribution);
   if (where) lines.push("", where);
 
-  lines.push(
-    "",
-    "<details>",
-    "<summary>What this was</summary>",
-    "",
-    // Strip the original marker so only one item marker survives in the body, and
-    // the fix prompt with it — there is nothing left to fix.
-    stripFixPromptBlock(openBody.replace(MARKER_RE, "").trim()),
-    "",
-    "</details>"
-  );
+  // The original detail stays for reference, minus its marker (one per body)
+  // and its fix prompt — there is nothing left to fix.
+  lines.push("", "**What this was**", "", stripFixPromptBlock(unwrapThreadBody(openBody)), "", "</details>");
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 

@@ -2954,7 +2954,8 @@ async function postGithubOutput(
       let threads = review.reviewThreads ?? [];
       // Stored rows lost but we have reviewed before, so threads should exist:
       // rebuild from the markers rather than posting a duplicate of each one.
-      if (threads.length === 0 && review.lastReviewedSha) {
+      // Same when the last batched review's outcome was never captured.
+      if (review.threadsNeedRecovery || (threads.length === 0 && review.lastReviewedSha)) {
         const recovered = await loadThreadsFromGitHub({
           installationId,
           owner: repo.owner,
@@ -2963,8 +2964,10 @@ async function postGithubOutput(
           headSha: review.headSha,
         });
         if (recovered?.length) {
-          threads = recovered;
-          log(review.id, "comment", `Rebuilt ${recovered.length} thread(s) from the pull request`);
+          const known = new Set(threads.map((t) => t.key));
+          const added = recovered.filter((t) => !known.has(t.key));
+          threads = [...threads, ...added];
+          log(review.id, "comment", `Rebuilt ${added.length} thread(s) from the pull request`);
         }
       }
       const plan = planReconciliation({
@@ -2988,7 +2991,16 @@ async function postGithubOutput(
         headSha: review.headSha,
         plan,
       });
-      setStatus(review.id, { reviewThreads: capThreads(result.threads) });
+      setStatus(review.id, {
+        reviewThreads: capThreads(result.threads),
+        threadsNeedRecovery: result.recoveryNeeded || undefined,
+      });
+      if (result.fellBack) {
+        log(review.id, "comment", "Batched review rejected — threads opened individually");
+      }
+      if (result.recoveryNeeded) {
+        log(review.id, "comment", "Batched review outcome unknown — thread ids will be rebuilt next run");
+      }
       openForCounting = plan.openForCounting;
       fixedCount = plan.fixedCount;
       unanchorable = plan.unanchorable;
