@@ -31,6 +31,7 @@ function installFetchStub(headRepoFullName = "acme/widgets") {
   const calls: Call[] = [];
   const comments = new Map<number, string>();
   const reviewComments = new Map<number, Array<Record<string, unknown>>>();
+  const reviewBodies = new Map<number, string>();
   let nextId = 4242;
   const original = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
@@ -50,8 +51,12 @@ function installFetchStub(headRepoFullName = "acme/widgets") {
     if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST") return ghResponse({ id: 9000 + calls.length });
     if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") {
       reviewComments.set(99, (body?.comments ?? []).map((c: any, i: number) => ({ id: 9500 + i, body: c.body, path: c.path })));
+      reviewBodies.set(99, String(body?.body ?? ""));
       return ghResponse({ id: 99 });
     }
+    let rv = /\/pulls\/\d+\/reviews\/(\d+)$/.exec(u);
+    if (rv && method === "GET") return ghResponse({ id: Number(rv[1]), body: reviewBodies.get(Number(rv[1])) ?? "" });
+    if (rv && method === "PUT") { reviewBodies.set(Number(rv[1]), String(body?.body ?? "")); return ghResponse({ id: Number(rv[1]) }); }
     if (/\/pulls\/\d+\/reviews\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse(reviewComments.get(99) ?? []);
     if (/\/issues\/comments\/\d+$/.test(u) && method === "DELETE") return { ok: true, status: 204, json: async () => undefined, text: async () => "" } as any;
     if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse([]);
@@ -66,7 +71,7 @@ function installFetchStub(headRepoFullName = "acme/widgets") {
     if (/\/check-runs$/.test(u) && method === "POST") return ghResponse({ id: 70 + calls.length, html_url: "https://github.com/acme/widgets/runs/1" });
     return ghResponse({});
   }) as any;
-  return { calls, comments, restore: () => { globalThis.fetch = original; } };
+  return { calls, comments, reviewBodies, restore: () => { globalThis.fetch = original; } };
 }
 
 function seedReview(workflow?: any) {
@@ -78,7 +83,7 @@ function seedReview(workflow?: any) {
 
 test("fork after criteria, plan in parallel, Verify check run at the join; results → judged → a separate Tests comment", async () => {
   const { install, repo, review } = seedReview();
-  const { calls, comments, restore } = installFetchStub();
+  const { calls, comments, reviewBodies, restore } = installFetchStub();
   try {
     await runReviewJob(review.id);
 
@@ -153,7 +158,7 @@ test("fork after criteria, plan in parallel, Verify check run at the join; resul
     const finalTests = comments.get(testsCommentId)!;
     assert.match(finalTests, /^## Tests by DevAsign/);
     assert.match(finalTests, /❌ `Failed \(1\)`/);
-    assert.match(finalTests, /### (✅|🟡|🔴) Test score: \d{1,3}\/100/);
+    assert.doesNotMatch(finalTests, /Test score/);
     assert.match(finalTests, /\*\*Verdict:\*\* FAIL/);
     assert.match(finalTests, /\[mock\] fail per the recorded test outcome/);
     assert.match(finalTests, /\*\*Test:\*\* `\.devasign\/tests\/criterion-2\.test\.ts`/);
@@ -165,8 +170,16 @@ test("fork after criteria, plan in parallel, Verify check run at the join; resul
       (c) => c.method === "POST" && /\/issues\/\d+\/comments$/.test(c.url) && /Tests by DevAsign/.test(String(c.body?.body))
     );
     assert.equal(testsPosts.length, 1, "exactly one tests comment for the run");
-    // The review's card is untouched by verification.
-    assert.ok(!comments.get(4242)!.includes(VERIFICATION_START));
+    // The card's head is refreshed in place with the late result: one failing
+    // test costs 10 points and earns a chip; the rows stay in the tests comment.
+    const refreshed = reviewBodies.get(99)!;
+    assert.ok(!refreshed.includes(VERIFICATION_START));
+    assert.match(refreshed, /❌ `Tests failing \(1\)`/);
+    assert.match(refreshed, /⚠️ \*\*1 of 2 verified tests are failing\*\*/);
+    assert.equal(refreshed.split("<!-- devasign:card-head -->").length, 2);
+    const scoreOf = (s: string) => Number(/Merge score: (\d+)\/100/.exec(s)![1]);
+    assert.equal(scoreOf(refreshed), scoreOf(body) - 10);
+    assert.ok(calls.some((c) => c.method === "PUT" && /\/pulls\/1\/reviews\/99$/.test(c.url)), "the review body was edited");
     const verifyChecks = calls.filter((c) => c.method === "POST" && /\/check-runs$/.test(c.url) && c.body?.name === "DevAsign · Verify");
     assert.equal(verifyChecks.length, 2);
     assert.equal(verifyChecks[1].body.conclusion, "failure");

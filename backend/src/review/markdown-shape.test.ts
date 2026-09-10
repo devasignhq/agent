@@ -137,6 +137,30 @@ test("the summary card renders as one block, with the fix prompt inside its <det
   );
 });
 
+test("a card whose every test failed audits clean, callout included", () => {
+  const items = build({ criteria: [criterion()] });
+  const body = formatSummaryCard({
+    open: items,
+    fixedCount: 0,
+    score: 100,
+    specless: false,
+    criteriaTotal: 1,
+    criteriaMet: 0,
+    summary: "",
+    fixPrompt: FIX_PROMPT,
+    verification: {
+      state: "completed",
+      counts: { pass: 0, fail: 2, unverifiable: 0, pending: 0 },
+      rows: [
+        { id: "1", text: "Refunds show", verdict: "fail", reason: "missing", testName: "t.test.ts" },
+        { id: "2", text: "Total is currency", verdict: "fail", reason: "bare number" },
+      ],
+    },
+  });
+  ok("the all-failing card", body);
+  assert.match(body, /Do not merge/);
+});
+
 test("a card full of unanchored blocks with fix prompts still audits clean", () => {
   const defects = Array.from({ length: 30 }, (_, i) =>
     finding({ path: `src/module-${i}.ts`, concern: `Unanchored finding ${i} about subsystem ${i}.`, fixPrompt: FIX_PROMPT } as any)

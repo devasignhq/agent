@@ -3,7 +3,18 @@
 //   node --import tsx/esm --test src/review/summary-card.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CARD_TITLE, MAX_CARD_ITEM_BLOCKS, formatChips, formatSummaryCard, summaryLines } from "./comment.js";
+import {
+  CARD_HEAD_END,
+  CARD_HEAD_START,
+  CARD_TITLE,
+  MAX_CARD_ITEM_BLOCKS,
+  formatCardHeader,
+  formatChips,
+  formatSummaryCard,
+  spliceCardHeader,
+  summaryLines,
+  type CardVerification,
+} from "./comment.js";
 import { buildReviewItems, type ReviewItem } from "./items.js";
 import { EMPTY_HOLISTIC, type HolisticFinding } from "./verdict-types.js";
 import type { PriorVerdict } from "./criteria-format.js";
@@ -60,15 +71,21 @@ test("zero-count chips are omitted entirely", () => {
   assert.equal(formatChips(open), "🐞 `Bugs (1)`");
 });
 
-test("a clean review says so, and met criteria never appear as a chip", () => {
+test("a clean review says so, without an icon, and met criteria never appear as a chip", () => {
   const open = items({ criteria: [{ id: "1", text: "a", met: true, evidence: null }] });
-  assert.equal(formatChips(open), "✅ `No issues found`");
+  assert.equal(formatChips(open), "`No issues found`");
+});
+
+test("failing tests get a chip, and a clean review with failing tests is not 'no issues'", () => {
+  assert.equal(formatChips([], 0, 2), "❌ `Tests failing (2)`");
+  const open = items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding()] } });
+  assert.equal(formatChips(open, 1, 1), "🐞 `Bugs (1)` · ❌ `Tests failing (1)` · ✅ `Fixed since last review (1)`");
 });
 
 test("fixed items get their own chip alongside whatever is still open", () => {
   const open = items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding()] } });
   assert.equal(formatChips(open, 2), "🐞 `Bugs (1)` · ✅ `Fixed since last review (2)`");
-  assert.equal(formatChips([], 2), "✅ `No issues found` · ✅ `Fixed since last review (2)`");
+  assert.equal(formatChips([], 2), "`No issues found` · ✅ `Fixed since last review (2)`");
 });
 
 test("the counts reflect the CURRENT open set — fixing 2 of 2 and adding 1 reads Bugs (1)", () => {
@@ -118,10 +135,77 @@ test("a runaway summary is clamped rather than pasted whole", () => {
 
 test("the card leads with the title, then chips, then the scored header", () => {
   const body = card({ open: items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding()] } }), score: 63 });
-  const lines = body.split("\n").filter(Boolean);
+  const lines = body.split("\n").filter((l) => l && !l.startsWith("<!--"));
   assert.equal(lines[0], CARD_TITLE);
   assert.equal(lines[1], "🐞 `Bugs (1)`");
   assert.equal(lines[2], "### 🟡 Merge score: 63/100");
+  assert.equal(body.split(CARD_HEAD_START).length, 2, "the head region is marked exactly once");
+  assert.equal(body.split(CARD_HEAD_END).length, 2);
+});
+
+// ─── verification on the card ──────────────────────────────────────────────
+
+const verification = (over: Partial<CardVerification> & { counts: CardVerification["counts"] }): CardVerification => ({
+  state: "completed",
+  rows: [],
+  ...over,
+});
+
+test("failing tests lower the score, add a chip, and point at the tests comment", () => {
+  const body = card({
+    score: 100,
+    verification: verification({ counts: { pass: 3, fail: 1, unverifiable: 0, pending: 0 } }),
+  });
+  assert.match(body, /❌ `Tests failing \(1\)`/);
+  assert.doesNotMatch(body, /No issues found/);
+  assert.match(body, /### ✅ Merge score: 90\/100/);
+  assert.match(body, /⚠️ \*\*1 of 4 verified tests are failing\*\* — check the "Tests by DevAsign" comment before merging\./);
+  assert.doesNotMatch(body, /Do not merge/);
+});
+
+test("every test failing caps the score in the red and says do not merge, naming each failure", () => {
+  const body = card({
+    score: 100,
+    verification: verification({
+      counts: { pass: 0, fail: 2, unverifiable: 1, pending: 0 },
+      rows: [
+        { id: "1", text: "Refunds show", verdict: "fail", reason: "refunds line missing", testName: ".devasign/tests/one.test.ts" },
+        { id: "2", text: "Total is currency", verdict: "fail", reason: "x".repeat(400) },
+        { id: "3", text: "Logging quiet", verdict: "unverifiable", reason: "no test ran" },
+      ],
+    }),
+  });
+  assert.match(body, /### 🔴 Merge score: 49\/100/);
+  assert.match(body, /🔴 \*\*Do not merge\.\*\* Every verified acceptance-criterion test failed \(2 of 2\)\./);
+  assert.match(body, /- \*\*1\*\* — Refunds show: refunds line missing \(`\.devasign\/tests\/one\.test\.ts`\)/);
+  assert.match(body, /- \*\*2\*\* — Total is currency: x{199}…/);
+  assert.doesNotMatch(body, /- \*\*3\*\*/, "only failures are listed");
+  assert.match(body, /Fix the criteria above so their tests pass, then push/);
+});
+
+test("a completed verification with no failures is a plain pointer; an unfinished one changes nothing", () => {
+  const clean = card({ score: 92, verification: verification({ counts: { pass: 2, fail: 0, unverifiable: 1, pending: 0 } }) });
+  assert.match(clean, /### ✅ Merge score: 92\/100/);
+  assert.match(clean, /\*\*Tests:\*\* 2 passed, 1 unverifiable — see the "Tests by DevAsign" comment\./);
+  const pending = card({ score: 92, verification: verification({ state: "pending", counts: { pass: 0, fail: 0, unverifiable: 0, pending: 3 } }) });
+  assert.doesNotMatch(pending, /Tests/);
+  assert.equal(pending, card({ score: 92 }));
+});
+
+test("the head region can be re-rendered in place once verification lands", () => {
+  const inputs = { open: [], fixedCount: 0, score: 100, specless: false, criteriaTotal: 2, criteriaMet: 2, summary: "Looks good." };
+  const before = card({ ...inputs, unanchored: items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding({ path: undefined })] } }) });
+  assert.equal(spliceCardHeader(before, formatCardHeader(inputs)), before, "unchanged inputs round-trip byte for byte");
+  const after = spliceCardHeader(
+    before,
+    formatCardHeader(inputs, verification({ counts: { pass: 1, fail: 1, unverifiable: 0, pending: 0 } }))
+  )!;
+  assert.match(after, /### ✅ Merge score: 90\/100/);
+  assert.match(after, /Tests failing \(1\)/);
+  assert.ok(after.includes("Missing await on flush()"), "the tail of the card survives the splice");
+  assert.equal(after.split(CARD_HEAD_START).length, 2);
+  assert.doesNotMatch(after, /\n{3,}/);
+  assert.equal(spliceCardHeader("## DevAsign Code Review\n\nold card without markers", formatCardHeader(inputs)), null);
 });
 
 test("the score icon tracks the band", () => {

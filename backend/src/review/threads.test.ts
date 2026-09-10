@@ -7,7 +7,14 @@ import assert from "node:assert/strict";
 import { commentableLines } from "./anchor.js";
 import { formatThreadBody, parseItemMarker } from "./comment.js";
 import { buildReviewItems, type ReviewItem, type ReviewStage } from "./items.js";
-import { bodyHash, planReconciliation, reconcileThreads, type ThreadClient, type ThreadOp } from "./threads.js";
+import {
+  MAX_RESOLVES_PER_RUN,
+  bodyHash,
+  planReconciliation,
+  reconcileThreads,
+  type ThreadClient,
+  type ThreadOp,
+} from "./threads.js";
 import { EMPTY_HOLISTIC, type HolisticFinding } from "./verdict-types.js";
 import type { PriorVerdict } from "./criteria-format.js";
 import type { Criterion, ReviewThread } from "../types.js";
@@ -421,6 +428,8 @@ test("applying a paired update migrates the stored key and match, so the next ru
       return "ok";
     },
     get: async () => "",
+    lookupThreads: async () => new Map(),
+    setResolved: async () => "ok",
   };
   const result = await reconcileThreads({
     installationId: 1, owner: "o", name: "n", prNumber: 1, headSha: SHA_NEW, plan: p, client,
@@ -448,10 +457,24 @@ function fakeClient(script: {
     | Awaited<ReturnType<ThreadClient["createReview"]>>
     | ((args: any) => Awaited<ReturnType<ThreadClient["createReview"]>>);
   single?: Awaited<ReturnType<ThreadClient["create"]>>;
+  // GitHub's view of the threads: comment id -> node id + resolved. null = lookup failed.
+  // Default: every comment id the run knows about maps to `T<id>`, unresolved.
+  threads?: Map<number, { threadId: string; isResolved: boolean }> | null;
+  resolve?: Awaited<ReturnType<ThreadClient["setResolved"]>>;
 }) {
   const calls: ClientCall[] = [];
   let nextId = 900;
+  const seen = new Set<number>();
   const client: ThreadClient = {
+    async lookupThreads() {
+      calls.push({ fn: "lookupThreads", args: {} });
+      if (script.threads !== undefined) return script.threads;
+      return new Map([...seen].map((id) => [id, { threadId: `T${id}`, isResolved: false }]));
+    },
+    async setResolved(_i, threadId, resolved) {
+      calls.push({ fn: "setResolved", args: { threadId, resolved } });
+      return script.resolve ?? "ok";
+    },
     async createReview(_i, _o, _n, _p, args) {
       calls.push({ fn: "createReview", args });
       if (typeof script.batch === "function") return script.batch(args);
@@ -461,11 +484,14 @@ function fakeClient(script: {
       const comments = [...args.comments]
         .reverse()
         .map((c) => ({ id: nextId++, body: c.body, path: c.path }));
+      for (const c of comments) seen.add(c.id);
       return { reviewId: 42, comments };
     },
     async create(_i, _o, _n, _p, args) {
       calls.push({ fn: "create", args });
-      return script.single ?? { id: nextId++ };
+      const res = script.single ?? { id: nextId++ };
+      if ("id" in res) seen.add(res.id);
+      return res;
     },
     async update(_i, _o, _n, commentId, body) {
       calls.push({ fn: "update", args: { commentId, body } });
@@ -592,6 +618,114 @@ test("an unknown batch outcome persists nothing and asks the next run to rebuild
   assert.equal(result.aborted, false);
   assert.equal(result.threads.length, 0, "no ids to persist — a guess would be a duplicate later");
   assert.equal(calls.filter((c) => c.fn === "create").length, 0, "never re-posted blind");
+});
+
+// ─── resolving on GitHub ───────────────────────────────────────────────────
+// A fixed finding or a met criterion is collapsed on GitHub; one that comes back
+// is reopened. Only a mismatch between desire and the last known GitHub state
+// costs a mutation, so a maintainer's manual change stands between changes.
+
+const syncCalls = (calls: ClientCall[]) => calls.filter((c) => c.fn === "lookupThreads" || c.fn === "setResolved");
+
+test("a criterion created already met is resolved right after its thread opens", async () => {
+  const [metItem] = items({ criteria: [criterion({ met: true, evidence: "gated" })] });
+  const { client, calls } = fakeClient({});
+  const result = await apply(plan({ items: [metItem] }), client);
+  assert.deepEqual(calls.map((c) => c.fn), ["createReview", "lookupThreads", "setResolved"]);
+  const t = result.threads[0];
+  assert.equal(calls[2].args.threadId, `T${t.commentId}`);
+  assert.equal(calls[2].args.resolved, true);
+  assert.equal(t.threadNodeId, `T${t.commentId}`);
+  assert.equal(t.githubResolved, true);
+  assert.equal(result.collapsed, 1);
+});
+
+test("a criterion that flips to met is edited first (Fixed in …), then collapsed", async () => {
+  const [unmetItem] = items({ criteria: [criterion()] });
+  const [metItem] = items({ criteria: [criterion({ met: true, evidence: "now gated" })] });
+  const { client, calls } = fakeClient({ threads: new Map([[500, { threadId: "T500", isResolved: false }]]) });
+  const result = await apply(plan({ items: [metItem], threads: [threadFor(unmetItem)] }), client);
+  assert.deepEqual(calls.map((c) => c.fn), ["update", "lookupThreads", "setResolved"]);
+  assert.match(calls[0].args.body, /Fixed in/);
+  assert.deepEqual(calls[2].args, { threadId: "T500", resolved: true });
+  assert.equal(result.threads[0].githubResolved, true);
+});
+
+test("a finding that stopped being reported is marked fixed and collapsed", async () => {
+  const [item] = defectItems();
+  const { client, calls } = fakeClient({ threads: new Map([[500, { threadId: "T500", isResolved: false }]]) });
+  const result = await apply(plan({ items: [], threads: [threadFor(item)] }), client);
+  assert.deepEqual(calls.map((c) => c.fn), ["get", "update", "lookupThreads", "setResolved"]);
+  assert.deepEqual(calls[3].args, { threadId: "T500", resolved: true });
+  assert.equal(result.threads[0].state, "resolved");
+  assert.equal(result.threads[0].githubResolved, true);
+});
+
+test("a finding that comes back is reopened on GitHub, with no lookup when the id is known", async () => {
+  const [item] = defectItems();
+  const resolvedThread = threadFor(item, {
+    state: "resolved", resolvedAtSha: SHA_OLD, missCount: 1, threadNodeId: "T500", githubResolved: true,
+  });
+  const { client, calls } = fakeClient({});
+  const result = await apply(plan({ items: [item], threads: [resolvedThread] }), client);
+  assert.deepEqual(calls.map((c) => c.fn), ["update", "setResolved"]);
+  assert.deepEqual(calls[1].args, { threadId: "T500", resolved: false });
+  assert.equal(result.threads[0].githubResolved, false);
+  assert.equal(result.reopened, 1);
+});
+
+test("a thread already in the wanted state on GitHub costs nothing", async () => {
+  const [item] = defectItems();
+  const carried = threadFor(item, { state: "resolved", threadNodeId: "T500", githubResolved: true });
+  const { client, calls } = fakeClient({});
+  await apply(plan({ items: [], threads: [carried] }), client);
+  assert.equal(syncCalls(calls).length, 0);
+  // A met criterion a maintainer un-resolved by hand stays open: our flag still
+  // says resolved and nothing about the item changed.
+  const [metItem] = items({ criteria: [criterion({ met: true, evidence: "gated" })] });
+  const manual = threadFor(metItem, { itemState: "met", threadNodeId: "T500", githubResolved: true });
+  const again = fakeClient({});
+  await apply(plan({ items: [metItem], threads: [manual] }), again.client);
+  assert.equal(syncCalls(again.calls).length, 0);
+});
+
+test("a thread a maintainer already resolved is observed, not resolved again", async () => {
+  const [item] = defectItems();
+  const { client, calls } = fakeClient({ threads: new Map([[500, { threadId: "T500", isResolved: true }]]) });
+  const result = await apply(plan({ items: [], threads: [threadFor(item)] }), client);
+  assert.deepEqual(syncCalls(calls).map((c) => c.fn), ["lookupThreads"]);
+  assert.equal(result.threads[0].githubResolved, true);
+  assert.equal(result.threads[0].threadNodeId, "T500");
+});
+
+test("a failed lookup or mutation leaves the flag unset so the next run retries", async () => {
+  const [item] = defectItems();
+  const noLookup = fakeClient({ threads: null });
+  const r1 = await apply(plan({ items: [], threads: [threadFor(item)] }), noLookup.client);
+  assert.deepEqual(syncCalls(noLookup.calls).map((c) => c.fn), ["lookupThreads"]);
+  assert.equal(r1.threads[0].githubResolved, undefined);
+
+  const failing = fakeClient({ resolve: "error" });
+  const r2 = await apply(plan({ items: [], threads: [threadFor(item, { threadNodeId: "T500" })] }), failing.client);
+  assert.deepEqual(syncCalls(failing.calls).map((c) => c.fn), ["setResolved"]);
+  assert.equal(r2.threads[0].githubResolved, undefined);
+  assert.equal(r2.collapsed, 0);
+});
+
+test("resolves are capped per run, and a rate-limited batch skips them entirely", async () => {
+  const threads = Array.from({ length: MAX_RESOLVES_PER_RUN + 5 }, (_, i) => {
+    const [item] = defectItems({ path: `src/f${i}.ts`, concern: `Finding number ${i} about subsystem ${i} is broken.` });
+    return threadFor(item, { commentId: 600 + i, state: "resolved", threadNodeId: `T${600 + i}` });
+  });
+  const { client, calls } = fakeClient({});
+  const result = await apply(plan({ items: [], threads }), client);
+  assert.equal(calls.filter((c) => c.fn === "setResolved").length, MAX_RESOLVES_PER_RUN);
+  assert.equal(result.threads.filter((t) => t.githubResolved).length, MAX_RESOLVES_PER_RUN);
+
+  const limited = fakeClient({ batch: { error: "rate_limit" } });
+  const [metItem] = items({ criteria: [criterion({ met: true, evidence: "gated" })] });
+  await apply(plan({ items: [metItem] }), limited.client);
+  assert.equal(syncCalls(limited.calls).length, 0);
 });
 
 // ─── the summary card rides as the review body ─────────────────────────────

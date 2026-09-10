@@ -57,6 +57,25 @@ export function mergeScore(open: Scorable[]): number {
   return Math.max(0, Math.min(100, Math.round(100 - penalty)));
 }
 
+export type VerificationCounts = { pass: number; fail: number; unverifiable: number; pending: number };
+
+// A failing verification test is an assertion failure against the code (the
+// judge routes broken/flaky tests to "unverifiable", never "fail"). Every
+// verified test failing is a different situation: cap the score in the red.
+export const FAILING_TEST_PENALTY = 10;
+export const ALL_FAILING_CAP = 49;
+
+export function applyVerification(
+  base: number,
+  counts?: VerificationCounts | null
+): { score: number; allFailing: boolean } {
+  if (!counts || counts.fail <= 0) return { score: base, allFailing: false };
+  const allFailing = counts.pass === 0;
+  let score = Math.max(0, Math.min(100, Math.round(base - counts.fail * FAILING_TEST_PENALTY)));
+  if (allFailing) score = Math.min(score, ALL_FAILING_CAP);
+  return { score, allFailing };
+}
+
 // Green at 80+, amber through the middle, red below 50 — the reader should be
 // able to tell "ship it" from "look at this" from the icon alone.
 export function scoreIcon(score: number): string {

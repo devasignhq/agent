@@ -16,7 +16,7 @@ import {
   reasonOrFallback,
 } from "./render.js";
 import { countByChip } from "./items.js";
-import { scoreHeader } from "./score.js";
+import { applyVerification, scoreHeader, type VerificationCounts } from "./score.js";
 
 export const CARD_TITLE = "## DevAsign Code Review";
 export const TESTS_TITLE = "## Tests by DevAsign";
@@ -348,15 +348,98 @@ function appendPromptDetails(lines: string[], prompt: string | null | undefined,
   lines.push("", "<details>", `<summary>${summary}</summary>`, "", fence, prompt, fence, "", "</details>");
 }
 
-export function formatChips(open: Chippable[], fixedCount = 0): string {
+export function formatChips(open: Chippable[], fixedCount = 0, failingTests = 0): string {
   const chips = countByChip(open)
     .filter((c) => c.count > 0)
     .map((c) => `${c.icon} \`${c.label} (${c.count})\``);
+  if (failingTests > 0) chips.push(`❌ \`Tests failing (${failingTests})\``);
   // Nothing open still deserves a chip — "clean" is the most useful thing the
   // card can say, and it must not be crowded out by the fixed-count chip.
-  if (!chips.length) chips.push("✅ `No issues found`");
+  if (!chips.length) chips.push("`No issues found`");
   if (fixedCount > 0) chips.push(`✅ \`Fixed since last review (${fixedCount})\``);
   return chips.join(" · ");
+}
+
+// ─── The card's head: chips, score, summary, verification ──────────────────
+// Marker-delimited so a verification result that lands after the card was
+// posted can re-render just this region in place (verify/report.ts).
+
+export const CARD_HEAD_START = "<!-- devasign:card-head -->";
+export const CARD_HEAD_END = "<!-- devasign:card-head-end -->";
+
+// The slice of verify/report.ts's VerificationView the card reads.
+export type CardVerification = {
+  state: string;
+  counts: VerificationCounts;
+  rows: Array<{ id: string; text: string; verdict: string; reason?: string; testName?: string }>;
+};
+
+export type CardHeadInputs = {
+  open: Chippable[];
+  fixedCount: number;
+  // The merge score before verification is applied.
+  score: number;
+  specless: boolean;
+  criteriaTotal: number;
+  criteriaMet: number;
+  summary: string;
+};
+
+const MAX_FAILING_BULLETS = 10;
+const REASON_CLIP = 200;
+
+function verificationLines(v: CardVerification, allFailing: boolean): string[] {
+  const { pass, fail, unverifiable } = v.counts;
+  if (fail <= 0) {
+    return [`**Tests:** ${pass} passed, ${unverifiable} unverifiable — see the "Tests by DevAsign" comment.`];
+  }
+  if (!allFailing) {
+    return [
+      `⚠️ **${fail} of ${fail + pass} verified tests are failing** — check the "Tests by DevAsign" comment before merging.`,
+    ];
+  }
+  const lines = [`🔴 **Do not merge.** Every verified acceptance-criterion test failed (${fail} of ${fail}).`, ""];
+  for (const r of v.rows.filter((r) => r.verdict === "fail").slice(0, MAX_FAILING_BULLETS)) {
+    const reason = (r.reason || "").trim().replace(/\s+/g, " ");
+    const why = reason ? `: ${reason.length > REASON_CLIP ? reason.slice(0, REASON_CLIP - 1) + "…" : reason}` : "";
+    lines.push(`- **${r.id}** — ${r.text}${why}${r.testName ? ` (\`${r.testName}\`)` : ""}`);
+  }
+  lines.push(
+    "",
+    "Fix the criteria above so their tests pass, then push — the score updates when verification re-runs. " +
+      'See the "Tests by DevAsign" comment for evidence.'
+  );
+  return lines;
+}
+
+export function formatCardHeader(inputs: CardHeadInputs, verification?: CardVerification | null): string {
+  const v = verification?.state === "completed" ? verification : null;
+  const { score, allFailing } = applyVerification(inputs.score, v?.counts);
+  const lines: string[] = [
+    CARD_HEAD_START,
+    formatChips(inputs.open, inputs.fixedCount, v?.counts.fail ?? 0),
+    "",
+    scoreHeader(score),
+    "",
+    ...summaryLines({
+      specless: inputs.specless,
+      criteriaTotal: inputs.criteriaTotal,
+      criteriaMet: inputs.criteriaMet,
+      summary: inputs.summary,
+    }),
+  ];
+  if (v) lines.push("", ...verificationLines(v, allFailing));
+  lines.push("", CARD_HEAD_END);
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n");
+}
+
+// Replace the head region of a posted card. null when the card predates the markers.
+export function spliceCardHeader(body: string, head: string): string | null {
+  const start = body.indexOf(CARD_HEAD_START);
+  const endAt = body.indexOf(CARD_HEAD_END);
+  if (start < 0 || endAt < start) return null;
+  const end = endAt + CARD_HEAD_END.length;
+  return (body.slice(0, start) + head + body.slice(end)).replace(/\n{3,}/g, "\n\n");
 }
 
 const SUMMARY_LINE_CAP = 2;
@@ -447,20 +530,28 @@ export function formatSummaryCard(args: {
   unanchored?: ReviewItem[];
   overflow?: ReviewItem[];
   metWithoutThread?: ReviewItem[];
-  // Trailing pointers: pre-existing security, the tests comment, the end-goal CTA.
+  // Trailing pointers: pre-existing security, the end-goal CTA.
   notes?: string[];
   cta?: string | null;
+  // Test verification, when it had finished by the time the card was built.
+  verification?: CardVerification | null;
 }): string {
-  const lines: string[] = [CARD_TITLE, "", formatChips(args.open, args.fixedCount), ""];
-  lines.push(scoreHeader(args.score), "");
-  lines.push(
-    ...summaryLines({
-      specless: args.specless,
-      criteriaTotal: args.criteriaTotal,
-      criteriaMet: args.criteriaMet,
-      summary: args.summary,
-    })
-  );
+  const lines: string[] = [
+    CARD_TITLE,
+    "",
+    formatCardHeader(
+      {
+        open: args.open,
+        fixedCount: args.fixedCount,
+        score: args.score,
+        specless: args.specless,
+        criteriaTotal: args.criteriaTotal,
+        criteriaMet: args.criteriaMet,
+        summary: args.summary,
+      },
+      args.verification
+    ),
+  ];
 
   appendPromptDetails(lines, args.fixPrompt, "Prompt to fix all issues");
   // Satisfied criteria have one home on the card — the "Met criteria" list —

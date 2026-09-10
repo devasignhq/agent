@@ -143,6 +143,33 @@ export async function gh<T>(
   return (text ? JSON.parse(text) : undefined) as T;
 }
 
+// GraphQL answers HTTP 200 with an `errors` array, which gh() would hand back as
+// success; this unwraps `data` and throws on errors instead.
+export class GitHubGraphQLError extends Error {
+  constructor(readonly errors: Array<{ message: string; type?: string }>) {
+    super(`GitHub GraphQL: ${errors.map((e) => e.message).join("; ")}`);
+    this.name = "GitHubGraphQLError";
+  }
+}
+
+export async function ghGraphQL<T>(
+  installationId: number,
+  query: string,
+  variables: Record<string, unknown> = {}
+): Promise<T> {
+  const res = await gh<{ data?: T; errors?: Array<{ message: string; type?: string }> }>(
+    installationId,
+    "/graphql",
+    {
+      method: "POST",
+      body: JSON.stringify({ query, variables }),
+      headers: { "Content-Type": "application/json" },
+    }
+  );
+  if (res?.errors?.length) throw new GitHubGraphQLError(res.errors);
+  return res?.data as T;
+}
+
 // Same auth as gh(), but hands back the Link header's rel="next" so a caller can
 // paginate. gh() parses and discards the response, which loses it.
 export async function ghPaged<T>(
@@ -277,6 +304,22 @@ export async function updatePRComment(
   } catch (err) {
     console.warn(`[github] failed to update PR comment ${owner}/${name}#${commentId}:`, err);
     return false;
+  }
+}
+
+// Current body of a PR/issue comment, or null when it cannot be read.
+export async function getPRComment(
+  installationId: number,
+  owner: string,
+  name: string,
+  commentId: number
+): Promise<string | null> {
+  try {
+    const res = await gh<{ body?: string }>(installationId, `/repos/${owner}/${name}/issues/comments/${commentId}`);
+    return typeof res?.body === "string" ? res.body : null;
+  } catch (err) {
+    console.warn(`[github] failed to read PR comment ${owner}/${name}#${commentId}:`, err);
+    return null;
   }
 }
 

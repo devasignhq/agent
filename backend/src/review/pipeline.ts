@@ -11,7 +11,14 @@ import { deletePRComment, dismissPRReview, dispatchWorkflow, gh, ghText, postPRC
 import { createPRReview, updatePRReview } from "../github/review-comments.js";
 import { joinVerifyBranch, startVerifyBranch, type VerifyBranch } from "../verify/branch.js";
 import { blastRadiusCriteria } from "../verify/blast-radius.js";
-import { postVerifyCheckRun, upsertVerifyComment, type VerificationView } from "../verify/report.js";
+import {
+  bestRunForSha,
+  buildVerificationView,
+  postVerifyCheckRun,
+  upsertVerifyComment,
+  type VerificationView,
+} from "../verify/report.js";
+import { latestRunForReview } from "../verify/runs.js";
 import { updateRun as updateVerifyRun } from "../verify/runs.js";
 import { progressCommentBody, reviewFailedCommentBody } from "./progress-comment.js";
 import { complete, completeStructured, completeWithMeta, currentUsage, detectVideoProvider, retryStructured, summarizeLinearFile, summarizeVideo, withModel, withUsage, type LLMMessage, type StructuredAttempt, type VideoSummary } from "../llm.js";
@@ -2734,11 +2741,7 @@ function fixAttribution(
 // Trailing pointers on the card for the things that deliberately don't get a
 // thread: pre-existing security (not introduced by this PR) and the tests
 // comment (its own conversation comment, posted by the verifier).
-export function cardNotes(args: {
-  holistic: HolisticVerdict;
-  repoFullName: string;
-  verification: VerificationView | null;
-}): string[] {
+export function cardNotes(args: { holistic: HolisticVerdict; repoFullName: string }): string[] {
   const notes: string[] = [];
   const securityLink = `[Security page](${config.webOrigin}/security?repo=${encodeURIComponent(args.repoFullName)})`;
   const pre = args.holistic.preexistingVulns.length;
@@ -2755,14 +2758,25 @@ export function cardNotes(args: {
         `confirmed against this commit; ${resolved === 1 ? "it resolves" : "they resolve"} on the ${securityLink} when merged.`
     );
   }
-  const v = args.verification;
-  if (v && v.state === "completed") {
-    notes.push(
-      `**Tests:** ${v.counts.pass} passed, ${v.counts.fail} failed, ${v.counts.unverifiable} unverifiable — ` +
-        `see the "Tests by DevAsign" comment.`
-    );
-  }
   return notes;
+}
+
+// Verification usually finishes after the join; a judge that completed in the
+// meantime should still shape the card, and report.ts refreshes it later otherwise.
+function completedVerification(
+  review: PRReview,
+  joined: VerificationView | null | undefined,
+  criteria: Criterion[]
+): VerificationView | null {
+  if (joined?.state === "completed") return joined;
+  const run = latestRunForReview(review.id, review.headSha);
+  if (!run) return null;
+  const best = bestRunForSha(run);
+  if (!best.verdicts.length) return null;
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo) return null;
+  const view = buildVerificationView({ run: best, review, repo, criteria });
+  return view.state === "completed" ? view : null;
 }
 
 async function postGithubOutput(
@@ -2935,7 +2949,7 @@ async function postGithubOutput(
           findings,
         })
       : null;
-  const score = mergeScore(
+  const baseScore = mergeScore(
     items
       .filter((i) => i.state === "open")
       .map((i) => ({
@@ -2944,7 +2958,9 @@ async function postGithubOutput(
         securitySeverity: i.securitySeverity,
       }))
   );
-  const notes = cardNotes({ holistic: args.holistic, repoFullName, verification: args.verification ?? null });
+  const notes = cardNotes({ holistic: args.holistic, repoFullName });
+  const cardVerification = completedVerification(review, args.verification, args.criteria);
+  const criteriaTotal = items.filter((i) => i.category === "criterion").length;
   type CardView = {
     open: Array<Pick<ReviewItem, "category" | "state">>;
     fixedCount: number;
@@ -2952,13 +2968,15 @@ async function postGithubOutput(
     overflow: ReviewItem[];
     metWithoutThread: ReviewItem[];
   };
-  const renderCard = (view: CardView) =>
-    formatSummaryCard({
+  let lastView: CardView | null = null;
+  const renderCard = (view: CardView) => {
+    lastView = view;
+    return formatSummaryCard({
       open: view.open,
       fixedCount: view.fixedCount,
-      score,
+      score: baseScore,
       specless,
-      criteriaTotal: items.filter((i) => i.category === "criterion").length,
+      criteriaTotal,
       criteriaMet: metItems.length,
       summary: args.summary,
       fixPrompt,
@@ -2967,7 +2985,9 @@ async function postGithubOutput(
       metWithoutThread: view.metWithoutThread,
       notes,
       cta: args.endGoalCTA ? buildEndGoalRequestCTA() : null,
+      verification: cardVerification,
     });
+  };
   // Every item on the card: what renders when threads are off or unavailable.
   let finalCard = renderCard({
     open: items.map((i) => ({ category: i.category, state: i.state })),
@@ -3095,7 +3115,10 @@ async function postGithubOutput(
         log(
           review.id,
           "comment",
-          `Threads: ${result.created} opened, ${result.updated} updated, ${result.resolved} marked fixed`
+          `Threads: ${result.created} opened, ${result.updated} updated, ${result.resolved} marked fixed` +
+            (result.collapsed || result.reopened
+              ? `, ${result.collapsed} collapsed, ${result.reopened} reopened`
+              : "")
         );
       }
       // Creates that did not land are still findings; they go on the card.
@@ -3122,6 +3145,24 @@ async function postGithubOutput(
     console.warn("[review] thread reconciliation failed:", err);
     log(review.id, "error", "Inline threads failed — findings listed on the review comment instead", {
       detail: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  // What the head region was built from, so a late verification result can
+  // re-render it in place (verify/report.ts refreshCardHead).
+  if (lastView) {
+    const view: CardView = lastView;
+    setStatus(review.id, {
+      cardHead: {
+        open: view.open.map((i) => ({ category: i.category, state: i.state })),
+        fixedCount: view.fixedCount,
+        score: baseScore,
+        specless,
+        criteriaTotal,
+        criteriaMet: metItems.length,
+        summary: args.summary,
+        sha: review.headSha,
+      },
     });
   }
 

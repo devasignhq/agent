@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
+import { generateKeyPairSync } from "node:crypto";
 import { db } from "../db.js";
 import { config } from "../config.js";
 import {
@@ -11,15 +12,16 @@ import {
   formatTestsComment,
   formatVerificationSection,
   REPLY_LINE,
+  refreshCardHead,
   shouldPostTestsComment,
   spliceVerificationSection,
-  testScore,
   TESTS_COMMENT_TITLE,
   VERIFICATION_END,
   VERIFICATION_START,
   verifyCheckRunPayload,
 } from "./report.js";
 import type { Criterion, Repository, VerifyArtifact, VerifyRun } from "../types.js";
+import { formatSummaryCard } from "../review/comment.js";
 
 const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/u;
 const criteria: Criterion[] = [
@@ -205,26 +207,27 @@ const completedView = () =>
     artifacts: [],
   });
 
-test("the tests comment is its own card: title, chips, a scored header and a short summary", () => {
+test("the tests comment is its own card: title, chips and a short summary — no score, no reply nag", () => {
   const body = formatTestsComment(completedView(), "acme/widgets");
   assert.equal(body.split("\n")[0], TESTS_COMMENT_TITLE);
   assert.match(body, /✅ `Passed \(1\)`/);
   assert.match(body, /❌ `Failed \(1\)`/);
-  assert.match(body, /### (✅|🟡|🔴) Test score: \d{1,3}\/100/);
+  assert.doesNotMatch(body, /Test score/, "the score lives on the review card now");
   assert.match(body, /1 of 2 criteria verified by tests, 1 failed\. Each verdict below links to its evidence\./);
   // The chip reads "Failed (1)", so the phrase "1 failed" belongs to the summary
   // alone — stateLine used to repeat it directly underneath.
   assert.equal(body.match(/1 failed/g)!.length, 1);
-  assert.match(body, new RegExp(REPLY_LINE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  assert.doesNotMatch(body, new RegExp(REPLY_LINE.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
 });
 
 test("each criterion's result is a collapsed section with its verdict, reason and test", () => {
   const body = formatTestsComment(completedView(), "acme/widgets");
-  assert.match(body, /<summary>❌ 2 — Total is formatted as currency<\/summary>/);
+  assert.match(body, /<summary>2 — Total is formatted as currency \(FAIL\)<\/summary>/);
   assert.match(body, /\*\*Verdict:\*\* FAIL/);
   assert.match(body, /total renders as a bare number/);
   assert.match(body, /\*\*Test:\*\* `\.devasign\/tests\/two\.test\.ts`/);
-  assert.match(body, /<summary>✅ 1 — Refunds line shows when refunds > 0<\/summary>/);
+  assert.match(body, /<summary>1 — Refunds line shows when refunds > 0 \(pass\)<\/summary>/);
+  assert.doesNotMatch(body, /<summary>(✅|❌|⚠️|⏳)/, "no verdict emoji on a test");
   assert.match(body, /\*\*Test:\*\* `src\/a\.test\.ts` \(existing\)/);
 });
 
@@ -259,13 +262,6 @@ test("the rows stay marker-delimited so the block can be spliced later", () => {
   assert.equal(body.split(VERIFICATION_START).length, 2);
 });
 
-test("testScore penalises failures hardest and clamps at 0", () => {
-  assert.equal(testScore({ pass: 5, fail: 0, unverifiable: 0, pending: 0 }), 100);
-  assert.equal(testScore({ pass: 3, fail: 1, unverifiable: 0, pending: 0 }), 80);
-  assert.equal(testScore({ pass: 3, fail: 0, unverifiable: 2, pending: 0 }), 90);
-  assert.equal(testScore({ pass: 0, fail: 9, unverifiable: 0, pending: 0 }), 0);
-});
-
 test("a comment is posted only once verification has finished, never as a setup nag", () => {
   const finished = ["completed", "failed", "timed_out", "lost"];
   const quiet = ["pending", "planning", "fork", "setup_pending", "skipped", "disabled"];
@@ -282,4 +278,46 @@ test("spliceVerificationSection with an empty section strips a legacy block from
   const stripped = spliceVerificationSection(legacy, "").trim();
   assert.doesNotMatch(stripped, /devasign:verification/);
   assert.match(stripped, /body text/);
+});
+
+test("refreshCardHead edits the review body only for the card's own sha and a finished run", async () => {
+  const head = { open: [], fixedCount: 0, score: 100, specless: false, criteriaTotal: 2, criteriaMet: 2, summary: "Fine.", sha: "abc1234" };
+  const repoRow = db.insert("repositories", { id: uuid(), installationId: uuid(), owner: "acme", name: "widgets" } as any);
+  db.insert("installations", { id: repoRow.installationId, installationId: 777 } as any);
+  const row = db.insert("prReviews", {
+    id: uuid(), repoId: repoRow.id, prNumber: 1, headSha: "abc1234", status: "changes_requested", criteria: [],
+    summaryReviewId: 99, summaryReviewSha: "abc1234", cardHead: head, createdAt: 0, updatedAt: 0,
+  } as any);
+  const posted = formatSummaryCard({ ...head });
+  // Every GitHub call mints an installation token, which signs an App JWT first.
+  config.github.appId = "123456";
+  config.github.privateKey = generateKeyPairSync("rsa", { modulusLength: 2048 })
+    .privateKey.export({ type: "pkcs8", format: "pem" })
+    .toString();
+  const calls: Array<{ method: string; url: string; body: any }> = [];
+  const original = globalThis.fetch;
+  globalThis.fetch = (async (url: any, init: any = {}) => {
+    const u = String(url);
+    const method = String(init.method || "GET").toUpperCase();
+    calls.push({ method, url: u, body: init.body ? JSON.parse(init.body) : undefined });
+    if (u.includes("/access_tokens")) return { ok: true, status: 200, text: async () => JSON.stringify({ token: "t", expires_at: new Date(Date.now() + 3_600_000).toISOString() }), json: async () => ({}) } as any;
+    if (/\/reviews\/99$/.test(u) && method === "GET") return { ok: true, status: 200, text: async () => JSON.stringify({ body: posted }) } as any;
+    return { ok: true, status: 200, text: async () => "{}" } as any;
+  }) as any;
+  const install = { installationId: 777 };
+  const view = (state: string, fail: number) =>
+    ({ state, counts: { pass: 2 - fail, fail, unverifiable: 0, pending: 0 }, rows: [] }) as any;
+  try {
+    await refreshCardHead({ install, repo: repoRow as any, reviewId: row.id, sha: "zzz9999", view: view("completed", 1) });
+    await refreshCardHead({ install, repo: repoRow as any, reviewId: row.id, sha: "abc1234", view: view("pending", 0) });
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 0, "another sha or an unfinished run never touches the card");
+    await refreshCardHead({ install, repo: repoRow as any, reviewId: row.id, sha: "abc1234", view: view("completed", 1) });
+    const put = calls.find((c) => c.method === "PUT" && /\/pulls\/1\/reviews\/99$/.test(c.url));
+    assert.ok(put, "the card's own sha with a finished run edits the review body");
+    assert.match(String(put!.body.body), /Merge score: 90\/100/);
+    assert.match(String(put!.body.body), /Tests failing \(1\)/);
+    assert.equal(String(put!.body.body).split("<!-- devasign:card-head -->").length, 2);
+  } finally {
+    globalThis.fetch = original;
+  }
 });

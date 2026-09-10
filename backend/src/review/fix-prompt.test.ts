@@ -109,7 +109,6 @@ test("pre-existing security is a pointer, labelled as not introduced by this PR"
       ],
     },
     repoFullName: "acme/widgets",
-    verification: null,
   });
   assert.equal(notes.length, 1);
   assert.match(notes[0], /2 pre-existing security findings touch files in this PR \(not introduced by it\)/);
@@ -123,32 +122,13 @@ test("resolved pre-existing findings get their own positive pointer", () => {
       resolvedPreexisting: [{ path: "old.ts", concern: "fixed", severity: "warn" }],
     },
     repoFullName: "acme/widgets",
-    verification: null,
   });
   assert.match(notes[0], /this PR fixes 1 previously-flagged security finding/);
 });
 
-test("a completed verification adds a pointer to the tests comment, not a section", () => {
-  const notes = cardNotes({
-    holistic: EMPTY_HOLISTIC,
-    repoFullName: "acme/widgets",
-    verification: {
-      state: "completed",
-      runId: "r1",
-      reviewId: "rev1",
-      runUrl: "https://app/reviews/rev1",
-      rows: [],
-      counts: { pass: 4, fail: 1, unverifiable: 0, pending: 0 },
-      tests: { generated: 2, existing: 1, prAuthored: 0 },
-    },
-  });
-  assert.match(notes[0], /\*\*Tests:\*\* 4 passed, 1 failed, 0 unverifiable/);
-  assert.match(notes[0], /"Tests by DevAsign" comment/);
-});
-
 test("a clean review adds no trailing pointers at all", () => {
   assert.deepEqual(
-    cardNotes({ holistic: EMPTY_HOLISTIC, repoFullName: "acme/widgets", verification: null }),
+    cardNotes({ holistic: EMPTY_HOLISTIC, repoFullName: "acme/widgets" }),
     []
   );
 });

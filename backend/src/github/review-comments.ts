@@ -6,7 +6,7 @@
 // summary card, so the Conversation tab shows the card and its threads as a
 // single block. The per-comment POST stays for file-level anchors, which
 // comments[] cannot carry, and as the fallback when a batch is refused.
-import { gh, ghPaged, GitHubApiError } from "./app.js";
+import { gh, ghGraphQL, ghPaged, GitHubApiError, GitHubGraphQLError } from "./app.js";
 
 export type ReviewCommentAnchor =
   | { kind: "line"; path: string; line: number; side: "RIGHT" }
@@ -99,6 +99,109 @@ export async function updatePRReview(
     if (err instanceof GitHubApiError && err.status === 404) return "gone";
     console.warn(`[github] failed to update review ${reviewId} on ${owner}/${name}#${prNumber}:`, err);
     return "error";
+  }
+}
+
+export type PRThreadRef = { threadId: string; isResolved: boolean };
+
+const THREADS_QUERY = `query($owner:String!,$name:String!,$number:Int!,$after:String){
+  repository(owner:$owner,name:$name){ pullRequest(number:$number){
+    reviewThreads(first:100,after:$after){
+      pageInfo{ hasNextPage endCursor }
+      nodes{ id isResolved comments(first:1){ nodes{ databaseId } } } } } } }`;
+
+type ThreadsPage = {
+  repository?: {
+    pullRequest?: {
+      reviewThreads?: {
+        pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+        nodes?: Array<{
+          id?: string;
+          isResolved?: boolean;
+          comments?: { nodes?: Array<{ databaseId?: number }> };
+        }>;
+      };
+    };
+  };
+};
+
+// Root review-comment id -> the GraphQL thread that owns it. Resolving a
+// conversation is GraphQL-only, and REST never reports thread ids. Returns null
+// on any failure, never an empty map, so a bad read is not mistaken for "no threads".
+export async function listPRReviewThreads(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  opts: { maxPages?: number } = {}
+): Promise<Map<number, PRThreadRef> | null> {
+  const out = new Map<number, PRThreadRef>();
+  let after: string | null = null;
+  try {
+    for (let page = 0; page < (opts.maxPages ?? 10); page++) {
+      const data: ThreadsPage = await ghGraphQL<ThreadsPage>(installationId, THREADS_QUERY, {
+        owner,
+        name,
+        number: prNumber,
+        after,
+      });
+      const threads = data?.repository?.pullRequest?.reviewThreads;
+      if (!threads) return null;
+      for (const t of threads.nodes ?? []) {
+        const root = t?.comments?.nodes?.[0]?.databaseId;
+        if (typeof t?.id === "string" && typeof root === "number") {
+          out.set(root, { threadId: t.id, isResolved: Boolean(t.isResolved) });
+        }
+      }
+      if (!threads.pageInfo?.hasNextPage || !threads.pageInfo.endCursor) break;
+      after = threads.pageInfo.endCursor;
+    }
+    return out;
+  } catch (err) {
+    console.warn(`[github] failed to list review threads on ${owner}/${name}#${prNumber}:`, err);
+    return null;
+  }
+}
+
+// Resolve (collapse) or unresolve a review thread on GitHub.
+export async function setPRThreadResolved(
+  installationId: number,
+  threadId: string,
+  resolved: boolean
+): Promise<"ok" | "rate_limit" | "error"> {
+  const op = resolved ? "resolveReviewThread" : "unresolveReviewThread";
+  try {
+    await ghGraphQL(installationId, `mutation($threadId:ID!){ ${op}(input:{threadId:$threadId}){ thread{ id isResolved } } }`, {
+      threadId,
+    });
+    return "ok";
+  } catch (err) {
+    const limited =
+      (err instanceof GitHubApiError && err.status === 403) ||
+      (err instanceof GitHubGraphQLError && err.errors.some((e) => e.type === "RATE_LIMITED"));
+    console.warn(`[github] failed to ${op} ${threadId}:`, err);
+    return limited ? "rate_limit" : "error";
+  }
+}
+
+// Current body of a submitted review (the summary card). "gone" on 404.
+export async function getPRReviewBody(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  reviewId: number
+): Promise<string | null | "gone"> {
+  try {
+    const res = await gh<{ body?: string }>(
+      installationId,
+      `/repos/${owner}/${name}/pulls/${prNumber}/reviews/${reviewId}`
+    );
+    return typeof res?.body === "string" ? res.body : null;
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) return "gone";
+    console.warn(`[github] failed to read review ${reviewId} on ${owner}/${name}#${prNumber}:`, err);
+    return null;
   }
 }
 
