@@ -137,6 +137,26 @@ test("the summary card renders as one block, with the fix prompt inside its <det
   );
 });
 
+test("a card full of unanchored blocks with fix prompts still audits clean", () => {
+  const defects = Array.from({ length: 30 }, (_, i) =>
+    finding({ path: `src/module-${i}.ts`, concern: `Unanchored finding ${i} about subsystem ${i}.`, fixPrompt: FIX_PROMPT } as any)
+  );
+  const items = build({ holistic: { ...EMPTY_HOLISTIC, defects } });
+  const body = formatSummaryCard({
+    open: items,
+    fixedCount: 0,
+    score: 30,
+    specless: true,
+    criteriaTotal: 0,
+    criteriaMet: 0,
+    summary: "",
+    unanchored: items,
+  });
+  assert.equal(items.length, 30);
+  ok("the card with unanchored blocks", body);
+  assert.ok(body.length < 65_536, "stays under GitHub's review body limit");
+});
+
 test("every thread body renders as one block, whatever the item is", () => {
   const cases: Array<[string, ReviewItem]> = [
     ["unmet criterion", build({ criteria: [criterion()] })[0]],

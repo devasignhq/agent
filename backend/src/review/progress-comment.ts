@@ -1,11 +1,9 @@
-// Body builders for the two states of the editable PR conversation comment that
-// DevAsign posts: the "review in progress" placeholder posted the moment a run
-// starts, and the failure copy if the run throws. The finished state — the
-// summary card — is built by comment.ts's formatSummaryCard.
+// Body builders for the PR conversation comment DevAsign posts: the "review in
+// progress" placeholder posted the moment a run starts (deleted once the summary
+// review lands, or edited into the card if that fails), and the failure copy if
+// the run throws. The card itself is comment.ts's formatSummaryCard.
 //
-// All three share the "## DevAsign Code Review" title so the comment keeps one
-// identity as it is edited through the run; only what sits under the title
-// changes. Pure — no db / network / LLM:
+// All share the "## DevAsign Code Review" title. Pure — no db / network / LLM:
 //   node --import tsx/esm --test src/review/progress-comment.test.ts
 import { CARD_TITLE } from "./comment.js";
 
@@ -17,15 +15,9 @@ export function progressCommentBody(): string {
     "",
     "⏳ `Review in progress`",
     "",
-    "A review of this pull request has been triggered and is currently running. " +
-      "This comment will be updated automatically once the analysis is complete, " +
-      "and any findings will appear as review comments on the lines they concern.",
-    "",
-    "**What's happening?**",
-    "",
-    "- Analysing the diff and changed files",
-    "- Evaluating code quality, patterns, and potential issues",
-    "- Generating actionable suggestions",
+    "DevAsign AI is currently reviewing this pull request. When the analysis is complete " +
+      "the results are posted as a single review below: a summary, plus one collapsed note " +
+      "per finding on the line it concerns.",
     "",
     "> This usually takes a minute or two. Please hang tight!",
   ].join("\n");

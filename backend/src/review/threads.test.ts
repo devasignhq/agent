@@ -594,6 +594,94 @@ test("an unknown batch outcome persists nothing and asks the next run to rebuild
   assert.equal(calls.filter((c) => c.fn === "create").length, 0, "never re-posted blind");
 });
 
+// ─── the summary card rides as the review body ─────────────────────────────
+
+const CARD = "## DevAsign Code Review\n\ncard";
+const applyWith = (p: ReturnType<typeof plan>, client: ThreadClient) =>
+  reconcileThreads({
+    installationId: 1,
+    owner: "acme",
+    name: "widgets",
+    prNumber: 1,
+    headSha: SHA_NEW,
+    plan: p,
+    summary: { body: CARD },
+    client,
+  });
+
+test("the card is the body of the batched review", async () => {
+  const p = plan({ items: threeItems() });
+  const { client, calls } = fakeClient({});
+  const result = await applyWith(p, client);
+  const batches = calls.filter((c) => c.fn === "createReview");
+  assert.equal(batches.length, 1);
+  assert.equal(batches[0].args.body, CARD);
+  assert.equal(batches[0].args.comments.length, 3);
+  assert.equal(result.reviewId, 42);
+  assert.equal(result.bodyPosted, true);
+});
+
+test("with a card but no new threads, a body-only review still posts", async () => {
+  const p = plan({ items: [] });
+  const { client, calls } = fakeClient({});
+  const result = await applyWith(p, client);
+  assert.deepEqual(calls.map((c) => c.fn), ["createReview"]);
+  assert.deepEqual(calls[0].args.comments, []);
+  assert.equal(calls[0].args.body, CARD);
+  assert.equal(result.bodyPosted, true);
+  assert.equal(result.reviewId, 42);
+});
+
+test("without a card, no new threads means no review at all", async () => {
+  const p = plan({ items: [] });
+  const { client, calls } = fakeClient({});
+  const result = await apply(p, client);
+  assert.equal(calls.length, 0);
+  assert.equal(result.bodyPosted, false);
+  assert.equal(result.reviewId, null);
+});
+
+test("a refused batch falls back to single threads, then posts the card on its own", async () => {
+  const p = plan({ items: threeItems() });
+  let batches = 0;
+  const { client, calls } = fakeClient({
+    batch: (args) => (batches++ === 0 ? { error: "anchor" } : { reviewId: 77, comments: [] }),
+  });
+  const result = await applyWith(p, client);
+  assert.deepEqual(
+    calls.map((c) => c.fn),
+    ["createReview", "create", "create", "create", "createReview"]
+  );
+  assert.deepEqual(calls[4].args.comments, []);
+  assert.equal(calls[4].args.body, CARD);
+  assert.equal(result.fellBack, true);
+  assert.equal(result.bodyPosted, true);
+  assert.equal(result.reviewId, 77);
+});
+
+test("a rate-limited batch posts nothing more: the card falls back to the caller", async () => {
+  const p = plan({ items: threeItems() });
+  const { client, calls } = fakeClient({ batch: { error: "rate_limit" } });
+  const result = await applyWith(p, client);
+  assert.equal(calls.length, 1);
+  assert.equal(result.aborted, true);
+  assert.equal(result.bodyPosted, false);
+  assert.equal(result.reviewId, null);
+});
+
+test("a batch that posted but could not be listed still counts the card as posted", async () => {
+  const p = plan({ items: threeItems() });
+  const { client } = fakeClient({ batch: { error: "other", reviewId: 42 } });
+  const result = await applyWith(p, client);
+  assert.equal(result.recoveryNeeded, true);
+  assert.equal(result.bodyPosted, true);
+  assert.equal(result.reviewId, 42);
+
+  const unknown = await applyWith(p, fakeClient({ batch: { error: "other" } }).client);
+  assert.equal(unknown.recoveryNeeded, true);
+  assert.equal(unknown.bodyPosted, false);
+});
+
 test("a listing that misses one marker keeps the others and flags recovery", async () => {
   const p = plan({ items: threeItems() });
   const { client } = fakeClient({

@@ -3,7 +3,7 @@
 //   node --import tsx/esm --test src/review/summary-card.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { CARD_TITLE, formatChips, formatSummaryCard, summaryLines } from "./comment.js";
+import { CARD_TITLE, MAX_CARD_ITEM_BLOCKS, formatChips, formatSummaryCard, summaryLines } from "./comment.js";
 import { buildReviewItems, type ReviewItem } from "./items.js";
 import { EMPTY_HOLISTIC, type HolisticFinding } from "./verdict-types.js";
 import type { PriorVerdict } from "./criteria-format.js";
@@ -143,13 +143,14 @@ test("with nothing to fix there is no prompt block at all", () => {
   assert.doesNotMatch(body, /<details>/);
 });
 
-test("items that never reached a thread are still listed on the card", () => {
+test("items that never reached a thread are still on the card: unanchored as blocks, overflow as a list", () => {
   const unanchored = items({ holistic: { ...EMPTY_HOLISTIC, crossRepoImpacts: [finding({ path: undefined, concern: "breaks the Go SDK", severity: "warn" })] } });
   const overflow = items({ holistic: { ...EMPTY_HOLISTIC, conventionFindings: [finding({ path: "v.ts", concern: "prefer const", severity: "nit" })] } });
   const met = items({ criteria: [{ id: "9", text: "logging stays quiet", met: true, evidence: null }] });
   const body = card({ unanchored, overflow, metWithoutThread: met });
-  assert.match(body, /<summary>Other findings — not anchored to the diff \(1\)<\/summary>/);
-  assert.match(body, /- \*\*Cross-repo\*\* — breaks the Go SDK/);
+  assert.match(body, /<summary>🔗 Cross-repo — breaks the Go SDK<\/summary>/, "an unanchored item is its own collapsed block");
+  assert.doesNotMatch(body, /Other findings — not anchored to the diff/);
+  assert.doesNotMatch(body, /devasign:item/, "card blocks carry no thread marker");
   assert.match(body, /<summary>Not shown inline \(1\)<\/summary>/);
   assert.match(body, /- \*\*Convention\*\* — `v\.ts` — prefer const/);
   assert.match(body, /<summary>Met criteria \(1\)<\/summary>/);
@@ -192,6 +193,33 @@ test("a met criterion with no thread is listed once, under Met criteria only", (
   });
   assert.equal(body.match(/logging stays quiet/g)!.length, 1, "listed exactly once");
   assert.match(body, /<summary>Met criteria \(1\)<\/summary>/);
-  assert.match(body, /<summary>Other findings — not anchored to the diff \(1\)<\/summary>/);
-  assert.match(body, /- \*\*Acceptance criterion\*\* — claims are gated/);
+  assert.match(body, /<summary>📋 Acceptance criterion not met — #2<\/summary>/);
+  assert.match(body, /\*\*Required:\*\* claims are gated/);
+});
+
+test("an unanchored block has the same shape as a thread body, minus the marker", () => {
+  const [item] = items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding({ path: undefined, fixPrompt: "Await it.\n\n```diff\n-a\n+b\n```" } as any)] } });
+  const body = card({ unanchored: [item] });
+  const at = body.indexOf("<details>\n<summary>🐞 Bug (blocker)");
+  assert.ok(at > 0, "block present");
+  const lines = body.slice(at).split("\n");
+  assert.equal(lines[2], "", "blank line after </summary>");
+  assert.match(body, /<summary>Prompt to fix with AI<\/summary>/);
+});
+
+test("blocks stop at the cap and at the size budget; the rest fall back to the list", () => {
+  const many = Array.from({ length: MAX_CARD_ITEM_BLOCKS + 5 }, (_, i) =>
+    finding({ path: `src/module-${i}.ts`, concern: `Unanchored finding number ${i} about a distinct subsystem ${i}.` })
+  );
+  const unanchored = items({ holistic: { ...EMPTY_HOLISTIC, defects: many } });
+  assert.equal(unanchored.length, many.length, "each finding is its own item");
+  const body = card({ unanchored });
+  assert.equal(body.match(/<summary>🐞 Bug \(blocker\) — /g)!.length, MAX_CARD_ITEM_BLOCKS);
+  assert.match(body, /<summary>Other findings — not anchored to the diff \(5\)<\/summary>/);
+
+  const huge = items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding({ path: undefined, fixPrompt: "x".repeat(70_000) } as any)] } });
+  const small = card({ unanchored: huge });
+  assert.doesNotMatch(small, /<summary>🐞 Bug \(blocker\) — /);
+  assert.match(small, /<summary>Other findings — not anchored to the diff \(1\)<\/summary>/);
+  assert.ok(small.length < 65_536);
 });

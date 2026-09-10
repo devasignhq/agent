@@ -7,7 +7,8 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { contributorNotifyTarget } from "../users.js";
-import { dismissPRReview, dispatchWorkflow, gh, ghText, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { deletePRComment, dismissPRReview, dispatchWorkflow, gh, ghText, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { createPRReview, updatePRReview } from "../github/review-comments.js";
 import { joinVerifyBranch, startVerifyBranch, type VerifyBranch } from "../verify/branch.js";
 import { blastRadiusCriteria } from "../verify/blast-radius.js";
 import { postVerifyCheckRun, upsertVerifyComment, type VerificationView } from "../verify/report.js";
@@ -1252,8 +1253,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       review.id,
       "comment",
       postConversationReview
-        ? "Posted Check Run; updated verdict comment"
-        : "Refreshed Check Run; updated verdict comment",
+        ? "Posted Check Run and the review carrying the verdict"
+        : "Refreshed Check Run and the review carrying the verdict",
       {
         meta: {
           lineNotes: verdict.comments.length,
@@ -2916,18 +2917,91 @@ async function postGithubOutput(
     }
   }
 
-  // 3. Inline threads: one per item, edited in place across pushes, marked fixed
-  // when an item stops being reported. Wrapped whole — if any of this fails the
-  // card still renders every item inline, which is what makes it safe to ship.
-  let openForCounting: Array<Pick<ReviewItem, "category" | "state">> = items.map((i) => ({
-    category: i.category,
-    state: i.state,
-  }));
-  let fixedCount = 0;
-  let unanchorable: ReviewItem[] = [];
-  let overflowed: ReviewItem[] = [];
+  // 3. The card and the threads. The card is rendered from the pure plan first
+  // so it can be the body of the review that carries this run's new threads —
+  // one block on the Conversation tab. If reality diverges from the plan the
+  // card is re-rendered and the review body edited.
   const metItems = items.filter((i) => i.state === "met");
-  let threadedKeys = new Set<string>();
+  const findings = collectConsolidatedFindings(args.holistic);
+  const unmetCriteria = splitForComment(args.criteria, args.prior).unmet;
+  const fixPrompt =
+    unmetCriteria.length > 0 || findings.length > 0
+      ? buildConsolidatedFixPrompt({
+          prTitle: review.prTitle,
+          repoFullName,
+          endGoal: args.endGoal,
+          unmetCriteria,
+          suggestions: args.suggestions,
+          findings,
+        })
+      : null;
+  const score = mergeScore(
+    items
+      .filter((i) => i.state === "open")
+      .map((i) => ({
+        scoreKind: i.scoreKind,
+        severity: i.severity,
+        securitySeverity: i.securitySeverity,
+      }))
+  );
+  const notes = cardNotes({ holistic: args.holistic, repoFullName, verification: args.verification ?? null });
+  type CardView = {
+    open: Array<Pick<ReviewItem, "category" | "state">>;
+    fixedCount: number;
+    unanchored: ReviewItem[];
+    overflow: ReviewItem[];
+    metWithoutThread: ReviewItem[];
+  };
+  const renderCard = (view: CardView) =>
+    formatSummaryCard({
+      open: view.open,
+      fixedCount: view.fixedCount,
+      score,
+      specless,
+      criteriaTotal: items.filter((i) => i.category === "criterion").length,
+      criteriaMet: metItems.length,
+      summary: args.summary,
+      fixPrompt,
+      unanchored: view.unanchored,
+      overflow: view.overflow,
+      metWithoutThread: view.metWithoutThread,
+      notes,
+      cta: args.endGoalCTA ? buildEndGoalRequestCTA() : null,
+    });
+  // Every item on the card: what renders when threads are off or unavailable.
+  let finalCard = renderCard({
+    open: items.map((i) => ({ category: i.category, state: i.state })),
+    fixedCount: 0,
+    unanchored: items,
+    overflow: [],
+    metWithoutThread: metItems,
+  });
+
+  // A same-sha rerun edits the review it already posted rather than adding one.
+  const reuse = review.summaryReviewId != null && review.summaryReviewSha === review.headSha;
+  let summaryReviewId: number | null = reuse ? review.summaryReviewId! : null;
+  let bodyPosted = false;
+  // Set when a batch carrying the card was rate-limited or left in an unknown
+  // state: a second POST could put two blocks on the PR.
+  let noRepost = false;
+  let prOpen = true;
+
+  const postSummaryReview = async (body: string): Promise<boolean> => {
+    if (reuse && summaryReviewId != null) {
+      const res = await updatePRReview(installationId, repo.owner, repo.name, review.prNumber, summaryReviewId, body);
+      if (res === "ok") return true;
+      if (res === "error") return false;
+    }
+    const res = await createPRReview(installationId, repo.owner, repo.name, review.prNumber, {
+      commitId: review.headSha,
+      comments: [],
+      body,
+    });
+    if ("error" in res && res.reviewId == null) return false;
+    summaryReviewId = res.reviewId!;
+    return true;
+  };
+
   try {
     // A closed or merged PR doesn't need new threads, and a head that moved mid-
     // run means our line numbers describe a superseded tree. One GET answers both
@@ -2938,18 +3012,16 @@ async function postGithubOutput(
           `/repos/${repo.owner}/${repo.name}/pulls/${review.prNumber}`
         )
       : null;
-    const prOpen = pr?.state === "open";
+    prOpen = pr ? pr.state === "open" : true;
     const headMoved = typeof pr?.head?.sha === "string" && pr.head.sha !== review.headSha;
     if (!args.inlineThreads) {
-      unanchorable = items;
+      // Nothing to reconcile; the card carries every item.
     } else if (!prOpen) {
       log(review.id, "comment", "Inline threads skipped — the pull request is closed");
-      unanchorable = items;
     } else if (args.diff === "") {
       // With no diff every item looks gone; reconciling would announce a PR-wide
       // set of phantom fixes.
       log(review.id, "comment", "Inline threads skipped — no diff to anchor against");
-      unanchorable = items;
     } else {
       let threads = review.reviewThreads ?? [];
       // Stored rows lost but we have reviewed before, so threads should exist:
@@ -2983,6 +3055,18 @@ async function postGithubOutput(
         commitUrl: (sha) => `https://github.com/${repo.owner}/${repo.name}/commit/${sha}`,
         budget: headMoved ? 0 : undefined,
       });
+      const plannedKeys = new Set(
+        plan.ops.flatMap((op) => (op.op === "create" || op.op === "update" ? [op.item.key] : []))
+      );
+      const plannedView: CardView = {
+        open: plan.openForCounting,
+        fixedCount: plan.fixedCount,
+        unanchored: plan.unanchorable,
+        overflow: plan.overflowed,
+        // Met criteria that get a thread are visible there; only the rest are listed.
+        metWithoutThread: metItems.filter((i) => !plannedKeys.has(i.key)),
+      };
+      const plannedCard = renderCard(plannedView);
       const result = await reconcileThreads({
         installationId,
         owner: repo.owner,
@@ -2990,6 +3074,7 @@ async function postGithubOutput(
         prNumber: review.prNumber,
         headSha: review.headSha,
         plan,
+        summary: reuse ? undefined : { body: plannedCard },
       });
       setStatus(review.id, {
         reviewThreads: capThreads(result.threads),
@@ -3001,11 +3086,6 @@ async function postGithubOutput(
       if (result.recoveryNeeded) {
         log(review.id, "comment", "Batched review outcome unknown — thread ids will be rebuilt next run");
       }
-      openForCounting = plan.openForCounting;
-      fixedCount = plan.fixedCount;
-      unanchorable = plan.unanchorable;
-      overflowed = plan.overflowed;
-      threadedKeys = new Set(result.threads.map((t) => t.key));
       if (result.aborted) {
         log(review.id, "comment", "Stopped opening threads — GitHub rate limit", {
           detail: "The remaining findings are listed on the review comment instead.",
@@ -3018,60 +3098,57 @@ async function postGithubOutput(
           `Threads: ${result.created} opened, ${result.updated} updated, ${result.resolved} marked fixed`
         );
       }
+      // Creates that did not land are still findings; they go on the card.
+      const threadedKeys = new Set(result.threads.map((t) => t.key));
+      const notCreated = plan.ops.flatMap((op) =>
+        op.op === "create" && op.item.state === "open" && !threadedKeys.has(op.item.key) ? [op.item] : []
+      );
+      finalCard = renderCard({
+        ...plannedView,
+        overflow: [...plan.overflowed, ...notCreated],
+        metWithoutThread: metItems.filter((i) => !threadedKeys.has(i.key)),
+      });
+      if (result.bodyPosted && result.reviewId != null) {
+        summaryReviewId = result.reviewId;
+        bodyPosted = true;
+        if (finalCard !== plannedCard) {
+          await updatePRReview(installationId, repo.owner, repo.name, review.prNumber, summaryReviewId, finalCard);
+        }
+      } else if (!reuse && (result.aborted || result.recoveryNeeded)) {
+        noRepost = true;
+      }
     }
   } catch (err) {
     console.warn("[review] thread reconciliation failed:", err);
     log(review.id, "error", "Inline threads failed — findings listed on the review comment instead", {
       detail: err instanceof Error ? err.message : String(err),
     });
-    unanchorable = items;
   }
 
-  // 4. The summary card, last: its chip counts and its overflow sections are
-  // outputs of step 3, and leaving the placeholder on "in progress" until the
-  // very end preserves the crash semantics (a thrown run leaves the comment
-  // saying it is running, and the next push re-runs it).
-  const findings = collectConsolidatedFindings(args.holistic);
-  const unmetCriteria = splitForComment(args.criteria, args.prior).unmet;
-  const fixPrompt =
-    unmetCriteria.length > 0 || findings.length > 0
-      ? buildConsolidatedFixPrompt({
-          prTitle: review.prTitle,
-          repoFullName,
-          endGoal: args.endGoal,
-          unmetCriteria,
-          suggestions: args.suggestions,
-          findings,
-        })
-      : null;
-  const scored = openForCounting.filter((i) => i.state === "open");
-  const score = mergeScore(
-    items
-      .filter((i) => i.state === "open")
-      .map((i) => ({
-        scoreKind: i.scoreKind,
-        severity: i.severity,
-        securitySeverity: i.securitySeverity,
-      }))
-  );
-  const commentBody = formatSummaryCard({
-    open: openForCounting,
-    fixedCount,
-    score,
-    specless,
-    criteriaTotal: items.filter((i) => i.category === "criterion").length,
-    criteriaMet: metItems.length,
-    summary: args.summary,
-    fixPrompt,
-    unanchored: unanchorable,
-    overflow: overflowed,
-    // Only the met criteria that never got a thread need listing here; the rest
-    // are visible as their own "criterion met" threads.
-    metWithoutThread: metItems.filter((i) => !threadedKeys.has(i.key)),
-    notes: cardNotes({ holistic: args.holistic, repoFullName, verification: args.verification ?? null }),
-    cta: args.endGoalCTA ? buildEndGoalRequestCTA() : null,
-  });
-  void scored;
+  // 4. Where the card lands. Preferred: the body of a review (posted above with
+  // the threads, edited on a rerun, or posted alone). Fallback: the placeholder
+  // comment, edited in place as before. The placeholder stays "in progress"
+  // until here so a thrown run still reads as running and re-runs on push.
+  if (!bodyPosted && prOpen && !noRepost) {
+    try {
+      bodyPosted = await postSummaryReview(finalCard);
+    } catch (err) {
+      console.warn("[review] failed to post summary review:", err);
+    }
+  }
+  if (bodyPosted && summaryReviewId != null) {
+    setStatus(review.id, { summaryReviewId, summaryReviewSha: review.headSha });
+    if (args.progressCommentId !== null) {
+      if (await deletePRComment(installationId, repo.owner, repo.name, args.progressCommentId)) {
+        setStatus(review.id, { progressCommentId: null });
+        log(review.id, "comment", "Removed 'review in progress' comment — verdict posted as a review");
+      } else {
+        await updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, finalCard);
+      }
+    }
+    return { verdictPosted: true };
+  }
+  log(review.id, "comment", "Summary review not posted — verdict written to the conversation comment");
 
   // `editOnly` skips posting a fresh comment when there's no placeholder to edit
   // — used on the refresh-only path, where a brand-new standalone comment each
@@ -3079,10 +3156,10 @@ async function postGithubOutput(
   // the review.
   const writeVerdictComment = async (editOnly = false): Promise<boolean> => {
     if (args.progressCommentId !== null) {
-      return updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, commentBody);
+      return updatePRComment(installationId, repo.owner, repo.name, args.progressCommentId, finalCard);
     }
     if (editOnly) return false;
-    const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, commentBody);
+    const id = await postPRCommentReturningId(installationId, repo.owner, repo.name, review.prNumber, finalCard);
     if (id !== null) {
       // Persist so a same-sha rerun reuses this comment even though the
       // placeholder POST at run start failed.

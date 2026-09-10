@@ -373,6 +373,9 @@ export type ReconcileResult = {
   // The batch's outcome is unknown (it may have posted); the next run must
   // rebuild thread ids from GitHub before creating anything.
   recoveryNeeded: boolean;
+  // The review carrying the summary body, when one posted this run.
+  reviewId: number | null;
+  bodyPosted: boolean;
 };
 
 export type ThreadClient = {
@@ -399,10 +402,13 @@ export async function reconcileThreads(args: {
   prNumber: number;
   headSha: string;
   plan: ReconciliationPlan;
+  // The summary card. When given, the run's review carries it as its body and
+  // is posted even with no new threads; absent, no threads means no review.
+  summary?: { body: string };
   // Tests hand in fakes; production uses the GitHub client.
   client?: ThreadClient;
 }): Promise<ReconcileResult> {
-  const { installationId, owner, name, prNumber, headSha, plan } = args;
+  const { installationId, owner, name, prNumber, headSha, plan, summary } = args;
   const client = args.client ?? liveClient;
   const out: ReviewThread[] = [];
   let created = 0;
@@ -411,6 +417,8 @@ export async function reconcileThreads(args: {
   let aborted = false;
   let fellBack = false;
   let recoveryNeeded = false;
+  let reviewId: number | null = null;
+  let bodyPosted = false;
   const lineCreates: LineCreateOp[] = [];
   const fileCreates: CreateOp[] = [];
 
@@ -543,9 +551,9 @@ export async function reconcileThreads(args: {
     out.push(threadFrom(op.item, op.anchor, res.id, op.body, headSha));
   };
 
-  // One review for the whole run, so the timeline shows a single "reviewed"
-  // event instead of one per finding. Ids come back by marker, never by index.
-  if (lineCreates.length) {
+  // One review for the whole run: the card as its body, the new threads as its
+  // comments, so the timeline shows a single block. Ids come back by marker.
+  if (lineCreates.length || summary) {
     const comments: BatchedReviewComment[] = lineCreates.map((op) => ({
       path: op.anchor.path,
       line: op.anchor.line,
@@ -555,19 +563,39 @@ export async function reconcileThreads(args: {
     const res = await client.createReview(installationId, owner, name, prNumber, {
       commitId: headSha,
       comments,
+      body: summary?.body,
     });
     if ("error" in res) {
       if (res.error === "anchor") {
         fellBack = true;
         for (const op of lineCreates) await createOne(op);
+        if (summary && !aborted) {
+          const again = await client.createReview(installationId, owner, name, prNumber, {
+            commitId: headSha,
+            comments: [],
+            body: summary.body,
+          });
+          if (!("error" in again) || again.reviewId != null) {
+            reviewId = again.reviewId!;
+            bodyPosted = true;
+          }
+        }
       } else if (res.error === "rate_limit") {
         aborted = true;
       } else {
         // It may have posted. Persisting nothing and rebuilding next run is the
         // only branch that cannot duplicate every thread.
         recoveryNeeded = true;
+        if (summary && res.reviewId != null) {
+          reviewId = res.reviewId;
+          bodyPosted = true;
+        }
       }
     } else {
+      if (summary) {
+        reviewId = res.reviewId;
+        bodyPosted = true;
+      }
       const byKey = new Map<string, number>();
       for (const c of res.comments) {
         const key = parseItemMarker(c.body);
@@ -590,7 +618,7 @@ export async function reconcileThreads(args: {
   // File-level anchors cannot ride in comments[]; they stay separate posts.
   for (const op of fileCreates) await createOne(op);
 
-  return { threads: out, created, updated, resolved, aborted, fellBack, recoveryNeeded };
+  return { threads: out, created, updated, resolved, aborted, fellBack, recoveryNeeded, reviewId, bodyPosted };
 }
 
 // Rebuild thread state from the PR itself. Only worth doing when the stored rows

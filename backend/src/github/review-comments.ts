@@ -2,12 +2,10 @@
 // a PR's diff. Thin layer over the REST API, mirroring app.ts's conventions:
 // best-effort, logs and swallows, never throws into the review pipeline.
 //
-// A run's new threads go up as ONE review (createPRReview): GitHub wraps every
-// standalone comment in its own auto-submitted review, so posting one at a time
-// shows one "reviewed" event per finding in the timeline. An empty review body
-// with comments[] is accepted (reviewdog posts exactly that). The per-comment
-// POST stays for file-level anchors, which comments[] cannot carry, and as the
-// fallback when a batch is refused.
+// A run's new threads go up as ONE review (createPRReview) whose body is the
+// summary card, so the Conversation tab shows the card and its threads as a
+// single block. The per-comment POST stays for file-level anchors, which
+// comments[] cannot carry, and as the fallback when a batch is refused.
 import { gh, ghPaged, GitHubApiError } from "./app.js";
 
 export type ReviewCommentAnchor =
@@ -26,7 +24,7 @@ export async function createPRReview(
   owner: string,
   name: string,
   prNumber: number,
-  args: { commitId: string; comments: BatchedReviewComment[] }
+  args: { commitId: string; comments: BatchedReviewComment[]; body?: string }
 ): Promise<CreatePRReviewResult> {
   const base = `/repos/${owner}/${name}/pulls/${prNumber}`;
   let reviewId: number;
@@ -36,7 +34,7 @@ export async function createPRReview(
       body: JSON.stringify({
         commit_id: args.commitId,
         event: "COMMENT",
-        body: "",
+        body: args.body ?? "",
         comments: args.comments,
       }),
       headers: { "Content-Type": "application/json" },
@@ -45,13 +43,16 @@ export async function createPRReview(
     reviewId = res.id;
   } catch (err) {
     const status = err instanceof GitHubApiError ? err.status : 0;
-    // Logged even for 422: a refused empty body would look exactly like a bad
-    // anchor from the caller's side, and the fallback would mask it.
     console.warn(
       `[github] failed to create batched review on ${owner}/${name}#${prNumber}:`,
       err instanceof GitHubApiError ? `${err.status} ${err.bodyText}` : err
     );
-    return { error: status === 422 ? "anchor" : status === 403 ? "rate_limit" : "other" };
+    // A 422 about the body (too long) is not an anchor problem; retrying the
+    // comments one at a time would not help.
+    const bodyRefused = status === 422 && err instanceof GitHubApiError && /too long/i.test(err.bodyText);
+    return {
+      error: status === 422 ? (bodyRefused ? "other" : "anchor") : status === 403 ? "rate_limit" : "other",
+    };
   }
 
   const comments: Array<{ id: number; body: string; path: string }> = [];
@@ -76,6 +77,29 @@ export async function createPRReview(
     return { error: "other", reviewId };
   }
   return { reviewId, comments };
+}
+
+// Edit a submitted review's body (the summary card) in place.
+export async function updatePRReview(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  reviewId: number,
+  body: string
+): Promise<"ok" | "gone" | "error"> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/pulls/${prNumber}/reviews/${reviewId}`, {
+      method: "PUT",
+      body: JSON.stringify({ body }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return "ok";
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) return "gone";
+    console.warn(`[github] failed to update review ${reviewId} on ${owner}/${name}#${prNumber}:`, err);
+    return "error";
+  }
 }
 
 export type ReviewCommentRow = {

@@ -33,6 +33,8 @@ test("merges duplicates: newest survives, history and pointers carry over", () =
     taskId: "task-1",
     progressCommentId: 42,
     progressCommentSha: "abc1234",
+    summaryReviewId: 99,
+    summaryReviewSha: "abc1234",
   });
   const newer = seedReview(repoId, 5, { updatedAt: 2000 });
 
@@ -66,6 +68,8 @@ test("merges duplicates: newest survives, history and pointers carry over", () =
   assert.equal(rows[0].taskId, "task-1");
   assert.equal(rows[0].progressCommentId, 42);
   assert.equal(rows[0].progressCommentSha, "abc1234");
+  assert.equal(rows[0].summaryReviewId, 99);
+  assert.equal(rows[0].summaryReviewSha, "abc1234");
 
   // Logs and notifications follow the survivor; the default link is rewritten.
   const movedLog = db.find("reviewLogs", (l) => l.id === log.id);
