@@ -122,6 +122,9 @@ const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun", "pip", "poetry",
 const MONOREPO_TOOLS = new Set(["pnpm", "turbo", "nx", "workspaces"]);
 const FRAMEWORKS = new Set(["vitest", "jest", "pytest", "playwright", "cypress", "go-test", "node-test"]);
 const SERVICES = new Set(["postgres", "mysql", "redis"]);
+// These names come from a customer's package.json and are rendered into a planner
+// prompt; the npm name grammar leaves no room for anything but a name.
+const PACKAGE_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/;
 
 const strings = (v: unknown, max: number): string[] =>
   Array.isArray(v) ? v.filter((x) => typeof x === "string" && x).map((x) => String(x).slice(0, 300)).slice(0, max) : [];
@@ -147,6 +150,9 @@ export function normalizeDetectedSetup(raw: unknown): DetectedSetup | null {
         ...(typeof f.version === "string" ? { version: f.version.slice(0, 40) } : {}),
         ...(typeof f.configPath === "string" ? { configPath: f.configPath.slice(0, 300) } : {}),
       })),
+    // Spread, not filled in like the rest: absent must stay absent, because it is what
+    // tells the planner not to enforce an import allow-list it cannot trust.
+    ...(Array.isArray(o.dependencies) ? { dependencies: strings(o.dependencies, 300).filter((n) => n.length <= 214 && PACKAGE_NAME.test(n)) } : {}),
     testCommands: strings(o.testCommands, 20),
     envExampleVars: strings(o.envExampleVars, 100),
     existingWorkflows: strings(o.existingWorkflows, 50),

@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, hasUntriedRung, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
@@ -183,6 +183,95 @@ test("no boot config: a ui criterion that needs e2e is unverifiable with a fix l
     assert.match(prompts[0], /Browser \(e2e\) tests: not available \(no app start \/ login configured\)/);
     assert.match(prompts[0], /UI criteria remain testable at component level/);
     assert.match(prompts[0], /\[1\]: max level component/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+const PKG = (deps: Record<string, string>) => JSON.stringify({ devDependencies: deps });
+
+test("the installed package list reaches the planner and the body prompt", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = deps({ files: { "package.json": PKG({ vitest: "^3", "@testing-library/react": "^16" }) }, responses: [{ tests: [gen("1", "unit")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    // renderSetup feeds buildPlannerUserPrompt and the body step's shared-context system prompt alike.
+    assert.match(prompts[0], /Installed packages \(the ONLY ones a test may import\): @testing-library\/react, vitest/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("without a render library the component rung closes, and a waved-off ui criterion is not re-asked", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const responses = [{ tests: [gen("2", "unit")], unverifiable: [{ criterionId: "1", reason: "nothing can render it" }] }];
+  const { deps: d, prompts } = deps({ files: { "package.json": PKG({ vitest: "^3" }) }, diff: UI_DIFF, responses });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(prompts.length, 1, "re-asking would only pressure the model into an import it does not have");
+    assert.match(prompts[0], /No component-test environment either/);
+    assert.doesNotMatch(prompts[0], /UI criteria remain testable at component level/);
+    assert.equal(db.find("verifyPlans", (p) => p.runId === s.run.id)!.unverifiable[0].criterionId, "1");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("with a render library present the component rung stays open and the criterion is re-asked", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const responses = [{ tests: [gen("2", "unit")], unverifiable: [{ criterionId: "1", reason: "nothing can render it" }] }, { tests: [gen("1", "component")] }];
+  const { deps: d, prompts } = deps({ files: { "package.json": PKG({ vitest: "^3", "@testing-library/react": "^16", jsdom: "^25" }) }, diff: UI_DIFF, responses });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[0], /UI criteria remain testable at component level/);
+    assert.match(prompts[1], /Re-plan ONLY these criteria/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a body importing a package the repo lacks is repaired once, naming what it may use instead", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, bodyPrompts } = deps({
+    files: { "package.json": PKG({ vitest: "^3" }) },
+    responses: [{ tests: [gen("1", "unit", { runner: "vitest" })] }],
+    bodies: {
+      "criterion-1.test.ts": [
+        { path: "criterion-1.test.ts", content: 'import "@testing-library/jest-dom/vitest";\nimport { it } from "vitest";\n' },
+        { path: "criterion-1.test.ts", content: 'import { it, expect } from "vitest";\nit("holds", () => expect(1).toBe(1));\n' },
+      ],
+    },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+    const attempts = (db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/criterion-1.test.ts`];
+    assert.match(attempts[0].reason, /it imports "@testing-library\/jest-dom", which this repository does not have/);
+    assert.match(attempts[0].reason, /Rewrite it using only these packages: .*vitest/);
+    assert.equal(attempts[1].kind, "repair");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.match(String(plan.tests[0].content), /import \{ it, expect \} from "vitest"/);
+    assert.equal(plan.unverifiable.length, 0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a body still importing a missing package after repair is dropped; its criterion says so, its sibling ships", async () => {
+  const s = seed([crit("1"), crit("2")]);
+  const doomed = { path: "criterion-1.test.ts", content: 'import { render } from "@testing-library/react";\n' };
+  const { deps: d } = deps({
+    files: { "package.json": PKG({ vitest: "^3" }) },
+    responses: [{ tests: [gen("1", "unit", { runner: "vitest" }), gen("2", "unit", { runner: "vitest" })] }],
+    bodies: { "criterion-1.test.ts": [doomed, doomed] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => t.criterionIds[0]), ["2"], "the sibling still ships");
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: MISSING_PACKAGE_REASON }]);
+    assert.match(String(db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")?.detail), /body failed: .*criterion-1/);
   } finally {
     s.cleanup();
   }

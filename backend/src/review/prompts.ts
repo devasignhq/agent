@@ -1067,7 +1067,10 @@ export function testPlannerSystemPrompt(): string {
     "e2e (a browser flow, Playwright). Escalate only when the level below cannot observe the behaviour. Never exceed " +
     "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says browser tests are not " +
     "available — plan that criterion at component level instead, and only when no component test could decide it " +
-    "put it in `unverifiable` with the policy's reason. An API-only diff normally gets no e2e; " +
+    "put it in `unverifiable` with the policy's reason. A component test needs a render library and a DOM " +
+    "environment among the repository's installed packages; nothing is installed for you, so where those are " +
+    "absent do not plan one — prove the behaviour through the plain modules the component delegates to instead. " +
+    "An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
     "One exception to `max level`: a criterion capped at component whose behaviour only real geometry can settle — a " +
     "canvas, a drag, a virtualised list, anything a flow library lays out by measuring live elements — may be planned " +
@@ -1101,9 +1104,14 @@ export function testFileSystemPrompt(): string {
     "re-anchored for you. In every other language import the code under test the way the repo's own suite does, " +
     "by package or module name, never by a path relative to your file — nothing re-anchors those. Never read " +
     "files relative to the test's own location — no __dirname, import.meta.url or readFileSync of a fixture; " +
-    "inline any fixture data. Deterministic; no network; seed data isolated per test; one criterion's behaviour " +
-    "per assertion group; the first line is a comment naming the criterion ids it proves. Component tests render " +
-    "the component with its real state and assert on the DOM. Playwright tests: role/test-id selectors over text, " +
+    "inline any fixture data. Import only the packages listed under `Installed packages` in the shared context, " +
+    "the runner's own module, and Node builtins: nothing is installed for you, so a package the repository does " +
+    "not have makes the whole suite fail to load and proves nothing. Where no matcher or render library is " +
+    "available, use the runner's own assertions. Deterministic; no network; seed data isolated per test; one " +
+    "criterion's behaviour per assertion group; the first line is a comment naming the criterion ids it proves. " +
+    "Where the setup provides a render library, component tests render the component with its real state and " +
+    "assert on the DOM; where it does not, prove the behaviour through the plain modules the component delegates " +
+    "to, in the repo's own convention. Playwright tests: role/test-id selectors over text, " +
     "explicit state assertions instead of fixed waits, relative URLs against baseURL, no login unless the setup " +
     "provides a login strategy. A request carrying a strategy version above 1 must take a different approach " +
     "from the flaky version before it.\n" +

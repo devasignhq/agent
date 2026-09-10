@@ -14,8 +14,10 @@ const ASSERTION: Record<string, RegExp> = {
   playwright: /expect\(|Timed out .* expect|toBeVisible|toHaveText|toContainText|toHaveURL|toBeChecked|toHaveValue|toHaveCount|Expected:|Received:/m,
 };
 
+// Vite/vitest say "Cannot find package" and "Failed to resolve import" where node says
+// "Cannot find module"; without them a suite that never loaded reads as a failed assertion.
 const INFRA: RegExp =
-  /Cannot find module|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|SyntaxError|ImportError|ModuleNotFoundError|command not found|ENOENT|no test files|no tests found|No tests found|collected 0 items|\[build failed\]|Executable doesn't exist|browserType\.launch|net::ERR_|ECONNREFUSED|Process from config\.webServer|Timed out waiting .* from config\.webServer/i;
+  /Cannot find module|Cannot find package|Failed to load url|Failed to resolve import|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|ERR_PACKAGE_PATH_NOT_EXPORTED|SyntaxError|ImportError|ModuleNotFoundError|command not found|ENOENT|no test files|no tests found|No tests found|collected 0 items|\[build failed\]|Executable doesn't exist|browserType\.launch|net::ERR_|ECONNREFUSED|Process from config\.webServer|Timed out waiting .* from config\.webServer/i;
 
 export function classifyAttempt(runner: TestRunner, r: Pick<ExecResult, "code" | "timedOut" | "spawnError" | "output">): { status: AttemptStatus; error?: string } {
   r = { ...r, output: (r.output || "").replace(/\u001b\[[0-9;]*m/g, "") };

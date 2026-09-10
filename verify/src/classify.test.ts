@@ -11,6 +11,14 @@ test("assertion evidence → fail; infrastructure failures → error; exit 0 →
   assert.equal(classifyAttempt("node-test", r(0, "TAP version 13\n# tests 1\n# pass 1")).status, "pass");
   assert.equal(classifyAttempt("node-test", r(0, "TAP version 13\n# tests 0\n# pass 0")).status, "error", "zero tests is not a pass");
   assert.equal(classifyAttempt("vitest", r(1, " FAIL  src/a.test.ts > total\nAssertionError: expected '$1' to be '$2'\n Tests  1 failed | 0 passed")).status, "fail");
+  // A suite that never loaded prints the same " FAIL <file>" header as a real failure.
+  const unloadable = classifyAttempt(
+    "vitest",
+    r(1, "⎯⎯ Failed Suites 1 ⎯⎯\n FAIL  .devasign/tests/a.test.ts [ .devasign/tests/a.test.ts ]\nError: Cannot find package '@testing-library/jest-dom/vitest' imported from '/r/.devasign/tests/a.test.ts'\n Test Files  1 failed (1)\n      Tests  no tests")
+  );
+  assert.equal(unloadable.status, "error", "a missing package is not a failed assertion");
+  assert.match(unloadable.error ?? "", /Cannot find package '@testing-library\/jest-dom\/vitest'/, "the real cause, not 'assertion failed'");
+  assert.equal(classifyAttempt("vitest", r(1, " FAIL  .devasign/tests/a.test.ts\nError: Failed to resolve import \"@testing-library/react\" from \".devasign/tests/a.test.ts\". Does the file exist?")).status, "error");
   assert.equal(classifyAttempt("jest", r(1, "  ● total › formats\n    expect(received).toBe(expected)\nTests:       1 failed, 0 passed")).status, "fail");
   assert.equal(classifyAttempt("pytest", r(1, "FAILED tests/test_a.py::test_x - AssertionError\n1 failed in 0.1s")).status, "fail");
   assert.equal(classifyAttempt("pytest", r(2, "ERROR collecting tests/test_a.py\nModuleNotFoundError: No module named 'app'")).status, "error");
