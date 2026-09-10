@@ -1,14 +1,15 @@
-// Offline end-to-end for the PR feedback contract: the review pipeline posts ONE
-// "review in progress" conversation comment per commit, persists its id + sha,
-// and edits THAT comment into the summary card on finish — while every
-// individual finding and acceptance criterion lands as its own inline review
-// comment thread, anchored to the code it concerns. A rerun on the SAME sha
-// reuses the card comment; only a new sha (push) gets a fresh one. Across pushes
-// the threads are reconciled in place: still-reported items are edited, items
-// that stop being reported are marked fixed.
+// Offline end-to-end for the PR feedback contract: the review pipeline posts a
+// "review in progress" conversation comment when a run starts, and on finish
+// posts ONE review whose body is the summary card and whose comments are the
+// inline threads — one per finding and acceptance criterion, anchored to the
+// code it concerns — then deletes the placeholder so the review block takes
+// its place. A rerun on the SAME sha edits that review's body; a new sha (push)
+// gets a fresh review. Across pushes the threads are reconciled in place:
+// still-reported items are edited, items that stop being reported are marked
+// fixed.
 //
-// No formal PR review is ever submitted with a body — a pass is a bodyless
-// APPROVE and a failure dismisses our stale approval.
+// A pass is still a separate bodyless APPROVE and a failure dismisses our stale
+// approval.
 //
 // Fully offline: empty ANTHROPIC_API_KEY forces the LLM mock, and global.fetch is
 // stubbed so every GitHub call (token, PR/diff/commits, git tree, check run,
@@ -74,7 +75,7 @@ function currentHeadSha() {
   return stubHeadSha;
 }
 
-function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number }) {
+function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number; firstReviewId?: number }) {
   const calls: Call[] = [];
   let nextCommentId = opts.firstCommentId;
   let nextThreadId = opts.firstThreadId ?? 900;
@@ -83,7 +84,7 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
   const threadBodies = new Map<number, string>();
   // Comments carried by each batched review, served back by the listing.
   const reviewComments = new Map<number, Array<Record<string, unknown>>>();
-  let nextReviewId = 99;
+  let nextReviewId = opts.firstReviewId ?? 99;
   const original = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
     const u = String(url);
@@ -111,8 +112,12 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
     // Create a PR/issue comment (".../issues/{n}/comments").
     if (/\/issues\/\d+\/comments$/.test(u) && method === "POST")
       return ghResponse({ id: nextCommentId++ });
-    // Edit a comment in place (".../issues/comments/{id}").
+    // Edit a comment in place (".../issues/comments/{id}"), or delete it.
     if (/\/issues\/comments\/\d+$/.test(u) && method === "PATCH") return ghResponse({});
+    if (/\/issues\/comments\/\d+$/.test(u) && method === "DELETE")
+      return { ok: true, status: 204, json: async () => undefined, text: async () => "", headers: { get: () => null } } as any;
+    // Edit a submitted review's body (".../reviews/{id}").
+    if (/\/pulls\/\d+\/reviews\/\d+$/.test(u) && method === "PUT") return ghResponse({ id: Number(u.split("/").pop()) });
     // Dismiss a stale approval (".../reviews/{id}/dismissals").
     if (/\/pulls\/\d+\/reviews\/\d+\/dismissals$/.test(u) && method === "PUT") return ghResponse({});
     // Inline review-comment threads. Ordered before the /pulls/{n} matcher below
@@ -217,30 +222,37 @@ test("placeholder → summary card, with every finding as its own inline thread"
   assert.match(String(createCalls[0].body?.body), /## DevAsign Code Review/);
   assert.match(String(createCalls[0].body?.body), /Review in progress/);
 
-  // 2. Its id + sha are persisted on the review row.
+  // 2. The placeholder is gone once the review posts: its id is cleared, the
+  //    sha is kept (it is the new-commit signal), and the review is recorded.
   const row = db.find("prReviews", (r) => r.id === id);
-  assert.equal(row?.progressCommentId, 4242);
+  assert.equal(row?.progressCommentId, null);
   assert.equal(row?.progressCommentSha, "abc1234");
+  assert.equal(row?.summaryReviewId, 99);
+  assert.equal(row?.summaryReviewSha, "abc1234");
+  assert.ok(
+    !calls.some((c) => c.method === "PATCH" && /\/issues\/comments\/4242$/.test(c.url)),
+    "the placeholder is never edited into the card when the review posts"
+  );
 
-  // 3. That exact comment becomes the summary card: title, chips, merge score,
-  //    and a short summary — NOT the old wall of every finding.
-  const patchCall = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/4242$/.test(c.url));
-  assert.ok(patchCall, "expected a PATCH editing comment 4242 into the card");
-  const card = String(patchCall!.body?.body);
+  // 3. The summary card is the BODY of the one review that carries the threads:
+  //    title, chips, merge score, and a short summary — NOT a wall of findings.
+  const reviews = calls.filter((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
+  assert.equal(reviews.length, 1, "the card and every line-anchored thread ride in one review");
+  const review = reviews[0];
+  assert.equal(review.body?.event, "COMMENT");
+  const card = String(review.body?.body);
   assert.match(card, /^## DevAsign Code Review/);
   assert.match(card, /### (✅|🟡|🔴) Merge score: \d{1,3}\/100/);
   assert.match(card, /`(Criteria not met|Bugs|Nitpicks|Security|No issues found) \(?\d*\)?`/);
   assert.doesNotMatch(card, /### Acceptance criteria not met/, "detail belongs on the threads now");
   assert.doesNotMatch(card, /### Line notes/);
+  assert.doesNotMatch(card, /devasign:item/, "the card is not a thread");
+  const del = calls.find((c) => c.method === "DELETE" && /\/issues\/comments\/4242$/.test(c.url));
+  assert.ok(del, "the placeholder is deleted");
+  assert.ok(calls.indexOf(del!) > calls.indexOf(review), "…only after the review has landed");
 
-  // 4. The detail is on inline threads instead: every line-anchored one rides
-  //    in ONE review (a single "reviewed" event in the timeline), each carrying
-  //    its item marker and collapsed under its heading.
-  const reviews = calls.filter((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
-  assert.equal(reviews.length, 1, "all line-anchored threads must ride in one review");
-  const review = reviews[0];
-  assert.equal(review.body?.event, "COMMENT");
-  assert.equal(review.body?.body ?? "", "", "the review itself renders no conversation block");
+  // 4. The detail is on the review's inline threads, each carrying its item
+  //    marker and collapsed under its heading.
   assert.equal(review.body?.commit_id, "abc1234", "threads anchor to the reviewed commit");
   const batched: any[] = review.body?.comments ?? [];
   assert.ok(batched.length > 0, "findings must land as inline review comments");
@@ -321,64 +333,68 @@ test("a failing run dismisses the stored stale approval", async () => {
 test("rerun on the same commit reuses the comment; a new commit gets a fresh one", async () => {
   const id = seedReview();
 
-  // First run → comment 5000 for sha abc1234.
-  let stub = installFetchStub({ firstCommentId: 5000 });
+  // First run → review 99 for sha abc1234; placeholder 5000 posted then deleted.
+  let stub = installFetchStub({ firstCommentId: 5000, firstReviewId: 99 });
   try {
     await runReviewJob(id);
   } finally {
     stub.restore();
   }
-  assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, 5000);
+  assert.equal(db.find("prReviews", (r) => r.id === id)?.summaryReviewId, 99);
+  assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, null);
 
-  // Second run, SAME sha (manual rerun) → no new comment; 5000 is reset to
-  // in-progress and edited back into the verdict.
-  stub = installFetchStub({ firstCommentId: 5001 });
+  // Second run, SAME sha (manual rerun) → a fresh placeholder (the last one was
+  // deleted), review 99's body is edited in place, no second review block.
+  stub = installFetchStub({ firstCommentId: 5001, firstReviewId: 100 });
   try {
     await runReviewJob(id);
   } finally {
     stub.restore();
   }
+  const placeholder = stub.calls.find((c) => c.method === "POST" && /\/issues\/1\/comments$/.test(c.url));
+  assert.ok(placeholder, "a rerun announces itself again");
+  assert.match(String(placeholder!.body?.body), /Review in progress/);
   assert.ok(
-    !stub.calls.some((c) => c.method === "POST" && /\/issues\/1\/comments$/.test(c.url)),
-    "a same-sha rerun must not post a new comment"
+    !stub.calls.some((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url)),
+    "a same-sha rerun must not post a second review"
   );
-  const patches = stub.calls.filter((c) => c.method === "PATCH" && /\/issues\/comments\/5000$/.test(c.url));
-  assert.ok(patches.length >= 2, "the existing comment cycles in-progress → card");
-  assert.match(String(patches[0].body?.body), /Review in progress/);
-  assert.match(String(patches[patches.length - 1].body?.body), /### (✅|🟡|🔴) Merge score:/);
+  const put = stub.calls.filter((c) => c.method === "PUT" && /\/pulls\/1\/reviews\/99$/.test(c.url));
+  assert.equal(put.length, 1, "the existing review's body is edited instead");
+  assert.match(String(put[0].body?.body), /### (✅|🟡|🔴) Merge score:/);
+  assert.ok(
+    stub.calls.some((c) => c.method === "DELETE" && /\/issues\/comments\/5001$/.test(c.url)),
+    "the rerun's placeholder is deleted too"
+  );
   // A same-sha rerun is not a new push: existing threads are edited, never
   // duplicated, and nothing is marked fixed.
   assert.ok(
     !stub.calls.some((c) => c.method === "POST" && /\/pulls\/1\/comments$/.test(c.url)),
     "a same-sha rerun must not open duplicate threads"
   );
-  assert.ok(
-    !stub.calls.some(
-      (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.comments?.length
-    ),
-    "a same-sha rerun must not post a batched review either"
-  );
-  assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, 5000);
+  assert.equal(db.find("prReviews", (r) => r.id === id)?.summaryReviewId, 99);
+  assert.equal(db.find("prReviews", (r) => r.id === id)?.progressCommentId, null);
 
-  // Third run after a push (new sha) → a FRESH comment, per the one-comment-
-  // per-commit rule.
+  // Third run after a push (new sha) → a FRESH review, per the one-review-per-
+  // commit rule.
   db.update("prReviews", (r) => r.id === id, { headSha: "bbb7777" });
-  stub = installFetchStub({ firstCommentId: 5001 });
+  stub = installFetchStub({ firstCommentId: 5002, firstReviewId: 101 });
   try {
     await runReviewJob(id);
   } finally {
     stub.restore();
   }
-  assert.ok(
-    stub.calls.some((c) => c.method === "POST" && /\/issues\/1\/comments$/.test(c.url)),
-    "a new sha gets its own announce→verdict comment"
-  );
+  const posted = stub.calls.find((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
+  assert.ok(posted, "a new sha gets its own review");
+  assert.equal(posted!.body?.commit_id, "bbb7777");
+  assert.match(String(posted!.body?.body), /### (✅|🟡|🔴) Merge score:/);
   const row = db.find("prReviews", (r) => r.id === id);
-  assert.equal(row?.progressCommentId, 5001, "the row now tracks the new commit's comment id");
+  assert.equal(row?.summaryReviewId, 101, "the row now tracks the new commit's review");
+  assert.equal(row?.summaryReviewSha, "bbb7777");
+  assert.equal(row?.progressCommentId, null);
   assert.equal(row?.progressCommentSha, "bbb7777");
   assert.ok(
-    stub.calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/5001$/.test(c.url)),
-    "the new comment (5001) is the one edited into the card"
+    stub.calls.some((c) => c.method === "DELETE" && /\/issues\/comments\/5002$/.test(c.url)),
+    "the new placeholder (5002) is deleted once the review lands"
   );
 });
 
@@ -417,6 +433,12 @@ test("across a push, threads are edited in place and a vanished finding is marke
       (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.comments?.length
     ),
     "nor ride in a new batched review"
+  );
+  assert.ok(
+    stub.calls.some(
+      (c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url) && c.body?.comments?.length === 0 && c.body?.body
+    ),
+    "the new commit's card still posts, as a body-only review"
   );
   const afterSecond = db.find("prReviews", (r) => r.id === id)?.reviewThreads ?? [];
   assert.deepEqual(
@@ -484,8 +506,7 @@ test("across a push, threads are edited in place and a vanished finding is marke
 
   // And the card counts it as fixed while still reporting what remains open.
   const card = String(
-    stub.calls.filter((c) => c.method === "PATCH" && /\/issues\/comments\/\d+$/.test(c.url)).pop()
-      ?.body?.body
+    stub.calls.filter((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url)).pop()?.body?.body
   );
   assert.match(card, /✅ `Fixed since last review \(1\)`/);
 });

@@ -670,13 +670,18 @@ export type PRReview = {
   additions: number | null;
   deletions: number | null;
   changedFiles: number | null;
-  // GitHub issue-comment id for the "review in progress" → verdict comment, and
-  // the head SHA it was posted for. One comment per commit: a rerun on the SAME
-  // sha edits this comment back through in-progress → verdict, while a new sha
-  // (push) gets a fresh comment. Optional so rows written before this existed
-  // still load.
+  // GitHub issue-comment id for the "review in progress" placeholder and the
+  // head SHA it was posted for. The id is cleared once the summary review posts
+  // and the placeholder is deleted (or when the run fell back to editing it into
+  // the card, it stays for a same-sha rerun). The sha is kept either way: it is
+  // the "new commit vs rerun" signal. Optional so rows written before this
+  // existed still load.
   progressCommentId?: number | null;
   progressCommentSha?: string | null;
+  // Id of the COMMENT review that carries the summary card for a sha, so a
+  // same-sha rerun edits its body instead of posting a second block.
+  summaryReviewId?: number | null;
+  summaryReviewSha?: string | null;
   // GitHub issue-comment id for the separate "Tests by DevAsign" comment the
   // verifier posts, and the head SHA it was posted for. Same one-per-commit
   // contract as progressCommentId above. Lives on the review row rather than the

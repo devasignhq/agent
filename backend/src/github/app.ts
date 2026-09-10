@@ -137,7 +137,10 @@ export async function gh<T>(
   if (!res.ok) {
     throw new GitHubApiError(res.status, url, await res.text());
   }
-  return (await res.json()) as T;
+  // DELETE endpoints answer 204 with no body.
+  if (res.status === 204) return undefined as T;
+  const text = await res.text();
+  return (text ? JSON.parse(text) : undefined) as T;
 }
 
 // Same auth as gh(), but hands back the Link header's rel="next" so a caller can
@@ -273,6 +276,26 @@ export async function updatePRComment(
     return true;
   } catch (err) {
     console.warn(`[github] failed to update PR comment ${owner}/${name}#${commentId}:`, err);
+    return false;
+  }
+}
+
+// Remove a PR/issue comment (the "review in progress" placeholder once the
+// summary review has posted). 404 counts as success. Best-effort, never throws.
+export async function deletePRComment(
+  installationId: number,
+  owner: string,
+  name: string,
+  commentId: number
+): Promise<boolean> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/issues/comments/${commentId}`, {
+      method: "DELETE",
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) return true;
+    console.warn(`[github] failed to delete PR comment ${owner}/${name}#${commentId}:`, err);
     return false;
   }
 }

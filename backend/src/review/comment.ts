@@ -1,6 +1,6 @@
 // Every piece of markdown DevAsign writes onto a pull request: the summary card
-// (the editable conversation comment) and the body of each inline review-comment
-// thread. Pure — no db / network / LLM:
+// (the body of the review that carries the threads, or the conversation comment
+// when that fails) and the body of each inline review-comment thread. Pure:
 //   node --import tsx/esm --test src/review/summary-card.test.ts
 //   node --import tsx/esm --test src/review/thread-body.test.ts
 //
@@ -126,7 +126,21 @@ function openCollapsed(lines: string[], summary: string) {
 export function formatThreadBody(item: ReviewItem, opts: ThreadBodyOpts = {}): string {
   const lines: string[] = [itemMarker(item.key)];
   openCollapsed(lines, summaryText(item));
+  lines.push(...threadDetailLines(item, opts), "", "</details>");
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
 
+// The same block without a marker, for items that live on the card because
+// nothing in the diff can carry a thread for them.
+export function formatCardItemBlock(item: ReviewItem): string {
+  const lines: string[] = [];
+  openCollapsed(lines, summaryText(item));
+  lines.push(...threadDetailLines(item), "", "</details>");
+  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+}
+
+export function threadDetailLines(item: ReviewItem, opts: ThreadBodyOpts = {}): string[] {
+  const lines: string[] = [];
   if (opts.reopened) {
     lines.push("**Reopened** — this came back in the latest review.", "");
   }
@@ -198,8 +212,7 @@ export function formatThreadBody(item: ReviewItem, opts: ThreadBodyOpts = {}): s
   }
 
   appendPromptDetails(lines, item.fixPrompt, FIX_PROMPT_SUMMARY);
-  lines.push("", "</details>");
-  return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
+  return lines;
 }
 
 const FIX_PROMPT_SUMMARY = "Prompt to fix with AI";
@@ -383,6 +396,30 @@ export function summaryLines(args: {
   return lines;
 }
 
+// GitHub refuses a review body over 65,536 chars; leave headroom for the lists
+// and notes that follow the blocks.
+export const CARD_BODY_BUDGET = 60_000;
+export const MAX_CARD_ITEM_BLOCKS = 25;
+
+// One collapsed block per item while the count and size allow; the rest are
+// returned for the compact list.
+function appendItemBlocks(lines: string[], items: ReviewItem[], budget: number): ReviewItem[] {
+  let used = lines.join("\n").length;
+  let count = 0;
+  const leftover: ReviewItem[] = [];
+  for (const item of items) {
+    const block = count < MAX_CARD_ITEM_BLOCKS ? formatCardItemBlock(item) : null;
+    if (block === null || used + block.length + 2 > budget) {
+      leftover.push(item);
+      continue;
+    }
+    lines.push("", block);
+    used += block.length + 2;
+    count++;
+  }
+  return leftover;
+}
+
 function appendItemList(lines: string[], summary: string, items: ReviewItem[]) {
   if (!items.length) return;
   lines.push("", "<details>", `<summary>${summary} (${items.length})</summary>`, "");
@@ -393,6 +430,8 @@ function appendItemList(lines: string[], summary: string, items: ReviewItem[]) {
   }
   lines.push("", "</details>");
 }
+
+const CARD_TAIL_RESERVE = 4_000;
 
 export function formatSummaryCard(args: {
   open: Chippable[];
@@ -428,7 +467,8 @@ export function formatSummaryCard(args: {
   // whichever reason kept them off a thread. Without this they'd appear there
   // AND under "Other findings", which reads as two different results.
   const stillOpen = (list?: ReviewItem[]) => (list ?? []).filter((i) => i.state === "open");
-  appendItemList(lines, "Other findings — not anchored to the diff", stillOpen(args.unanchored));
+  const leftover = appendItemBlocks(lines, stillOpen(args.unanchored), CARD_BODY_BUDGET - CARD_TAIL_RESERVE);
+  appendItemList(lines, "Other findings — not anchored to the diff", leftover);
   appendItemList(lines, "Not shown inline", stillOpen(args.overflow));
   appendItemList(lines, "Met criteria", args.metWithoutThread ?? []);
 

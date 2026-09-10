@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   attributionLine,
+  formatCardItemBlock,
   formatResolvedThreadBody,
   stripFixPromptBlock,
   formatThreadBody,
@@ -385,6 +386,13 @@ test("a thread body is one collapsed block: marker, then <details> with the head
   assert.equal(lines[lines.length - 2], "");
   assert.equal(body.match(/<details>/g)!.length, 2, "outer wrapper + fix prompt");
   assert.equal(body.match(/<\/details>/g)!.length, 2);
+});
+
+test("a card block is the thread body without its marker line", () => {
+  const item = findingItem({ fixPrompt: "Fix: await it\n\n```diff\n-a\n+b\n```" });
+  const thread = formatThreadBody(item).split("\n");
+  assert.match(thread[0], /^<!-- devasign:item/);
+  assert.equal(formatCardItemBlock(item), thread.slice(1).join("\n"));
 });
 
 test("summary text is HTML-escaped so a title like <Props> is not swallowed as a tag", () => {

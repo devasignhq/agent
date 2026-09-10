@@ -30,6 +30,7 @@ function ghResponse(body: any) {
 function installFetchStub(headRepoFullName = "acme/widgets") {
   const calls: Call[] = [];
   const comments = new Map<number, string>();
+  const reviewComments = new Map<number, Array<Record<string, unknown>>>();
   let nextId = 4242;
   const original = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
@@ -47,6 +48,12 @@ function installFetchStub(headRepoFullName = "acme/widgets") {
     if (m && method === "GET") return ghResponse({ id: Number(m[1]), body: comments.get(Number(m[1])) ?? "" });
     if (/\/pulls\/\d+\/commits/.test(u) && method === "GET") return ghResponse([{ sha: "abc1234", commit: { message: "Add widget" } }]);
     if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST") return ghResponse({ id: 9000 + calls.length });
+    if (/\/pulls\/\d+\/reviews$/.test(u) && method === "POST") {
+      reviewComments.set(99, (body?.comments ?? []).map((c: any, i: number) => ({ id: 9500 + i, body: c.body, path: c.path })));
+      return ghResponse({ id: 99 });
+    }
+    if (/\/pulls\/\d+\/reviews\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse(reviewComments.get(99) ?? []);
+    if (/\/issues\/comments\/\d+$/.test(u) && method === "DELETE") return { ok: true, status: 204, json: async () => undefined, text: async () => "" } as any;
     if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse([]);
     if (/\/pulls\/comments\/\d+$/.test(u)) return ghResponse({ body: "" });
     if (/\/pulls\/\d+$/.test(u) && method === "GET") {
@@ -93,9 +100,11 @@ test("fork after criteria, plan in parallel, Verify check run at the join; resul
     assert.ok(plan.tests.filter((x) => x.origin === "generated").every((x) => x.path.startsWith(".devasign/tests/")));
     assert.ok(run.tokenUsage.plan, "plan usage recorded per provider");
 
-    // The review's card is comment 4242 and carries no verification detail.
-    const patch = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/4242$/.test(c.url));
-    const body = String(patch!.body?.body);
+    // The review's card is the body of the posted review and carries no
+    // verification detail; the placeholder 4242 is removed once it lands.
+    const posted = calls.find((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
+    const body = String(posted!.body?.body);
+    assert.ok(calls.some((c) => c.method === "DELETE" && /\/issues\/comments\/4242$/.test(c.url)));
     assert.match(body, /^## DevAsign Code Review/);
     assert.ok(!body.includes(VERIFICATION_START), "verification no longer lives in the review comment");
 
@@ -177,14 +186,14 @@ test("stages.verify=false → the branch is skipped, logged, and reported as dis
     assert.equal(run.skipReason, "verify_disabled");
     const verify = calls.find((c) => c.method === "POST" && /\/check-runs$/.test(c.url) && c.body?.name === "DevAsign · Verify");
     assert.equal(verify?.body.output.title, "Verification disabled");
-    const patch = calls.find((c) => c.method === "PATCH" && /\/issues\/comments\/\d+$/.test(c.url));
+    const posted = calls.find((c) => c.method === "POST" && /\/pulls\/1\/reviews$/.test(c.url));
     // Nothing actionable to say, so no tests comment is posted; the check run
     // carries the state instead.
     assert.ok(
       !calls.some((c) => c.method === "POST" && /Tests by DevAsign/.test(String(c.body?.body))),
       "a disabled verify stage posts no tests comment"
     );
-    assert.doesNotMatch(String(patch!.body?.body), /Verification is turned off/);
+    assert.doesNotMatch(String(posted!.body?.body), /Verification is turned off/);
   } finally {
     restore();
   }

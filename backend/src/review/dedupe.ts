@@ -52,6 +52,14 @@ export function dedupePRReviews(): number {
         patch.approveReviewId = loser.approveReviewId;
       }
       if (
+        survivor.summaryReviewId == null &&
+        patch.summaryReviewId === undefined &&
+        loser.summaryReviewId != null
+      ) {
+        patch.summaryReviewId = loser.summaryReviewId;
+        patch.summaryReviewSha = loser.summaryReviewSha;
+      }
+      if (
         survivor.verifyCommentId == null &&
         patch.verifyCommentId === undefined &&
         loser.verifyCommentId != null

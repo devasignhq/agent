@@ -12,11 +12,12 @@ test("every state of the comment carries the same title, so editing it doesn't c
   }
 });
 
-test("the placeholder says a review is running and that findings will appear inline", () => {
+test("the placeholder says DevAsign is reviewing and where the results will land", () => {
   const body = progressCommentBody();
   assert.match(body, /⏳ `Review in progress`/);
-  assert.match(body, /updated automatically once the analysis is complete/);
-  assert.match(body, /appear as review comments on the lines they concern/);
+  assert.match(body, /DevAsign AI is currently reviewing this pull request/);
+  assert.match(body, /posted as a single review below/);
+  assert.match(body, /one collapsed note per finding/);
 });
 
 test("the failure copy admits the run failed and promises a retry", () => {

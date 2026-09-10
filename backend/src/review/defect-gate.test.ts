@@ -240,8 +240,10 @@ test("a defect reaches the PR as its own thread, and is counted on the card", as
         if (/\/pulls\/\d+\/comments$/.test(u) && String(init.method).toUpperCase() === "POST") {
           threads.push({ body: parsed.body, path: parsed.path, line: parsed.line });
         }
-        // Line-anchored threads ride together in one batched review.
+        // Line-anchored threads ride together in one batched review whose body
+        // is the card.
         if (/\/pulls\/\d+\/reviews$/.test(u) && String(init.method).toUpperCase() === "POST") {
+          if (parsed.body) cards.push(parsed.body);
           for (const c of parsed.comments ?? []) threads.push({ body: c.body, path: c.path, line: c.line });
         }
       } catch {
@@ -267,7 +269,7 @@ test("a defect reaches the PR as its own thread, and is counted on the card", as
 
   // The card carries the count and the gate, not the prose.
   const card = cards.at(-1);
-  assert.ok(card, "the conversation comment should have been edited into the card");
+  assert.ok(card, "the review carrying the threads should have the card as its body");
   assert.match(card!, /🐞 `Bugs \(1\)`/);
   assert.doesNotMatch(card!, /Bugs and correctness issues/, "detail belongs on the thread");
 });
