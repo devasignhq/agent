@@ -14,6 +14,8 @@ import {
   deletePRReviewComment,
   getPRReviewComment,
   listPRReviewComments,
+  listPRReviewThreads,
+  setPRThreadResolved,
   updatePRReviewComment,
   type BatchedReviewComment,
   type ReviewCommentAnchor,
@@ -37,6 +39,13 @@ import { bestMatch, type FindingIdentity } from "./identity.js";
 // one that actually protects us — two reviews in the same minute must not trip it.
 export const MAX_OPEN_THREADS_PER_PR = 40;
 export const MAX_THREAD_WRITES_PER_RUN = 25;
+// GraphQL resolve/unresolve mutations count against the same limit as writes.
+export const MAX_RESOLVES_PER_RUN = 20;
+
+// A fixed finding or a met criterion is collapsed on GitHub; anything else stays open.
+export function wantResolved(t: Pick<ReviewThread, "state" | "itemState">): boolean {
+  return t.state === "resolved" || t.itemState === "met";
+}
 
 // Per-category ceilings so one noisy advisory stage can't crowd out the criteria
 // and bugs that people actually act on. Criteria are uncapped: they are the point.
@@ -376,6 +385,9 @@ export type ReconcileResult = {
   // The review carrying the summary body, when one posted this run.
   reviewId: number | null;
   bodyPosted: boolean;
+  // Threads resolved / unresolved on GitHub this run.
+  collapsed: number;
+  reopened: number;
 };
 
 export type ThreadClient = {
@@ -383,6 +395,8 @@ export type ThreadClient = {
   create: typeof createPRReviewComment;
   update: typeof updatePRReviewComment;
   get: typeof getPRReviewComment;
+  lookupThreads: typeof listPRReviewThreads;
+  setResolved: typeof setPRThreadResolved;
 };
 
 const liveClient: ThreadClient = {
@@ -390,6 +404,8 @@ const liveClient: ThreadClient = {
   create: createPRReviewComment,
   update: updatePRReviewComment,
   get: getPRReviewComment,
+  lookupThreads: listPRReviewThreads,
+  setResolved: setPRThreadResolved,
 };
 
 type CreateOp = Extract<ThreadOp, { op: "create" }>;
@@ -425,7 +441,7 @@ export async function reconcileThreads(args: {
   for (const op of plan.ops) {
     switch (op.op) {
       case "carry":
-        out.push(op.thread);
+        out.push({ ...op.thread });
         break;
       case "miss":
         out.push({
@@ -618,7 +634,55 @@ export async function reconcileThreads(args: {
   // File-level anchors cannot ride in comments[]; they stay separate posts.
   for (const op of fileCreates) await createOne(op);
 
-  return { threads: out, created, updated, resolved, aborted, fellBack, recoveryNeeded, reviewId, bodyPosted };
+  // GitHub resolution, last: the batch above is what gives new threads their
+  // ids. Only a mismatch between what we want and what we last set/observed
+  // triggers a mutation, so a maintainer's manual resolve or unresolve stands
+  // until the item's state changes again.
+  let collapsed = 0;
+  let reopened = 0;
+  if (!aborted) {
+    const mismatched = () => out.filter((t) => wantResolved(t) !== (t.githubResolved ?? false));
+    let candidates = mismatched();
+    if (candidates.some((t) => !t.threadNodeId)) {
+      const refs = await client.lookupThreads(installationId, owner, name, prNumber);
+      if (refs) {
+        for (const t of candidates) {
+          const ref = t.threadNodeId ? null : refs.get(t.commentId);
+          if (!ref) continue;
+          t.threadNodeId = ref.threadId;
+          if (t.githubResolved === undefined) t.githubResolved = ref.isResolved;
+        }
+      }
+      candidates = mismatched().filter((t) => t.threadNodeId);
+    }
+    for (const t of candidates.slice(0, MAX_RESOLVES_PER_RUN)) {
+      const want = wantResolved(t);
+      const res = await client.setResolved(installationId, t.threadNodeId!, want);
+      if (res === "rate_limit") {
+        aborted = true;
+        break;
+      }
+      if (res !== "ok") continue;
+      t.githubResolved = want;
+      t.updatedAt = Date.now();
+      if (want) collapsed++;
+      else reopened++;
+    }
+  }
+
+  return {
+    threads: out,
+    created,
+    updated,
+    resolved,
+    aborted,
+    fellBack,
+    recoveryNeeded,
+    reviewId,
+    bodyPosted,
+    collapsed,
+    reopened,
+  };
 }
 
 // Rebuild thread state from the PR itself. Only worth doing when the stored rows

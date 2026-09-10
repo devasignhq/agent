@@ -84,6 +84,8 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
   const threadBodies = new Map<number, string>();
   // Comments carried by each batched review, served back by the listing.
   const reviewComments = new Map<number, Array<Record<string, unknown>>>();
+  // GitHub's resolved conversations, keyed by thread node id (`T<comment id>`).
+  const resolvedThreads = new Set<string>();
   let nextReviewId = opts.firstReviewId ?? 99;
   const original = globalThis.fetch;
   globalThis.fetch = (async (url: any, init: any = {}) => {
@@ -122,8 +124,33 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
     if (/\/pulls\/\d+\/reviews\/\d+\/dismissals$/.test(u) && method === "PUT") return ghResponse({});
     // Inline review-comment threads. Ordered before the /pulls/{n} matcher below
     // and anchored so "/pulls/1/comments" can't be caught by another rule.
-    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST")
-      return ghResponse({ id: nextThreadId++, path: body?.path, line: body?.line ?? null });
+    if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "POST") {
+      const id = nextThreadId++;
+      threadBodies.set(id, String(body?.body ?? ""));
+      return ghResponse({ id, path: body?.path, line: body?.line ?? null });
+    }
+    // GraphQL: the thread listing (node ids + resolved state) and the
+    // resolve/unresolve mutations. Every comment this stub has seen owns a thread.
+    if (/\/graphql$/.test(u) && method === "POST") {
+      const q = String(body?.query ?? "");
+      if (/reviewThreads/.test(q)) {
+        const nodes = [...threadBodies.keys()].map((id) => ({
+          id: `T${id}`,
+          isResolved: resolvedThreads.has(`T${id}`),
+          comments: { nodes: [{ databaseId: id }] },
+        }));
+        return ghResponse({
+          data: { repository: { pullRequest: { reviewThreads: { pageInfo: { hasNextPage: false, endCursor: null }, nodes } } } },
+        });
+      }
+      const m = /(resolveReviewThread|unresolveReviewThread)/.exec(q);
+      if (m) {
+        const tid = String(body?.variables?.threadId);
+        if (m[1] === "resolveReviewThread") resolvedThreads.add(tid);
+        else resolvedThreads.delete(tid);
+        return ghResponse({ data: { [m[1]]: { thread: { id: tid, isResolved: resolvedThreads.has(tid) } } } });
+      }
+    }
     if (/\/pulls\/\d+\/comments(\?|$)/.test(u) && method === "GET") return ghResponse([]);
     if (/\/pulls\/comments\/\d+$/.test(u) && method === "PATCH") return ghResponse({});
     if (/\/pulls\/comments\/\d+$/.test(u) && method === "GET")
@@ -162,7 +189,7 @@ function installFetchStub(opts: { firstCommentId: number; firstThreadId?: number
     if (/\/check-runs$/.test(u) && method === "POST") return ghResponse({ id: 7 });
     return ghResponse({});
   }) as any;
-  return { calls, restore: () => { globalThis.fetch = original; } };
+  return { calls, resolvedThreads, restore: () => { globalThis.fetch = original; } };
 }
 
 // Seed a PUBLIC repo (no private-repo gate), an install row, and a queued review.
@@ -503,6 +530,16 @@ test("across a push, threads are edited in place and a vanished finding is marke
   const gone = finalThreads.find((t) => t.commentId === 4321);
   assert.equal(gone?.state, "resolved");
   assert.equal(gone?.resolvedAtSha, "ccc8888");
+  // …and the conversation is resolved on GitHub, so it collapses: the thread's
+  // node id was looked up once and the mutation sent after the body edit.
+  const mutation = stub.calls.find(
+    (c) => c.method === "POST" && /\/graphql$/.test(c.url) && /resolveReviewThread/.test(String(c.body?.query)) && c.body?.variables?.threadId === "T4321"
+  );
+  assert.ok(mutation, "the fixed thread is resolved on GitHub");
+  assert.ok(stub.calls.indexOf(mutation!) > stub.calls.indexOf(resolvePatch!), "resolved only after its body was rewritten");
+  assert.ok(stub.resolvedThreads.has("T4321"));
+  assert.equal(gone?.threadNodeId, "T4321");
+  assert.equal(gone?.githubResolved, true);
 
   // And the card counts it as fixed while still reporting what remains open.
   const card = String(

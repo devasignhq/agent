@@ -642,6 +642,11 @@ export type ReviewThread = {
   missCount: number;
   resolvedAtSha?: string;
   resolvedAt?: number;
+  // GraphQL PullRequestReviewThread id, looked up the first time the thread
+  // needs resolving on GitHub.
+  threadNodeId?: string;
+  // Resolved state we last set or observed on GitHub. Undefined = never looked.
+  githubResolved?: boolean;
   // Hash of the body we last wrote, so an unchanged thread costs no API call.
   bodyHash: string;
   // Rebuilt from the PR's comments after the stored rows were lost. Such a row
@@ -682,6 +687,18 @@ export type PRReview = {
   // same-sha rerun edits its body instead of posting a second block.
   summaryReviewId?: number | null;
   summaryReviewSha?: string | null;
+  // Inputs of the card's head region (chips, score, summary), kept so a late
+  // verification result can re-render just that region in place.
+  cardHead?: {
+    open: Array<{ category: ReviewItemCategory; state: "open" | "met" }>;
+    fixedCount: number;
+    score: number;
+    specless: boolean;
+    criteriaTotal: number;
+    criteriaMet: number;
+    summary: string;
+    sha: string;
+  } | null;
   // GitHub issue-comment id for the separate "Tests by DevAsign" comment the
   // verifier posts, and the head SHA it was posted for. Same one-per-commit
   // contract as progressCommentId above. Lives on the review row rather than the

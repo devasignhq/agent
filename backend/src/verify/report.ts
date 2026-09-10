@@ -9,9 +9,10 @@
 // legacy block out of review comments written before this change.
 import { db } from "../db.js";
 import { config } from "../config.js";
-import { gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { getPRComment, gh, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { getPRReviewBody, updatePRReview } from "../github/review-comments.js";
+import { formatCardHeader, spliceCardHeader } from "../review/comment.js";
 import { codeFence } from "../review/render.js";
-import { scoreHeader } from "../review/score.js";
 import type { Criterion, PRReview, Repository, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { RunnerResult } from "./contract.js";
 import { hasRunnerEvidence, updateRun } from "./runs.js";
@@ -375,6 +376,9 @@ export async function rerenderReport(runId: string): Promise<void> {
     runId: run.id,
     view,
   });
+  // The card's score and chips depend on these results, and the card usually
+  // posted before they existed.
+  await refreshCardHead({ install, repo, reviewId: review.id, sha: run.sha, view });
   // Reviews written before this change carry the old spliced block; strip it so
   // the PR doesn't show verification twice.
   if (review.progressCommentId != null) {
@@ -382,16 +386,60 @@ export async function rerenderReport(runId: string): Promise<void> {
   }
 }
 
+const cardRefreshesInFlight = new Map<string, Promise<void>>();
+
+// Re-render the marker-delimited head of the summary card with the finished
+// verification. Targets the review that carries the card for this sha, or the
+// conversation comment when the run fell back to it. Best-effort.
+export async function refreshCardHead(args: {
+  install: { installationId: number };
+  repo: Repository;
+  reviewId: string;
+  sha: string;
+  view: VerificationView;
+}): Promise<void> {
+  if (args.view.state !== "completed") return;
+  const key = `${args.reviewId}:${args.sha}:card`;
+  const inFlight = cardRefreshesInFlight.get(key);
+  if (inFlight) return inFlight;
+  const task = (async () => {
+    const { install, repo, sha, view } = args;
+    const review = db.find("prReviews", (r) => r.id === args.reviewId);
+    const head = review?.cardHead;
+    if (!review || !head || head.sha !== sha) return;
+    const target =
+      review.summaryReviewId != null && review.summaryReviewSha === sha
+        ? { kind: "review" as const, id: review.summaryReviewId }
+        : review.progressCommentId != null && review.progressCommentSha === sha
+        ? { kind: "comment" as const, id: review.progressCommentId }
+        : null;
+    if (!target) return;
+    const body =
+      target.kind === "review"
+        ? await getPRReviewBody(install.installationId, repo.owner, repo.name, review.prNumber, target.id)
+        : await getPRComment(install.installationId, repo.owner, repo.name, target.id);
+    if (typeof body !== "string") return;
+    const next = spliceCardHeader(body, formatCardHeader(head, view));
+    if (next === null || next === body || next.length > 65_000) return;
+    if (target.kind === "review") {
+      await updatePRReview(install.installationId, repo.owner, repo.name, review.prNumber, target.id, next);
+    } else {
+      await updatePRComment(install.installationId, repo.owner, repo.name, target.id, next);
+    }
+  })();
+  cardRefreshesInFlight.set(key, task);
+  try {
+    await task;
+  } catch (err) {
+    console.warn("[verify] failed to refresh the card head:", err);
+  } finally {
+    cardRefreshesInFlight.delete(key);
+  }
+}
+
 // ─── The "Tests by DevAsign" comment ───────────────────────────────────────
 
 export const TESTS_COMMENT_TITLE = "## Tests by DevAsign";
-
-// Deterministic, like the review's merge score: a failed criterion is the real
-// signal, an unverifiable one is a gap rather than a defect, so it costs less.
-export function testScore(counts: VerificationView["counts"]): number {
-  const penalty = counts.fail * 20 + counts.unverifiable * 5 + counts.pending * 5;
-  return Math.max(0, Math.min(100, 100 - penalty));
-}
 
 function testChips(view: VerificationView): string {
   const chips: string[] = [];
@@ -401,10 +449,6 @@ function testChips(view: VerificationView): string {
   if (view.counts.pending) chips.push(`⏳ \`Pending (${view.counts.pending})\``);
   if (!chips.length) chips.push("⚠️ `Nothing to verify`");
   return chips.join(" · ");
-}
-
-function verdictIcon(v: VerificationRowVerdict): string {
-  return v === "pass" ? "✅" : v === "fail" ? "❌" : v === "unverifiable" ? "⚠️" : "⏳";
 }
 
 // One paste that tells an agent what to fix. Only the failures — an unverifiable
@@ -435,14 +479,14 @@ function buildTestFixPrompt(view: VerificationView, repoFullName: string): strin
   return lines.join("\n");
 }
 
-// Same shape as the review's summary card: title, chips, a scored header, a short
-// summary, per-item detail, one copyable prompt. Per-test detail is a <details>
-// block rather than its own thread because a generated test file usually isn't
-// part of the PR's diff, so there is nothing to anchor a review comment to.
+// Same shape as the review's summary card: title, chips, a short summary,
+// per-item detail, one copyable prompt. Per-test detail is a <details> block
+// rather than its own thread because a generated test file usually isn't part
+// of the PR's diff, so there is nothing to anchor a review comment to. The
+// score lives on the review card, which folds these results into the merge score.
 export function formatTestsComment(view: VerificationView, repoFullName: string): string {
   const lines: string[] = [TESTS_COMMENT_TITLE, "", testChips(view), ""];
   if (view.state === "completed") {
-    lines.push(scoreHeader(testScore(view.counts), "Test score"), "");
     // One line of arithmetic, not two: stateLine's own count sentence would say
     // the same thing again directly underneath.
     const tail = [
@@ -466,7 +510,7 @@ export function formatTestsComment(view: VerificationView, repoFullName: string)
 
   lines.push("", VERIFICATION_START);
   for (const r of view.rows) {
-    lines.push("", "<details>", `<summary>${verdictIcon(r.verdict)} ${r.id} — ${r.text}</summary>`, "");
+    lines.push("", "<details>", `<summary>${r.id} — ${r.text} (${verdictWord(r.verdict)})</summary>`, "");
     lines.push(`**Verdict:** ${verdictWord(r.verdict)}`);
     if (r.reason) lines.push("", r.reason);
     if (r.testName) {
@@ -497,7 +541,6 @@ export function formatTestsComment(view: VerificationView, repoFullName: string)
       "</details>"
     );
   }
-  lines.push("", REPLY_LINE);
   return lines.join("\n").replace(/\n{3,}/g, "\n\n").trim();
 }
 
@@ -587,12 +630,9 @@ async function stripLegacyVerificationSection(
   commentId: number
 ): Promise<void> {
   try {
-    const current = await gh<{ body?: string }>(
-      installationId,
-      `/repos/${repo.owner}/${repo.name}/issues/comments/${commentId}`
-    );
-    if (typeof current?.body !== "string" || !current.body.includes(VERIFICATION_START)) return;
-    const next = spliceVerificationSection(current.body, "").trim();
+    const current = await getPRComment(installationId, repo.owner, repo.name, commentId);
+    if (current === null || !current.includes(VERIFICATION_START)) return;
+    const next = spliceVerificationSection(current, "").trim();
     await updatePRComment(installationId, repo.owner, repo.name, commentId, next);
   } catch (err) {
     console.warn("[verify] failed to strip the legacy verification section:", err);
