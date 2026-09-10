@@ -62,7 +62,7 @@ export async function runFileTests(args: {
       log.info(`attempt ${n}/${max}: ${c.status}${c.error ? ` — ${c.error}` : ""}`);
       if (c.status === "pass" && n === 1) break;
       if (c.status === "pass" && n > 1) break; // pass after a failure: flaky, stop here
-      if (c.status === "error" && max > 1 && n === 1 && /could not start|ENOENT|Cannot find module/.test(c.error || "")) break; // infra, retrying won't help
+      if (c.status === "error" && max > 1 && n === 1 && /could not start|ENOENT|Cannot find module|Cannot find package|Failed to (?:load url|resolve import)/.test(c.error || "")) break; // infra, retrying won't help
     }
     log.endGroup();
     const status = aggregateAttempts(attempts.map((a) => a.status));

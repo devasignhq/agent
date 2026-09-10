@@ -29,6 +29,7 @@ import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format
 import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, VerifyStageUsage } from "../types.js";
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
+import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, type ImportAllowList } from "./imports.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
@@ -45,6 +46,7 @@ export const NO_LEVEL_REASON = "planner could not produce a test at an allowed l
 export const RETIRED_REASON = "could not produce a stable test (retired after repeated flakes)";
 export const PLAN_CUT_OFF_REASON = "the test plan was cut off before this criterion was covered";
 export const PLAN_UNUSABLE_REASON = "the planner did not return a usable test plan";
+export const MISSING_PACKAGE_REASON = "proving this needs a test package this repository does not have";
 
 export type PlannerLLM = (args: { system: string; messages: LLMMessage[]; maxTokens: number; tool: StructuredTool }) => Promise<StructuredResult>;
 
@@ -65,6 +67,9 @@ export type PlanPolicy = {
   e2ePolicy: "auto" | "always" | "never";
   e2eAllowed: boolean;
   bootConfigured: boolean;
+  // Whether the repo has anything to render a component with. True when unknown, so a
+  // detection blind spot never closes a rung that is open today.
+  componentCapable: boolean;
   apiOnly: boolean;
   maxLevel: Map<string, TestLevel>;
   // Test files this PR adds or changes. They ship inside the change under review,
@@ -154,7 +159,7 @@ export function planPolicy(args: {
     if (kind === "ui") maxLevel.set(c.id, e2eAllowed ? "e2e" : "component");
     else maxLevel.set(c.id, apiOnly ? "integration" : "component");
   }
-  return { e2ePolicy, e2eAllowed, bootConfigured, apiOnly, maxLevel, prAuthoredTests: new Set(args.touched.filter(isTestPath)) };
+  return { e2ePolicy, e2eAllowed, bootConfigured, componentCapable: hasRenderStack(args.setup), apiOnly, maxLevel, prAuthoredTests: new Set(args.touched.filter(isTestPath)) };
 }
 
 // The planner's paths come from a model reading an attacker-influenced diff, so
@@ -182,13 +187,7 @@ export function normalizeGeneratedPath(p: string, runner: TestRunner): { path: s
 // Every match is gated on code-spans.ts: only a specifier whose own quotes open a
 // literal in code position is rewritten, so module-looking text inside a string,
 // a comment, or a template literal is left as the data it is.
-const LEAD = [
-  String.raw`(?:^|\n)[ \t]*(?:import|export)[^'"\`]*?\bfrom\s*`,
-  String.raw`(?:^|\n)[ \t]*import\s*`,
-  String.raw`\b(?:import|require(?:\.resolve)?)\s*\(\s*`,
-  String.raw`\b(?:\w+\.)*(?:mock\.module|unstable_mockModule|(?:create|gen)MockFromModule|deepUnmock|(?:do|un|set|dont|doUn)?[Mm]ock|(?:import|require)(?:Actual|Mock))\s*\(\s*`,
-].join("|");
-const RELATIVE_IMPORT = new RegExp(`(${LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`]*)?)\\2`, "g");
+const RELATIVE_IMPORT = new RegExp(`(${IMPORT_LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`]*)?)\\2`, "g");
 
 const withoutExt = (p: string): string => p.replace(/\.[cm]?[jt]sx?$/, "");
 
@@ -237,12 +236,31 @@ export function rebaseRelativeImports(
   });
 }
 
-export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
-  return normalizeManifestTests(raw, knownIds, fallbackRunner).filter((t) => t.origin === "existing" || t.content);
+// vitest and jest are spawned from the repo's own node_modules; the CLI supplies
+// playwright and the tsx behind node-test/bundled, so only those two can be missing.
+const REPO_INSTALLED_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vitest", "jest"]);
+const JS_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vitest", "jest", "node-test", "bundled"]);
+
+export function runnerAvailable(runner: TestRunner, setup: DetectedSetup): boolean {
+  // No frameworks detected at all is a blind spot, not a repo without test tooling.
+  if (!REPO_INSTALLED_RUNNERS.has(runner) || !setup.frameworks.length) return true;
+  return setup.frameworks.some((f) => f.name === runner);
+}
+
+/** The runner a JS test can actually be spawned with. Never a python or go one. */
+function jsRunnerFor(setup: DetectedSetup): TestRunner {
+  const f = fallbackRunnerFor(setup);
+  return JS_RUNNERS.has(f) ? f : "bundled";
+}
+
+export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner, setup?: DetectedSetup): RawPlanTest[] {
+  return normalizeManifestTests(raw, knownIds, fallbackRunner, setup).filter((t) => t.origin === "existing" || t.content);
 }
 
 // Manifest entries carry no content for generated tests; the authoring step fills it in.
-export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
+// `setup` is optional on the same terms as everything else here: absent means we cannot
+// know what the repo has, so the runner the model picked stands.
+export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner, setup?: DetectedSetup): RawPlanTest[] {
   const list = (raw as { tests?: unknown })?.tests;
   if (!Array.isArray(list)) return [];
   const out: RawPlanTest[] = [];
@@ -253,7 +271,10 @@ export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fall
     if (!path || !ids.length) continue;
     const origin = o.origin === "existing" ? "existing" : "generated";
     const level = LEVELS.includes(o.level as TestLevel) ? (o.level as TestLevel) : "unit";
-    const runner = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
+    const picked = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
+    // Coerce rather than drop: the criterion stays covered. Before normalizeGeneratedPath,
+    // which keys the path prefix off the runner.
+    const runner = origin === "generated" && setup && !runnerAvailable(picked, setup) ? jsRunnerFor(setup) : picked;
     const content = typeof o.content === "string" && o.content.trim() ? o.content : null;
     const moved = origin === "generated" ? normalizeGeneratedPath(path, runner) : null;
     const safe = origin === "generated" ? moved?.path : path.replace(/^\.\//, "");
@@ -344,9 +365,10 @@ export function mayEscalateToBrowser(t: RawPlanTest, policy: PlanPolicy): boolea
  */
 export function hasUntriedRung(criterionId: string, policy: PlanPolicy): boolean {
   const cap = policy.maxLevel.get(criterionId);
-  // The component rung stays open with no boot config: a UI criterion can still be
-  // rendered and asserted on, so waving it off is worth one re-ask.
-  return cap === "e2e" || (cap === "component" && !policy.apiOnly);
+  // The component rung stays open with no boot config — but only where the repo can
+  // actually render; re-asking otherwise just pressures the model into an import it
+  // does not have.
+  return cap === "e2e" || (cap === "component" && !policy.apiOnly && policy.componentCapable);
 }
 
 /** Drop existing tests that aren't in the tree (hallucinated), tests this PR wrote, and tests above their allowed level. */
@@ -424,10 +446,12 @@ export function buildCommands(tests: PlanTest[]): PlanCommand[] {
 
 function renderSetup(setup: DetectedSetup, yml: DevasignVerifyConfig | null): string {
   const fw = setup.frameworks.map((f) => `${f.name}${f.version ? `@${f.version}` : ""}${f.configPath ? ` (${f.configPath})` : ""}`).join(", ") || "none detected";
+  const deps = setup.dependencies ?? [];
   return [
     `- Languages: ${setup.languages.join(", ") || "unknown"}`,
     `- Package manager: ${setup.packageManager ?? "unknown"}`,
     `- Test frameworks: ${fw}`,
+    deps.length ? `- Installed packages (the ONLY ones a test may import): ${deps.join(", ")}` : "- Installed packages: unknown (no package.json seen)",
     `- Test commands: ${setup.testCommands.join("; ") || "none"}`,
     `- Services: ${setup.services.join(", ") || "none"}`,
     setup.monorepo ? `- Monorepo: ${setup.monorepo.tool} (${setup.monorepo.packages.join(", ")})` : "",
@@ -447,7 +471,10 @@ function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup): 
     ...ids.map((id) => `- [${id}]: max level ${policy.maxLevel.get(id)}`),
     policy.e2eAllowed
       ? "- Browser (e2e) tests: available"
-      : `- Browser (e2e) tests: not available (${policy.e2ePolicy === "never" ? "e2e: never" : NO_BOOT_REASON}). UI criteria remain testable at component level: render the component with its real state and assert on the DOM. Mark a UI criterion unverifiable only if no component test could decide it.`,
+      : `- Browser (e2e) tests: not available (${policy.e2ePolicy === "never" ? "e2e: never" : NO_BOOT_REASON}).` +
+        (policy.componentCapable
+          ? " UI criteria remain testable at component level: render the component with its real state and assert on the DOM. Mark a UI criterion unverifiable only if no component test could decide it."
+          : " No component-test environment either — the repository has no render library or DOM environment among its installed packages, and nothing may be added. Prove what you can through the plain modules the component delegates to, in the repo's own convention; mark a UI criterion unverifiable only when no such test could decide it."),
     `- Diff scope: ${policy.apiOnly ? "api-only (no frontend files touched)" : "includes frontend files"}`,
     // Without this the model reads "Test frameworks: vitest" and rules the
     // browser out, even where the runner would have supplied one.
@@ -541,10 +568,24 @@ function validateManifest(input: unknown): Validation<PlanManifest> {
 }
 const manifestRepair = (reason: string) => `Your previous answer could not be used: ${reason}. Call ${planManifestTool.name} now with the complete plan.`;
 
-function validateTestFile(input: unknown): Validation<{ content: string }> {
-  const content = (input as { content?: unknown } | null)?.content;
-  if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "content is empty" };
-  return { ok: true, value: { content } };
+// retryStructured allows exactly one repair pass, so the reason has to carry everything
+// the model needs to rewrite the file — including what it may import instead.
+export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void): (input: unknown) => Validation<{ content: string }> {
+  return (input) => {
+    const content = (input as { content?: unknown } | null)?.content;
+    if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "content is empty" };
+    const bad = disallowedImports(content, allow);
+    if (!bad.length) return { ok: true, value: { content } };
+    onReject?.(bad);
+    const available = [...allow.names].sort().join(", ") || "none";
+    return {
+      ok: false,
+      reason:
+        `it imports ${bad.map((b) => `"${b}"`).join(", ")}, which this repository does not have — the runner installs nothing, so the suite would fail to load. ` +
+        `Rewrite it using only these packages: ${available}; Node builtins; and the runner's own assertions. ` +
+        "If the criterion cannot be proven without a package that is missing, return a file that proves as much of it as you can",
+    };
+  };
 }
 const testFileRepair = (reason: string) => `Your previous answer could not be used: ${reason}. Call ${planTestFileTool.name} now with the complete file contents.`;
 
@@ -609,7 +650,9 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const readFile = deps.readFile ?? defaultReadFile;
   const [ymlRaw, packageJson, envExample] = await Promise.all([
     treePaths.has(".devasign.yml") ? readFile(install, repo, ".devasign.yml", run.sha) : Promise.resolve(null),
-    !repo.verify?.detected && treePaths.has("package.json") ? readFile(install, repo, "package.json", run.sha) : Promise.resolve(null),
+    // Always at run.sha, even when a runner has reported: a PR that adds a dependency
+    // must not have its own test judged against the list from before it.
+    treePaths.has("package.json") ? readFile(install, repo, "package.json", run.sha) : Promise.resolve(null),
     !repo.verify?.detected && treePaths.has(".env.example") ? readFile(install, repo, ".env.example", run.sha) : Promise.resolve(null),
   ]);
   const yml = parseDevasignVerify(ymlRaw);
@@ -618,7 +661,13 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
       verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: ymlRaw.slice(0, 20_000), parsed: yml, sha: run.sha } },
     });
   }
-  const setup = repo.verify?.detected ?? inferSetupFromTree(paths, { packageJson, envExample });
+  const inferred = inferSetupFromTree(paths, { packageJson, envExample });
+  const detected = repo.verify?.detected ?? inferred;
+  // The runner's list unions the workspaces, the head manifest is current: take both,
+  // and leave it absent when neither could be read so the allow-list stays off.
+  const dependencies =
+    detected.dependencies || inferred.dependencies ? [...new Set([...(detected.dependencies ?? []), ...(inferred.dependencies ?? [])])].sort() : undefined;
+  const setup: DetectedSetup = { ...detected, ...(dependencies ? { dependencies } : {}) };
   const touched = diffPaths(diff);
   const wf = effectiveWorkflow(repo);
   const policy = planPolicy({ criteria, wfE2e: wf.verify?.e2e ?? "auto", yml, setup, touched });
@@ -727,6 +776,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const attempts: PlanAttempts = { manifest: [], bodies: {} };
         const cutOff = new Set<string>();
         const unusable = new Set<string>();
+        const missingPackage = new Set<string>();
         const lose = (ids: Iterable<string>, stop: string | null) => {
           for (const id of ids) (stop === "max_tokens" ? cutOff : unusable).add(id);
         };
@@ -737,7 +787,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         attempts.manifest = first.attempts;
         if (!first.value) lose(knownIds, first.lastStopReason);
         const parsed = first.value ?? {};
-        let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner);
+        let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner, ctx.setup);
         const unverifiable = new Map(normalizeUnverifiable(parsed, knownIds).map((u) => [u.criterionId, u.reason]));
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
         const dropped = violations.map((v) => `${v.test.path} (${v.reason})`);
@@ -764,7 +814,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           }
           const secondJson = second.value ?? {};
           const replanKnown = new Set(replanIds);
-          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner);
+          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner, ctx.setup);
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
           for (const u of normalizeUnverifiable(secondJson, replanKnown)) unverifiable.set(u.criterionId, u.reason);
@@ -794,11 +844,18 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const bodyFailed: string[] = [];
         const generated = survivors.filter((t) => t.origin === "generated");
         const author = async (t: (typeof survivors)[number]) => {
+          // Per test, not per run: the allow-list depends on t.runner and the pool runs
+          // three of these at once.
+          let rejected: string[] = [];
+          const validate = makeTestFileValidator(buildImportAllowList(ctx.setup, t.runner), (bad) => {
+            rejected = bad;
+          });
           try {
-            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t), planTestFileTool, BODY_BUDGETS, validateTestFile, testFileRepair);
+            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
             attempts.bodies[t.path] = r.attempts;
             if (r.value) return void authored.set(t, r.value.content);
             bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
+            if (rejected.length) for (const id of t.criterionIds) missingPackage.add(id);
             lose(t.criterionIds, r.lastStopReason);
           } catch (err) {
             bodyFailed.push(`${t.path} (${err instanceof Error ? err.message : String(err)})`.slice(0, 300));
@@ -849,6 +906,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             const reason = noBoot && BOOT_REASON_HINT.test(cited) ? NO_BOOT_REASON : cited;
             planUnverifiable.push({ criterionId: c.id, reason, ...(reason === NO_BOOT_REASON ? { fixUrl } : {}) });
           } else if (cutOff.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_CUT_OFF_REASON });
+          else if (missingPackage.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: MISSING_PACKAGE_REASON });
           else if (unusable.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_UNUSABLE_REASON });
           else if (noBoot) planUnverifiable.push({ criterionId: c.id, reason: NO_BOOT_REASON, fixUrl });
           else if (isUi && ctx.policy.e2ePolicy === "never")

@@ -51,6 +51,9 @@ export type DetectedSetup = {
   packageManager?: "npm" | "pnpm" | "yarn" | "bun" | "pip" | "poetry" | "go" | null;
   monorepo?: { tool: "pnpm" | "turbo" | "nx" | "workspaces" | null; packages: string[] } | null;
   frameworks: DetectedFramework[];
+  // Declared package names (dependencies + devDependencies). Absent on rows stored
+  // before this field existed, so read it as `?? []`.
+  dependencies?: string[];
   testCommands: string[];
   envExampleVars: string[];
   existingWorkflows: string[];

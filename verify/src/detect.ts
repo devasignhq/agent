@@ -58,6 +58,17 @@ function readText(root: string, rel: string): string | null {
   }
 }
 
+export function manifestNames(text: string | null | undefined): string[] {
+  if (!text) return [];
+  try {
+    const j = JSON.parse(text);
+    // A workspace package's own name resolves too, and is usually imported by it.
+    return [...Object.keys(j?.dependencies || {}), ...Object.keys(j?.devDependencies || {}), ...(typeof j?.name === "string" ? [j.name] : [])];
+  } catch {
+    return [];
+  }
+}
+
 export function envVarNames(text: string | null): string[] {
   if (!text) return [];
   const out = new Set<string>();
@@ -102,6 +113,17 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
   }
   const deps: Record<string, string> = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
   const dep = (name: string) => (name in deps ? String(deps[name]).replace(/^[\^~>=<\s]+/, "") : undefined);
+  // A generated test resolves against the whole install, so a workspace package's
+  // dependencies — and its own name — are as reachable as the root's.
+  const dependencies = pkg
+    ? [
+        ...new Set(
+          paths
+            .filter((p) => /^[^/]+\/[^/]+\/package\.json$/.test(p))
+            .reduce((acc, p) => acc.concat(manifestNames(readText(root, p))), Object.keys(deps))
+        ),
+      ].sort()
+    : undefined;
 
   const langCounts = new Map<string, number>();
   for (const p of paths) {
@@ -158,6 +180,7 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
     packageManager,
     monorepo,
     frameworks,
+    dependencies,
     testCommands,
     envExampleVars: envVars,
     existingWorkflows: paths.filter((p) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p)),
