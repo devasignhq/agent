@@ -6,12 +6,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runnerAvailable, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
-import type { PlanTest } from "./contract.js";
+import type { DetectedSetup, PlanTest } from "./contract.js";
 import { ADOPT_DIR } from "./onboarding/job.js";
 
 const DIFF = ["diff --git a/src/handler.ts b/src/handler.ts", "--- a/src/handler.ts", "+++ b/src/handler.ts", "@@ -1 +1,2 @@", " export function handler() {}", "+export function refunds() { return 1; }"].join("\n");
@@ -275,6 +275,50 @@ test("a body still importing a missing package after repair is dropped; its crit
   } finally {
     s.cleanup();
   }
+});
+
+test("a runner the repo cannot spawn is coerced, not planned; a detected one is kept", async () => {
+  const plannedRunner = async (pkg: Record<string, string> | null) => {
+    const s = seed([crit("1")]);
+    const files = pkg ? { "package.json": PKG(pkg) } : undefined;
+    const { deps: d } = deps({ files, responses: [{ tests: [gen("1", "unit", { runner: "vitest" })] }] });
+    try {
+      await runVerifyPlan(s.run.id, d);
+      const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+      return { runner: plan.tests[0].runner, path: plan.tests[0].path, cmd: plan.commands[0].cmd };
+    } finally {
+      s.cleanup();
+    }
+  };
+
+  // npx --no-install vitest cannot spawn in a repo that has no vitest.
+  const coerced = await plannedRunner({ jest: "^29" });
+  assert.equal(coerced.runner, "jest", "coerced to what the repo actually has");
+  assert.match(coerced.cmd, /jest/);
+  assert.equal(coerced.path, `${GENERATED_TEST_PREFIX}/criterion-1.test.ts`, "coercion must not move the file");
+
+  assert.equal((await plannedRunner({ vitest: "^3" })).runner, "vitest", "a detected runner is the model's to pick");
+  assert.equal((await plannedRunner(null)).runner, "vitest", "no frameworks detected is a blind spot, not a veto");
+});
+
+test("runnerAvailable only judges the runners that come from the repo's own node_modules", () => {
+  const setup = (names: DetectedSetup["frameworks"][number]["name"][]): DetectedSetup => ({
+    languages: [], packageManager: null, monorepo: null, frameworks: names.map((name) => ({ name })), testCommands: [], envExampleVars: [], existingWorkflows: [], services: [],
+  });
+  assert.equal(runnerAvailable("vitest", setup(["jest"])), false);
+  assert.equal(runnerAvailable("jest", setup(["jest"])), true);
+  assert.equal(runnerAvailable("vitest", setup([])), true, "nothing detected — do not enforce");
+  for (const r of ["playwright", "node-test", "bundled", "pytest", "go"] as const) {
+    assert.equal(runnerAvailable(r, setup(["jest"])), true, `${r} does not come from the repo's node_modules`);
+  }
+});
+
+test("a python test is never coerced onto a JS runner", () => {
+  const setup: DetectedSetup = {
+    languages: ["python"], packageManager: "pip", monorepo: null, frameworks: [{ name: "pytest" }], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [],
+  };
+  const raw = { tests: [{ path: "test_x.py", content: "def test_x(): pass\n", criterionIds: ["1"], level: "unit", origin: "generated", runner: "pytest", targetFiles: [] }] };
+  assert.equal(normalizeRawTests(raw, new Set(["1"]), "pytest", setup)[0].runner, "pytest");
 });
 
 test("flake history: a quarantined signature is regenerated at a new strategy; a retired one is dropped", async () => {

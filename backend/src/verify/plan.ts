@@ -236,12 +236,31 @@ export function rebaseRelativeImports(
   });
 }
 
-export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
-  return normalizeManifestTests(raw, knownIds, fallbackRunner).filter((t) => t.origin === "existing" || t.content);
+// vitest and jest are spawned from the repo's own node_modules; the CLI supplies
+// playwright and the tsx behind node-test/bundled, so only those two can be missing.
+const REPO_INSTALLED_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vitest", "jest"]);
+const JS_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vitest", "jest", "node-test", "bundled"]);
+
+export function runnerAvailable(runner: TestRunner, setup: DetectedSetup): boolean {
+  // No frameworks detected at all is a blind spot, not a repo without test tooling.
+  if (!REPO_INSTALLED_RUNNERS.has(runner) || !setup.frameworks.length) return true;
+  return setup.frameworks.some((f) => f.name === runner);
+}
+
+/** The runner a JS test can actually be spawned with. Never a python or go one. */
+function jsRunnerFor(setup: DetectedSetup): TestRunner {
+  const f = fallbackRunnerFor(setup);
+  return JS_RUNNERS.has(f) ? f : "bundled";
+}
+
+export function normalizeRawTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner, setup?: DetectedSetup): RawPlanTest[] {
+  return normalizeManifestTests(raw, knownIds, fallbackRunner, setup).filter((t) => t.origin === "existing" || t.content);
 }
 
 // Manifest entries carry no content for generated tests; the authoring step fills it in.
-export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner): RawPlanTest[] {
+// `setup` is optional on the same terms as everything else here: absent means we cannot
+// know what the repo has, so the runner the model picked stands.
+export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fallbackRunner: TestRunner, setup?: DetectedSetup): RawPlanTest[] {
   const list = (raw as { tests?: unknown })?.tests;
   if (!Array.isArray(list)) return [];
   const out: RawPlanTest[] = [];
@@ -252,7 +271,10 @@ export function normalizeManifestTests(raw: unknown, knownIds: Set<string>, fall
     if (!path || !ids.length) continue;
     const origin = o.origin === "existing" ? "existing" : "generated";
     const level = LEVELS.includes(o.level as TestLevel) ? (o.level as TestLevel) : "unit";
-    const runner = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
+    const picked = RUNNERS.has(String(o.runner)) ? (o.runner as TestRunner) : level === "e2e" ? "playwright" : fallbackRunner;
+    // Coerce rather than drop: the criterion stays covered. Before normalizeGeneratedPath,
+    // which keys the path prefix off the runner.
+    const runner = origin === "generated" && setup && !runnerAvailable(picked, setup) ? jsRunnerFor(setup) : picked;
     const content = typeof o.content === "string" && o.content.trim() ? o.content : null;
     const moved = origin === "generated" ? normalizeGeneratedPath(path, runner) : null;
     const safe = origin === "generated" ? moved?.path : path.replace(/^\.\//, "");
@@ -765,7 +787,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         attempts.manifest = first.attempts;
         if (!first.value) lose(knownIds, first.lastStopReason);
         const parsed = first.value ?? {};
-        let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner);
+        let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner, ctx.setup);
         const unverifiable = new Map(normalizeUnverifiable(parsed, knownIds).map((u) => [u.criterionId, u.reason]));
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
         const dropped = violations.map((v) => `${v.test.path} (${v.reason})`);
@@ -792,7 +814,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           }
           const secondJson = second.value ?? {};
           const replanKnown = new Set(replanIds);
-          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner);
+          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner, ctx.setup);
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
           for (const u of normalizeUnverifiable(secondJson, replanKnown)) unverifiable.set(u.criterionId, u.reason);
