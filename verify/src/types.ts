@@ -1,6 +1,16 @@
 // Wire contract with the DevAsign API (/v1). Mirrors backend/src/verify/contract.ts;
 // additive changes only, kept in sync by hand.
-export const CLI_VERSION = "1.2.0";
+import { createRequire } from "node:module";
+
+// Substituted from package.json at build time (scripts/build.mjs), which folds this
+// to a literal and drops the tsx-only fallback below. Hand-maintaining it drifted once.
+declare const __CLI_VERSION__: string | undefined;
+
+function manifestVersion(): string {
+  return createRequire(import.meta.url)("../package.json").version;
+}
+
+export const CLI_VERSION: string = typeof __CLI_VERSION__ === "string" ? __CLI_VERSION__ : manifestVersion();
 export const API_VERSION = 1;
 
 export type TestLevel = "unit" | "integration" | "component" | "e2e";
