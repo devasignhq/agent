@@ -1,0 +1,32 @@
+# Added by DevAsign. Runs DevAsign's generated acceptance tests for each pull
+# request inside this CI and reports per-criterion evidence on the PR.
+# Secrets stay here: DevAsign never receives them. Edit freely.
+# devasign-workflow: v2
+name: DevAsign verify
+on:
+  pull_request:
+    types:
+      - opened
+      - synchronize
+      - reopened
+  repository_dispatch:
+    types:
+      - devasign-verify
+permissions:
+  contents: read
+  id-token: write
+concurrency:
+  group: devasign-verify-${{ github.event.pull_request.number || github.event.client_payload.pr }}
+  cancel-in-progress: true
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.event.client_payload.sha }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: DevAsign verify
+        uses: devasignhq/verify-action@v1
