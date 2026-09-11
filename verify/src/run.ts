@@ -8,6 +8,7 @@ import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js"
 import { diagnosePlaywrightOutput, preflight } from "./doctor.js";
 import { log, setOutput } from "./log.js";
 import type { TokenSource } from "./oidc.js";
+import { writeModuleTypeShims } from "./module-type.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
 import { CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
@@ -81,6 +82,9 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
     if (t.origin !== "generated" || !t.content) continue;
     const full = ws.write(t.path, t.content);
     artifacts.push({ clientRef: `test_file:${t.id}`, kind: "test_file", path: full, displayPath: t.path, contentType: "text/plain", testId: t.id, criterionIds: t.criterionIds });
+  }
+  for (const s of writeModuleTypeShims(ws, plan.tests)) {
+    log.info(`${s.dir}: declared "type": "${s.type}" so the tests relocated there load as they were written`);
   }
   for (const t of plan.tests) {
     if (t.origin === "existing" && !existsSync(path.resolve(ws.root, t.path))) {
