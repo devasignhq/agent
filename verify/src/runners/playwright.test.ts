@@ -139,6 +139,30 @@ test("a file whose second test always fails is a failure, not a flake", () => {
   assert.equal(out.attempts.length, 3, "every result is still kept as evidence");
 });
 
+// bishopBethel/fundsflow#23: a timed-out test, then a sibling that passed, left the
+// file's error empty and the judge wrote "test could not run: error".
+test("a file's error comes from the test behind its status, not the last test to run", () => {
+  const ws = new Workspace(mkdtempSync(path.join(os.tmpdir(), "dv-pw-err-")));
+  const file = ".devasign/tests/e2e/canvas-edge-color-bar.spec.ts";
+  const planned = [{ id: "t1", path: file, criterionIds: ["1"], level: "e2e", origin: "generated", runner: "playwright" } as PlanTest];
+  const timedOut = { status: "timedOut", retry: 0, duration: 30_000, error: { message: "Test timeout of 30000ms exceeded." } };
+  const assertion = { message: "Error: expect(locator).toBeVisible() failed" };
+
+  const [broken] = mapReport({ suites: [{ file, specs: [
+    { title: "colors the bar", file, tests: [{ results: [timedOut] }] },
+    { title: "draws the edge", file, tests: [{ results: [{ status: "passed", retry: 0, duration: 800 }] }] },
+  ] }] }, planned, ws, [], "");
+  assert.equal(broken.status, "error");
+  assert.equal(broken.error, "Test timeout of 30000ms exceeded.");
+
+  const [failing] = mapReport({ suites: [{ file, specs: [
+    { title: "colors the bar", file, tests: [{ results: [{ status: "failed", retry: 0, duration: 900, error: assertion }, { status: "failed", retry: 1, duration: 900, error: assertion }] }] },
+    { title: "draws the edge", file, tests: [{ results: [timedOut] }] },
+  ] }] }, planned, ws, [], "");
+  assert.equal(failing.status, "fail");
+  assert.equal(failing.error, assertion.message, "the assertion, not the sibling's timeout");
+});
+
 test("playwrightBrowsersRoot honours an explicit PLAYWRIGHT_BROWSERS_PATH", () => {
   assert.equal(playwrightBrowsersRoot({ PLAYWRIGHT_BROWSERS_PATH: "/opt/pw" } as any, "/home/x"), "/opt/pw");
 });

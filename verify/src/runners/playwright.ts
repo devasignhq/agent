@@ -194,7 +194,8 @@ export function mapReport(report: PwReport, tests: PlanTest[], ws: Workspace, ar
       status,
       attempts,
       durationMs: attempts.reduce((s, a) => s + a.durationMs, 0),
-      error: status === "pass" ? undefined : attempts[attempts.length - 1]?.error,
+      // Not the last attempt: in a multi-test file that can be a sibling that passed.
+      error: attempts.find((a) => a.status === status)?.error,
       artifactIds: [],
     });
   }
