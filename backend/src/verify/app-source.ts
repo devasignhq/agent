@@ -1,5 +1,6 @@
-// A browser test drives the running app, so its author needs the screens the flow passes
-// through — the entry and the components it mounts — or every selector is a guess.
+// What a generated test's author is shown of the code at the PR head, since a name it never saw
+// is a guess: for a browser test, the screens the flow passes through — the entry and the
+// components it mounts; for a unit or component test, the code it calls and what that imports.
 import { posix } from "node:path";
 import { isTestPath } from "./detect.js";
 
@@ -41,22 +42,19 @@ export function localImports(from: string, content: string, tree: ReadonlySet<st
   return [...out];
 }
 
-/** The test's own target files first, then the screens from the entry down, then the modules they import. */
-export async function appSourceFor(args: {
-  targetFiles: string[];
-  tree: ReadonlySet<string>;
-  read: (path: string) => Promise<string | null>;
-  limits?: typeof APP_SOURCE_LIMITS;
-}): Promise<SourceFile[]> {
-  const lim = args.limits ?? APP_SOURCE_LIMITS;
+type Limits = typeof APP_SOURCE_LIMITS;
+type Reader = (path: string) => Promise<string | null>;
+
+// The files an author is shown, read breadth first within one budget.
+function crawler(tree: ReadonlySet<string>, readFile: Reader, lim: Limits) {
   const seen = new Set<string>();
   const out: SourceFile[] = [];
   let total = 0;
   const take = async (paths: string[]) => {
     // Deduped before the seen check: two files in one batch often import the same module.
-    const fresh = [...new Set(paths)].filter((p) => args.tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"));
+    const fresh = [...new Set(paths)].filter((p) => tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"));
     for (const p of fresh) seen.add(p);
-    const read = await Promise.all(fresh.map(async (path) => ({ path, content: await args.read(path) })));
+    const read = await Promise.all(fresh.map(async (path) => ({ path, content: await readFile(path) })));
     return read.filter((f): f is { path: string; content: string } => typeof f.content === "string");
   };
   const add = (f: { path: string; content: string }): boolean => {
@@ -74,13 +72,19 @@ export async function appSourceFor(args: {
       const next: string[] = [];
       for (const f of frontier) {
         if (!add(f)) return false;
-        next.push(...localImports(f.path, f.content, args.tree).filter(follow));
+        next.push(...localImports(f.path, f.content, tree).filter(follow));
       }
       if (depth >= lim.depth) break;
       frontier = await take(next);
     }
     return true;
   };
+  return { out, take, crawl };
+}
+
+/** The test's own target files first, then the screens from the entry down, then the modules they import. */
+export async function appSourceFor(args: { targetFiles: string[]; tree: ReadonlySet<string>; read: Reader; limits?: Limits }): Promise<SourceFile[]> {
+  const { out, take, crawl } = crawler(args.tree, args.read, args.limits ?? APP_SOURCE_LIMITS);
   const isUi = (p: string) => UI_FILE.test(p);
   const indexHtml = args.tree.has("index.html") ? await args.read("index.html") : null;
   if (!(await crawl(await take([...args.targetFiles, ...entryPaths(args.tree, indexHtml)]), isUi))) return out;
@@ -88,6 +92,20 @@ export async function appSourceFor(args: {
   // and a name the author never saw is still a guess however well it knows the screen.
   const imported = out.flatMap((f) => localImports(f.path, f.content, args.tree)).filter((p) => !isUi(p));
   await crawl(await take(imported), (p) => !isUi(p));
+  return out;
+}
+
+// A unit or component test calls the code directly, so its author needs that code and what it
+// leans on — the constants, types and contexts it imports — rather than the screens around it.
+export const UNIT_SOURCE_LIMITS: Limits = { files: 16, fileChars: 12_000, totalChars: 48_000, depth: 2 };
+
+/**
+ * The runner's config — whether it names a DOM environment or a setup file decides what the test
+ * must declare itself — then the test's target files and what they import, two levels down.
+ */
+export async function sourceUnderTest(args: { targetFiles: string[]; config?: string; tree: ReadonlySet<string>; read: Reader; limits?: Limits }): Promise<SourceFile[]> {
+  const { out, take, crawl } = crawler(args.tree, args.read, args.limits ?? UNIT_SOURCE_LIMITS);
+  await crawl(await take([...(args.config ? [args.config] : []), ...args.targetFiles]), () => true);
   return out;
 }
 

@@ -2,7 +2,7 @@
 //   node --import tsx/esm --test src/verify/app-source.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { appSourceFor, entryPaths, localImports, persistKey, waysIn } from "./app-source.js";
+import { appSourceFor, entryPaths, localImports, persistKey, sourceUnderTest, waysIn } from "./app-source.js";
 
 const files: Record<string, string> = {
   "index.html": '<div id="root"></div>\n<script type="module" src="/src/main.tsx"></script>\n',
@@ -87,6 +87,26 @@ test("labels, templates and sample data reach the author after the screens that 
   ]);
   const screensOnly = await appSourceFor({ targetFiles: [], tree: appTree, read: appRead, limits: { files: 4, fileChars: 12_000, totalChars: 90_000, depth: 8 } });
   assert.deepEqual(screensOnly.map((f) => f.path), ["src/main.tsx", "src/App.tsx", "src/components/Palette.tsx", "src/components/TemplateMenu.tsx"], "a short budget drops data before screens");
+});
+
+test("a unit or component test's author sees the runner's config, then the code it calls and what that imports, two levels down", async () => {
+  const f: Record<string, string> = {
+    "vitest.config.ts": "export default { test: { environment: 'node' } }\n",
+    "src/lib/edgeStyle.ts": "import { EDGE_COLORS } from '../config/edgeColors'\nimport type { Line } from '../types'\n",
+    "src/lib/edgeStyle.test.ts": "import './edgeStyle'\n",
+    "src/config/edgeColors.ts": "import { brand } from './brand'\nexport const EDGE_COLORS = [{ name: 'Green', color: '#16a34a' }]\n",
+    "src/config/brand.ts": "import { deeper } from './deeper'\nexport const brand = 1\n",
+    "src/config/deeper.ts": "export const deeper = 1\n",
+    "src/types.ts": "export type Line = {}\n",
+  };
+  const out = await sourceUnderTest({
+    targetFiles: ["src/lib/edgeStyle.ts", "src/lib/edgeStyle.test.ts"],
+    config: "vitest.config.ts",
+    tree: new Set(Object.keys(f)),
+    read: async (p) => f[p] ?? null,
+  });
+  assert.deepEqual(out.map((s) => s.path), ["vitest.config.ts", "src/lib/edgeStyle.ts", "src/config/edgeColors.ts", "src/types.ts", "src/config/brand.ts"]);
+  assert.match(out[2].content, /#16a34a/, "the values a test would otherwise guess");
 });
 
 test("ways in: built-in collections with the screens that show them, and the keys state is saved under", () => {

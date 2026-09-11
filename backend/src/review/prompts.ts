@@ -1123,7 +1123,11 @@ export function testFileSystemPrompt(): string {
     "assert on the DOM — through the framework's own renderer (react-dom's createRoot inside act) when no testing " +
     "library is installed, and with the runner's environment docblock (e.g. `// @vitest-environment happy-dom`, " +
     "naming a DOM environment the repo has) when its config sets none; where it does not, prove the behaviour " +
-    "through the plain modules the component delegates to, in the repo's own convention. Playwright tests: " +
+    "through the plain modules the component delegates to, in the repo's own convention. Unit and component " +
+    "tests: take every import, export, value, type and context shape from the request's `Source under test` — " +
+    "the code as this PR's head has it, with the runner's config when there is one — never from memory or from a " +
+    "name alone; an expected value that source does not show is a guess that fails a correct change. " +
+    "Playwright tests: " +
     "before writing any setup, find in the request's `App source` every way the app reaches a populated state — " +
     "a template or sample menu, an import, a store key it persists to, a fixture route — and start from the most " +
     "direct one; drive through the UI only the behaviour the criteria are about. Building data by dragging items " +

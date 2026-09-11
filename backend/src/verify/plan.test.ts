@@ -1134,7 +1134,7 @@ test("a head with no verify block plans e2e from the base branch's and hands it 
   }
 });
 
-test("a browser test's author is shown the app it drives; a unit test's author is not", async () => {
+test("a browser test's author is shown the app it drives; a unit test's author, the code it calls", async () => {
   const s = seed([crit("1", "ui"), crit("2")]);
   const files = {
     ".devasign.yml": BOOT_YML,
@@ -1142,6 +1142,7 @@ test("a browser test's author is shown the app it drives; a unit test's author i
     "src/main.tsx": "import App from './App'\nimport { TEMPLATES } from './templates'\n",
     "src/App.tsx": "export default function App() { return <button>Templates</button> }\n",
     "src/templates.ts": "export const TEMPLATES = []\n",
+    "src/handler.ts": "export function handler() { return 1 }\n",
     "package.json": PKG({ "@xyflow/react": "^12.8.2" }),
   };
   const { deps: d, bodyPrompts } = deps({
@@ -1158,6 +1159,8 @@ test("a browser test's author is shown the app it drives; a unit test's author i
     assert.match(browser, /### src\/App\.tsx\n````\nexport default function App\(\) \{ return <button>Templates<\/button> \}/);
     assert.match(browser, /### src\/main\.tsx/);
     assert.doesNotMatch(unit, /## App source/);
+    assert.match(unit, /## Source under test\n.+\n### src\/handler\.ts\n````\nexport function handler\(\) \{ return 1 \}/);
+    assert.doesNotMatch(browser, /## Source under test/);
     // The planner never saw the app; its setup steps would outrank what the source shows.
     assert.doesNotMatch(browser, /^- strategy:/m);
     assert.match(unit, /^- strategy: call the handler$/m);
@@ -1166,6 +1169,32 @@ test("a browser test's author is shown the app it drives; a unit test's author i
     assert.match(browser, /## Ways into a populated state\n.+\n- `TEMPLATES` in src\/templates\.ts — shown by src\/main\.tsx/);
     assert.ok(browser.indexOf("## Ways into") < browser.indexOf("## App source"), "listed ahead of the source it points into");
     assert.doesNotMatch(unit, /## Ways into/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a vitest author sees the Vite config vitest falls back to, then the code under test and what it imports", async () => {
+  const s = seed([crit("1")]);
+  const files = {
+    "package.json": PKG({ vitest: "^3.2.0" }),
+    "vite.config.ts": "export default defineConfig({ plugins: [react()] })\n",
+    "src/handler.ts": "import { RATES } from './rates'\nexport const handler = () => RATES.green\n",
+    "src/rates.ts": "export const RATES = { green: '#16a34a' }\n",
+  };
+  const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, ...Object.keys(files)],
+    files,
+    responses: [{ tests: [gen("1", "unit", { runner: "vitest", targetFiles: ["src/handler.ts"] })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const unit = bodyPrompts.find((p) => /^- runner: vitest$/m.test(p))!;
+    const at = (p: string) => unit.indexOf(`### ${p}\n`);
+    const section = unit.indexOf("## Source under test");
+    assert.ok(section >= 0 && section < at("vite.config.ts"), "the config comes first: it says whether a DOM environment is set");
+    assert.ok(at("vite.config.ts") < at("src/handler.ts") && at("src/handler.ts") < at("src/rates.ts"), "then the code under test, then what it imports");
+    assert.match(unit, /export const RATES = \{ green: '#16a34a' \}/, "the values a test would otherwise guess");
   } finally {
     s.cleanup();
   }

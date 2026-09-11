@@ -30,7 +30,7 @@ import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, Verify
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, type ImportAllowList } from "./imports.js";
-import { appSourceFor, waysIn, type SourceFile } from "./app-source.js";
+import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
 import { specLint } from "./spec-lint.js";
@@ -670,7 +670,15 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
       : "",
     "",
     ...(t.runner === "playwright" ? waysIn(source, ctx.treePaths) : []),
-    ...(source.length ? ["## App source", "What this PR's head renders — build every step and selector of the flow from it.", ...source.map(renderSourceFile)] : []),
+    ...(!source.length
+      ? []
+      : t.runner === "playwright"
+        ? ["## App source", "What this PR's head renders — build every step and selector of the flow from it.", ...source.map(renderSourceFile)]
+        : [
+            "## Source under test",
+            "The code this test calls and what it imports, with the runner's config when it has one, as this PR's head has them. Take every name, value and shape from here.",
+            ...source.map(renderSourceFile),
+          ]),
     ...(t.runner === "playwright" ? libraryNotes(ctx.setup.dependencies) : []),
     `Write the complete file and submit it with ${planTestFileTool.name}.`,
   ]
@@ -922,7 +930,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const authored = new Map<object, string>();
         const bodyFailed: string[] = [];
         const generated = survivors.filter((t) => t.origin === "generated");
-        // Browser files in one plan crawl the same app, so each repo file is read once.
+        // The files in one plan crawl the same code, so each repo file is read once.
         const headReads = new Map<string, Promise<string | null>>();
         const readHead = (p: string) => {
           if (!headReads.has(p)) headReads.set(p, (deps.readFile ?? defaultReadFile)(install, repo, p, run.sha));
@@ -940,7 +948,15 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             t.rebaseFrom ?? t.path
           );
           try {
-            const source = t.runner === "playwright" ? await appSourceFor({ targetFiles: t.targetFiles, tree: ctx.treePaths, read: readHead }).catch(() => []) : [];
+            // vitest reads the Vite config when it has none of its own, and a Vite app keeps its
+            // `test` block there.
+            const config =
+              ctx.setup.frameworks.find((f) => f.name === t.runner)?.configPath ??
+              (t.runner === "vitest" ? [...ctx.treePaths].find((p) => /^vite\.config\.[cm]?[jt]s$/.test(p)) : undefined);
+            const source = await (t.runner === "playwright"
+              ? appSourceFor({ targetFiles: t.targetFiles, tree: ctx.treePaths, read: readHead })
+              : sourceUnderTest({ targetFiles: t.targetFiles, config, tree: ctx.treePaths, read: readHead })
+            ).catch(() => []);
             const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t, source), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
             attempts.bodies[t.path] = r.attempts;
             if (r.value) return void authored.set(t, r.value.content);
