@@ -132,6 +132,13 @@ test("ways in: built-in collections with the screens that show them, and the key
   assert.deepEqual(waysIn([src("src/lib/format.ts", "export const formatMoney = String\n")], new Set(["src/lib/format.ts"])), [], "nothing to start from");
 });
 
+test("persistKey skips the brackets inside a regex or template literal in the creator", () => {
+  // From review: a `)` in a regex character class closed the call early and lost the key.
+  assert.equal(persistKey("export const useS = create(persist((set) => ({ re: /[)]/, x: 1 }), { name: 'kept' }))"), "kept");
+  assert.equal(persistKey("create(persist((set) => ({ parts: (s) => s.split(/[,}]/), half: (n) => n / 2 }), { name: 'kept' }))"), "kept", "a division is not a regex");
+  assert.equal(persistKey("create(persist((set) => ({ label: `)} ${1}` }), { name: 'kept' }))"), "kept");
+});
+
 test("persistKey finds persist's options past a block-bodied creator, a trailing comma and look-alike objects", () => {
   const store = [
     "export const useFlowStore = create<FlowState>()(",

@@ -113,6 +113,24 @@ const STARTER = /(templates?|samples?|examples?|presets?|demos?|fixtures?|starte
 const EXPORTED = /export\s+(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/g;
 const STORAGE_KEY = /localStorage\.(?:setItem|getItem)\(\s*['"]([^'"]+)['"]/g;
 
+// A `/` opens a regex literal, not a division, after an operator, an opening bracket, a comma or
+// `return`. Its brackets are not code: the `)` in `/[)]/` would otherwise close the call early.
+function regexEnd(content: string, at: number): number {
+  let k = at - 1;
+  while (k >= 0 && /\s/.test(content[k])) k--;
+  if (k >= 0 && !"(,=:[!&|?{};+-*%<>~^".includes(content[k]) && !/\breturn$/.test(content.slice(Math.max(0, k - 5), k + 1))) return at;
+  let inClass = false;
+  for (let j = at + 1; j < content.length && content[j] !== "\n"; j++) {
+    const c = content[j];
+    if (c === "\\") j++;
+    else if (c === "[") inClass = true;
+    else if (c === "]") inClass = false;
+    else if (c === "/" && !inClass) return j;
+  }
+  // No closing slash on the line: a division after all.
+  return at;
+}
+
 // zustand's `persist(creator, { name })`. A block-bodied creator, a trailing comma and look-alike
 // `{ name }` objects defeat a single regex, so walk the call's top-level arguments instead.
 export function persistKey(content: string): string | undefined {
@@ -125,6 +143,7 @@ export function persistKey(content: string): string | undefined {
     const ch = content[i];
     if (ch === "/" && content[i + 1] === "/") i = content.indexOf("\n", i) < 0 ? content.length : content.indexOf("\n", i);
     else if (ch === "/" && content[i + 1] === "*") i = content.indexOf("*/", i + 2) < 0 ? content.length : content.indexOf("*/", i + 2) + 1;
+    else if (ch === "/") i = regexEnd(content, i);
     else if (ch === '"' || ch === "'" || ch === "`") {
       let j = i + 1;
       while (j < content.length && content[j] !== ch) j += content[j] === "\\" ? 2 : 1;
