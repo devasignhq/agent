@@ -118,7 +118,7 @@ const STORAGE_KEY = /localStorage\.(?:setItem|getItem)\(\s*['"]([^'"]+)['"]/g;
 function regexEnd(content: string, at: number): number {
   let k = at - 1;
   while (k >= 0 && /\s/.test(content[k])) k--;
-  if (k >= 0 && !"(,=:[!&|?{};+-*%<>~^".includes(content[k]) && !/\breturn$/.test(content.slice(Math.max(0, k - 5), k + 1))) return at;
+  if (k >= 0 && !"(,=:[!&|?{};+-*%<>~^/".includes(content[k]) && !/\breturn$/.test(content.slice(Math.max(0, k - 5), k + 1))) return at;
   let inClass = false;
   for (let j = at + 1; j < content.length && content[j] !== "\n"; j++) {
     const c = content[j];
@@ -129,6 +129,34 @@ function regexEnd(content: string, at: number): number {
   }
   // No closing slash on the line: a division after all.
   return at;
+}
+
+function quoteEnd(content: string, at: number): number {
+  const quote = content[at];
+  let j = at + 1;
+  while (j < content.length && content[j] !== quote) j += content[j] === "\\" ? 2 : 1;
+  return j;
+}
+
+// A template literal runs to its closing backtick, but a `${}` inside it is code that can hold
+// strings and templates of its own: read to the next backtick, `${`(`}` ends the literal early.
+function templateEnd(content: string, at: number): number {
+  for (let j = at + 1; j < content.length; j++) {
+    const c = content[j];
+    if (c === "\\") j++;
+    else if (c === "`") return j;
+    else if (c === "$" && content[j + 1] === "{") {
+      let depth = 0;
+      for (j += 1; j < content.length; j++) {
+        const d = content[j];
+        if (d === "`") j = templateEnd(content, j);
+        else if (d === '"' || d === "'") j = quoteEnd(content, j);
+        else if (d === "{") depth++;
+        else if (d === "}" && --depth === 0) break;
+      }
+    }
+  }
+  return content.length;
 }
 
 // zustand's `persist(creator, { name })`. A block-bodied creator, a trailing comma and look-alike
@@ -144,11 +172,9 @@ export function persistKey(content: string): string | undefined {
     if (ch === "/" && content[i + 1] === "/") i = content.indexOf("\n", i) < 0 ? content.length : content.indexOf("\n", i);
     else if (ch === "/" && content[i + 1] === "*") i = content.indexOf("*/", i + 2) < 0 ? content.length : content.indexOf("*/", i + 2) + 1;
     else if (ch === "/") i = regexEnd(content, i);
-    else if (ch === '"' || ch === "'" || ch === "`") {
-      let j = i + 1;
-      while (j < content.length && content[j] !== ch) j += content[j] === "\\" ? 2 : 1;
-      i = j;
-    } else if ("([{".includes(ch)) depth++;
+    else if (ch === "`") i = templateEnd(content, i);
+    else if (ch === '"' || ch === "'") i = quoteEnd(content, i);
+    else if ("([{".includes(ch)) depth++;
     else if (")]}".includes(ch) && --depth === 0) {
       args.push(content.slice(start, i));
       break;

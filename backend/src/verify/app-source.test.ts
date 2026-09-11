@@ -137,6 +137,10 @@ test("persistKey skips the brackets inside a regex or template literal in the cr
   assert.equal(persistKey("export const useS = create(persist((set) => ({ re: /[)]/, x: 1 }), { name: 'kept' }))"), "kept");
   assert.equal(persistKey("create(persist((set) => ({ parts: (s) => s.split(/[,}]/), half: (n) => n / 2 }), { name: 'kept' }))"), "kept", "a division is not a regex");
   assert.equal(persistKey("create(persist((set) => ({ label: `)} ${1}` }), { name: 'kept' }))"), "kept");
+  assert.equal(persistKey("create(persist((set) => ({ label: `a ${x ? `(` : ''} b` }), { name: 'kept' }))"), "kept", "a template inside another's ${}");
+  // From review: `*` and `%` do belong in the set — after either, a `/` can only open a regex.
+  assert.equal(persistKey("create(persist((set) => ({ n: 2 * /[)]/.source.length }), { name: 'kept' }))"), "kept");
+  assert.equal(persistKey("create(persist((set) => ({ a: (n) => n * 2 / 4, b: (n) => n % 4 / 2 }), { name: 'kept' }))"), "kept", "a division after either is still a division");
 });
 
 test("persistKey finds persist's options past a block-bodied creator, a trailing comma and look-alike objects", () => {
