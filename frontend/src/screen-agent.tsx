@@ -604,7 +604,7 @@ const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
             {v.retired && <span className="pill nit" title="Three flaky runs of this test signature; DevAsign stopped generating it">could not verify reliably</span>}
             {a.implied && <span className="pill nit" title="Implied by the ticket, not stated in it">implied</span>}
             {v.test && <span className="mono mute acv-test">{v.test.level}{v.test.origin === "existing" ? " (existing)" : ""} · {v.test.name}</span>}
-            {v.attempts > 1 && <span className="mono mute acv-test">{v.attempts} attempts</span>}
+            {v.attempts > 1 && <span className="mono mute acv-test">{v.attempts} {v.test?.runner === "playwright" ? "results" : "attempts"}</span>}
             {v.test?.origin === "generated" && onAdopt && v.verdict !== "pending" && (
               adopt && adopt.url
                 ? <a className="mono acv-test" href={adopt.url} target="_blank" rel="noreferrer">adopt PR opened</a>

@@ -32,6 +32,16 @@ test("summaryTable lists every criterion: its test, its planned reason with a fi
   assert.match(rows[2], /^\| 3\. Nothing planned \| — \| unverifiable \| no test planned \|$/);
 });
 
+test("a Playwright file's outcome counts results across its test() blocks, not retries", () => {
+  const pwPlan: RunnerPlan = { ...plan, criteria: [plan.criteria[0]], tests: [{ ...plan.tests[0], path: ".devasign/tests/e2e/cart.spec.ts", level: "e2e", runner: "playwright" }], unverifiable: [] };
+  const pwResults: RunnerResult[] = [
+    { ...results[0], test: ".devasign/tests/e2e/cart.spec.ts", level: "e2e", runner: "playwright", status: "error", attempts: [{ n: 1, status: "error", durationMs: 1, artifactIds: [] }, { n: 2, status: "pass", durationMs: 1, artifactIds: [] }] },
+  ];
+  const row = summaryTable(pwPlan, pwResults).split("\n")[2];
+  assert.match(row, /error \(2 results\)/);
+  assert.doesNotMatch(row, /attempt/);
+});
+
 test("summaryTable with no results still has a row per criterion", () => {
   const rows = summaryTable({ ...plan, tests: [], unverifiable: undefined }, []).split("\n").slice(2);
   assert.equal(rows.length, 3);

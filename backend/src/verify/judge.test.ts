@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { computeVerdicts, FLAKY_REASON, mergeModelVerdicts, runVerifyJudge } from "./judge.js";
+import { buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, runVerifyJudge } from "./judge.js";
 import { createVerifyRun, snapshotCriteriaRevision, updateRun } from "./runs.js";
 import type { Criterion, VerifyArtifact, VerifyPlan } from "../types.js";
 import type { RunnerAttempt, RunnerResult } from "./contract.js";
@@ -198,6 +198,24 @@ test("the reason quotes the attempt behind the result's status, not the last tes
   });
   assert.equal(out[0].reason, `test could not run: ${timeout}`);
   assert.equal(out[1].reason, "assertion failed on the test run: expect(bar).toHaveCSS() failed");
+});
+
+test("the judge's evidence never presents a Playwright file's test() blocks as retries", () => {
+  const timeout = "Test timeout of 30000ms exceeded.";
+  const criteria = [crit("1", "ui"), crit("2")];
+  const results = [
+    result({ runner: "playwright", level: "e2e", test: ".devasign/tests/e2e/canvas-edge-color-bar.spec.ts", testId: "t1", criterionIds: ["1"], status: "error", attempts: [attempt(1, "error", timeout), attempt(2, "pass", "")] }),
+    result({ test: ".devasign/tests/total.test.ts", testId: "t2", criterionIds: ["2"], status: "fail", attempts: [attempt(1, "fail", "AssertionError: expected 2 to equal 3"), attempt(2, "fail", "AssertionError: expected 2 to equal 3")] }),
+  ];
+  const code = computeVerdicts({ criteria, results, plan: null, doctor: null, artifacts: [] });
+  const prompt = buildJudgeUserPrompt({ criteria, code, results, artifacts: [], logs: new Map(), doctor: null });
+  assert.match(prompt, /2 result\(s\) across its test\(\) blocks and their retries/);
+  assert.match(prompt, /result 1: error in 1ms — Test timeout of 30000ms exceeded\./);
+  assert.match(prompt, /result 2: pass/);
+  assert.doesNotMatch(prompt, /attempt 1: error/, "a sibling test's pass must never read as a retry");
+  // Other runners re-run the whole file, so their entries really are retries.
+  assert.match(prompt, /, 2 attempt\(s\)/);
+  assert.match(prompt, /attempt 2: fail/);
 });
 
 test("only re-runs of one test are reported as failing on every attempt", () => {

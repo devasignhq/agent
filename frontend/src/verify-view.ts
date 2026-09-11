@@ -62,7 +62,7 @@ export type CriterionVerification = {
   fixUrl: string | null;
   flaky: boolean;
   retired: boolean;
-  test: { id: string; name: string; level: string; origin: "existing" | "generated" } | null;
+  test: { id: string; name: string; level: string; origin: "existing" | "generated"; runner: string } | null;
   attempts: number;
   durationMs: number;
   recording: Recording | null; // the latest attempt's recording
@@ -106,7 +106,7 @@ export function verificationForCriterion(view: RunView | null, criterionId: stri
     fixUrl: verdict === "unverifiable" ? v?.fixUrl ?? planned?.fixUrl ?? null : null,
     flaky: !!v?.flaky,
     retired: !!v?.retired,
-    test: primary ? { id: primary.id, name: primary.path, level: primary.level, origin: primary.origin } : null,
+    test: primary ? { id: primary.id, name: primary.path, level: primary.level, origin: primary.origin, runner: primary.runner } : null,
     attempts: results.reduce((m, r) => Math.max(m, r.attempts.length), 0),
     durationMs: results.reduce((s, r) => s + r.durationMs, 0),
     recording: attemptRecordings.length ? attemptRecordings[attemptRecordings.length - 1] : null,

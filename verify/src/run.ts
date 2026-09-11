@@ -135,7 +135,8 @@ export function summaryTable(plan: RunnerPlan, results: RunnerResult[]): string 
     const u = unverifiable.get(c.id);
     if (mine.length) {
       const tests = mine.map((r) => `${r.level} ${r.origin} \`${cell(r.test)}\``).join("<br>");
-      const outcome = mine.map((r) => `${r.status} (${r.attempts.length} attempt${r.attempts.length === 1 ? "" : "s"})`).join("<br>");
+      // Playwright's list spans the file's test() blocks; those are results, not retries.
+      const outcome = mine.map((r) => `${r.status} (${r.attempts.length} ${r.runner === "playwright" ? "result" : "attempt"}${r.attempts.length === 1 ? "" : "s"})`).join("<br>");
       return `| ${c.id}. ${cell(c.text)} | ${tests} | ${outcome} | |`;
     }
     const note = u ? `${cell(u.reason)}${u.fixUrl ? ` — [configure app start](${u.fixUrl})` : ""}` : "no test planned";

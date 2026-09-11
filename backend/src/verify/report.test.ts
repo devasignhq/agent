@@ -94,6 +94,25 @@ test("completed: recording link only on rows with a video, expired wording, fail
   assert.equal(verifyCheckRunPayload(someUnverifiable, "abc").conclusion, "neutral");
 });
 
+test("a flaky Playwright file links to its results, a re-run test to its attempts", () => {
+  const plan = { id: "p", schemaVersion: 1, runId: "run1", repoId: "repo", criteriaRevision: 1, commands: [], unverifiable: [], createdAt: 0, tests: [
+    { id: "t1", path: ".devasign/tests/e2e/refunds.spec.ts", content: null, criterionIds: ["1"], level: "e2e", levelReason: "", origin: "generated", runner: "playwright", testSignature: "s", strategyVersion: 1, targetFiles: [] },
+    { id: "t2", path: "src/total.test.ts", content: null, criterionIds: ["2"], level: "unit", levelReason: "", origin: "existing", runner: "vitest", testSignature: "s2", strategyVersion: 1, targetFiles: [] },
+  ] } as any;
+  const att = (n: number, status: string) => ({ n, status, durationMs: 1, artifactIds: [] });
+  const results = [
+    // Two test() blocks: one passed, the other failed and passed on its retry.
+    { id: "r1", testId: "t1", criterionIds: ["1"], test: ".devasign/tests/e2e/refunds.spec.ts", runner: "playwright", level: "e2e", origin: "generated", status: "flaky", attempts: [att(1, "pass"), att(2, "fail"), att(3, "pass")], durationMs: 3, artifactIds: [] },
+    { id: "r2", testId: "t2", criterionIds: ["2"], test: "src/total.test.ts", runner: "vitest", level: "unit", origin: "existing", status: "flaky", attempts: [att(1, "fail"), att(2, "pass")], durationMs: 2, artifactIds: [] },
+  ] as any;
+  const flake = (criterionId: string) => ({ criterionId, verdict: "unverifiable" as const, reason: "flaky test — quarantined", evidenceRefs: [], flaky: true });
+  const view = buildVerificationView({ run: baseRun({ status: "completed", verdicts: [flake("1"), flake("2")] }), review, repo, criteria, plan, results, artifacts: [] });
+  const section = formatVerificationSection(view);
+  assert.match(section, /\[all 3 results\]\(/, "a spec file's entries are its test() blocks, not one test's retries");
+  assert.match(section, /\[all 2 attempts\]\(/);
+  assert.match(formatTestsComment(view, "acme/w"), /Flaky — \[all 3 results\]\(/);
+});
+
 test("pending with runner evidence, disabled, and failed states", () => {
   const evidenced = { ...repo, verify: { onboarding: { state: "verified" }, detected: { languages: [], frameworks: [], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] } } } as unknown as Repository;
   const pending = buildVerificationView({ run: baseRun({ status: "running" }), review, repo: evidenced, criteria, plan: null, results: null, artifacts: [] });

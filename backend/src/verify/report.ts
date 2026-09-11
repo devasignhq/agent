@@ -36,6 +36,7 @@ export type VerificationRow = {
   testName?: string;
   level?: string;
   origin?: "existing" | "generated";
+  runner?: string;
   recording?: { artifactId: string; expired: boolean } | null;
   attempts?: number;
   flaky?: boolean;
@@ -167,6 +168,7 @@ export function buildVerificationView(args: {
       testName: primary?.path,
       level: primary?.level,
       origin: primary?.origin,
+      runner: primary?.runner,
       recording: video ? { artifactId: video.artifactId, expired: video.expired } : null,
       attempts: crs.reduce((m, r) => Math.max(m, r.attempts.length), 0) || undefined,
       flaky: v?.flaky,
@@ -223,6 +225,11 @@ function verdictWord(v: VerificationRowVerdict): string {
   return v === "pass" ? "pass" : v === "fail" ? "FAIL" : v === "unverifiable" ? "unverifiable" : "pending";
 }
 
+// A Playwright row's entries run across the file's test() blocks, not one test's retries.
+function attemptsLabel(r: VerificationRow): string {
+  return `all ${r.attempts} ${r.runner === "playwright" ? "results" : "attempts"}`;
+}
+
 export function formatVerificationSection(view: VerificationView): string {
   const lines: string[] = [VERIFICATION_START, "### Verification", stateLine(view)];
   // A test that ships inside the change cannot be evidence for it; say so rather
@@ -238,7 +245,7 @@ export function formatVerificationSection(view: VerificationView): string {
     if (r.fixUrl) parts.push(`[configure app start](${r.fixUrl})`);
     if (r.testName) parts.push(`${r.level ?? "test"}${r.origin === "existing" ? " (existing)" : ""} \`${r.testName}\``);
     if (r.recording) parts.push(r.recording.expired ? `[recording expired](${r.deepLink})` : `[▶ Watch recording](${r.deepLink})`);
-    if (r.flaky && r.attempts) parts.push(`[all ${r.attempts} attempts](${r.deepLink})`);
+    if (r.flaky && r.attempts) parts.push(`[${attemptsLabel(r)}](${r.deepLink})`);
     if (!r.recording && r.verdict !== "pending") parts.push(`[details](${r.deepLink})`);
     lines.push(`- ${parts.join(" · ")}`);
   }
@@ -516,7 +523,7 @@ export function formatTestsComment(view: VerificationView, repoFullName: string)
     if (r.testName) {
       lines.push("", `**Test:** \`${r.testName}\`${r.origin === "existing" ? " (existing)" : ""}${r.level ? ` · ${r.level}` : ""}`);
     }
-    if (r.flaky && r.attempts) lines.push("", `Flaky — [all ${r.attempts} attempts](${r.deepLink})`);
+    if (r.flaky && r.attempts) lines.push("", `Flaky — [${attemptsLabel(r)}](${r.deepLink})`);
     const evidence = r.recording
       ? r.recording.expired
         ? `[recording expired](${r.deepLink})`

@@ -173,8 +173,12 @@ export function buildJudgeUserPrompt(args: {
     lines.push(`- [${v.criterionId}] provisional: ${v.verdict} — ${c?.text ?? ""}`);
     lines.push(`  mechanical reason: ${v.reason}`);
     for (const r of args.results.filter((r) => r.criterionIds.includes(v.criterionId))) {
-      lines.push(`  test ${r.test || r.testId} (${r.level}, ${r.origin}, ${r.runner}): ${r.status}, ${r.attempts.length} attempt(s)`);
-      for (const a of r.attempts) lines.push(`    attempt ${a.n}: ${a.status} in ${a.durationMs}ms${a.error ? ` — ${a.error.split("\n").slice(0, 3).join(" ").slice(0, 400)}` : ""}`);
+      // Playwright lists every test() block's results in turn, so calling them
+      // attempts would present a sibling test's pass as a retry.
+      const pw = r.runner === "playwright";
+      const unit = pw ? "result" : "attempt";
+      lines.push(`  test ${r.test || r.testId} (${r.level}, ${r.origin}, ${r.runner}): ${r.status}, ${r.attempts.length} ${unit}(s)${pw ? " across its test() blocks and their retries" : ""}`);
+      for (const a of r.attempts) lines.push(`    ${unit} ${a.n}: ${a.status} in ${a.durationMs}ms${a.error ? ` — ${a.error.split("\n").slice(0, 3).join(" ").slice(0, 400)}` : ""}`);
       for (const id of new Set([...r.artifactIds, ...r.attempts.flatMap((a) => a.artifactIds)])) {
         const art = byId.get(id);
         if (!art) continue;
