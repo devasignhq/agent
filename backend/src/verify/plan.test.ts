@@ -277,6 +277,137 @@ test("a body still importing a missing package after repair is dropped; its crit
   }
 });
 
+test("two generated tests given one path both ship, under distinct names, neither overwriting the other", async () => {
+  const s = seed([crit("1"), crit("2")]);
+  // Seen live: three browser tests planned at one path ran as one file, and all three criteria
+  // were credited with the last file's outcome.
+  const { deps: d } = deps({
+    responses: [{ tests: [gen("1", "unit", { path: "src/shape.test.ts" }), gen("2", "unit", { path: "src/shape.test.ts" })] }],
+    bodies: { "src/shape.test.ts": [{ path: "src/shape.test.ts", content: "// one\n" }, { path: "src/shape.test.ts", content: "// two\n" }] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => [t.criterionIds[0], t.path, t.content]), [
+      ["1", ".devasign/tests/src/shape.test.ts", "// one\n"],
+      ["2", ".devasign/tests/src/shape-2.test.ts", "// two\n"],
+    ]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a browser spec that does not parse is repaired once, told the error and its line, before it can sink its batch", async () => {
+  const s = seed([crit("1", "ui")]);
+  // The live case: one bad regex flag made Playwright fail two passing specs loaded beside it.
+  const broken = "import { test } from '@playwright/test'\ntest('pill', async ({ page }) => {\n  await page.getByRole('group', { name: /^Edge from /ac }).press('Enter')\n})\n";
+  const fixed = "import { test } from '@playwright/test'\ntest('pill', async ({ page }) => {\n  await page.getByRole('group', { name: /^Edge from /i }).first().press('Enter')\n})\n";
+  const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, ".devasign.yml"],
+    files: { ".devasign.yml": BOOT_YML },
+    diff: UI_DIFF,
+    responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] }],
+    bodies: { "e2e/pill.spec.ts": [{ path: "e2e/pill.spec.ts", content: broken }, { path: "e2e/pill.spec.ts", content: fixed }] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    const attempts = (log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/e2e/pill.spec.ts`];
+    assert.match(attempts[0].reason, /it does not parse — .*at line 3: await page\.getByRole\('group', \{ name: \/\^Edge from \/ac \}\)/);
+    assert.equal(attempts[1].kind, "repair");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.tests[0].content, fixed);
+    assert.deepEqual(plan.unverifiable, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a browser spec that clicks a line is sent back once with how to select it, and ships if the author insists", async () => {
+  const clicks = "import { test } from '@playwright/test'\ntest('pill', async ({ page }) => {\n  await page.getByRole('group', { name: 'Edge from a to b' }).click()\n})\n";
+  const presses = clicks.replace(".click()", ".press('Enter')");
+  for (const second of [presses, clicks]) {
+    const s = seed([crit("1", "ui")]);
+    const { deps: d, bodyPrompts } = deps({
+      tree: [...BASE_TREE, ".devasign.yml"],
+      files: { ".devasign.yml": BOOT_YML, "package.json": PKG({ "@xyflow/react": "^12.8.2" }) },
+      diff: UI_DIFF,
+      responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] }],
+      bodies: { "e2e/pill.spec.ts": [{ path: "e2e/pill.spec.ts", content: clicks }, { path: "e2e/pill.spec.ts", content: second }] },
+    });
+    try {
+      await runVerifyPlan(s.run.id, d);
+      assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+      const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+      assert.match((log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/e2e/pill.spec.ts`][0].reason, /clicks a React Flow line .*press\('Enter'\)/);
+      const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+      // Told once: a pattern check is a nudge, never a reason to drop a spec that may be right.
+      assert.equal(plan.tests.find((t) => t.level === "e2e")?.content, second);
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
+test("a criterion covered only by a browser test is re-asked, in the same re-plan, for a fallback below e2e", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const { deps: d, prompts } = deps({
+    tree: [...BASE_TREE, ".devasign.yml"],
+    files: { ".devasign.yml": BOOT_YML },
+    diff: UI_DIFF,
+    responses: [
+      { tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" }), gen("2", "unit")] },
+      // The fallback, plus a repeat of the browser test the criterion already has.
+      { tests: [gen("1", "unit", { path: "pill.logic.test.ts" }), gen("1", "e2e", { path: "e2e/pill-again.spec.ts" })] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /Re-plan ONLY these criteria/);
+    assert.match(prompts[1], /\[1\]: covered only by a browser test/);
+    assert.doesNotMatch(prompts[1], /^- \[2\] /m, "a criterion that has a cheap test is not re-asked");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(
+      plan.tests.filter((t) => t.criterionIds.includes("1")).map((t) => [t.level, t.path]),
+      [["e2e", ".devasign/tests/e2e/pill.spec.ts"], ["unit", ".devasign/tests/pill.logic.test.ts"]],
+      "the fallback ships beside the browser test; the repeated browser test does not"
+    );
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.deepEqual((log.meta as any).fallback, ["1"]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a re-plan that cites this PR's own test as a fallback gets that test written by DevAsign instead", async () => {
+  const s = seed([crit("1", "ui")]);
+  const { deps: d, prompts } = deps({
+    tree: [...BASE_TREE, ".devasign.yml"],
+    files: { ".devasign.yml": BOOT_YML },
+    diff: [UI_DIFF, TEST_DIFF].join("\n"),
+    responses: [
+      { tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] },
+      // Seen live: asked for fallbacks, the model cited the tests the PR ships with.
+      { tests: [{ path: "src/handler.test.ts", content: null, criterionIds: ["1"], level: "unit", levelReason: "x", origin: "existing", runner: "node-test", targetFiles: ["src/handler.ts"] }] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.match(prompts[1], /\[1\]: covered only by a browser test.*never a test file this PR adds or changes/);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => [t.level, t.origin, t.path]), [
+      ["e2e", "generated", ".devasign/tests/e2e/pill.spec.ts"],
+      ["unit", "generated", ".devasign/tests/src/handler.test.ts"],
+    ]);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    assert.doesNotMatch(String(log.detail), /pr_authored, re-plan/);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("a runner the repo cannot spawn is coerced, not planned; a detected one is kept", async () => {
   const plannedRunner = async (pkg: Record<string, string> | null) => {
     const s = seed([crit("1")]);
@@ -366,6 +497,9 @@ test("generated test paths may never escape .devasign/tests/", () => {
   assert.equal(normalizeGeneratedPath("checkout.spec.ts", "playwright")?.path, ".devasign/tests/e2e/checkout.spec.ts");
   assert.equal(normalizeGeneratedPath("tests/total.test.ts", "node-test")?.path, ".devasign/tests/total.test.ts");
   assert.equal(normalizeGeneratedPath(".devasign/tests/e2e/x.spec.ts", "playwright")?.path, ".devasign/tests/e2e/x.spec.ts");
+  // Seen live: a browser test the model placed straight under .devasign/tests/ was never found.
+  assert.equal(normalizeGeneratedPath(".devasign/tests/lineShape.e2e.spec.ts", "playwright")?.path, ".devasign/tests/e2e/lineShape.e2e.spec.ts");
+  assert.equal(normalizeGeneratedPath(".devasign/tests/src/lib/x.test.ts", "vitest")?.path, ".devasign/tests/src/lib/x.test.ts");
   for (const bad of ["../../.github/workflows/steal.yml", "a/../../../etc/passwd", "..", ".devasign/../x.ts", ".devasign/hooks/pre-push", "/etc/passwd/../x"]) {
     assert.equal(normalizeGeneratedPath(bad, "node-test"), null, bad);
   }
@@ -850,6 +984,20 @@ test("an invalid manifest gets one repair pass, and a second failure is reported
   }
 });
 
+test("a manifest that sends its lists as JSON text is read as the lists, without a repair pass", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = deps({ responses: [{ tests: JSON.stringify([gen("1", "unit")]), unverifiable: "[]" }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 1, "seen live: the repair repeated the string and the whole re-plan was lost");
+    assert.equal(plan.tests.length, 1);
+    assert.deepEqual(plan.unverifiable, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("a body cut off twice drops that file alone; its sibling still ships, rebased", async () => {
   const s = seed([crit("1"), crit("2")]);
   const { deps: d, bodyPrompts } = deps({
@@ -991,14 +1139,16 @@ test("a browser test's author is shown the app it drives; a unit test's author i
   const files = {
     ".devasign.yml": BOOT_YML,
     "index.html": '<script type="module" src="/src/main.tsx"></script>',
-    "src/main.tsx": "import App from './App'\n",
+    "src/main.tsx": "import App from './App'\nimport { TEMPLATES } from './templates'\n",
     "src/App.tsx": "export default function App() { return <button>Templates</button> }\n",
+    "src/templates.ts": "export const TEMPLATES = []\n",
+    "package.json": PKG({ "@xyflow/react": "^12.8.2" }),
   };
   const { deps: d, bodyPrompts } = deps({
     tree: [...BASE_TREE, ...Object.keys(files)],
     files,
     diff: UI_DIFF,
-    responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts", targetFiles: ["src/App.tsx"] }), gen("2", "unit")] }],
+    responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts", targetFiles: ["src/App.tsx"], strategy: "drag two blocks onto the canvas and join them" }), gen("2", "unit", { strategy: "call the handler" })] }],
   });
   try {
     await runVerifyPlan(s.run.id, d);
@@ -1008,6 +1158,14 @@ test("a browser test's author is shown the app it drives; a unit test's author i
     assert.match(browser, /### src\/App\.tsx\n````\nexport default function App\(\) \{ return <button>Templates<\/button> \}/);
     assert.match(browser, /### src\/main\.tsx/);
     assert.doesNotMatch(unit, /## App source/);
+    // The planner never saw the app; its setup steps would outrank what the source shows.
+    assert.doesNotMatch(browser, /^- strategy:/m);
+    assert.match(unit, /^- strategy: call the handler$/m);
+    assert.match(browser, /## Library notes\n- Each line is an SVG group/);
+    assert.doesNotMatch(unit, /## Library notes/);
+    assert.match(browser, /## Ways into a populated state\n.+\n- `TEMPLATES` in src\/templates\.ts — shown by src\/main\.tsx/);
+    assert.ok(browser.indexOf("## Ways into") < browser.indexOf("## App source"), "listed ahead of the source it points into");
+    assert.doesNotMatch(unit, /## Ways into/);
   } finally {
     s.cleanup();
   }

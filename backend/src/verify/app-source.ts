@@ -5,7 +5,8 @@ import { isTestPath } from "./detect.js";
 
 export type SourceFile = { path: string; content: string; truncated: boolean };
 
-export const APP_SOURCE_LIMITS = { files: 16, fileChars: 12_000, totalChars: 90_000, depth: 3 };
+// Characters bind (roughly 35K tokens); the file count only stops a swarm of tiny modules.
+export const APP_SOURCE_LIMITS = { files: 60, fileChars: 12_000, totalChars: 140_000, depth: 8 };
 
 const UI_FILE = /\.(tsx|jsx|vue|svelte)$/;
 const CODE_EXTS = [".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".mjs"];
@@ -40,7 +41,7 @@ export function localImports(from: string, content: string, tree: ReadonlySet<st
   return [...out];
 }
 
-/** The test's own target files first, then the app from its entry down, breadth first. */
+/** The test's own target files first, then the screens from the entry down, then the modules they import. */
 export async function appSourceFor(args: {
   targetFiles: string[];
   tree: ReadonlySet<string>;
@@ -52,25 +53,102 @@ export async function appSourceFor(args: {
   const out: SourceFile[] = [];
   let total = 0;
   const take = async (paths: string[]) => {
-    const fresh = paths.filter((p) => args.tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"));
+    // Deduped before the seen check: two files in one batch often import the same module.
+    const fresh = [...new Set(paths)].filter((p) => args.tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"));
     for (const p of fresh) seen.add(p);
     const read = await Promise.all(fresh.map(async (path) => ({ path, content: await args.read(path) })));
     return read.filter((f): f is { path: string; content: string } => typeof f.content === "string");
   };
-  const indexHtml = args.tree.has("index.html") ? await args.read("index.html") : null;
-  let frontier = await take([...args.targetFiles, ...entryPaths(args.tree, indexHtml)]);
-  for (let depth = 0; frontier.length; depth++) {
-    const next: string[] = [];
-    for (const f of frontier) {
-      const room = Math.min(lim.fileChars, lim.totalChars - total);
-      if (out.length >= lim.files || room <= 0) return out;
-      const truncated = f.content.length > room;
-      out.push({ path: f.path, content: truncated ? f.content.slice(0, room) : f.content, truncated });
-      total += Math.min(f.content.length, room);
-      next.push(...localImports(f.path, f.content, args.tree).filter((p) => UI_FILE.test(p)));
+  const add = (f: { path: string; content: string }): boolean => {
+    const room = Math.min(lim.fileChars, lim.totalChars - total);
+    if (out.length >= lim.files || room <= 0) return false;
+    const truncated = f.content.length > room;
+    out.push({ path: f.path, content: truncated ? f.content.slice(0, room) : f.content, truncated });
+    total += Math.min(f.content.length, room);
+    return true;
+  };
+  // Breadth first; false once the budget is spent.
+  const crawl = async (start: Array<{ path: string; content: string }>, follow: (path: string) => boolean): Promise<boolean> => {
+    let frontier = start;
+    for (let depth = 0; frontier.length; depth++) {
+      const next: string[] = [];
+      for (const f of frontier) {
+        if (!add(f)) return false;
+        next.push(...localImports(f.path, f.content, args.tree).filter(follow));
+      }
+      if (depth >= lim.depth) break;
+      frontier = await take(next);
     }
-    if (depth >= lim.depth) break;
-    frontier = await take(next);
-  }
+    return true;
+  };
+  const isUi = (p: string) => UI_FILE.test(p);
+  const indexHtml = args.tree.has("index.html") ? await args.read("index.html") : null;
+  if (!(await crawl(await take([...args.targetFiles, ...entryPaths(args.tree, indexHtml)]), isUi))) return out;
+  // Then the plain modules the screens import: labels, templates and sample data live there,
+  // and a name the author never saw is still a guess however well it knows the screen.
+  const imported = out.flatMap((f) => localImports(f.path, f.content, args.tree)).filter((p) => !isUi(p));
+  await crawl(await take(imported), (p) => !isUi(p));
   return out;
+}
+
+const STARTER = /(templates?|samples?|examples?|presets?|demos?|fixtures?|starters?|seeds?)/i;
+const EXPORTED = /export\s+(?:const|let|var|function)\s+([A-Za-z_$][\w$]*)/g;
+const STORAGE_KEY = /localStorage\.(?:setItem|getItem)\(\s*['"]([^'"]+)['"]/g;
+
+// zustand's `persist(creator, { name })`. A block-bodied creator, a trailing comma and look-alike
+// `{ name }` objects defeat a single regex, so walk the call's top-level arguments instead.
+export function persistKey(content: string): string | undefined {
+  const at = content.search(/\bpersist\s*\(/);
+  if (at < 0) return undefined;
+  const args: string[] = [];
+  let depth = 0;
+  let start = content.indexOf("(", at) + 1;
+  for (let i = start - 1; i < content.length; i++) {
+    const ch = content[i];
+    if (ch === "/" && content[i + 1] === "/") i = content.indexOf("\n", i) < 0 ? content.length : content.indexOf("\n", i);
+    else if (ch === "/" && content[i + 1] === "*") i = content.indexOf("*/", i + 2) < 0 ? content.length : content.indexOf("*/", i + 2) + 1;
+    else if (ch === '"' || ch === "'" || ch === "`") {
+      let j = i + 1;
+      while (j < content.length && content[j] !== ch) j += content[j] === "\\" ? 2 : 1;
+      i = j;
+    } else if ("([{".includes(ch)) depth++;
+    else if (")]}".includes(ch) && --depth === 0) {
+      args.push(content.slice(start, i));
+      break;
+    } else if (ch === "," && depth === 1) {
+      args.push(content.slice(start, i));
+      start = i + 1;
+    }
+  }
+  const options = args.filter((a) => a.trim()).at(-1) ?? "";
+  return /^\s*\{[\s\S]*?\bname:\s*['"]([^'"]+)['"]/.exec(options)?.[1];
+}
+
+/**
+ * Built-in data and saved state a browser test can start from, found in the source it is shown.
+ * Buried among forty files, a template menu reads as one screen of many; listed, it is a way in.
+ */
+export function waysIn(source: readonly SourceFile[], tree: ReadonlySet<string>): string[] {
+  const out: string[] = [];
+  for (const f of source) {
+    const names = UI_FILE.test(f.path) ? [] : [...f.content.matchAll(EXPORTED)].map((m) => m[1]).filter((n) => STARTER.test(n));
+    if (names.length) {
+      const importers = source.filter((s) => s.path !== f.path && localImports(s.path, s.content, tree).includes(f.path));
+      const shownBy = importers.filter((s) => UI_FILE.test(s.path)).map((s) => s.path);
+      // With no screen importing it, say what does: sample data often reaches the page only
+      // through a template, and a test that assumes it loads by default starts from nothing.
+      const via = shownBy.length
+        ? ` — shown by ${shownBy.join(", ")}`
+        : importers.length
+          ? ` — used by ${importers.map((s) => s.path).join(", ")}, not by any screen directly`
+          : "";
+      out.push(`\`${names.join("`, `")}\` in ${f.path}${via}`);
+    }
+    const persisted = persistKey(f.content);
+    if (persisted) out.push(`${f.path} persists its store under "${persisted}" (zustand \`persist\`)`);
+    const keys = [...new Set([...f.content.matchAll(STORAGE_KEY)].map((m) => m[1]))];
+    if (keys.length) out.push(`${f.path} reads or writes localStorage ${keys.map((k) => `"${k}"`).join(", ")}`);
+  }
+  if (!out.length) return [];
+  return ["## Ways into a populated state", "Found in the source below. Start from one of these unless a criterion is about building that data itself.", ...out.map((w) => `- ${w}`)];
 }
