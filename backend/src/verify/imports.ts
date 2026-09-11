@@ -20,7 +20,9 @@ export const IMPORT_LEAD = [
 const BARE_IMPORT = new RegExp(`(${IMPORT_LEAD})(['"\`])([^'"\`\\n]+)\\2`, "g");
 const BUILTINS = new Set(builtinModules);
 const NPM_NAME = /^(?:@[a-z0-9-~][a-z0-9-._~]*\/)?[a-z0-9-~][a-z0-9-._~]*$/i;
-const RENDER_LIBS = ["@testing-library/react", "@testing-library/vue", "@testing-library/svelte", "@testing-library/preact", "@testing-library/angular", "@testing-library/dom", "@vue/test-utils", "enzyme"];
+// A framework's own DOM renderer mounts components without a testing library (react-dom's
+// createRoot inside act), so it counts when a DOM environment is installed beside it.
+const RENDER_LIBS = ["@testing-library/react", "@testing-library/vue", "@testing-library/svelte", "@testing-library/preact", "@testing-library/angular", "@testing-library/dom", "@vue/test-utils", "enzyme", "react-dom", "preact"];
 const DOM_ENVS = ["jsdom", "happy-dom", "jest-environment-jsdom", "@happy-dom/global-registrator"];
 
 export type ImportAllowList = { names: ReadonlySet<string>; enforce: boolean };

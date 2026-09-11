@@ -60,7 +60,12 @@ export function computeVerdicts(args: {
   const planned = new Map((args.plan?.unverifiable ?? []).map((u) => [u.criterionId, u]));
   for (const c of args.criteria) {
     if (!isVerifiable(c)) continue;
-    const covering = args.results.filter((r) => r.criterionIds.includes(c.id));
+    const all = args.results.filter((r) => r.criterionIds.includes(c.id));
+    // A browser test that ran decides its criterion; the tests below it are its fallback, read
+    // only when no browser test could run — a wrong assertion in one must not overturn what
+    // the browser saw.
+    const browserRan = all.some((r) => r.level === "e2e" && r.status !== "error" && r.status !== "skipped");
+    const covering = browserRan ? all.filter((r) => r.level === "e2e") : all;
     // A doctor diagnosis covers the tests that could not run (usually the e2e
     // subset); criteria whose own tests ran keep their real pass/fail.
     if (args.doctor && (!covering.length || covering.every((r) => r.status === "error" || r.status === "skipped"))) {

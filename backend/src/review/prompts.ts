@@ -1049,7 +1049,9 @@ export function testPlannerSystemPrompt(): string {
     "\"origin\": \"existing\"|\"generated\", \"runner\": \"vitest\"|\"jest\"|\"pytest\"|\"playwright\"|\"go\"|" +
     "\"node-test\"|\"bundled\", \"targetFiles\": [string], \"strategy\": string}], \"unverifiable\": " +
     "[{\"criterionId\": string, \"reason\": string}]}. Do not write file contents here: a separate step authors " +
-    "each generated file from your `strategy`, one or two sentences on what the file will set up and assert.\n" +
+    "each generated file from your `strategy`, one or two sentences on what the file will set up and assert. For " +
+    "an e2e test, name the flow it drives and what it checks, never how it builds its starting data: its author " +
+    "sees the app's source and reaches that state the most direct way the app offers.\n" +
     "\nYour tests run inside the customer's own CI against the PR head and their outcomes become per-criterion " +
     "verdicts, so a test must prove exactly its criterion — from the ticket's intent, independently of how the diff " +
     "chose to implement it — and nothing more.\n" +
@@ -1067,9 +1069,10 @@ export function testPlannerSystemPrompt(): string {
     "e2e (a browser flow, Playwright). Escalate only when the level below cannot observe the behaviour. Never exceed " +
     "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says browser tests are not " +
     "available — plan that criterion at component level instead, and only when no component test could decide it " +
-    "put it in `unverifiable` with the policy's reason. A component test needs a render library and a DOM " +
-    "environment among the repository's installed packages; nothing is installed for you, so where those are " +
-    "absent do not plan one — prove the behaviour through the plain modules the component delegates to instead. " +
+    "put it in `unverifiable` with the policy's reason. A component test needs something to render with — a " +
+    "testing library, or the framework's own DOM renderer such as react-dom — and a DOM environment among the " +
+    "repository's installed packages; nothing is installed for you, so where those are absent do not plan one — " +
+    "prove the behaviour through the plain modules the component delegates to instead. " +
     "An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
     "One exception to `max level`: a criterion capped at component whose behaviour only real geometry can settle — a " +
@@ -1077,6 +1080,13 @@ export function testPlannerSystemPrompt(): string {
     "at e2e when the Level policy says so, because a component test renders into a DOM shim with no layout engine and " +
     "would prove nothing. Say in `levelReason` what component cannot observe. Do not reach for this anywhere a " +
     "rendered component with its real state would do.\n" +
+    "\n## A browser test carries a fallback\n" +
+    "A browser test can fail to run for reasons that have nothing to do with the change — the app not booting, a " +
+    "page it cannot reach. So every criterion you plan at e2e also gets a generated entry at the cheapest level " +
+    "below e2e that can observe the logic behind it: a unit test of the function the screen calls, or a component " +
+    "test of the rendered piece — never a test file this PR adds or changes, which cannot vouch for the change it " +
+    "ships with. The browser test decides the criterion whenever it runs; the fallback keeps a verdict when it " +
+    "cannot.\n" +
     "\n## Unverifiable is a last resort\n" +
     "Never put a criterion in `unverifiable` while its `max level` still allows a rung you have not attempted. That " +
     "the cheap level cannot see the behaviour is the reason to climb the ladder, not to opt out of it; a headless or " +
@@ -1110,10 +1120,31 @@ export function testFileSystemPrompt(): string {
     "available, use the runner's own assertions. Deterministic; no network; seed data isolated per test; one " +
     "criterion's behaviour per assertion group; the first line is a comment naming the criterion ids it proves. " +
     "Where the setup provides a render library, component tests render the component with its real state and " +
-    "assert on the DOM; where it does not, prove the behaviour through the plain modules the component delegates " +
-    "to, in the repo's own convention. Playwright tests: role/test-id selectors over text, " +
+    "assert on the DOM — through the framework's own renderer (react-dom's createRoot inside act) when no testing " +
+    "library is installed, and with the runner's environment docblock (e.g. `// @vitest-environment happy-dom`, " +
+    "naming a DOM environment the repo has) when its config sets none; where it does not, prove the behaviour " +
+    "through the plain modules the component delegates to, in the repo's own convention. Unit and component " +
+    "tests: take every import, export, value, type and context shape from the request's `Source under test` — " +
+    "the code as this PR's head has it, with the runner's config when there is one — never from memory or from a " +
+    "name alone; an expected value that source does not show is a guess that fails a correct change. " +
+    "Playwright tests: " +
+    "before writing any setup, find in the request's `App source` every way the app reaches a populated state — " +
+    "a template or sample menu, an import, a store key it persists to, a fixture route — and start from the most " +
+    "direct one; drive through the UI only the behaviour the criteria are about. Building data by dragging items " +
+    "onto a canvas or joining connection handles is a last resort that rarely survives CI: use it only when that " +
+    "source offers no other way in. Take every step through what " +
+    "that source actually renders — its roles and labels, containers that start collapsed or hidden, how items " +
+    "are added or dragged — never through a name that source does not show; scope a role query to the " +
+    "container that owns it (`getByRole('listbox', { name: 'Themes' }).getByRole('option')`), since `.first()` " +
+    "over the whole page can land on a same-role element elsewhere, such as a <select>'s options; " +
+    "role/test-id selectors over text, " +
     "explicit state assertions instead of fixed waits, relative URLs against baseURL, no login unless the setup " +
-    "provides a login strategy. A request carrying a strategy version above 1 must take a different approach " +
+    "provides a login strategy. Assert only what the criteria name or that source shows the app doing — never a " +
+    "shortcut or side effect you have not seen wired up, such as a key that clears a selection. Reach and " +
+    "confirm the starting state with actions and waits (`locator.waitFor()`, a click), never with `expect`: an " +
+    "`expect` is how the verdict reads the criterion, so a setup `expect` that misses marks a correct change as " +
+    "failing. A request " +
+    "carrying a strategy version above 1 must take a different approach " +
     "from the flaky version before it.\n" +
     "\n## Output\n" +
     "Only the tool call; `content` is the whole file. Never use emoji in any text you output."

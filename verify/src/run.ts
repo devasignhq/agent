@@ -199,9 +199,12 @@ export async function run(opts: RunOptions): Promise<number> {
   }
   announceUnverifiable(plan);
   const failOn: FailOn = opts.failOn ?? plan.failOn ?? "never";
+  // A branch cut before onboarding has no verify block of its own; boot from the plan's.
+  const bootYml = yml ?? plan.verifyConfig ?? null;
+  if (!yml && plan.verifyConfig) log.info("no verify block in this checkout's .devasign.yml; starting the app with the one the plan was made from");
 
   try {
-    const { results, artifacts, doctor } = await executePlan(plan, ws, { yml, testTimeoutMs: opts.testTimeoutMs, setup });
+    const { results, artifacts, doctor } = await executePlan(plan, ws, { yml: bootYml, testTimeoutMs: opts.testTimeoutMs, setup });
     let finalResults = results;
     if (api && ctx) {
       const ids = await uploadArtifacts(api, runId, artifacts, plan.uploadLimits, fetchImpl);
