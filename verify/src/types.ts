@@ -122,6 +122,8 @@ export type RunnerPlan = {
   // Optional: servers older than 1.2 send neither.
   unverifiable?: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
   failOn?: FailOn;
+  // The base branch's verify block, for a checkout cut before onboarding that has none.
+  verifyConfig?: DevasignVerifyConfig;
 };
 
 export type FailOn = "never" | "verdict" | "unverifiable";

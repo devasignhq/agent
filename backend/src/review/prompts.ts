@@ -1067,9 +1067,10 @@ export function testPlannerSystemPrompt(): string {
     "e2e (a browser flow, Playwright). Escalate only when the level below cannot observe the behaviour. Never exceed " +
     "the per-criterion `max level` in the Level policy, and never plan e2e when the policy says browser tests are not " +
     "available — plan that criterion at component level instead, and only when no component test could decide it " +
-    "put it in `unverifiable` with the policy's reason. A component test needs a render library and a DOM " +
-    "environment among the repository's installed packages; nothing is installed for you, so where those are " +
-    "absent do not plan one — prove the behaviour through the plain modules the component delegates to instead. " +
+    "put it in `unverifiable` with the policy's reason. A component test needs something to render with — a " +
+    "testing library, or the framework's own DOM renderer such as react-dom — and a DOM environment among the " +
+    "repository's installed packages; nothing is installed for you, so where those are absent do not plan one — " +
+    "prove the behaviour through the plain modules the component delegates to instead. " +
     "An API-only diff normally gets no e2e; " +
     "a criterion about existing consumers still rendering correctly is what legitimately escalates it.\n" +
     "One exception to `max level`: a criterion capped at component whose behaviour only real geometry can settle — a " +
@@ -1110,8 +1111,15 @@ export function testFileSystemPrompt(): string {
     "available, use the runner's own assertions. Deterministic; no network; seed data isolated per test; one " +
     "criterion's behaviour per assertion group; the first line is a comment naming the criterion ids it proves. " +
     "Where the setup provides a render library, component tests render the component with its real state and " +
-    "assert on the DOM; where it does not, prove the behaviour through the plain modules the component delegates " +
-    "to, in the repo's own convention. Playwright tests: role/test-id selectors over text, " +
+    "assert on the DOM — through the framework's own renderer (react-dom's createRoot inside act) when no testing " +
+    "library is installed, and with the runner's environment docblock (e.g. `// @vitest-environment happy-dom`, " +
+    "naming a DOM environment the repo has) when its config sets none; where it does not, prove the behaviour " +
+    "through the plain modules the component delegates to, in the repo's own convention. Playwright tests: " +
+    "the strategy says what to prove, but reach the state a criterion starts from the shortest robust way the " +
+    "request's `App source` offers — a built-in template or sample, the key its store persists under, a fixture " +
+    "route — and drive through the UI only the behaviour the criterion is about; take every step through what " +
+    "that source actually renders — its roles and labels, containers that start collapsed or hidden, how items " +
+    "are added or dragged — never through a name that source does not show; role/test-id selectors over text, " +
     "explicit state assertions instead of fixed waits, relative URLs against baseURL, no login unless the setup " +
     "provides a login strategy. A request carrying a strategy version above 1 must take a different approach " +
     "from the flaky version before it.\n" +

@@ -30,6 +30,7 @@ import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, Verify
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, type ImportAllowList } from "./imports.js";
+import { appSourceFor, type SourceFile } from "./app-source.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
@@ -498,6 +499,7 @@ export type PlanContext = {
   treePaths: Set<string>;
   setup: DetectedSetup;
   yml: DevasignVerifyConfig | null;
+  ymlFrom: "head" | "base" | null;
   policy: PlanPolicy;
   existingTests: string[];
   candidates: Array<{ path: string; imports: string[] }>;
@@ -615,7 +617,9 @@ function renderSharedContext(ctx: PlanContext): string {
   return ["# Shared context", "", "## Repository test setup", renderSetup(ctx.setup, ctx.yml), "", renderDiff(ctx)].join("\n");
 }
 
-export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strategyVersion?: number }): string {
+const renderSourceFile = (f: SourceFile) => `### ${f.path}${f.truncated ? " (truncated)" : ""}\n\`\`\`\`\n${f.content}\n\`\`\`\``;
+
+export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strategyVersion?: number }, source: SourceFile[] = []): string {
   const byId = new Map(ctx.criteria.map((c) => [c.id, c]));
   return [
     `# Write the test file for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
@@ -630,10 +634,21 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
       ? `- strategy version: ${t.strategyVersion} — the previous version of this test was flaky; take a different approach (explicit state assertions, role/test-id selectors, isolated data).`
       : "",
     "",
+    ...(source.length ? ["## App source", "What this PR's head renders — build every step and selector of the flow from it.", ...source.map(renderSourceFile)] : []),
     `Write the complete file and submit it with ${planTestFileTool.name}.`,
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+// A branch cut before onboarding carries no verify block, so every PR it opens would plan as
+// if the app could not boot; the base branch's block is the one in force for it.
+async function readVerifyYml(headRaw: string | null, headSha: string, baseRef: string | undefined, read: (ref: string) => Promise<string | null>) {
+  const head = parseDevasignVerify(headRaw);
+  if (head || !baseRef) return { raw: headRaw, sha: headSha, yml: head, from: head ? ("head" as const) : null };
+  const baseRaw = await read(baseRef);
+  const base = parseDevasignVerify(baseRaw);
+  return base ? { raw: baseRaw, sha: baseRef, yml: base, from: "base" as const } : { raw: headRaw, sha: headSha, yml: null, from: null };
 }
 
 async function gatherContext(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<PlanContext> {
@@ -648,17 +663,18 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const paths = tree.filter((e) => e.type === "blob").map((e) => e.path);
   const treePaths = new Set(paths);
   const readFile = deps.readFile ?? defaultReadFile;
-  const [ymlRaw, packageJson, envExample] = await Promise.all([
+  const [headYml, packageJson, envExample] = await Promise.all([
     treePaths.has(".devasign.yml") ? readFile(install, repo, ".devasign.yml", run.sha) : Promise.resolve(null),
     // Always at run.sha, even when a runner has reported: a PR that adds a dependency
     // must not have its own test judged against the list from before it.
     treePaths.has("package.json") ? readFile(install, repo, "package.json", run.sha) : Promise.resolve(null),
     !repo.verify?.detected && treePaths.has(".env.example") ? readFile(install, repo, ".env.example", run.sha) : Promise.resolve(null),
   ]);
-  const yml = parseDevasignVerify(ymlRaw);
-  if (ymlRaw != null) {
+  const boot = await readVerifyYml(headYml, run.sha, review?.baseSha || repo.defaultBranch, (ref) => readFile(install, repo, ".devasign.yml", ref));
+  const yml = boot.yml;
+  if (boot.raw != null) {
     db.update("repositories", (r) => r.id === repo.id, {
-      verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: ymlRaw.slice(0, 20_000), parsed: yml, sha: run.sha } },
+      verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: boot.raw.slice(0, 20_000), parsed: yml, sha: boot.sha } },
     });
   }
   const inferred = inferSetupFromTree(paths, { packageJson, envExample });
@@ -699,6 +715,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     treePaths,
     setup,
     yml,
+    ymlFrom: boot.from,
     policy,
     existingTests,
     candidates,
@@ -843,6 +860,12 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const authored = new Map<object, string>();
         const bodyFailed: string[] = [];
         const generated = survivors.filter((t) => t.origin === "generated");
+        // Browser files in one plan crawl the same app, so each repo file is read once.
+        const headReads = new Map<string, Promise<string | null>>();
+        const readHead = (p: string) => {
+          if (!headReads.has(p)) headReads.set(p, (deps.readFile ?? defaultReadFile)(install, repo, p, run.sha));
+          return headReads.get(p)!;
+        };
         const author = async (t: (typeof survivors)[number]) => {
           // Per test, not per run: the allow-list depends on t.runner and the pool runs
           // three of these at once.
@@ -851,7 +874,8 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             rejected = bad;
           });
           try {
-            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
+            const source = t.runner === "playwright" ? await appSourceFor({ targetFiles: t.targetFiles, tree: ctx.treePaths, read: readHead }).catch(() => []) : [];
+            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t, source), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
             attempts.bodies[t.path] = r.attempts;
             if (r.value) return void authored.set(t, r.value.content);
             bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
@@ -924,6 +948,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           commands: buildCommands(finalTests),
           unverifiable: planUnverifiable,
           prAuthoredTests: [...ctx.policy.prAuthoredTests],
+          ...(ctx.yml && ctx.ymlFrom ? { verifyConfig: ctx.yml, verifyConfigFrom: ctx.ymlFrom } : {}),
           createdAt: Date.now(),
         });
         const planFinishedAt = Date.now();
@@ -950,6 +975,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           action: `Test plan ready: ${generatedCount} generated, ${finalTests.length - generatedCount} existing, ${planUnverifiable.length} unverifiable`,
           detail: [
             `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""}${bodiesMs ? `, bodies ${secs(bodiesMs)}` : ""})`,
+            ...(ctx.ymlFrom === "base" ? ["app start read from the base branch's .devasign.yml — this PR's head has no verify block of its own"] : []),
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
             ...(first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),
@@ -968,6 +994,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             unresolvedImports: unresolved,
             apiOnly: ctx.policy.apiOnly,
             e2eAllowed: ctx.policy.e2eAllowed,
+            verifyConfigFrom: ctx.ymlFrom,
             prAuthoredTests: [...ctx.policy.prAuthoredTests],
             escalated: escapedIds,
             cutOff: [...cutOff].filter((id) => !finalCovered.has(id)),

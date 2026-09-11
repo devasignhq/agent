@@ -960,3 +960,75 @@ test("a UI criterion the planner still ties to app start after the re-ask keeps 
     s.cleanup();
   }
 });
+
+// --- A branch cut before onboarding still boots the app ---
+
+test("a head with no verify block plans e2e from the base branch's and hands it to the runner", async () => {
+  const s = seed([crit("1", "ui")]);
+  const reads: string[] = [];
+  const { deps: d, prompts } = deps({ diff: UI_DIFF, responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] }] });
+  d.readFile = async (_i, _r, path, sha) => {
+    reads.push(`${path}@${sha}`);
+    return path === ".devasign.yml" && sha === "d" ? BOOT_YML : null;
+  };
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.ok(reads.includes(".devasign.yml@d"), "read at the review's base sha");
+    assert.match(prompts[0], /Browser \(e2e\) tests: available/);
+    assert.deepEqual(plan.tests.map((t) => [t.level, t.runner]), [["e2e", "playwright"]]);
+    assert.deepEqual(plan.verifyConfig, { e2e: "auto", start: "npm run dev", url: "http://localhost:5173" });
+    assert.equal(plan.verifyConfigFrom, "base");
+    assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.devasignYml?.sha, "d");
+    assert.match(String(db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")?.detail), /base branch/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a browser test's author is shown the app it drives; a unit test's author is not", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const files = {
+    ".devasign.yml": BOOT_YML,
+    "index.html": '<script type="module" src="/src/main.tsx"></script>',
+    "src/main.tsx": "import App from './App'\n",
+    "src/App.tsx": "export default function App() { return <button>Templates</button> }\n",
+  };
+  const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, ...Object.keys(files)],
+    files,
+    diff: UI_DIFF,
+    responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts", targetFiles: ["src/App.tsx"] }), gen("2", "unit")] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const browser = bodyPrompts.find((p) => /^- runner: playwright$/m.test(p))!;
+    const unit = bodyPrompts.find((p) => /^- runner: node-test$/m.test(p))!;
+    assert.match(browser, /## App source/);
+    assert.match(browser, /### src\/App\.tsx\n````\nexport default function App\(\) \{ return <button>Templates<\/button> \}/);
+    assert.match(browser, /### src\/main\.tsx/);
+    assert.doesNotMatch(unit, /## App source/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the head's own verify block wins, and the base branch is never read", async () => {
+  const s = seed([crit("1", "ui")]);
+  const reads: string[] = [];
+  const { deps: d } = deps({ tree: [...BASE_TREE, ".devasign.yml"], diff: UI_DIFF, responses: [{ tests: [gen("1", "e2e")] }] });
+  d.readFile = async (_i, _r, path, sha) => {
+    reads.push(`${path}@${sha}`);
+    if (path !== ".devasign.yml") return null;
+    return sha === s.run.sha ? "verify:\n  start: npm start\n  url: http://localhost:3000\n" : BOOT_YML;
+  };
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.verifyConfigFrom, "head");
+    assert.equal(plan.verifyConfig?.start, "npm start");
+    assert.ok(!reads.includes(".devasign.yml@d"));
+  } finally {
+    s.cleanup();
+  }
+});

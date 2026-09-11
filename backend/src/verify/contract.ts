@@ -129,6 +129,8 @@ export type RunnerPlan = {
   unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
   // The repo's configured default for the CLI's --fail-on; the flag overrides it.
   failOn: "never" | "verdict" | "unverifiable";
+  // The `verify:` block the plan was made with, for a checkout whose .devasign.yml has none.
+  verifyConfig?: DevasignVerifyConfig;
 };
 
 export type ResolveEmptyReason =

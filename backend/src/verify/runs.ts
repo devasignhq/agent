@@ -216,6 +216,7 @@ export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository
     uploadLimits: { ...UPLOAD_LIMITS },
     unverifiable: plan.unverifiable,
     failOn: failOnFor(repo),
+    ...(plan.verifyConfig ? { verifyConfig: plan.verifyConfig } : {}),
   };
 }
 

@@ -85,3 +85,9 @@ test("hasRenderStack needs a DOM runner, a render library and a DOM environment 
     "node --test has no DOM environment to render into"
   );
 });
+
+test("the framework's own renderer counts: react-dom and happy-dom render components with no testing library", () => {
+  assert.equal(hasRenderStack(setup({ dependencies: ["happy-dom", "react", "react-dom", "vitest"] })), true);
+  assert.equal(hasRenderStack(setup({ dependencies: ["jsdom", "preact"] })), true);
+  assert.equal(hasRenderStack(setup({ dependencies: ["react", "react-dom"] })), false, "still needs a DOM environment");
+});
