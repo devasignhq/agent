@@ -26,7 +26,7 @@ function view(over: Partial<RunView> = {}): RunView {
     run: { id: "run1", status: "completed", createdAt: NOW - 2 * DAY, verdicts: [{ criterionId: "1", verdict: "fail", reason: "refunds line missing", evidenceRefs: [] }, { criterionId: "2", verdict: "unverifiable", reason: "flaky test — quarantined", evidenceRefs: [], flaky: true }] } as RunView["run"],
     criteria: [],
     revision: 1,
-    plan: { tests: [{ id: "t1", path: ".devasign/tests/e2e/refunds.spec.ts", criterionIds: ["1"], level: "e2e", origin: "generated" }, { id: "t2", path: "src/x.test.ts", criterionIds: ["2"], level: "unit", origin: "existing" }] } as RunView["plan"],
+    plan: { tests: [{ id: "t1", path: ".devasign/tests/e2e/refunds.spec.ts", criterionIds: ["1"], level: "e2e", origin: "generated", runner: "playwright" }, { id: "t2", path: "src/x.test.ts", criterionIds: ["2"], level: "unit", origin: "existing", runner: "node-test" }] } as RunView["plan"],
     results: [{ id: "r1", testId: "t1", criterionIds: ["1"], attempts: [{ n: 1 }, { n: 2 }, { n: 3 }], durationMs: 4200 }, { id: "r2", testId: "t2", criterionIds: ["2"], attempts: [{ n: 1 }, { n: 2 }], durationMs: 300 }] as RunView["results"],
     artifacts: [
       art({ id: "v1", attempt: 1, getUrl: "https://x/v1" }),
@@ -44,7 +44,7 @@ test("verificationForCriterion: verdict, test, attempts, the latest attempt's re
   const v = verificationForCriterion(view(), "1", NOW)!;
   assert.equal(v.verdict, "fail");
   assert.equal(v.reason, "refunds line missing");
-  assert.deepEqual(v.test, { id: "t1", name: ".devasign/tests/e2e/refunds.spec.ts", level: "e2e", origin: "generated" });
+  assert.deepEqual(v.test, { id: "t1", name: ".devasign/tests/e2e/refunds.spec.ts", level: "e2e", origin: "generated", runner: "playwright" });
   assert.equal(v.attempts, 3);
   assert.equal(formatDuration(v.durationMs), "4.2s");
   assert.equal(v.recording?.artifactId, "v3", "the latest attempt's recording is the primary one");

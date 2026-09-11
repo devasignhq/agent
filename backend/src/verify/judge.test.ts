@@ -4,10 +4,10 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { computeVerdicts, FLAKY_REASON, mergeModelVerdicts, runVerifyJudge } from "./judge.js";
+import { buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, runVerifyJudge } from "./judge.js";
 import { createVerifyRun, snapshotCriteriaRevision, updateRun } from "./runs.js";
 import type { Criterion, VerifyArtifact, VerifyPlan } from "../types.js";
-import type { RunnerResult } from "./contract.js";
+import type { RunnerAttempt, RunnerResult } from "./contract.js";
 
 const crit = (id: string, kind: Criterion["kind"] = "code"): Criterion => ({ id, text: `criterion ${id}`, met: null, evidence: null, kind });
 const art = (id: string, kind: VerifyArtifact["kind"], testId: string): VerifyArtifact =>
@@ -15,6 +15,7 @@ const art = (id: string, kind: VerifyArtifact["kind"], testId: string): VerifyAr
 const result = (over: Partial<RunnerResult> & { testId: string; criterionIds: string[]; status: RunnerResult["status"] }): RunnerResult => ({
   id: uuid(), test: over.testId, runner: "node-test", level: "unit", origin: "generated", attempts: [], durationMs: 1, artifactIds: [], ...over,
 });
+const attempt = (n: number, status: RunnerAttempt["status"], error?: string): RunnerAttempt => ({ n, status, durationMs: 1, error, artifactIds: [] });
 
 test("no result → unverifiable (planner reason wins); error → unverifiable; doctor → unverifiable", () => {
   const plan = { unverifiable: [{ criterionId: "2", reason: "no app start / login configured" }] } as unknown as VerifyPlan;
@@ -207,4 +208,59 @@ test("a planned fix link rides on the no-result verdict and survives the model's
   const merged = mergeModelVerdicts(code, [{ criterionId: "1", verdict: "unverifiable", reason: "No app start was configured, so the pill was never exercised.", evidenceArtifactIds: [] }], []);
   assert.equal(merged[0].reason, "No app start was configured, so the pill was never exercised.");
   assert.equal(merged[0].fixUrl, "https://app/workflow?repo=r");
+});
+
+test("the reason quotes the attempt behind the result's status, not the last test to run", () => {
+  const pw = { runner: "playwright", level: "e2e" } as const;
+  const timeout = "Test timeout of 30000ms exceeded.";
+  const out = computeVerdicts({
+    criteria: [crit("1", "ui"), crit("2", "ui")],
+    results: [
+      // bishopBethel/fundsflow#23 as the CLI sent it.
+      result({ ...pw, testId: "t1", criterionIds: ["1"], status: "error", attempts: [attempt(1, "error", timeout), attempt(2, "pass", "")] }),
+      result({ ...pw, testId: "t2", criterionIds: ["2"], status: "fail", error: timeout, attempts: [attempt(1, "fail", "expect(bar).toHaveCSS() failed"), attempt(2, "fail", "expect(bar).toHaveCSS() failed"), attempt(3, "error", timeout)] }),
+    ],
+    plan: null,
+    doctor: null,
+    artifacts: [],
+  });
+  assert.equal(out[0].reason, `test could not run: ${timeout}`);
+  assert.equal(out[1].reason, "assertion failed on the test run: expect(bar).toHaveCSS() failed");
+});
+
+test("the judge's evidence never presents a Playwright file's test() blocks as retries", () => {
+  const timeout = "Test timeout of 30000ms exceeded.";
+  const criteria = [crit("1", "ui"), crit("2")];
+  const results = [
+    result({ runner: "playwright", level: "e2e", test: ".devasign/tests/e2e/canvas-edge-color-bar.spec.ts", testId: "t1", criterionIds: ["1"], status: "error", attempts: [attempt(1, "error", timeout), attempt(2, "pass", "")] }),
+    result({ test: ".devasign/tests/total.test.ts", testId: "t2", criterionIds: ["2"], status: "fail", attempts: [attempt(1, "fail", "AssertionError: expected 2 to equal 3"), attempt(2, "fail", "AssertionError: expected 2 to equal 3")] }),
+  ];
+  const code = computeVerdicts({ criteria, results, plan: null, doctor: null, artifacts: [] });
+  const prompt = buildJudgeUserPrompt({ criteria, code, results, artifacts: [], logs: new Map(), doctor: null });
+  assert.match(prompt, /2 result\(s\) across its test\(\) blocks and their retries/);
+  assert.match(prompt, /result 1: error in 1ms — Test timeout of 30000ms exceeded\./);
+  assert.match(prompt, /result 2: pass/);
+  assert.doesNotMatch(prompt, /attempt 1: error/, "a sibling test's pass must never read as a retry");
+  // Other runners re-run the whole file, so their entries really are retries.
+  assert.match(prompt, /, 2 attempt\(s\)/);
+  assert.match(prompt, /attempt 2: fail/);
+});
+
+test("only re-runs of one test are reported as failing on every attempt", () => {
+  const msg = "AssertionError: expected 2 to equal 3";
+  const out = computeVerdicts({
+    criteria: [crit("1"), crit("2"), crit("3", "ui")],
+    results: [
+      result({ testId: "t1", criterionIds: ["1"], status: "fail", error: msg, attempts: [attempt(1, "fail", msg), attempt(2, "fail", msg)] }),
+      result({ testId: "t2", criterionIds: ["2"], status: "fail", error: "timed out after 60000ms", attempts: [attempt(1, "fail", msg), attempt(2, "error", "timed out after 60000ms")] }),
+      // Two test() blocks that each failed once, not one test that failed twice.
+      result({ testId: "t3", criterionIds: ["3"], runner: "playwright", level: "e2e", status: "fail", attempts: [attempt(1, "fail", "expect(bar).toBeVisible() failed"), attempt(2, "fail", "expect(edge).toBeVisible() failed")] }),
+    ],
+    plan: null,
+    doctor: null,
+    artifacts: [],
+  });
+  assert.equal(out[0].reason, `assertion failed on all 2 attempts: ${msg}`);
+  assert.equal(out[1].reason, `assertion failed on the test run: ${msg}`, "an errored retry did not fail an assertion");
+  assert.equal(out[2].reason, "assertion failed on the test run: expect(bar).toBeVisible() failed");
 });

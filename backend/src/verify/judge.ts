@@ -42,6 +42,13 @@ function artifactsFor(result: RunnerResult, artifacts: VerifyArtifact[], attempt
     .sort((x, y) => EVIDENCE_KIND_ORDER.indexOf(byId.get(x)!.kind) - EVIDENCE_KIND_ORDER.indexOf(byId.get(y)!.kind));
 }
 
+// Attempts can span several Playwright test() blocks, and older CLIs set `error`
+// from the last one: empty after a passing sibling, or a sibling's message.
+function statusMessage(r: RunnerResult): string | undefined {
+  const said = r.attempts.filter((a) => a.error);
+  return (said.find((a) => a.status === r.status) ?? said[0])?.error ?? r.error;
+}
+
 export function computeVerdicts(args: {
   criteria: Criterion[];
   results: RunnerResult[];
@@ -85,11 +92,12 @@ export function computeVerdicts(args: {
     }
     if (failed.length) {
       const first = failed[0];
-      const attempts = first.attempts.length;
+      // Attempts from separate Playwright test() blocks are not retries of one test.
+      const allRetriesFailed = first.runner !== "playwright" && first.attempts.length > 1 && first.attempts.every((a) => a.status === "fail");
       out.push({
         criterionId: c.id,
         verdict: "fail",
-        reason: `assertion failed on ${attempts > 1 ? `all ${attempts} attempts` : "the test run"}: ${(first.error || first.attempts.at(-1)?.error || "see log").split("\n")[0]}`.slice(0, 300),
+        reason: `assertion failed on ${allRetriesFailed ? `all ${first.attempts.length} attempts` : "the test run"}: ${(statusMessage(first) || "see log").split("\n")[0]}`.slice(0, 300),
         evidenceRefs: refs(failed),
       });
       continue;
@@ -106,7 +114,7 @@ export function computeVerdicts(args: {
     out.push({
       criterionId: c.id,
       verdict: "unverifiable",
-      reason: `test could not run: ${(e.error || e.attempts.at(-1)?.error || e.status).split("\n")[0]}`.slice(0, 300),
+      reason: `test could not run: ${(statusMessage(e) || e.status).split("\n")[0]}`.slice(0, 300),
       evidenceRefs: refs(errored),
     });
   }
@@ -170,8 +178,12 @@ export function buildJudgeUserPrompt(args: {
     lines.push(`- [${v.criterionId}] provisional: ${v.verdict} — ${c?.text ?? ""}`);
     lines.push(`  mechanical reason: ${v.reason}`);
     for (const r of args.results.filter((r) => r.criterionIds.includes(v.criterionId))) {
-      lines.push(`  test ${r.test || r.testId} (${r.level}, ${r.origin}, ${r.runner}): ${r.status}, ${r.attempts.length} attempt(s)`);
-      for (const a of r.attempts) lines.push(`    attempt ${a.n}: ${a.status} in ${a.durationMs}ms${a.error ? ` — ${a.error.split("\n").slice(0, 3).join(" ").slice(0, 400)}` : ""}`);
+      // Playwright lists every test() block's results in turn, so calling them
+      // attempts would present a sibling test's pass as a retry.
+      const pw = r.runner === "playwright";
+      const unit = pw ? "result" : "attempt";
+      lines.push(`  test ${r.test || r.testId} (${r.level}, ${r.origin}, ${r.runner}): ${r.status}, ${r.attempts.length} ${unit}(s)${pw ? " across its test() blocks and their retries" : ""}`);
+      for (const a of r.attempts) lines.push(`    ${unit} ${a.n}: ${a.status} in ${a.durationMs}ms${a.error ? ` — ${a.error.split("\n").slice(0, 3).join(" ").slice(0, 400)}` : ""}`);
       for (const id of new Set([...r.artifactIds, ...r.attempts.flatMap((a) => a.artifactIds)])) {
         const art = byId.get(id);
         if (!art) continue;
