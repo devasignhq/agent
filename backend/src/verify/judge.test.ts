@@ -172,6 +172,34 @@ test("a doctor diagnosis only clouds the criteria whose own tests could not run"
   assert.match(by.get("4")!.reason, /setup needs attention/);
 });
 
+test("a browser test that ran decides its criterion; the tests below it count only when it could not run", () => {
+  const e2e = (testId: string, id: string, status: RunnerResult["status"]) => result({ testId, criterionIds: [id], status, runner: "playwright", level: "e2e" });
+  const unit = (testId: string, id: string, status: RunnerResult["status"]) => result({ testId, criterionIds: [id], status, ...(status === "fail" ? { error: "expected 1 to be 2" } : {}) });
+  const out = computeVerdicts({
+    criteria: ["1", "2", "3", "4", "5"].map((id) => crit(id, "ui")),
+    results: [
+      e2e("b1", "1", "pass"), unit("u1", "1", "fail"),
+      e2e("b2", "2", "fail"), unit("u2", "2", "pass"),
+      e2e("b3", "3", "error"), unit("u3", "3", "pass"),
+      e2e("b4", "4", "error"), unit("u4", "4", "fail"),
+      e2e("b5", "5", "error"), unit("u5", "5", "error"),
+    ],
+    plan: null,
+    doctor: null,
+    artifacts: [],
+  });
+  assert.deepEqual(out.map((v) => [v.criterionId, v.verdict]), [["1", "pass"], ["2", "fail"], ["3", "pass"], ["4", "fail"], ["5", "unverifiable"]]);
+  assert.ok(out[0].evidenceRefs.every((r) => r.testId === "b1"), "the fallback the browser overruled is not cited");
+  const noBoot = computeVerdicts({
+    criteria: [crit("1", "ui")],
+    results: [e2e("b1", "1", "error"), unit("u1", "1", "pass")],
+    plan: null,
+    doctor: { stage: "start", code: "no_start_command", message: "no start command" },
+    artifacts: [],
+  });
+  assert.equal(noBoot[0].verdict, "pass", "an app that would not boot costs nothing when the fallback ran");
+});
+
 test("a planned fix link rides on the no-result verdict and survives the model's reason rewrite", () => {
   const plan = { unverifiable: [{ criterionId: "1", reason: "no app start / login configured", fixUrl: "https://app/workflow?repo=r" }] } as unknown as VerifyPlan;
   const code = computeVerdicts({ criteria: [crit("1", "ui")], results: [], plan, doctor: null, artifacts: [] });

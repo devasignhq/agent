@@ -27,3 +27,10 @@ test("runnerPlanFor passes the repo's stored fail-on setting through, including 
   const legacy = runnerPlanFor(run, plan, { workflow: { verify: { failOn: "bogus" } } } as unknown as Repository);
   assert.equal(legacy.failOn, "never");
 });
+
+test("runnerPlanFor hands the runner the verify block the plan was made with, and none when it had none", () => {
+  const verifyConfig = { start: "npm run dev -- --port 5173", url: "http://localhost:5173", ready: "/" };
+  const out = runnerPlanFor(run, { ...plan, verifyConfig, verifyConfigFrom: "base" } as VerifyPlan, {} as Repository);
+  assert.deepEqual(out.verifyConfig, verifyConfig);
+  assert.equal("verifyConfig" in runnerPlanFor(run, plan, {} as Repository), false);
+});

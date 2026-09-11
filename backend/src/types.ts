@@ -1339,6 +1339,9 @@ export type VerifyPlan = {
   unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }>;
   // Test files the PR itself adds or changes — withheld from the planner as evidence.
   prAuthoredTests?: string[];
+  // The `verify:` block the plan assumed; "base" when the PR head carries none of its own.
+  verifyConfig?: DevasignVerifyConfig;
+  verifyConfigFrom?: "head" | "base";
   createdAt: number;
 };
 

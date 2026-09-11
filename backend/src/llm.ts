@@ -389,9 +389,9 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
     return JSON.stringify({ path, content });
   }
 
-  // Test planner: one generated test per criterion (Playwright for `ui`), citing
-  // the first listed existing test for the first criterion when the prompt lists
-  // any. Honors the prompt's per-criterion "max level" lines.
+  // Test planner: one generated test per criterion (Playwright plus a unit fallback
+  // for `ui`), citing the first listed existing test for the first criterion when the
+  // prompt lists any. Honors the prompt's per-criterion "max level" lines.
   if (system?.includes("test planning")) {
     const crits = [...last.matchAll(/^- \[([^\]]+)\] \((code|ui|unverifiable)\)(?: \[implied\])? (.+)$/gm)].map((m) => ({ id: m[1], kind: m[2], text: m[3] }));
     const maxLevel = new Map([...last.matchAll(/^- \[([^\]]+)\]: max level (\w+)/gm)].map((m) => [m[1], m[2]]));
@@ -410,6 +410,11 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
           path: `.devasign/tests/e2e/criterion-${c.id}.spec.ts`,
           criterionIds: [c.id], level: "e2e", levelReason: "[mock] observable only in the rendered UI", origin: "generated", runner: "playwright", targetFiles: ["src/app.tsx"],
           strategy: "[mock] open the app and assert the main region renders",
+        });
+        tests.push({
+          path: `.devasign/tests/criterion-${c.id}.test.ts`,
+          criterionIds: [c.id], level: "unit", levelReason: "[mock] the logic behind the screen, for when the browser cannot run", origin: "generated", runner: "node-test", targetFiles: ["src/handler.ts"],
+          strategy: "[mock] call the handler and assert its return value",
         });
         continue;
       }

@@ -30,6 +30,11 @@ import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, Verify
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, type ImportAllowList } from "./imports.js";
+import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
+import { libraryNotes } from "./library-notes.js";
+import { syntaxError } from "./syntax.js";
+import { specLint } from "./spec-lint.js";
+import { withDomEnvironment } from "./dom-env.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
@@ -174,9 +179,11 @@ export const GENERATED_TEST_PREFIX = ".devasign/tests";
 export function normalizeGeneratedPath(p: string, runner: TestRunner): { path: string; from: string } | null {
   const from = p.replace(/^\.\//, "").replace(/^\/+/, "");
   if (from.split("/").some((seg) => seg === ".." || seg === "." || seg === "")) return null;
-  if (from.startsWith(".devasign/")) return from.startsWith(`${GENERATED_TEST_PREFIX}/`) ? { path: from, from } : null;
-  const clean = from.replace(/^(tests?|__tests__|spec|e2e)\//, "");
+  const inPrefix = from.startsWith(`${GENERATED_TEST_PREFIX}/`);
+  if (from.startsWith(".devasign/") && !inPrefix) return null;
+  const clean = (inPrefix ? from.slice(GENERATED_TEST_PREFIX.length + 1) : from).replace(/^(tests?|__tests__|spec|e2e)\//, "");
   if (!clean) return null;
+  // The runner points Playwright at .devasign/tests/e2e alone: a browser test anywhere else is never found.
   return { path: runner === "playwright" ? `${GENERATED_TEST_PREFIX}/e2e/${clean}` : `${GENERATED_TEST_PREFIX}/${clean}`, from };
 }
 
@@ -498,6 +505,7 @@ export type PlanContext = {
   treePaths: Set<string>;
   setup: DetectedSetup;
   yml: DevasignVerifyConfig | null;
+  ymlFrom: "head" | "base" | null;
   policy: PlanPolicy;
   existingTests: string[];
   candidates: Array<{ path: string; imports: string[] }>;
@@ -505,7 +513,7 @@ export type PlanContext = {
   prTitle: string;
 };
 
-export type ReplanCohorts = { level: string[]; escalate: string[] };
+export type ReplanCohorts = { level: string[]; escalate: string[]; fallback?: string[] };
 
 function replanHeader(r: ReplanCohorts): string {
   const lines = ["## Re-plan ONLY these criteria"];
@@ -513,14 +521,19 @@ function replanHeader(r: ReplanCohorts): string {
   if (r.escalate.length)
     lines.push(
       `- [${r.escalate.join("], [")}]: you marked these unverifiable, but the Level policy below still allows a rung you did not attempt. ` +
-        "Plan a test at the highest level the policy allows for it, with a levelReason naming what the level beneath it cannot observe. Repeat the unverifiable entry only if no test at any allowed level could decide the criterion."
+        "Plan a test at the highest level the policy allows for it, with a levelReason naming what the level beneath it cannot observe, and when that level is e2e add a fallback below it too. Repeat the unverifiable entry only if no test at any allowed level could decide the criterion."
+    );
+  if (r.fallback?.length)
+    lines.push(
+      `- [${r.fallback.join("], [")}]: covered only by a browser test, which can fail to run for reasons that have nothing to do with the change. ` +
+        "Plan each a fallback: a generated test at the cheapest level below e2e that can observe the logic behind it, never a test file this PR adds or changes. Do not plan another browser test for these."
     );
   // The criteria list follows immediately; without the break it reads as one list.
   return lines.join("\n") + "\n";
 }
 
 export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: ReplanCohorts } = {}): string {
-  const replanIds = opts.replan ? [...opts.replan.level, ...opts.replan.escalate] : [];
+  const replanIds = opts.replan ? [...opts.replan.level, ...opts.replan.escalate, ...(opts.replan.fallback ?? [])] : [];
   const target = opts.replan ? ctx.criteria.filter((c) => replanIds.includes(c.id)) : ctx.criteria;
   const lines = [
     `# Test plan for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
@@ -559,9 +572,22 @@ const BOOT_REASON_HINT = /app start|login|boot/i;
 type PlanManifest = { tests?: unknown; unverifiable?: unknown };
 type PlanAttempts = { manifest: StructuredAttempt[]; replan?: StructuredAttempt[]; bodies: Record<string, StructuredAttempt[]> };
 
+// A model sometimes sends a list as the JSON text of one, and its repair pass has repeated
+// that — losing a whole re-plan — so a string that parses to a list is read as the list.
+function listOf(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  try {
+    const parsed: unknown = JSON.parse(value);
+    return Array.isArray(parsed) ? parsed : value;
+  } catch {
+    return value;
+  }
+}
+
 function validateManifest(input: unknown): Validation<PlanManifest> {
-  const o = input as PlanManifest | null;
-  if (!o || typeof o !== "object") return { ok: false, reason: "no plan object in the response" };
+  const given = input as PlanManifest | null;
+  if (!given || typeof given !== "object") return { ok: false, reason: "no plan object in the response" };
+  const o = { ...given, tests: listOf(given.tests), unverifiable: listOf(given.unverifiable) };
   if (o.tests != null && !Array.isArray(o.tests)) return { ok: false, reason: "tests is not an array" };
   if (o.unverifiable != null && !Array.isArray(o.unverifiable)) return { ok: false, reason: "unverifiable is not an array" };
   return { ok: true, value: o };
@@ -570,21 +596,31 @@ const manifestRepair = (reason: string) => `Your previous answer could not be us
 
 // retryStructured allows exactly one repair pass, so the reason has to carry everything
 // the model needs to rewrite the file — including what it may import instead.
-export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void): (input: unknown) => Validation<{ content: string }> {
+export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void, path?: string): (input: unknown) => Validation<{ content: string }> {
+  let calls = 0;
   return (input) => {
-    const content = (input as { content?: unknown } | null)?.content;
+    const given = input as { content?: unknown; path?: unknown } | null;
+    const content = given?.content;
     if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "content is empty" };
     const bad = disallowedImports(content, allow);
-    if (!bad.length) return { ok: true, value: { content } };
+    const unparsable = syntaxError(path ?? (typeof given?.path === "string" ? given.path : ""), content);
+    // First answer only: a pattern check is a nudge, and a spec that insists may be right.
+    // Asked later, it would drop a file whose only repair went to a syntax error.
+    const patterns = calls++ === 0 ? specLint(content, allow.names) : [];
+    if (!bad.length && !unparsable && !patterns.length) return { ok: true, value: { content } };
+    // Reported every failure, empty included, so a later syntax-only miss is not blamed on a package.
     onReject?.(bad);
     const available = [...allow.names].sort().join(", ") || "none";
-    return {
-      ok: false,
-      reason:
-        `it imports ${bad.map((b) => `"${b}"`).join(", ")}, which this repository does not have — the runner installs nothing, so the suite would fail to load. ` +
-        `Rewrite it using only these packages: ${available}; Node builtins; and the runner's own assertions. ` +
-        "If the criterion cannot be proven without a package that is missing, return a file that proves as much of it as you can",
-    };
+    const problems = [
+      unparsable ? `it does not parse — ${unparsable} — and a spec that cannot load fails every other spec run beside it` : "",
+      bad.length
+        ? `it imports ${bad.map((b) => `"${b}"`).join(", ")}, which this repository does not have — the runner installs nothing, so the suite would fail to load. ` +
+          `Rewrite it using only these packages: ${available}; Node builtins; and the runner's own assertions. ` +
+          "If the criterion cannot be proven without a package that is missing, return a file that proves as much of it as you can"
+        : "",
+      ...patterns,
+    ];
+    return { ok: false, reason: problems.filter(Boolean).join("; and ") };
   };
 }
 const testFileRepair = (reason: string) => `Your previous answer could not be used: ${reason}. Call ${planTestFileTool.name} now with the complete file contents.`;
@@ -615,7 +651,9 @@ function renderSharedContext(ctx: PlanContext): string {
   return ["# Shared context", "", "## Repository test setup", renderSetup(ctx.setup, ctx.yml), "", renderDiff(ctx)].join("\n");
 }
 
-export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strategyVersion?: number }): string {
+const renderSourceFile = (f: SourceFile) => `### ${f.path}${f.truncated ? " (truncated)" : ""}\n\`\`\`\`\n${f.content}\n\`\`\`\``;
+
+export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strategyVersion?: number }, source: SourceFile[] = []): string {
   const byId = new Map(ctx.criteria.map((c) => [c.id, c]));
   return [
     `# Write the test file for PR "${ctx.prTitle}" (${ctx.repo.owner}/${ctx.repo.name}#${ctx.run.prNumber})`,
@@ -624,16 +662,39 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
     `- level: ${t.level}${t.levelReason ? ` (${t.levelReason})` : ""}`,
     "- criteria:",
     ...t.criterionIds.map((id) => `  - [${id}] ${byId.get(id)?.text ?? ""}`),
-    t.strategy ? `- strategy: ${t.strategy}` : "",
+    // The planner never sees the app, so its setup steps for a browser test are guesses the
+    // author follows over what the source shows; the criteria already say what to prove.
+    t.strategy && t.runner !== "playwright" ? `- strategy: ${t.strategy}` : "",
     t.targetFiles.length ? `- targetFiles: ${t.targetFiles.join(", ")}` : "",
     (t.strategyVersion ?? 1) > 1
       ? `- strategy version: ${t.strategyVersion} — the previous version of this test was flaky; take a different approach (explicit state assertions, role/test-id selectors, isolated data).`
       : "",
     "",
+    ...(t.runner === "playwright" ? waysIn(source, ctx.treePaths) : []),
+    ...(!source.length
+      ? []
+      : t.runner === "playwright"
+        ? ["## App source", "What this PR's head renders — build every step and selector of the flow from it.", ...source.map(renderSourceFile)]
+        : [
+            "## Source under test",
+            "The code this test calls and what it imports, with the runner's config when it has one, as this PR's head has them. Take every name, value and shape from here.",
+            ...source.map(renderSourceFile),
+          ]),
+    ...(t.runner === "playwright" ? libraryNotes(ctx.setup.dependencies) : []),
     `Write the complete file and submit it with ${planTestFileTool.name}.`,
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+// A branch cut before onboarding carries no verify block, so every PR it opens would plan as
+// if the app could not boot; the base branch's block is the one in force for it.
+async function readVerifyYml(headRaw: string | null, headSha: string, baseRef: string | undefined, read: (ref: string) => Promise<string | null>) {
+  const head = parseDevasignVerify(headRaw);
+  if (head || !baseRef) return { raw: headRaw, sha: headSha, yml: head, from: head ? ("head" as const) : null };
+  const baseRaw = await read(baseRef);
+  const base = parseDevasignVerify(baseRaw);
+  return base ? { raw: baseRaw, sha: baseRef, yml: base, from: "base" as const } : { raw: headRaw, sha: headSha, yml: null, from: null };
 }
 
 async function gatherContext(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<PlanContext> {
@@ -648,17 +709,18 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const paths = tree.filter((e) => e.type === "blob").map((e) => e.path);
   const treePaths = new Set(paths);
   const readFile = deps.readFile ?? defaultReadFile;
-  const [ymlRaw, packageJson, envExample] = await Promise.all([
+  const [headYml, packageJson, envExample] = await Promise.all([
     treePaths.has(".devasign.yml") ? readFile(install, repo, ".devasign.yml", run.sha) : Promise.resolve(null),
     // Always at run.sha, even when a runner has reported: a PR that adds a dependency
     // must not have its own test judged against the list from before it.
     treePaths.has("package.json") ? readFile(install, repo, "package.json", run.sha) : Promise.resolve(null),
     !repo.verify?.detected && treePaths.has(".env.example") ? readFile(install, repo, ".env.example", run.sha) : Promise.resolve(null),
   ]);
-  const yml = parseDevasignVerify(ymlRaw);
-  if (ymlRaw != null) {
+  const boot = await readVerifyYml(headYml, run.sha, review?.baseSha || repo.defaultBranch, (ref) => readFile(install, repo, ".devasign.yml", ref));
+  const yml = boot.yml;
+  if (boot.raw != null) {
     db.update("repositories", (r) => r.id === repo.id, {
-      verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: ymlRaw.slice(0, 20_000), parsed: yml, sha: run.sha } },
+      verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: boot.raw.slice(0, 20_000), parsed: yml, sha: boot.sha } },
     });
   }
   const inferred = inferSetupFromTree(paths, { packageJson, envExample });
@@ -699,6 +761,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     treePaths,
     setup,
     yml,
+    ymlFrom: boot.from,
     policy,
     existingTests,
     candidates,
@@ -792,19 +855,21 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
         const dropped = violations.map((v) => `${v.test.path} (${v.reason})`);
 
-        // One re-plan, covering two cohorts: criteria a violating test left uncovered,
-        // and criteria the model waved off as unverifiable while a rung it never tried
-        // was still open to it. Both go in a single call.
+        // One re-plan, covering three cohorts: criteria a violating test left uncovered, criteria
+        // waved off as unverifiable while a rung was still open, and criteria only a browser test
+        // covers — a browser that cannot boot would leave those with no verdict at all.
         const covered = new Set(kept.flatMap((t) => t.criterionIds));
         const uncovered = ctx.criteria.map((c) => c.id).filter((id) => !covered.has(id) && !unverifiable.has(id));
         const violatedIds = uncovered.filter((id) => violations.some((v) => v.test.criterionIds.includes(id)));
         const escapedIds = [...unverifiable.keys()].filter((id) => !covered.has(id) && hasUntriedRung(id, ctx.policy));
-        const replanIds = [...violatedIds, ...escapedIds];
+        const coveredAt = (id: string, browser: boolean) => kept.some((t) => (t.level === "e2e") === browser && t.criterionIds.includes(id));
+        const fallbackIds = ctx.criteria.map((c) => c.id).filter((id) => coveredAt(id, true) && !coveredAt(id, false));
+        const replanIds = [...violatedIds, ...escapedIds, ...fallbackIds];
         let replanMs = 0;
         let replanLost: string | null = null;
         if (replanIds.length) {
           const replanStartedAt = Date.now();
-          const user = buildPlannerUserPrompt(ctx, { replan: { level: violatedIds, escalate: escapedIds } });
+          const user = buildPlannerUserPrompt(ctx, { replan: { level: violatedIds, escalate: escapedIds, fallback: fallbackIds } });
           const second = await askPlanner<PlanManifest>(llm, system, user, planManifestTool, MANIFEST_BUDGETS, validateManifest, manifestRepair);
           replanMs = Date.now() - replanStartedAt;
           attempts.replan = second.attempts;
@@ -814,12 +879,35 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           }
           const secondJson = second.value ?? {};
           const replanKnown = new Set(replanIds);
-          const again = normalizeManifestTests(secondJson, replanKnown, fallbackRunner, ctx.setup);
+          // The last call, and a test this PR wrote cannot vouch for the change it ships with:
+          // rather than lose the coverage asked for, DevAsign writes that test itself.
+          const ownTest = (t: unknown) => {
+            const o = t as { origin?: unknown; path?: unknown } | null;
+            return o?.origin === "existing" && typeof o.path === "string" && ctx.policy.prAuthoredTests.has(o.path.replace(/^\.\//, ""));
+          };
+          const listed = (secondJson as PlanManifest).tests;
+          const asked = Array.isArray(listed) ? { ...secondJson, tests: listed.map((t) => (ownTest(t) ? { ...(t as object), origin: "generated" } : t)) } : secondJson;
+          // The fallback cohort already has its browser test; a second one is not what was asked.
+          const browserCovered = new Set(fallbackIds);
+          const again = normalizeManifestTests(asked, replanKnown, fallbackRunner, ctx.setup).filter(
+            (t) => t.level !== "e2e" || t.criterionIds.some((id) => !browserCovered.has(id))
+          );
           const enforced = enforcePlanPolicy(again, ctx.policy, ctx.treePaths);
           kept = [...kept, ...enforced.kept];
           for (const u of normalizeUnverifiable(secondJson, replanKnown)) unverifiable.set(u.criterionId, u.reason);
           for (const v of enforced.violations) dropped.push(`${v.test.path} (${v.reason}, re-plan)`);
         }
+
+        // Two generated tests given one path would overwrite each other on disk, and the report
+        // would credit both with whichever was written last.
+        const taken = new Set<string>();
+        kept = kept.map((t) => {
+          if (t.origin !== "generated") return t;
+          let path = t.path;
+          for (let n = 2; taken.has(path); n++) path = t.path.replace(/([^/.]+)((?:\.[^/.]+)*)$/, `$1-${n}$2`);
+          taken.add(path);
+          return path === t.path ? t : { ...t, path };
+        });
 
         // Signatures, quarantine strategy bumps, and retirement — before any file
         // is authored, so a retired test costs no body call.
@@ -843,17 +931,39 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const authored = new Map<object, string>();
         const bodyFailed: string[] = [];
         const generated = survivors.filter((t) => t.origin === "generated");
+        // The files in one plan crawl the same code, so each repo file is read once.
+        const headReads = new Map<string, Promise<string | null>>();
+        const readHead = (p: string) => {
+          if (!headReads.has(p)) headReads.set(p, (deps.readFile ?? defaultReadFile)(install, repo, p, run.sha));
+          return headReads.get(p)!;
+        };
         const author = async (t: (typeof survivors)[number]) => {
           // Per test, not per run: the allow-list depends on t.runner and the pool runs
           // three of these at once.
           let rejected: string[] = [];
-          const validate = makeTestFileValidator(buildImportAllowList(ctx.setup, t.runner), (bad) => {
-            rejected = bad;
-          });
+          const validate = makeTestFileValidator(
+            buildImportAllowList(ctx.setup, t.runner),
+            (bad) => {
+              rejected = bad;
+            },
+            t.rebaseFrom ?? t.path
+          );
           try {
-            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
+            // vitest reads the Vite config when it has none of its own, and a Vite app keeps its
+            // `test` block there.
+            const config =
+              ctx.setup.frameworks.find((f) => f.name === t.runner)?.configPath ??
+              (t.runner === "vitest" ? [...ctx.treePaths].find((p) => /^vite\.config\.[cm]?[jt]s$/.test(p)) : undefined);
+            const source = await (t.runner === "playwright"
+              ? appSourceFor({ targetFiles: t.targetFiles, tree: ctx.treePaths, read: readHead })
+              : sourceUnderTest({ targetFiles: t.targetFiles, config, tree: ctx.treePaths, read: readHead })
+            ).catch(() => []);
+            const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t, source), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
             attempts.bodies[t.path] = r.attempts;
-            if (r.value) return void authored.set(t, r.value.content);
+            if (r.value) {
+              const configSource = config ? source.find((f) => f.path === config)?.content : undefined;
+              return void authored.set(t, withDomEnvironment(r.value.content, { runner: t.runner, dependencies: ctx.setup.dependencies ?? [], config: configSource }));
+            }
             bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
             if (rejected.length) for (const id of t.criterionIds) missingPackage.add(id);
             lose(t.criterionIds, r.lastStopReason);
@@ -924,6 +1034,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           commands: buildCommands(finalTests),
           unverifiable: planUnverifiable,
           prAuthoredTests: [...ctx.policy.prAuthoredTests],
+          ...(ctx.yml && ctx.ymlFrom ? { verifyConfig: ctx.yml, verifyConfigFrom: ctx.ymlFrom } : {}),
           createdAt: Date.now(),
         });
         const planFinishedAt = Date.now();
@@ -950,6 +1061,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           action: `Test plan ready: ${generatedCount} generated, ${finalTests.length - generatedCount} existing, ${planUnverifiable.length} unverifiable`,
           detail: [
             `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""}${bodiesMs ? `, bodies ${secs(bodiesMs)}` : ""})`,
+            ...(ctx.ymlFrom === "base" ? ["app start read from the base branch's .devasign.yml — this PR's head has no verify block of its own"] : []),
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
             ...(first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),
@@ -968,8 +1080,10 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             unresolvedImports: unresolved,
             apiOnly: ctx.policy.apiOnly,
             e2eAllowed: ctx.policy.e2eAllowed,
+            verifyConfigFrom: ctx.ymlFrom,
             prAuthoredTests: [...ctx.policy.prAuthoredTests],
             escalated: escapedIds,
+            fallback: fallbackIds,
             cutOff: [...cutOff].filter((id) => !finalCovered.has(id)),
             bodyFailed,
             attempts,
