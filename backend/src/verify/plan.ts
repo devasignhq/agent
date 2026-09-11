@@ -34,6 +34,7 @@ import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-so
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
 import { specLint } from "./spec-lint.js";
+import { withDomEnvironment } from "./dom-env.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
@@ -959,7 +960,10 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             ).catch(() => []);
             const r = await askPlanner<{ content: string }>(llm, bodySystem, buildTestFilePrompt(ctx, t, source), planTestFileTool, BODY_BUDGETS, validate, testFileRepair);
             attempts.bodies[t.path] = r.attempts;
-            if (r.value) return void authored.set(t, r.value.content);
+            if (r.value) {
+              const configSource = config ? source.find((f) => f.path === config)?.content : undefined;
+              return void authored.set(t, withDomEnvironment(r.value.content, { runner: t.runner, dependencies: ctx.setup.dependencies ?? [], config: configSource }));
+            }
             bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
             if (rejected.length) for (const id of t.criterionIds) missingPackage.add(id);
             lose(t.criterionIds, r.lastStopReason);

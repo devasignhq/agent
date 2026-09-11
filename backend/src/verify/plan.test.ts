@@ -1200,6 +1200,27 @@ test("a vitest author sees the Vite config vitest falls back to, then the code u
   }
 });
 
+test("a generated vitest test that renders is given the DOM environment its config does not set", async () => {
+  const s = seed([crit("1")]);
+  const files = {
+    "package.json": PKG({ vitest: "^3.2.0", "happy-dom": "^20.0.0", react: "^19.0.0", "react-dom": "^19.0.0" }),
+    "vite.config.ts": "export default defineConfig({ plugins: [react()] })\n",
+  };
+  const rendered = "// criteria: [1]\nimport { createRoot } from 'react-dom/client'\ncreateRoot(document.createElement('div'))\n";
+  const { deps: d } = deps({
+    tree: [...BASE_TREE, ...Object.keys(files)],
+    files,
+    responses: [{ tests: [gen("1", "unit", { runner: "vitest", content: rendered })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.tests[0].content, `// @vitest-environment happy-dom\n${rendered}`);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("the head's own verify block wins, and the base branch is never read", async () => {
   const s = seed([crit("1", "ui")]);
   const reads: string[] = [];
