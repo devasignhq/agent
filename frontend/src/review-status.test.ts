@@ -62,8 +62,8 @@ test("canMessageAgent: open and legacy rows yes, merged/closed no", () => {
 });
 
 test("lock copy names the actual lifecycle state, and is absent when open", () => {
-  assert.equal(composerLockReason("merged"), "PR merged — messaging closed");
-  assert.equal(composerLockReason("closed"), "PR closed — messaging closed");
+  assert.equal(composerLockReason("merged"), "PR merged, messaging closed");
+  assert.equal(composerLockReason("closed"), "PR closed, messaging closed");
   assert.equal(composerLockReason("open"), null);
   assert.equal(composerLockReason(undefined), null);
   assert.match(composerLockPlaceholder("merged")!, /merged/);

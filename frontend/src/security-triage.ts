@@ -117,7 +117,7 @@ export function validateRuling(draft: RulingDraft): RulingValidation {
   if (requiresNote(draft.code) && !note) {
     return {
       ok: false,
-      error: "Add a sentence explaining why — that explanation is what the agent learns from.",
+      error: "Add a sentence explaining why. That explanation is what the agent learns from.",
     };
   }
   return {

@@ -801,7 +801,7 @@ const SetBilling = () => {
         <div className="card-body flex justify-between items-center" style={{ gap: 16, flexWrap: "wrap" }}>
           <div style={{ minWidth: 0, flex: 1 }}>
             <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>
-              Your {planLabel(purchased)} plan lapsed — you're on Free
+              Your {planLabel(purchased)} plan lapsed, so you're on Free
             </div>
             <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
               {status === "past_due" ? "Your last payment failed." : "Your subscription ended."} Update your
@@ -918,7 +918,7 @@ const SetBilling = () => {
               <div className="mono" style={{ fontSize: 13 }}>Switch to {switchName} now?</div>
               <div className="mute" style={{ fontSize: 12 }}>
                 Takes effect immediately
-                {status === "trialing" ? " — no charge until your trial ends." : ", with a prorated charge today."}
+                {status === "trialing" ? ", with no charge until your trial ends." : ", with a prorated charge today."}
                 {switchTo.interval === "year" ? " You save 20% with annual billing." : ""}
               </div>
               <div className="flex gap-2">
@@ -932,7 +932,7 @@ const SetBilling = () => {
             <>
               <div className="mono" style={{ fontSize: 13 }}>Switch to {switchName}</div>
               <div className="mute" style={{ fontSize: 12 }}>
-                Takes effect {renew ? `on ${renew}` : "next period"} — you keep {planLabel(effective)} ({curInterval === "year" ? "annual" : "monthly"}) until then.
+                Takes effect {renew ? `on ${renew}` : "next period"}. You keep {planLabel(effective)} ({curInterval === "year" ? "annual" : "monthly"}) until then.
                 Or switch now and we'll credit the prorated difference.
               </div>
               <div className="flex gap-2">
@@ -963,7 +963,7 @@ const SetBilling = () => {
             <div className="mono" style={{ fontSize: 13 }}>{planLabel(effective)} plan · billed {curInterval === "year" ? "annually" : "monthly"}</div>
             <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
               {pendingCancel
-                ? `Set to cancel${renew ? ` on ${renew}` : ""} — you'll drop to Free then. Reopen the portal to keep it.`
+                ? `Set to cancel${renew ? ` on ${renew}` : ""}. You'll drop to Free then. Reopen the portal to keep it.`
                 : "Update your card or view invoices in the Stripe portal. Cancelling sends you to Stripe to confirm, then back here."}
             </div>
           </div>
@@ -1071,7 +1071,7 @@ const SetAccount = () => {
               <div className="mono" style={{ fontSize: 13 }}>Delete your account</div>
               <div className="mute" style={{ fontSize: 12, marginTop: 4 }}>
                 This is immediate and permanent. Your profile, agent settings, review history, and GitHub
-                installs are erased right away — there's no way to undo it or restore later.
+                installs are erased right away. There's no way to undo it or restore later.
               </div>
             </div>
             <button className="btn danger" onClick={() => setStep("confirm")}>Delete account…</button>
@@ -1082,7 +1082,7 @@ const SetAccount = () => {
           <div className="col gap-3">
             <div className="mono" style={{ fontSize: 13, color: "var(--danger)" }}>This can't be undone.</div>
             <div className="mute" style={{ fontSize: 12 }}>
-              Your account and all its data are deleted immediately and permanently — there's no grace period
+              Your account and all its data are deleted immediately and permanently. There's no grace period
               and no way to restore it afterward.
             </div>
             <div className="mute" style={{ fontSize: 12 }}>

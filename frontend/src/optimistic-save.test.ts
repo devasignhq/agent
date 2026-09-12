@@ -234,5 +234,5 @@ test("helpers: isTransientNotDurable + saveErrorMessage", () => {
   assert.equal(saveErrorMessage({ message: "upgrade_required" }), "That control is a Pro/Max feature.");
   assert.equal(saveErrorMessage({ body: { message: "Friendly" }, message: "raw_code" }), "Friendly", "prefers body.message over the code");
   assert.equal(saveErrorMessage({ message: "raw_code" }), "raw_code");
-  assert.equal(saveErrorMessage({}), "Couldn't save — reverted.");
+  assert.equal(saveErrorMessage({}), "Couldn't save. Reverted.");
 });

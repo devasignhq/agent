@@ -88,44 +88,30 @@ test("paywall gate: free user may save stage changes but not advanced changes", 
   assert.equal(advancedChanged(current, advancedSave), true, "advanced change must be refused for free");
 });
 
-test("normalizeWorkflow keeps valid stage prompts, trims, caps length, drops the rest", () => {
+// Custom per-stage prompts are disabled: nothing inbound is kept, nothing
+// stored is honoured, and sending one is not an advanced change.
+test("normalizeWorkflow drops every inbound stage prompt", () => {
   const wf = normalizeWorkflow({
     ...WORKFLOW_DEFAULTS,
-    prompts: {
-      review: "  Focus on error handling.  ", // trimmed
-      holistic: "x".repeat(5000),             // capped at 2000
-      criteria: "   ",                        // blank -> dropped
-      docs: 123,                              // non-string -> dropped
-      bogus: "nope",                          // unknown key -> dropped
-    },
+    prompts: { review: "Focus on error handling.", holistic: "x".repeat(50), bogus: "nope" },
   });
-  assert.equal(wf.prompts?.review, "Focus on error handling.");
-  assert.equal(wf.prompts?.holistic?.length, 2000);
-  assert.equal(wf.prompts?.criteria, undefined);
-  assert.equal(wf.prompts?.docs, undefined);
-  assert.equal((wf.prompts as any)?.bogus, undefined);
-});
-
-test("normalizeWorkflow defaults prompts to an empty object", () => {
+  assert.deepEqual(wf.prompts, {});
   assert.deepEqual(normalizeWorkflow({ version: 1 }).prompts, {});
 });
 
-test("effectiveWorkflow fills prompts with {} and merges stored ones", () => {
+test("effectiveWorkflow ignores prompts already stored on the repo", () => {
   assert.deepEqual(effectiveWorkflow({ workflow: undefined }).prompts, {});
   const wf = effectiveWorkflow({
-    workflow: { version: 1, prompts: { review: "be strict" } } as any,
+    workflow: { version: 1, prompts: { review: "be strict", security: "paranoid" } } as any,
   });
-  assert.deepEqual(wf.prompts, { review: "be strict" });
+  assert.deepEqual(wf.prompts, {});
 });
 
-test("advancedChanged: editing a stage prompt is an ADVANCED change", () => {
+test("advancedChanged: a stage prompt in the payload is not a change", () => {
   const base = WORKFLOW_DEFAULTS;
   const promptEdit = normalizeWorkflow({ ...base, prompts: { review: "focus on tests" } });
-  assert.equal(advancedChanged(base, promptEdit), true, "setting a prompt is advanced");
-  assert.equal(advancedChanged(promptEdit, base), true, "clearing a prompt is advanced");
-  // Two equivalent prompt sets are NOT a change.
-  const same = normalizeWorkflow({ ...base, prompts: { review: "focus on tests" } });
-  assert.equal(advancedChanged(promptEdit, same), false, "identical prompts are not a change");
+  assert.equal(advancedChanged(base, promptEdit), false);
+  assert.equal(advancedChanged({ ...base, prompts: { review: "stale stored text" } }, base), false);
 });
 
 test("normalizeWorkflow coerces the actions step and defaults it off", () => {
@@ -185,12 +171,12 @@ test("verify stage defaults on with e2e:auto / failOn:never and normalizes", () 
   });
   assert.equal(wf.stages.verify, false);
   assert.deepEqual(wf.verify, { e2e: "never", failOn: "never" });
-  assert.equal(wf.prompts?.verify, "prefer integration tests");
+  assert.deepEqual(wf.prompts, {}, "custom prompts are disabled");
 
   const bad = normalizeWorkflow({ version: 1, verify: { e2e: "sometimes", failOn: "verdict" } });
   assert.deepEqual(bad.verify, { e2e: "auto", failOn: "verdict" });
   // Toggling the stage is a BASIC edit, like every other stage.
-  assert.equal(advancedChanged(WORKFLOW_DEFAULTS, wf), true, "the prompt edit is advanced");
+  assert.equal(advancedChanged(WORKFLOW_DEFAULTS, wf), false, "prompts are ignored and verify settings are basic");
   const stageOnly = normalizeWorkflow({ ...WORKFLOW_DEFAULTS, stages: { ...WORKFLOW_DEFAULTS.stages, verify: false } });
   assert.equal(advancedChanged(WORKFLOW_DEFAULTS, stageOnly), false);
 });

@@ -43,15 +43,15 @@ export function canMessageAgent(prState?: PRState): boolean {
 }
 
 export function composerLockReason(prState?: PRState): string | null {
-  if (prState === "merged") return "PR merged — messaging closed";
-  if (prState === "closed") return "PR closed — messaging closed";
+  if (prState === "merged") return "PR merged, messaging closed";
+  if (prState === "closed") return "PR closed, messaging closed";
   return null;
 }
 
 export function composerLockPlaceholder(prState?: PRState): string | null {
   if (!isTerminalPrState(prState)) return null;
   const what = prState === "merged" ? "merged" : "closed";
-  return `This pull request is ${what} — the review agent is no longer taking messages.`;
+  return `This pull request is ${what}. The review agent is no longer taking messages.`;
 }
 
 // The sidebar dot's 3-value union, persisted in localStorage — deliberately not

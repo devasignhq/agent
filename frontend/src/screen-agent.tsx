@@ -52,7 +52,7 @@ const EVENTS_BY_PR = {
     tool: { name: "analyze_loom", out: '36.4s · 4 key frames · transcript: 218 tokens\ncta_copy: "Confirm withdrawal"\nintent: chain selection before amount' } },
   { t: "12:04:24", action: "image.ocr", target: <>figma <span className="str">"Withdraw / 04"</span></>,
     icon: "image", flavor: "warn",
-    detail: <>Two screenshots OCR'd — copy strings, button placement, loading-state spec extracted.</>,
+    detail: <>Two screenshots OCR'd: copy strings, button placement, loading-state spec extracted.</>,
     tool: { name: "ocr_screenshots", out: 'frames: 2\nstrings_extracted: 14\nspec: "spinner inside CTA while pending"' } },
   { t: "12:04:28", action: "docs.read", target: <>acme/pay/<span className="kw">docs/usdc.md</span></>,
     icon: "doc", flavor: "info",
@@ -83,7 +83,7 @@ const EVENTS_BY_PR = {
   1142: [
   { t: "12:08:02", action: "goal.ingest", target: <>linear://<span className="kw">SEC-204</span></>,
     icon: "linear", flavor: "info",
-    detail: <>Pulled RBAC ticket — 14 acceptance criteria, 2 attached threat-model docs.</>,
+    detail: <>Pulled RBAC ticket: 14 acceptance criteria, 2 attached threat-model docs.</>,
     tool: { name: "fetch_linear_ticket", out: 'title: "Role-based access for orgs"\npriority: high' } },
   { t: "12:08:05", action: "docs.read", target: <>acme/admin/<span className="kw">docs/rbac.md</span></>,
     icon: "doc", flavor: "info",
@@ -119,7 +119,7 @@ const EVENTS_BY_PR = {
 
   1139: [
   { t: "07:14:02", action: "goal.ingest", target: <>linear://<span className="kw">ENG-1240</span></>,
-    icon: "linear", flavor: "info", detail: <>Refactor — no functional change expected.</> },
+    icon: "linear", flavor: "info", detail: <>Refactor, no functional change expected.</> },
   { t: "07:14:09", action: "pr.fetch", target: <>acme/admin#<span className="kw">1139</span></>,
     icon: "git", flavor: "info", detail: <>+612 / −588 across 22 files. Net +24 lines.</> },
   { t: "07:14:31", action: "diff.analyze", target: <>22 files</>,
@@ -133,7 +133,7 @@ const EVENTS_BY_PR = {
   { t: "11:32:14", action: "pr.fetch", target: <>acme/infra#<span className="kw">411</span></>,
     icon: "git", flavor: "info", detail: <>+92 / −4 across 3 files.</> },
   { t: "11:32:28", action: "diff.analyze", target: <>3 files</>,
-    icon: "brain", flavor: "active", detail: <>3 hard blockers identified — extension not allow-listed on RDS.</> },
+    icon: "brain", flavor: "active", detail: <>3 hard blockers identified: extension not allow-listed on RDS.</> },
   { t: "11:32:36", action: "comment.post", target: <>migrations/0094.sql:<span className="kw">12</span></>,
     icon: "warn", flavor: "danger", detail: <>Posted blocker inline.</>,
     inline: { sev: "danger", title: "Blocker · pg_uuidv7 not allow-listed on RDS",
@@ -425,7 +425,7 @@ const FINDING_LABEL = {
   consistency: "Consistency",
   deferral: "Deferred work",
   convention: "DEVASIGN.md",
-  docDrift: "DEVASIGN.md — docs outdated",
+  docDrift: "DEVASIGN.md docs outdated",
   suggestion: "Suggested change",
 };
 
@@ -516,7 +516,7 @@ const TerminalFor = ({ pr, lines }) =>
         <i className="dot" style={{ background: "#f5a524" }}></i>
         <i className="dot" style={{ background: "#ff7a3d" }}></i>
       </div>
-      <span className="tt-name">~/{pr.repo.replace("/", "-")} — review #{pr.id}</span>
+      <span className="tt-name">~/{pr.repo.replace("/", "-")} · review #{pr.id}</span>
       <span style={{ marginLeft: "auto", fontSize: 11, color: "var(--fg-mute)", fontFamily: "var(--mono)" }}>
         {pr.status === "running" ? <><span className="pulse">●</span> running</> : pr.status}
       </span>
@@ -594,7 +594,7 @@ const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
       </div>
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
-        {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit — broken by a later change</div>}
+        {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit, then broken by a later change</div>}
         {v && (
           <div className="acv-badges">
             <span className={`pill ${verdictTone(v.verdict)}`} title={v.reason || undefined}>
@@ -865,7 +865,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
             <div className="ac-row" style={{ opacity: 0.85 }}>
                 <div className="ac-check"><Icon name="check" size={11} /></div>
                 <div>
-                  <div style={{ fontSize: 13, color: "var(--fg)" }}>No acceptance criteria — reviewed for correctness only.</div>
+                  <div style={{ fontSize: 13, color: "var(--fg)" }}>No acceptance criteria. Reviewed for correctness only.</div>
                   <div className="mute mono" style={{ fontSize: 12, marginTop: 3 }}>
                     Add an end goal on the PR (description, Loom, or screenshot + notes) to enable criteria checks.
                   </div>
@@ -941,7 +941,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
                   <span style={{ flex: 1, minWidth: 0, wordBreak: "break-word", opacity: isPending ? 0.5 : 1 }}>{r.label}</span>
                   <button
                     className="icon-btn"
-                    title="Remove this constraint — re-synthesises the end goal and re-runs the review"
+                    title="Remove this constraint. This re-synthesises the end goal and re-runs the review"
                     aria-label="Remove constraint"
                     onClick={() => setPendingDelete(r.key)}
                     style={{ flex: "0 0 auto", width: 22, height: 22 }}
@@ -1400,7 +1400,7 @@ function extractIngestedSources(logs, attachments = []) {
         flavor: "warn",
         label: `Issue #${num}`,
         state: "primary",
-        note: "closes/fixes-linked — authoritative job-to-be-done",
+        note: "closes/fixes-linked, authoritative job-to-be-done",
       });
     }
     for (const num of secondary) {
@@ -1945,7 +1945,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
         updateUserEvent(id, key, {
           flavor: "danger",
           detail: closed
-            ? <>This pull request is closed — the review agent is no longer taking messages.</>
+            ? <>This pull request is closed. The review agent is no longer taking messages.</>
             : <>Message not delivered: {String(err?.message || err)}</>,
         });
       }

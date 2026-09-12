@@ -277,6 +277,7 @@ export type RepoWorkflow = {
   stages: { holistic: boolean; defects: boolean; docs: boolean; deferrals: boolean; crossRepo: boolean };
   verdict: { blocking: boolean };
   // Per-stage maintainer instructions (the stages that make an LLM call).
+  // Per-stage custom prompts are disabled: the API always returns {} and ignores input.
   prompts?: Partial<Record<StagePromptKey, string>>;
   // Optional "Run GitHub Action" step — dispatch a workflow after a review.
   actions?: { enabled: boolean; workflow: string; runWhen: "always" | "passed" };

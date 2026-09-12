@@ -31,8 +31,8 @@ export function isTransientNotDurable(e: any): boolean {
 // the backend's friendly `body.message` over the raw error code.
 export function saveErrorMessage(e: any): string {
   if (e?.message === "upgrade_required") return "That control is a Pro/Max feature.";
-  if (e?.message === "already_funded") return "This bounty is funded — its criteria are locked.";
-  return e?.body?.message || e?.message || "Couldn't save — reverted.";
+  if (e?.message === "already_funded") return "This bounty is funded, so its criteria are locked.";
+  return e?.body?.message || e?.message || "Couldn't save. Reverted.";
 }
 
 export type SaveDeps<T> = {
@@ -83,7 +83,7 @@ export async function runSave<T>(deps: SaveDeps<T>, next: T, isRetry = false): P
         // forever: the write is staged and the heartbeat persists it, so keep the
         // optimistic state but replace the spinner with a calm, terminal note.
         deps.setPending(false);
-        deps.setErr("Still saving in the background — reload later to confirm.");
+        deps.setErr("Still saving in the background. Reload later to confirm.");
         return;
       }
       deps.setPending(true); // keep the optimistic state — do NOT revert

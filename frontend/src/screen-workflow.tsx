@@ -1,42 +1,40 @@
 // @ts-nocheck
 // Workflow screen — a node-based editor for the per-repo review pipeline.
 //
-// Three panes: a repository rail (left, styled like the Settings submenu and
-// showing per-repo review counts), a React Flow canvas of the pipeline (center),
-// and a detail panel for the selected node (right). The pipeline is a fixed,
-// linear chain — users can't add/remove nodes, only activate/deactivate the
-// optional steps and steer each AI stage with a custom prompt.
+// A full-bleed React Flow canvas of the pipeline with a floating detail panel
+// for the selected node. The repo picker and the repo's details (reviews,
+// verification setup) live in the app header (see workflow-header.tsx). The
+// pipeline is a fixed graph — users can't add/remove nodes, only activate the
+// optional steps.
 //
 // Tiering: toggling which optional stages run is BASIC (free). The entry-trigger
-// policy, verdict mode, per-stage custom prompts and the GitHub Action step are
+// policy, verdict mode, guidance materials and the GitHub Action step are
 // ADVANCED (Pro/Max): free users see them locked with an upgrade nudge. Saves
 // are optimistic and persist per repo via PUT /api/repositories/:id/workflow.
 import React from "react";
 import { useSearchParams } from "react-router-dom";
 import {
   ReactFlow,
-  Background,
+  BaseEdge,
+  EdgeLabelRenderer,
   Handle,
   Position,
   MarkerType,
+  getBezierPath,
   useNodesState,
   useEdgesState,
   type NodeProps,
+  type EdgeProps,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Icon } from "./icons";
-import { api, type Repository, type RepoWorkflow, type StagePromptKey, type ActionWorkflow, type RepoGuidanceItem } from "./api";
+import { api, type Repository, type RepoWorkflow, type ActionWorkflow, type RepoGuidanceItem } from "./api";
 import { runSave } from "./optimistic-save";
 import { useAuth } from "./auth-context";
+import type { WorkflowHeaderState } from "./workflow-header";
+import { EDGES, LAYOUT, NODE_W, edgeHandles, usedHandles, type EdgeKind, type NodeId } from "./workflow-graph";
 
 type StageKey = "holistic" | "defects" | "deferrals" | "docs" | "crossRepo";
-type NodeId =
-  // Main PR-review lane
-  | "trigger" | "ingest" | "criteria" | "newcommit" | "review"
-  | "holistic" | "backstop" | "secgate" | "preexisting"
-  | "defects" | "deferrals" | "docs" | "crossrepo" | "verdict" | "actions"
-  // Maintainer-feedback lane (second entry path + loop back)
-  | "mtrigger" | "manalyze" | "mrescore" | "mguide";
 
 // How a node reads on the canvas + in the detail panel:
 //  trigger  — an entry point (PR event, or a maintainer comment)
@@ -45,156 +43,94 @@ type NodeId =
 //  info     — a read-only step the agent always does; no controls, just a badge
 type NodeKind = "trigger" | "stage" | "branch" | "info";
 
-// Pipeline nodes. `pos` lays each out explicitly so the graph can branch and
-// loop (no longer a single column). `stageKey` marks an optional stage in
-// wf.stages; `promptKey` marks an LLM stage that accepts a custom prompt;
-// `badge` stamps an "always on" / "advisory" pill on read-only nodes; `lane`
+// Pipeline nodes (positions live in workflow-graph.ts). `stageKey` marks an optional stage in
+// wf.stages; `badge` stamps an "always on" / "advisory" pill on read-only nodes; `lane`
 // separates the maintainer entry path from the main PR lane.
 type NodeDef = {
   id: NodeId;
   name: string;
   tag: string;        // category, shown in the detail-panel header
   icon: string;
-  color: string;      // per-node icon colour (a CSS var, e.g. "var(--info)")
+  color: string;      // colour family (a CSS var): entry / context / criteria / review / security / quality / conventions / output
   short: string;      // brief description on the node
   desc: string;       // fuller description in the panel
-  pos: { x: number; y: number }; // explicit canvas position
   kind?: NodeKind;    // default "stage"
   mandatory?: boolean; // always runs — no on/off switch
   stageKey?: StageKey;
-  promptKey?: StagePromptKey;
   advanced?: boolean; // node exposes Pro/Max-only switches
   readOnly?: boolean; // informational: panel shows desc + badge, no controls
   badge?: "always-on" | "advisory" | "auto";
   lane?: "pr" | "maintainer";
 };
 
-// Canvas geometry. Two lanes (main PR spine at x≈0, maintainer lane to the
-// right); the security fork and the new-commit offshoot sit on either side.
-const X_MAIN = 0;
-const X_LEFT = -330;   // new-commit intent offshoot
-const X_WR = -185;     // whole-repo review (left arm of the security fork)
-const X_BK = 195;      // security backstop (right arm)
-const X_MAINT = 540;   // maintainer-feedback lane
-const ROW = 112;       // vertical spacing between rows
-
 const NODE_DEFS: NodeDef[] = [
   // ── Main PR-review lane ──────────────────────────────────────────────────
   { id: "trigger", name: "New / updated PR", tag: "Trigger", icon: "play", color: "var(--info)", kind: "trigger", mandatory: true, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: 0 },
     short: "Fires on PR opened / updated",
     desc: "Runs whenever a pull request is opened or updated. A new push to an open PR re-enters the pipeline as a re-review (which adds the new-commit intent step)." },
   { id: "ingest", name: "Ingest context", tag: "Context", icon: "doc", color: "var(--cyan)", mandatory: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW },
     short: "Diff, tickets, Looms & frames",
-    desc: "Pull the diff, linked tickets, attached Looms & design frames, and the relevant slice of the repo index. Attach guidance materials below — videos, docs & PDFs the agent indexes and follows on every review of this repo." },
-  { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", color: "var(--purple)", mandatory: true, promptKey: "criteria", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 2 },
+    desc: "Pull the diff, linked tickets, attached Looms & design frames, and the relevant slice of the repo index. Attach guidance materials below: videos, docs & PDFs the agent indexes and follows on every review of this repo." },
+  { id: "criteria", name: "Synthesize criteria", tag: "Agent", icon: "brain", color: "var(--purple)", mandatory: true, lane: "pr",
     short: "Derive end goal & criteria",
     desc: "Derive the end goal & acceptance criteria the PR must meet." },
   { id: "newcommit", name: "New-commit intent review", tag: "Agent", icon: "git", color: "var(--purple)", kind: "info", readOnly: true, badge: "advisory", lane: "pr",
-    pos: { x: X_LEFT, y: ROW * 2 },
     short: "Re-reviews: new commits vs. intent",
     desc: "On a re-review after a fresh push, check the new commits against their own commit-message intent and the delta diff, then append acceptance criteria for any new checkable promises." },
-  { id: "review", name: "Review diff", tag: "Agent", icon: "code", color: "var(--accent)", mandatory: true, promptKey: "review", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 3 },
+  { id: "review", name: "Review diff", tag: "Agent", icon: "code", color: "var(--green)", mandatory: true, lane: "pr",
     short: "Diff vs. each criterion",
     desc: "Check the diff against each acceptance criterion." },
-  { id: "holistic", name: "Whole-repo review", tag: "Agent", icon: "git", color: "var(--green)", kind: "branch", mandatory: false, stageKey: "holistic", promptKey: "holistic", lane: "pr",
-    pos: { x: X_WR, y: ROW * 4 },
+  { id: "holistic", name: "Whole-repo review", tag: "Agent", icon: "git", color: "var(--green)", kind: "branch", mandatory: false, stageKey: "holistic", lane: "pr",
     short: "Regressions, errors & security",
-    desc: "Check the change against the repo index for regressions, critical errors & security flaws. Turning this off does NOT disable security — it reroutes to the security backstop, and the Security gate stays on." },
-  { id: "backstop", name: "Security backstop", tag: "Security", icon: "shield", color: "var(--danger)", kind: "branch", readOnly: true, badge: "always-on", promptKey: "security", lane: "pr",
-    pos: { x: X_BK, y: ROW * 4 },
+    desc: "Check the change against the repo index for regressions, critical errors & security flaws. Turning this off does NOT disable security. It reroutes to the security backstop, and the Security gate stays on." },
+  { id: "backstop", name: "Security backstop", tag: "Security", icon: "shield", color: "var(--danger)", kind: "branch", readOnly: true, badge: "always-on", lane: "pr",
     short: "Security-only fallback",
-    desc: "When the whole-repo review is off (or its index isn't built yet), a security-only pass still runs against the diff — so security is never skipped. Its custom prompt falls back to the whole-repo review's prompt when left blank." },
+    desc: "When the whole-repo review is off (or its index isn't built yet), a security-only pass still runs against the diff, so security is never skipped. Its custom prompt falls back to the whole-repo review's prompt when left blank." },
   { id: "secgate", name: "Security gate", tag: "Security", icon: "shield", color: "var(--danger)", kind: "info", readOnly: true, badge: "always-on", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 5 },
-    short: "Always analyzed — can't be disabled",
+    short: "Always analyzed, can't be disabled",
     desc: "Security is analyzed on every review, whichever arm ran above. A vulnerability this PR introduces blocks the merge even in advisory mode." },
-  { id: "preexisting", name: "Pre-existing vulnerabilities", tag: "Security", icon: "shield", color: "var(--warn)", kind: "info", readOnly: true, badge: "advisory", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 6 },
+  { id: "preexisting", name: "Pre-existing vulnerabilities", tag: "Security", icon: "shield", color: "var(--danger)", kind: "info", readOnly: true, badge: "advisory", lane: "pr",
     short: "Surfaced from the index ⟲ re-verified",
-    desc: "Surface vulnerabilities already living in files this PR touches or depends on (from the index security audit). Touched files are re-verified against the PR head, so a vuln this PR fixes is dropped and credited as resolved. Advisory — never blocks the merge." },
-  { id: "defects", name: "Bug detection", tag: "Agent", icon: "bug", color: "var(--danger)", mandatory: false, stageKey: "defects", promptKey: "defects", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 7 },
+    desc: "Surface vulnerabilities already living in files this PR touches or depends on (from the index security audit). Touched files are re-verified against the PR head, so a vuln this PR fixes is dropped and credited as resolved. Advisory, so it never blocks the merge." },
+  { id: "defects", name: "Bug detection", tag: "Agent", icon: "bug", color: "var(--warn)", mandatory: false, stageKey: "defects", lane: "pr",
     short: "Correctness bugs, criteria aside",
-    desc: "Review the changed code for correctness and robustness on its own terms — logic errors, null handling, error paths, async and concurrency, resource leaks, API misuse, data integrity. Independent of the acceptance criteria: a PR can meet every requirement and still be wrong. Runs on every PR whether or not the repo index is built. A bug severe enough to break a feature or lose data blocks the merge." },
-  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", color: "var(--warn)", mandatory: false, stageKey: "deferrals", promptKey: "deferrals", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 8 },
+    desc: "Review the changed code for correctness and robustness on its own terms: logic errors, null handling, error paths, async and concurrency, resource leaks, API misuse, data integrity. Independent of the acceptance criteria: a PR can meet every requirement and still be wrong. Runs on every PR whether or not the repo index is built. A bug severe enough to break a feature or lose data blocks the merge." },
+  { id: "deferrals", name: "Deferred-work scan", tag: "Agent", icon: "warn", color: "var(--warn)", mandatory: false, stageKey: "deferrals", lane: "pr",
     short: "TODOs, stubs & silent punts",
-    desc: "Catch self-admitted punts — TODOs, stubs, NotImplemented buried in the diff." },
-  { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", color: "var(--pink)", mandatory: false, stageKey: "docs", promptKey: "docs", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 9 },
+    desc: "Catch self-admitted punts: TODOs, stubs, and NotImplemented buried in the diff." },
+  { id: "docs", name: "DEVASIGN.md guidance", tag: "Agent", icon: "doc", color: "var(--pink)", mandatory: false, stageKey: "docs", lane: "pr",
     short: "Conventions & doc drift",
     desc: "Enforce your repo conventions & flag docs the change makes outdated." },
-  { id: "crossrepo", name: "Cross-repo impact", tag: "Agent", icon: "git", color: "var(--info)", mandatory: false, advanced: true, badge: "advisory", stageKey: "crossRepo", promptKey: "crossRepo", lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 10 },
+  { id: "crossrepo", name: "Cross-repo impact", tag: "Agent", icon: "git", color: "var(--pink)", mandatory: false, advanced: true, badge: "advisory", stageKey: "crossRepo", lane: "pr",
     short: "Breakage & parity across sibling repos",
-    desc: "Check whether this PR breaks a consumer in another repository in your org, and flag capabilities it adds that sibling repos don't have yet. Reads the org map DevAsign builds in the background. Advisory — it never blocks the merge." },
+    desc: "Check whether this PR breaks a consumer in another repository in your org, and flag capabilities it adds that sibling repos don't have yet. Reads the org map DevAsign builds in the background. Advisory, so it never blocks the merge." },
   { id: "verdict", name: "Post verdict", tag: "Output", icon: "check", color: "var(--lemon)", mandatory: true, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 11 },
     short: "Check Run + PR review + notify",
     desc: "Post the Check Run + PR review and notify your connected integrations." },
-  { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", color: "var(--danger)", mandatory: false, advanced: true, lane: "pr",
-    pos: { x: X_MAIN, y: ROW * 12 },
+  { id: "actions", name: "Run GitHub Action", tag: "Action", icon: "terminal", color: "var(--lemon)", mandatory: false, advanced: true, lane: "pr",
     short: "Dispatch a workflow on finish",
     desc: "Dispatch a chosen GitHub Actions workflow after the review (workflow_dispatch)." },
 
   // ── Maintainer-feedback lane (second entry path, loops back to the trigger) ─
   { id: "mtrigger", name: "Maintainer comment", tag: "Trigger", icon: "message", color: "var(--info)", kind: "trigger", readOnly: true, lane: "maintainer",
-    pos: { x: X_MAINT, y: 0 },
     short: "Owner / member / collaborator reply",
-    desc: "A comment from someone with authority over the repo (owner, member, or collaborator) re-enters the review — to dispute a finding, raise the bar, or add context. Always on." },
+    desc: "A comment from someone with authority over the repo (owner, member, or collaborator) re-enters the review to dispute a finding, raise the bar, or add context. Always on." },
   { id: "manalyze", name: "Analyze feedback", tag: "Agent", icon: "brain", color: "var(--purple)", kind: "info", readOnly: true, badge: "auto", lane: "maintainer",
-    pos: { x: X_MAINT, y: ROW },
     short: "Refine goal; classify the comment",
     desc: "Read the comment (and any videos/docs in it), refine the end goal, and classify it into disputes, re-opens, and brand-new criteria." },
   { id: "mrescore", name: "Re-score / re-open / add", tag: "Agent", icon: "brain", color: "var(--purple)", kind: "info", readOnly: true, badge: "auto", lane: "maintainer",
-    pos: { x: X_MAINT, y: ROW * 2 },
     short: "Clear FPs · re-open · raise the bar",
-    desc: "Clear false positives (unmet→met, verified against the codebase), re-open passed criteria on the maintainer's authority (met→unmet), and add any new criteria. The security gate is never softened — a flip back to approved re-checks for introduced blockers first." },
+    desc: "Clear false positives (unmet→met, verified against the codebase), re-open passed criteria on the maintainer's authority (met→unmet), and add any new criteria. The security gate is never softened: a flip back to approved re-checks for introduced blockers first." },
   { id: "mguide", name: "Post guide / corrected verdict", tag: "Output", icon: "check", color: "var(--lemon)", kind: "info", readOnly: true, badge: "auto", lane: "maintainer",
-    pos: { x: X_MAINT, y: ROW * 3 },
     short: "Implementation guide or correction",
     desc: "Post an implementation guide (when the bar moved up) or a corrected verdict (when a dispute cleared). The developer's next push then loops back through the PR trigger." },
 ];
 
-// Explicit edges. `seq` is the normal top→bottom flow; `branch` is a labelled
-// fork (drawn in the accent colour); `loop` is a dashed feedback edge. Handle
-// ids match the six handles StageNode renders (tt/bs/lt/ls/rt/rs).
-type EdgeKind = "seq" | "branch" | "loop";
-type EdgeDef = { from: NodeId; to: NodeId; fromH?: string; toH?: string; kind?: EdgeKind; label?: string };
-const EDGES: EdgeDef[] = [
-  // Main lane
-  { from: "trigger", to: "ingest" },
-  { from: "ingest", to: "criteria" },
-  { from: "criteria", to: "review" },
-  // New-commit intent offshoot (re-review only) → appends criteria
-  { from: "trigger", to: "newcommit", fromH: "ls", toH: "tt", kind: "branch", label: "re-review (new push)" },
-  { from: "newcommit", to: "criteria", fromH: "rs", toH: "lt", kind: "branch", label: "append criteria" },
-  // Security fork off the diff review, merging into the always-on gate
-  { from: "review", to: "holistic", kind: "branch", label: "whole-repo on" },
-  { from: "review", to: "backstop", kind: "branch", label: "off → security only" },
-  { from: "holistic", to: "secgate" },
-  { from: "backstop", to: "secgate" },
-  { from: "secgate", to: "preexisting" },
-  { from: "preexisting", to: "defects" },
-  { from: "defects", to: "deferrals" },
-  { from: "deferrals", to: "docs" },
-  { from: "docs", to: "crossrepo" },
-  { from: "crossrepo", to: "verdict" },
-  { from: "verdict", to: "actions" },
-  // Maintainer-feedback lane + loop back into the PR trigger
-  { from: "mtrigger", to: "manalyze" },
-  { from: "manalyze", to: "mrescore" },
-  { from: "mrescore", to: "mguide" },
-  { from: "mguide", to: "trigger", fromH: "ls", toH: "rt", kind: "loop", label: "dev pushes → re-review" },
-];
+const USED_HANDLES = usedHandles(EDGES);
 
 // One-click presets. Strict = maximum rigor; Balanced = quieter defaults;
 // Light = lean + advisory (never blocks the merge). Only the core policy
-// (trigger / stages / verdict) — prompts & actions are preserved on apply.
+// (trigger / stages / verdict) — actions are preserved on apply.
 const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdict">> = {
   strict: {
     trigger: { onSynchronize: true, skipDrafts: false, skipBots: false },
@@ -216,8 +152,6 @@ const TEMPLATES: Record<string, Pick<RepoWorkflow, "trigger" | "stages" | "verdi
   },
 };
 
-const PROMPT_MAX = 2000;
-const EDGE_COLOR = "#39414c";
 
 const goUpgrade = () =>
   (window.location.href = `${window.location.origin}/?billing=upgrade`);
@@ -239,28 +173,25 @@ const ProLock = () => (
 );
 
 // Is a node "lit" right now? The actions step keys off wf.actions.enabled;
-// optional stages off wf.stages[key]. The security backstop is the fallback
-// arm, so it's lit only when the whole-repo review is OFF; the new-commit
-// intent step only fires on re-reviews, so it dims when re-review-on-push is
-// off. Everything else (mandatory steps, always-on security, the maintainer
-// lane) is always lit.
+// optional stages off wf.stages[key]; the new-commit intent step only fires on
+// re-reviews, so it dims when re-review-on-push is off. Everything else
+// (mandatory steps, always-on security, the maintainer lane) is always lit —
+// including the security backstop, which stays visible and shows "standby"
+// while the whole-repo review covers security (see backstopStandby).
 const nodeOn = (def: NodeDef, wf: RepoWorkflow) => {
   if (def.id === "actions") return !!wf.actions?.enabled;
-  if (def.id === "backstop") return !wf.stages.holistic;
   if (def.id === "newcommit") return !!wf.trigger.onSynchronize;
   if (def.stageKey) return !!wf.stages[def.stageKey];
   return true;
 };
 
+// The backstop is the fallback arm: idle while the whole-repo review is on.
+const backstopStandby = (def: NodeDef, wf: RepoWorkflow) => def.id === "backstop" && !!wf.stages.holistic;
+
 // Stamp a lock glyph only when ALL of a node's controls are Pro/Max-locked.
-// Optional stages keep their (free) on/off switch, so they never get the glyph
-// even though their prompt is locked.
+// Optional stages keep their (free) on/off switch, so they never get the glyph.
 const nodeLocked = (def: NodeDef, advancedLocked: boolean) =>
-  advancedLocked &&
-  (def.id === "trigger" ||
-    def.id === "verdict" ||
-    def.id === "actions" ||
-    (!!def.promptKey && def.mandatory));
+  advancedLocked && (def.id === "trigger" || def.id === "verdict" || def.id === "actions");
 
 // A node shows an on/off dot when it can be toggled (optional stage or the
 // actions step) and isn't fully locked.
@@ -284,144 +215,146 @@ const activeMode = (wf: RepoWorkflow): string => {
   return "custom";
 };
 
-// Short text stamped on read-only nodes so the always-on / advisory nature
-// reads at a glance on the canvas (the "auto" maintainer steps stay unstamped).
+// Status chip text for read-only nodes.
 const BADGE_TEXT: Record<NonNullable<NodeDef["badge"]>, string> = {
   "always-on": "always on",
   advisory: "advisory",
-  auto: "",
+  auto: "auto",
 };
 
 // ── Custom React Flow node ──────────────────────────────────────────────────
+const HANDLES = [
+  { id: "tt", type: "target", pos: Position.Top }, { id: "ts", type: "source", pos: Position.Top },
+  { id: "bt", type: "target", pos: Position.Bottom }, { id: "bs", type: "source", pos: Position.Bottom },
+  { id: "lt", type: "target", pos: Position.Left }, { id: "ls", type: "source", pos: Position.Left },
+  { id: "rt", type: "target", pos: Position.Right }, { id: "rs", type: "source", pos: Position.Right },
+] as const;
+const LANE_LABEL = { pr: "PR review", maintainer: "Maintainer" };
+
 function StageNode({ data }: NodeProps) {
-  const { def, on, selected, locked } = data as any;
-  const badgeText = def.badge ? BADGE_TEXT[def.badge as keyof typeof BADGE_TEXT] : "";
-  // Per-node icon colour flows through the --nc custom property (used by the
-  // icon square + the on dot). Sharp edges throughout, matching the app buttons.
-  // Six handles (top/bottom + both sides) so branch and loop edges attach
-  // cleanly; all are invisible (styled away in .wf-node-handle).
+  const { def, on, selected, locked, handles, standby } = data as any;
+  const status = standby ? "standby" : nodeToggleable(def) ? (on ? "on" : "off") : def.badge ? BADGE_TEXT[def.badge as keyof typeof BADGE_TEXT] : "always on";
   return (
     <div
-      className={`wf-node wf-kind-${def.kind || "stage"} ${def.lane === "maintainer" ? "wf-lane-m" : ""} ${on ? "" : "is-off"} ${selected ? "is-selected" : ""}`}
-      style={{ ["--nc" as any]: def.color }}
+      className={`wf-node wf-kind-${def.kind || "stage"} ${on ? "" : "is-off"} ${selected ? "is-selected" : ""}`}
+      style={{ width: NODE_W, ["--nc" as any]: def.color }}
     >
-      {def.kind === "trigger" && <span className="wf-node-tab">{def.tag}</span>}
-      <Handle id="tt" type="target" position={Position.Top} isConnectable={false} className="wf-node-handle" />
-      <Handle id="lt" type="target" position={Position.Left} isConnectable={false} className="wf-node-handle" />
-      <Handle id="ls" type="source" position={Position.Left} isConnectable={false} className="wf-node-handle" />
-      <Handle id="rt" type="target" position={Position.Right} isConnectable={false} className="wf-node-handle" />
-      <Handle id="rs" type="source" position={Position.Right} isConnectable={false} className="wf-node-handle" />
-      <span className="wf-node-ico">
-        <Icon name={def.icon} size={15} />
-      </span>
-      <div className="wf-node-text">
-        <div className="wf-node-name">{def.name}</div>
-        <div className="wf-node-desc">{def.short}</div>
+      {HANDLES.map((h) => (
+        <Handle
+          key={h.id}
+          id={h.id}
+          type={h.type}
+          position={h.pos}
+          isConnectable={false}
+          className={`wf-node-handle ${handles.has(h.id) ? "" : "is-hidden"}`}
+        />
+      ))}
+      <div className="wf-node-head">
+        <span className="wf-node-ico"><Icon name={def.icon} size={16} /></span>
+        <div className="wf-node-text">
+          <div className="wf-node-name">{def.name}</div>
+          <div className="wf-node-sub">{def.tag} / {LANE_LABEL[def.lane || "pr"]}</div>
+        </div>
       </div>
-      {locked ? (
-        <span className="wf-node-flag" title="Pro/Max"><Icon name="lock" size={11} /></span>
-      ) : badgeText ? (
-        <span className={`wf-node-badge ${def.badge}`}>{badgeText}</span>
-      ) : nodeToggleable(def) ? (
-        <span className={`wf-node-dot ${on ? "on" : "off"}`} title={on ? "active" : "inactive"} />
-      ) : null}
-      <Handle id="bs" type="source" position={Position.Bottom} isConnectable={false} className="wf-node-handle" />
+      <div className="wf-node-chips">
+        <span className={`wf-chip st-${status.replace(/\s+/g, "-")}`}>
+          <span className="wf-chip-k">Status</span>{status}
+        </span>
+        {locked && (
+          <span className="wf-chip is-pro" title="Pro/Max"><Icon name="lock" size={9} /> Pro</span>
+        )}
+      </div>
     </div>
   );
 }
 const nodeTypes = { stage: StageNode };
+
+// Keep the fitted graph clear of the floating panel (right) and mode bar (top);
+// on mobile the panel stacks below the canvas instead. The panel sits outside
+// the canvas' un-zoomed box, so its size is scaled by the app zoom.
+const uiZoom = () => parseFloat(getComputedStyle(document.body).zoom as string) || 1;
+const PANEL_W = 340;
+const fitViewFor = (isMobile: boolean, panelW: number) =>
+  isMobile
+    ? { padding: "16px", maxZoom: 1 }
+    : { padding: { top: `${56 * uiZoom()}px`, right: `${(panelW + 32) * uiZoom()}px`, bottom: "24px", left: "24px" }, maxZoom: 1 };
+
+// The detail panel's left edge lines up with the header's Verification button,
+// whose width follows the repo's verification state — so measure, don't guess.
+function usePanelWidth(): number {
+  const [w, setW] = React.useState(PANEL_W);
+  React.useEffect(() => {
+    const topbar = document.querySelector(".topbar");
+    if (!topbar) return;
+    const measure = () => {
+      const v = topbar.querySelector(".wf-verify");
+      const actions = topbar.querySelector(".topbar-actions");
+      if (!v || !actions) return setW(PANEL_W);
+      setW(Math.round((actions.getBoundingClientRect().right - v.getBoundingClientRect().left) / uiZoom()));
+    };
+    measure();
+    const mo = new MutationObserver(measure);
+    mo.observe(topbar, { childList: true, subtree: true, characterData: true });
+    window.addEventListener("resize", measure);
+    return () => { mo.disconnect(); window.removeEventListener("resize", measure); };
+  }, []);
+  return w;
+}
+const ZOOM_MIN = 0.25;
+const ZOOM_MAX = 1.5;
+
+// Bezier edge with a floating label chip (bold label + muted tag pills).
+function ChipEdge({ id, sourceX, sourceY, targetX, targetY, sourcePosition, targetPosition, style, markerEnd, data }: EdgeProps) {
+  const [path, lx, ly] = getBezierPath({ sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition });
+  const d = (data || {}) as { kind?: EdgeKind; label?: string; tags?: string[] };
+  return (
+    <>
+      <BaseEdge id={id} path={path} style={style} markerEnd={markerEnd} />
+      {d.label && (
+        <EdgeLabelRenderer>
+          <div className={`wf-edge-chip is-${d.kind || "seq"}`} style={{ transform: `translate(-50%, -50%) translate(${lx}px, ${ly}px)` }}>
+            <b>{d.label}</b>
+            {(d.tags || []).map((t) => <span key={t} className="wf-edge-tag">{t}</span>)}
+          </div>
+        </EdgeLabelRenderer>
+      )}
+    </>
+  );
+}
+const edgeTypes = { chip: ChipEdge };
 
 // Build the React Flow nodes/edges from the workflow + current selection.
 function buildGraph(wf: RepoWorkflow, selectedId: string, advancedLocked: boolean) {
   const nodes = NODE_DEFS.map((def) => ({
     id: def.id,
     type: "stage",
-    position: def.pos,
+    position: LAYOUT[def.id],
     data: {
       def,
       on: nodeOn(def, wf),
       selected: def.id === selectedId,
       locked: nodeLocked(def, advancedLocked),
+      handles: USED_HANDLES.get(def.id) || new Set(),
+      standby: backstopStandby(def, wf),
     },
-    // Nodes can be dragged to re-space the layout; edges follow automatically and
-    // the wiring can't be changed (connect/select are off at the canvas level).
+    // Nodes can be dragged to re-space the layout; the wiring can't be changed.
     draggable: true,
     selectable: false,
   }));
-  const edges = EDGES.map((e) => {
-    const isLoop = e.kind === "loop";
-    const isBranch = e.kind === "branch";
-    const color = isLoop ? "var(--purple)" : isBranch ? "var(--accent)" : EDGE_COLOR;
-    return {
-      id: `${e.from}__${e.to}__${e.label || e.kind || "seq"}`,
-      source: e.from,
-      target: e.to,
-      sourceHandle: e.fromH || "bs",
-      targetHandle: e.toH || "tt",
-      type: "smoothstep",
-      label: e.label,
-      labelShowBg: true,
-      labelStyle: { fill: "var(--fg-dim)", fontFamily: "var(--mono)", fontSize: 10 },
-      labelBgStyle: { fill: "var(--bg-1)", fillOpacity: 0.94 },
-      labelBgPadding: [6, 3] as [number, number],
-      animated: isLoop,
-      style: {
-        stroke: color,
-        strokeWidth: 1.5,
-        ...(isLoop ? { strokeDasharray: "5 4" } : {}),
-      },
-      markerEnd: { type: MarkerType.ArrowClosed, color, width: 16, height: 16 },
-    };
-  });
+  const edges = EDGES.map((e) => ({
+    id: `${e.from}__${e.to}`,
+    source: e.from,
+    target: e.to,
+    sourceHandle: edgeHandles(e).from,
+    targetHandle: edgeHandles(e).to,
+    type: "chip",
+    data: { kind: e.kind || "seq", label: e.label, tags: e.tags },
+    animated: e.kind === "loop",
+    style: { stroke: "var(--wf-edge)", strokeWidth: 1.25, ...(e.kind === "loop" ? { strokeDasharray: "4 4" } : {}) },
+    markerEnd: { type: MarkerType.ArrowClosed, color: "var(--wf-edge)", width: 12, height: 12 },
+  }));
   return { nodes, edges };
 }
-
-// ── Per-stage custom prompt editor (advanced) ───────────────────────────────
-function PromptEditor({ promptKey, value, locked, onSave }) {
-  const [text, setText] = React.useState(value || "");
-  // Re-seed if the underlying value changes (e.g. a mode was applied).
-  React.useEffect(() => setText(value || ""), [value]);
-
-  if (locked) {
-    return (
-      <div className="wf-prompt">
-        <div className="wf-prompt-head">
-          <span className="wf-label">Custom prompt</span>
-          <ProLock />
-        </div>
-        <div className="wf-prompt-locked" onClick={goUpgrade}>
-          <Icon name="lock" size={12} />
-          <span>Steer this step with your own instructions — a Pro/Max feature. Upgrade to edit →</span>
-        </div>
-      </div>
-    );
-  }
-
-  const commit = () => {
-    const next = text.trim();
-    if (next !== (value || "")) onSave(promptKey, next);
-  };
-  return (
-    <div className="wf-prompt">
-      <div className="wf-prompt-head">
-        <span className="wf-label">Custom prompt</span>
-        <span className="mute" style={{ fontSize: 11 }}>appended to this step's agent instructions</span>
-      </div>
-      <textarea
-        className="textarea wf-textarea"
-        value={text}
-        placeholder="e.g. Pay extra attention to error handling, N+1 queries, and missing tests…"
-        onChange={(e) => setText(e.target.value.slice(0, PROMPT_MAX))}
-        onBlur={commit}
-        rows={7}
-      />
-      <div className="wf-prompt-foot mute">
-        {text.length}/{PROMPT_MAX} · saved when you click away
-      </div>
-    </div>
-  );
-}
-
 // ── "Run GitHub Action" editor (advanced) ───────────────────────────────────
 function ActionsEditor({ repoId, actions, locked, onSave }) {
   const a = actions || { enabled: false, workflow: "", runWhen: "passed" };
@@ -449,7 +382,7 @@ function ActionsEditor({ repoId, actions, locked, onSave }) {
         </div>
         <div className="wf-prompt-locked" onClick={goUpgrade}>
           <Icon name="lock" size={12} />
-          <span>Dispatch a GitHub Actions workflow after each review — a Pro/Max feature. Upgrade to edit →</span>
+          <span>Dispatch a GitHub Actions workflow after each review. This is a Pro/Max feature. Upgrade to edit →</span>
         </div>
       </div>
     );
@@ -477,7 +410,7 @@ function ActionsEditor({ repoId, actions, locked, onSave }) {
           <div className="mute mono" style={{ fontSize: 12 }}>loading workflows…</div>
         ) : list.error === "actions_unavailable" ? (
           <div className="wf-prompt-foot mute" style={{ textAlign: "left" }}>
-            No Actions access yet — grant the GitHub App <span className="mono">actions:read</span> /{" "}
+            No Actions access yet. Grant the GitHub App <span className="mono">actions:read</span> /{" "}
             <span className="mono">actions:write</span>, then reload.
           </div>
         ) : options.length === 0 ? (
@@ -515,7 +448,7 @@ function ActionsEditor({ repoId, actions, locked, onSave }) {
 // the user attach a video link, a documentation link, or a PDF. New items index
 // asynchronously (status starts "indexing"), so we poll until everything settles.
 function guidanceErrText(e: any): string {
-  const m = e?.message || "Couldn't add — try again.";
+  const m = e?.message || "Couldn't add. Try again.";
   switch (m) {
     case "invalid_url": return "That doesn't look like a valid URL.";
     case "not_a_pdf": return "That file isn't a PDF.";
@@ -576,7 +509,7 @@ function GuidanceEditor({ repoId, locked }) {
         </div>
         <div className="wf-prompt-locked" onClick={goUpgrade}>
           <Icon name="lock" size={12} />
-          <span>Attach videos, docs & PDFs the agent must follow on every review — a Pro/Max feature. Upgrade to add →</span>
+          <span>Attach videos, docs & PDFs the agent must follow on every review. This is a Pro/Max feature. Upgrade to add →</span>
         </div>
       </div>
     );
@@ -627,9 +560,7 @@ function GuidanceEditor({ repoId, locked }) {
 
       {loading ? (
         <div className="mute mono" style={{ fontSize: 12 }}>loading…</div>
-      ) : items.length === 0 ? (
-        <div className="mute mono" style={{ fontSize: 12 }}>No materials yet.</div>
-      ) : (
+      ) : items.length === 0 ? null : (
         <ul className="wf-guidance-list">
           {items.map((it) => (
             <li key={it.id} className="wf-guidance-item">
@@ -688,7 +619,7 @@ function GuidanceEditor({ repoId, locked }) {
 }
 
 // ── Right-hand detail / edit panel for the selected node ─────────────────────
-function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleTrigger, onToggleBlocking, onSavePrompt, onSaveActions }) {
+function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleTrigger, onToggleBlocking, onSaveActions }) {
   const on = nodeOn(def, wf);
   const status =
     def.badge === "always-on"
@@ -717,9 +648,9 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
         {def.readOnly && (
           <div className="wf-ctl-group">
             {def.badge === "always-on" ? (
-              <span className="pill" style={{ color: "var(--green)" }}><i className="dot" /> Always on — can't be disabled</span>
+              <span className="pill" style={{ color: "var(--green)" }}><i className="dot" /> Always on, can't be disabled</span>
             ) : def.badge === "advisory" ? (
-              <span className="pill" style={{ color: "var(--warn)" }}><i className="dot" /> Advisory — never blocks the merge</span>
+              <span className="pill" style={{ color: "var(--warn)" }}><i className="dot" /> Advisory, never blocks the merge</span>
             ) : (
               <span className="pill" style={{ color: "var(--fg-mute)" }}><i className="dot" /> Automatic</span>
             )}
@@ -728,9 +659,9 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
             )}
             {def.id === "backstop" && (
               <div className="wf-ctl-desc mute">
-                {on
-                  ? "Active now — the whole-repo review is off, so this security-only pass is what runs."
-                  : "Idle now — the whole-repo review is on and already covers security."}
+                {backstopStandby(def, wf)
+                  ? "Standby: the whole-repo review is on and already covers security."
+                  : "Active now: the whole-repo review is off, so this security-only pass is what runs."}
               </div>
             )}
           </div>
@@ -750,7 +681,7 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
         {/* Security can't be switched off via the whole-repo toggle. */}
         {def.id === "holistic" && (
           <div className="wf-ctl-desc mute" style={{ marginTop: 8 }}>
-            Turning this off doesn't disable security — a security-only backstop still runs and the Security gate stays on.
+            Turning this off doesn't disable security. A security-only backstop still runs and the Security gate stays on.
           </div>
         )}
 
@@ -787,7 +718,7 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
                 <div className="wf-ctl-desc mute">
                   {wf.verdict.blocking
                     ? "REQUEST_CHANGES gates the PR"
-                    : "advisory COMMENT — never blocks the merge"}
+                    : "advisory COMMENT, never blocks the merge"}
                 </div>
               </div>
             </label>
@@ -800,7 +731,7 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
         )}
 
         {/* Mandatory, non-AI step with no switches. */}
-        {def.mandatory && !def.promptKey && def.id !== "trigger" && def.id !== "verdict" && (
+        {def.mandatory && def.id !== "trigger" && def.id !== "verdict" && (
           <span className="pill" style={{ color: "var(--fg-mute)" }}>
             <i className="dot" /> always on
           </span>
@@ -809,17 +740,6 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
         {/* Ingest node: repo-scoped guidance materials (ADVANCED). */}
         {def.id === "ingest" && (
           <GuidanceEditor key={repoId} repoId={repoId} locked={advancedLocked} />
-        )}
-
-        {/* AI stage: custom prompt (ADVANCED). */}
-        {def.promptKey && (
-          <PromptEditor
-            key={def.id}
-            promptKey={def.promptKey}
-            value={wf.prompts?.[def.promptKey] || ""}
-            locked={advancedLocked}
-            onSave={onSavePrompt}
-          />
         )}
 
         {/* GitHub Action step (ADVANCED). */}
@@ -837,70 +757,7 @@ function NodeDetails({ def, wf, repoId, advancedLocked, onToggleStage, onToggleT
   );
 }
 
-// Verification setup checklist for the selected repo: onboarding PR state,
-// detected stack, missing secrets, and "Regenerate setup PR" (never re-opens a
-// PR the user closed on its own).
-const VerifySetupPanel = ({ repo }) => {
-  const [setup, setSetup] = React.useState(null);
-  const [mode, setMode] = React.useState("separate");
-  const [workflow, setWorkflow] = React.useState("");
-  const [busy, setBusy] = React.useState(false);
-  const load = React.useCallback(() => api.verifySetup(repo.id).then(setSetup).catch(() => setSetup(null)), [repo.id]);
-  React.useEffect(() => { void load(); }, [load]);
-  if (!setup) return null;
-  const ob = setup.onboarding || { state: "none" };
-  const label =
-    ob.state === "verified" ? "verified — a run succeeded" :
-    ob.state === "pr_merged" ? "workflow merged — waiting for the first run" :
-    ob.state === "pr_open" ? `setup PR #${ob.prNumber} open` :
-    ob.state === "pr_closed" ? `setup PR #${ob.prNumber} was closed` : "not set up";
-  const workflows = setup.detected?.existingWorkflows || [];
-  const boot = setup.devasignYml?.start
-    ? ` · boots with ${setup.devasignYml.start}`
-    : " · no app start configured — set verify.start and verify.url in .devasign.yml to enable browser tests (UI criteria are otherwise checked at component level or reported unverifiable)";
-  return (
-    <div className="wf-verify-setup" onClick={(e) => e.stopPropagation()}>
-      <div className="mono mute" style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.06em" }}>verification setup</div>
-      <div className="mono" style={{ fontSize: 11, marginTop: 4 }}>
-        <span className={`pill ${ob.state === "verified" ? "ok" : ob.state === "pr_open" || ob.state === "pr_merged" ? "info" : "nit"}`}>{label}</span>
-        {ob.prUrl && <> <a href={ob.prUrl} target="_blank" rel="noreferrer">open</a></>}
-      </div>
-      {setup.detected && (
-        <div className="mono mute" style={{ fontSize: 11, marginTop: 4 }}>
-          {(setup.detected.frameworks || []).map((f) => f.name).join(", ") || "no test framework (bundled runner)"}{boot}
-        </div>
-      )}
-      {ob.missingSecrets && ob.missingSecrets.length > 0 && (
-        <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>missing secrets: {ob.missingSecrets.join(", ")}</div>
-      )}
-      {ob.lastDiagnosis && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>setup needs attention: {ob.lastDiagnosis.message}</div>}
-      {ob.lastError && <div className="t-warn mono" style={{ fontSize: 11, marginTop: 4 }}>{ob.lastError}</div>}
-      {/* Shown even once verified: this is the only way an onboarded repo ever gets an
-          updated workflow, and the mode selectors are only meaningful before one exists. */}
-      <div style={{ display: "flex", gap: 6, marginTop: 6, flexWrap: "wrap", alignItems: "center" }}>
-        {ob.state !== "verified" && (
-          <>
-            <select className="mono" value={mode} onChange={(e) => setMode(e.target.value)} style={{ fontSize: 11 }}>
-              <option value="separate">separate workflow</option>
-              {workflows.length > 0 && <option value="extend">add a step to an existing workflow</option>}
-            </select>
-            {mode === "extend" && (
-              <select className="mono" value={workflow} onChange={(e) => setWorkflow(e.target.value)} style={{ fontSize: 11 }}>
-                <option value="">pick a workflow</option>
-                {workflows.map((w) => <option key={w} value={w}>{w}</option>)}
-              </select>
-            )}
-          </>
-        )}
-        <button type="button" className="btn sm" disabled={busy} onClick={async () => { setBusy(true); try { await api.requestSetupPr(repo.id, { mode, workflow: workflow || undefined }); setTimeout(() => { void load(); setBusy(false); }, 2500); } catch { setBusy(false); } }}>
-          {busy ? "Opening…" : ob.state === "none" ? "Open setup PR" : ob.state === "verified" ? "Update workflow" : "Regenerate setup PR"}
-        </button>
-      </div>
-    </div>
-  );
-};
-
-const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) => void } = {}) => {
+const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowHeaderState | null) => void; isMobile?: boolean } = {}) => {
   const { user } = useAuth();
   const [params, setParams] = useSearchParams();
   const [repos, setRepos] = React.useState<Repository[]>([]);
@@ -928,6 +785,28 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
 
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([]);
+  const flowRef = React.useRef<HTMLDivElement>(null);
+  const rfInst = React.useRef<any>(null);
+
+  // Cmd/Ctrl + wheel zooms about the pointer. Handled here (capture phase, ahead
+  // of React Flow's own wheel handler) so it works whatever key state RF tracks.
+  React.useEffect(() => {
+    const el = flowRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (!(e.metaKey || e.ctrlKey) || !rfInst.current) return;
+      e.preventDefault();
+      e.stopPropagation();
+      const inst = rfInst.current;
+      const { x, y, zoom } = inst.getViewport();
+      const next = Math.min(ZOOM_MAX, Math.max(ZOOM_MIN, zoom * Math.pow(2, -e.deltaY * 0.01)));
+      const r = el.getBoundingClientRect();
+      const px = e.clientX - r.left, py = e.clientY - r.top;
+      inst.setViewport({ x: px - ((px - x) / zoom) * next, y: py - ((py - y) / zoom) * next, zoom: next });
+    };
+    el.addEventListener("wheel", onWheel, { capture: true, passive: false });
+    return () => el.removeEventListener("wheel", onWheel, { capture: true } as any);
+  }, [wf]);
 
   // Load the user's repos once; default to the first.
   React.useEffect(() => {
@@ -1029,7 +908,7 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
   const toggleStage = (key: StageKey) =>
     wf && save({ ...wf, stages: { ...wf.stages, [key]: !wf.stages[key] } });
 
-  // Advanced (paid): trigger policy + verdict mode + prompts + actions.
+  // Advanced (paid): trigger policy + verdict mode + actions.
   const toggleTrigger = (key: string) => {
     if (advancedLocked) return goUpgrade();
     if (wf) save({ ...wf, trigger: { ...wf.trigger, [key]: !wf.trigger[key] } });
@@ -1038,43 +917,44 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
     if (advancedLocked) return goUpgrade();
     if (wf) save({ ...wf, verdict: { blocking: !wf.verdict.blocking } });
   };
-  const savePrompt = (key: StagePromptKey, text: string) => {
-    if (advancedLocked) return goUpgrade();
-    if (!wf) return;
-    const prompts = { ...(wf.prompts || {}) };
-    if (text) prompts[key] = text;
-    else delete prompts[key];
-    save({ ...wf, prompts });
-  };
   const saveActions = (patch: Partial<RepoWorkflow["actions"]>) => {
     if (advancedLocked) return goUpgrade();
     if (!wf) return;
     const actions = { enabled: false, workflow: "", runWhen: "passed", ...(wf.actions || {}), ...patch };
     save({ ...wf, actions });
   };
-  // Apply a mode but preserve prompts/actions (merge over the current workflow).
+  // Apply a mode but preserve actions (merge over the current workflow).
   const applyMode = (name: string) => {
     if (advancedLocked) return goUpgrade();
     if (!wf) return;
     save({ ...wf, version: 1, ...TEMPLATES[name] });
   };
 
-  const repo = repos.find((r) => r.id === repoId);
+  const repo = repos.find((r) => r.id === repoId) || null;
   const selectedDef = NODE_DEFS.find((n) => n.id === selectedId) || null;
   const noRepos = repos.length === 0 && !loading;
   const mode = wf ? activeMode(wf) : null;
+  const panelW = usePanelWidth();
+  const fit = React.useMemo(() => fitViewFor(isMobile, panelW), [isMobile, panelW]);
 
-  // Surface the selected repo's name to the app shell for the header breadcrumb
-  // (user / Workflow / repo). Clear it on unmount so other pages don't inherit it.
+  const select = React.useCallback(
+    (id: string) => {
+      setRepoId(id);
+      setParams({ repo: id }, { replace: true });
+    },
+    [setParams]
+  );
+
+  // Surface the repo picker + selected repo's details to the app header.
+  // Cleared on unmount so other pages don't inherit it.
   React.useEffect(() => {
-    onRepoChange?.(repo ? repo.name : null);
-  }, [repo, onRepoChange]);
-  React.useEffect(() => () => onRepoChange?.(null), [onRepoChange]);
+    onHeader?.({ repos, repoId, repo, select });
+  }, [repos, repoId, repo, select, onHeader]);
+  React.useEffect(() => () => onHeader?.(null), [onHeader]);
 
   return (
-    <div className="wf-layout">
-      {/* Full-bleed canvas — the floating panels below sit over it. */}
-      <div className="wf-flow">
+    <div className="wf-layout" style={{ ["--wf-panel-w" as any]: `${panelW}px` }}>
+      <div className="wf-flow" ref={flowRef}>
         {noRepos ? (
           <div className="wf-canvas-empty">
             <div className="card" style={{ maxWidth: 460 }}>
@@ -1092,14 +972,15 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
             nodes={rfNodes}
             edges={rfEdges}
             nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onNodeClick={(_, n) => setSelectedId(n.id as NodeId)}
-            onInit={(inst) => requestAnimationFrame(() => inst.fitView({ padding: 0.12, maxZoom: 1 }))}
+            onInit={(inst) => { rfInst.current = inst; requestAnimationFrame(() => inst.fitView(fit)); }}
             fitView
-            fitViewOptions={{ padding: 0.12, maxZoom: 1 }}
-            minZoom={0.3}
-            maxZoom={1.5}
+            fitViewOptions={fit}
+            minZoom={ZOOM_MIN}
+            maxZoom={ZOOM_MAX}
             nodesDraggable
             nodesConnectable={false}
             elementsSelectable={false}
@@ -1107,68 +988,11 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
             deleteKeyCode={null}
             panOnScroll
             proOptions={{ hideAttribution: false }}
-          >
-            <Background color="var(--line)" gap={22} size={1} />
-          </ReactFlow>
+          />
         )}
       </div>
 
-      {/* Floating left section — repositories, laid out like the agent's review queue */}
-      <aside className="wf-rail pr-queue">
-        <div className="pr-queue-head">
-          <h3 className="card-title">Repositories</h3>
-        </div>
-        <div className="pr-queue-list">
-          {noRepos && (
-            <div className="mute mono" style={{ padding: 20, fontSize: 12, textAlign: "center" }}>
-              No repositories connected.
-            </div>
-          )}
-          {repos.map((r) => {
-            const s = r.reviewStats;
-            return (
-              <div
-                key={r.id}
-                className={`pr-card ${r.id === repoId ? "picked" : ""}`}
-                onClick={() => {
-                  setRepoId(r.id);
-                  setParams({ repo: r.id }, { replace: true });
-                }}
-                title={`${r.owner}/${r.name}`}
-              >
-                <div className="pr-card-row">
-                  <span className="mono mute" style={{ fontSize: 11 }}>{r.owner}</span>
-                  <Icon name="github" size={12} />
-                </div>
-                <div className="pr-card-title">{r.name}</div>
-                {s && (
-                  <div className="pr-card-row" style={{ marginTop: 6 }}>
-                    <span className="mono mute" style={{ fontSize: 11 }}>
-                      {s.total} {s.total === 1 ? "review" : "reviews"}
-                    </span>
-                    <span className="mono" style={{ fontSize: 11 }}>
-                      <span className="wf-stat-ok">✓ {s.approved}</span>
-                      {" · "}
-                      <span className="wf-stat-blk">✕ {s.blocked}</span>
-                    </span>
-                  </div>
-                )}
-                {r.id === repoId && <VerifySetupPanel repo={r} />}
-                {r.flakeRate && r.flakeRate.total > 0 && (
-                  <div className="pr-card-row" style={{ marginTop: 4 }} title="Quarantined generated tests over the last 30 verification runs">
-                    <span className={`mono ${r.flakeRate.rate > 0.1 ? "t-warn" : "mute"}`} style={{ fontSize: 11 }}>
-                      flake {Math.round(r.flakeRate.rate * 100)}% ({r.flakeRate.flaky}/{r.flakeRate.total})
-                    </span>
-                  </div>
-                )}
-              </div>
-            );
-          })}
-        </div>
-      </aside>
-
-      {/* Mode selector — sits top-left of the canvas, where the repo name used
-          to be (the repo name now lives in the header breadcrumb). */}
+      {/* Mode selector — floats top-left over the canvas. */}
       {!noRepos && (
         <div className="wf-toolbar">
           <div className="wf-toolbar-left">
@@ -1217,7 +1041,6 @@ const WorkflowPage = ({ onRepoChange }: { onRepoChange?: (name: string | null) =
             onToggleStage={toggleStage}
             onToggleTrigger={toggleTrigger}
             onToggleBlocking={toggleBlocking}
-            onSavePrompt={savePrompt}
             onSaveActions={saveActions}
           />
         ) : (

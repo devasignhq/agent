@@ -17,7 +17,7 @@ const Auth = ({ onSignIn }) => (
         <div className="ob-eyebrow">code review · multimodal</div>
         <h1 className="auth-h1">Ship code that <span className="accent">matches the goal.</span></h1>
         <p className="auth-p">
-          DevAsign ingests the ticket, Loom or screenshot first — then reviews every PR
+          DevAsign ingests the ticket, Loom or screenshot first, then reviews every PR
           against that goal.
         </p>
         <button className="gh-btn" onClick={onSignIn}>
@@ -42,7 +42,7 @@ const Auth = ({ onSignIn }) => (
             <i className="dot" style={{ background: "#f5a524" }}></i>
             <i className="dot" style={{ background: "#ff7a3d" }}></i>
           </div>
-          <span className="tt-name">devasign — review · PR #482</span>
+          <span className="tt-name">devasign · review · PR #482</span>
         </div>
         <div className="terminal-body">
           <div className="t-line t-comment"># devasign review queued</div>
@@ -63,8 +63,8 @@ const Auth = ({ onSignIn }) => (
           </div>
           <div className="t-box danger">
             <div className="t-line"><span className="t-danger">▸ blockers</span> <span className="t-dim">2</span></div>
-            <div className="t-line t-dim">  · WithdrawForm.tsx:142 — chain id not validated</div>
-            <div className="t-line t-dim">  · useUSDC.ts:88     — wallet check fires after submit</div>
+            <div className="t-line t-dim">  · WithdrawForm.tsx:142 · chain id not validated</div>
+            <div className="t-line t-dim">  · useUSDC.ts:88     · wallet check fires after submit</div>
           </div>
           <div className="t-line">&nbsp;</div>
           <div className="t-line t-comment"># posting inline comments to PR…</div>
@@ -313,7 +313,7 @@ const OBPricing = ({ onChooseFree }) => {
       <div className="ob-eyebrow">step 01 / plan</div>
       <h1 className="ob-title">Choose the plan that fits your team.</h1>
       <p className="ob-desc">
-        Every paid plan starts with a 14-day free trial — full access now, no charge until day 14,
+        Every paid plan starts with a 14-day free trial: full access now, no charge until day 14,
         cancel anytime. You can change or cancel your plan later in Settings.
       </p>
 
@@ -446,13 +446,13 @@ const OBGitHub = ({ install, setInstall, refreshInstalls, isPaid }) => {
       <p className="ob-desc">
         DevAsign reads PR diffs and posts inline review comments through a GitHub App you
         install on your personal account or organization. Pick which repositories the app
-        can see on GitHub — that's the source of truth.
+        can see on GitHub, which is the source of truth.
       </p>
 
       <p className="mono" style={{ fontSize: 12, marginBottom: 14, lineHeight: 1.6, color: isPaid ? "var(--fg-mute)" : "var(--warn)" }}>
         {isPaid
           ? "Your plan reviews public and private repositories."
-          : "Free reviews public repositories only — private repos need Pro. You can still grant private repos, but they won't be reviewed until you upgrade."}
+          : "Free reviews public repositories only. Private repos need Pro. You can still grant private repos, but they won't be reviewed until you upgrade."}
       </p>
 
       {status !== "installed" ? (
@@ -492,7 +492,7 @@ const GHInstallPanel = ({ status, onLaunch }) => {
       <ul className="gh-install-list">
         <li>
           <Icon name="check" size={11} color="var(--accent)"/>
-          <span><b>You</b> choose which repos the app can access on GitHub — DevAsign only ever sees what you grant.</span>
+          <span><b>You</b> choose which repos the app can access on GitHub. DevAsign only ever sees what you grant.</span>
         </li>
         <li>
           <Icon name="check" size={11} color="var(--accent)"/>
@@ -500,7 +500,7 @@ const GHInstallPanel = ({ status, onLaunch }) => {
         </li>
         <li>
           <Icon name="check" size={11} color="var(--accent)"/>
-          <span>You can add, remove, or change repos any time from GitHub settings — changes sync back here instantly.</span>
+          <span>You can add, remove, or change repos any time from GitHub settings. Changes sync back here instantly.</span>
         </li>
       </ul>
 
@@ -572,7 +572,7 @@ const GHRepoBrowser = ({ accounts, onReconfigure, totalRepos, isPaid }) => (
             // user up front so they're not confused to find it already there.
             <div className="mono" style={{ fontSize: 11, lineHeight: 1.6, color: "var(--fg-mute)", padding: "8px 12px", borderRadius: 8, background: "var(--bg-2)", margin: "0 0 8px" }}>
               <Icon name="check" size={11} color="var(--accent)"/>{" "}
-              DevAsign is already installed on <b>{acct.login}</b> by an organization owner — you have
+              DevAsign is already installed on <b>{acct.login}</b> by an organization owner, so you have
               access to these repositories.
             </div>
           )}
@@ -741,12 +741,12 @@ const OBInteg = ({ integ, setInteg }) => {
 
       {linearError && (
         <div className="mono txt-danger" style={{ fontSize: 11, marginTop: 10 }}>
-          Couldn't connect Linear — the authorization didn't complete. Click Connect to try again.
+          Couldn't connect Linear. The authorization didn't complete. Click Connect to try again.
         </div>
       )}
       {planKnown && isFree && (
         <p className="mute mono" style={{ fontSize: 11, marginTop: 12, lineHeight: 1.6 }}>
-          Linear is a Pro &amp; Max feature — connect it any time from Settings → Integrations after upgrading.
+          Linear is a Pro &amp; Max feature. Connect it any time from Settings → Integrations after upgrading.
         </p>
       )}
     </>
