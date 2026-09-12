@@ -276,7 +276,7 @@ export const FundBountyPage = () => {
       setSavePending(false);
       setSaveErr(
         isTransientNotDurable(e)
-          ? "Your edits are still saving — retry funding in a moment."
+          ? "Your edits are still saving. Retry funding in a moment."
           : saveErrorMessage(e)
       );
       return false;
@@ -389,7 +389,7 @@ export const FundBountyPage = () => {
               ) : (
                 <>
                   Your funding transaction was signed and broadcast to Stellar. Waiting for on-chain
-                  confirmation — this usually takes under a minute. You can close this page; the bounty
+                  confirmation. This usually takes under a minute. You can close this page; the bounty
                   opens automatically once the escrow confirms.
                 </>
               )}
@@ -424,7 +424,7 @@ export const FundBountyPage = () => {
               ) : null}
 
               {locked ? (
-                <p className="fb-nudge">This bounty is funded — its criteria are locked.</p>
+                <p className="fb-nudge">This bounty is funded, so its criteria are locked.</p>
               ) : (
                 <p className="fb-nudge">
                   DevAsign drafted these from your issue and your codebase.{" "}
@@ -551,7 +551,7 @@ export const FundBountyPage = () => {
               <div className="tu-notice fb-notice fb-notice-ok">
                 <Icon name="check" size={15} />
                 <span>
-                  This bounty is already funded — <b>{money(bounty.amountUsdc)} USDC</b> is held in
+                  This bounty is already funded. <b>{money(bounty.amountUsdc)} USDC</b> is held in
                   escrow. There's nothing left to do here.
                 </span>
               </div>

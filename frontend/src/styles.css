@@ -234,9 +234,9 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
   flex-shrink: 0;
 }
 .crumbs {
-  display: flex; align-items: center; gap: 8px;
+  display: flex; align-items: center; gap: 8px; min-width: 0;
   font-family: var(--mono); font-size: 12px;
-  color: var(--fg-mute);
+  color: var(--fg-mute); white-space: nowrap;
 }
 .crumbs .sep { color: var(--fg-faint); }
 .crumbs .now { color: var(--fg); }
@@ -5134,130 +5134,121 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 
 /* ── Workflow screen — node-based per-repo review pipeline ───────────── */
-/* Full-bleed React Flow canvas with floating sections layered over it (the
-   repo list and node details detach from the page edges). */
-.wf-layout { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+/* Minimalist canvas: pure black ground, thin grey bezier edges, dark rounded
+   node cards. The detail panel floats over the canvas; the repo picker and
+   repo details live in the header (.wf-repo-* / .wf-head-* below). */
+.wf-layout { position: relative; flex: 1; min-height: 0; overflow: hidden; --wf-edge: #3a3a3a; --wf-card: #101010; --wf-card-line: #232323; }
 
-/* Shared "floating" card look for the side sections + the top bar. */
 .wf-float {
-  background: var(--bg-1); border: 1px solid var(--line-2);
+  background: var(--wf-card); border: 1px solid var(--wf-card-line);
   box-shadow: 0 14px 40px rgba(0, 0, 0, 0.55);
 }
-
-/* Left section — repositories. Floats and hugs its content height (capped to
-   the viewport). Its box + rows reuse the agent screen's review-queue layout
-   (`.pr-queue` / `.pr-card`); this rule only positions and sizes it. */
-.wf-rail {
-  position: absolute; left: 16px; top: 16px; z-index: 5;
-  width: 248px; max-height: calc(100% - 32px);
-}
-/* Let the queue list scroll (instead of overflowing) when the rail is capped. */
-.wf-rail .pr-queue-list { min-height: 0; }
 .wf-stat-ok { color: var(--green); }
 .wf-stat-blk { color: var(--warn); }
 
-/* Mode selector — sits directly on the canvas (no card behind it), top-left
-   where the repo name used to be (the repo name now lives in the header). */
+/* Mode selector — floats top-left over the canvas (no card behind it). */
 .wf-toolbar {
-  position: absolute; top: 16px; left: 280px; right: 372px; z-index: 6;
+  position: absolute; top: 16px; left: 16px; right: calc(var(--wf-panel-w, 340px) + 32px); z-index: 6;
   display: flex; align-items: center; justify-content: space-between; gap: 12px;
-  padding: 0;
   pointer-events: none; /* let canvas panning work through the empty gaps */
 }
 .wf-toolbar > * { pointer-events: auto; }
-.wf-toolbar-left { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.wf-toolbar-left { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
 .wf-err { font-size: 11px; }
-/* Mode (preset) buttons — the applied mode stays highlighted. */
 .wf-mode-btn {
   display: inline-flex; align-items: center; justify-content: center;
   height: 26px; padding: 0 11px;
-  background: transparent; border: 1px solid var(--line-2);
+  background: var(--wf-card); border: 1px solid var(--wf-card-line);
   color: var(--fg-dim); cursor: pointer;
   font-family: var(--mono); font-size: 11px;
   transition: background 0.12s ease, border-color 0.12s ease, color 0.12s ease;
 }
 .wf-mode-btn:hover { background: var(--bg-2); color: var(--fg); border-color: var(--line-3); }
-.wf-mode-btn.is-active {
-  background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
-}
-/* "Custom" is a read-only status (not an applyable preset): it lights up when
-   the workflow has been tweaked off every preset. Non-interactive — no hover. */
+.wf-mode-btn.is-active { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
+/* "Custom" is a read-only status, not an applyable preset — no hover. */
 .wf-mode-btn.is-custom { cursor: default; }
-.wf-mode-btn.is-custom:hover { background: transparent; border-color: var(--line-2); color: var(--fg-dim); }
+.wf-mode-btn.is-custom:hover { background: var(--wf-card); border-color: var(--wf-card-line); color: var(--fg-dim); }
 .wf-mode-btn.is-custom.is-active,
-.wf-mode-btn.is-custom.is-active:hover {
-  background: var(--accent-glow); border-color: var(--accent); color: var(--accent);
-}
-.wf-flow { position: absolute; inset: 0; }
+.wf-mode-btn.is-custom.is-active:hover { background: var(--accent-glow); border-color: var(--accent); color: var(--accent); }
+
+/* Cancel the app-wide CSS zoom on the canvas: React Flow measures handles with
+   getBoundingClientRect (which includes zoom), so edges land 10% off otherwise. */
+.wf-flow { position: absolute; inset: 0; background: var(--bg); zoom: calc(1 / var(--zoom, 1)); }
+.wf-flow .react-flow { background: var(--bg); }
 .wf-canvas-empty {
   position: absolute; inset: 0;
   display: flex; align-items: center; justify-content: center;
   padding: 24px; font-size: 12px;
 }
 
-/* React Flow node — reset the wrapper, style our custom card. */
+/* React Flow node — reset the wrapper, style our card. */
 .react-flow__node-stage { background: transparent; border: none; padding: 0; width: auto; }
 .wf-node {
   position: relative;
-  display: flex; align-items: center; gap: 11px;
-  width: 272px; padding: 11px 13px;
-  background: var(--bg-1); border: 1px solid var(--line-2);
-  cursor: grab; transition: border-color 0.12s ease, box-shadow 0.12s ease, transform 0.12s ease;
+  display: flex; flex-direction: column; gap: 12px;
+  padding: 14px 16px 14px;
+  background: var(--wf-card); border: 1px solid var(--wf-card-line);
+  cursor: grab; transition: border-color 0.12s ease, box-shadow 0.12s ease, opacity 0.12s ease;
 }
 .wf-node:active { cursor: grabbing; }
-.wf-node:hover { border-color: var(--line-3); transform: translateY(-1px); }
-.wf-node.is-off { opacity: 0.5; }
+.wf-node:hover { border-color: var(--line-3); }
+.wf-node.is-off { opacity: 0.45; }
 .wf-node.is-selected {
   border-color: var(--accent);
   box-shadow: 0 0 0 1px var(--accent), 0 0 0 5px var(--accent-glow);
 }
-.wf-node-handle { opacity: 0; width: 1px; height: 1px; min-width: 0; min-height: 0; border: 0; }
-/* Per-node coloured icon square (colour via --nc). Sharp edges, like the app buttons. */
-.wf-node-ico {
-  display: inline-flex; align-items: center; justify-content: center;
-  width: 30px; height: 30px; flex: 0 0 auto;
-  color: var(--nc, var(--accent));
-  background: color-mix(in srgb, var(--nc, var(--accent)) 16%, var(--bg-2));
-  border: 1px solid color-mix(in srgb, var(--nc, var(--accent)) 42%, transparent);
+/* Connection points: solid squares centred on the card border, so an edge
+   visibly lands on the card; unused sides hide. */
+.wf-node-handle {
+  width: 7px; height: 7px; min-width: 0; min-height: 0;
+  background: var(--wf-edge); border: none; border-radius: 0;
 }
+/* Sit over the 1px border, flush with its outer edge (React Flow centres them
+   on it), so an edge's endpoint — the handle's outer face — is exactly the
+   card's outer border. */
+.wf-node-handle.react-flow__handle-left { left: -1px; transform: translate(0, -50%); }
+.wf-node-handle.react-flow__handle-right { right: -1px; transform: translate(0, -50%); }
+.wf-node-handle.react-flow__handle-top { top: -1px; transform: translate(-50%, 0); }
+.wf-node-handle.react-flow__handle-bottom { bottom: -1px; transform: translate(-50%, 0); }
+.wf-node-handle.is-hidden { opacity: 0; pointer-events: none; }
+.wf-node-head { display: flex; align-items: center; gap: 12px; }
+.wf-node-ico { display: inline-flex; flex: 0 0 auto; color: var(--nc, var(--purple)); }
 .wf-node-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
 .wf-node-name {
-  font-family: var(--mono); font-size: 13px; color: var(--fg);
+  font-family: var(--sans); font-size: 15px; font-weight: 600; color: var(--fg); letter-spacing: -0.01em;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.wf-node-desc {
-  font-size: 11px; color: var(--fg-mute); line-height: 1.35;
+.wf-node-sub {
+  font-family: var(--sans); font-size: 12px; font-weight: 500; color: var(--nc, var(--purple));
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-/* "Trigger" tab above the entry node (matches the reference design). */
-.wf-node-tab {
-  position: absolute; top: -1px; left: 0; transform: translateY(-100%);
-  padding: 2px 9px; font-family: var(--mono); font-size: 10px; color: var(--fg-dim);
-  background: var(--bg-1); border: 1px solid var(--line-2); border-bottom: none;
+.wf-node-chips { display: flex; gap: 6px; flex-wrap: nowrap; overflow: hidden; }
+.wf-chip {
+  display: inline-flex; align-items: center; gap: 5px; flex: 0 0 auto;
+  height: 22px; padding: 0 8px;
+  background: #1a1a1a; color: var(--fg); font-family: var(--sans); font-size: 11px; font-weight: 500; white-space: nowrap;
 }
-.wf-node-flag { color: var(--purple); display: inline-flex; flex: 0 0 auto; }
-.wf-node-dot { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; }
-.wf-node-dot.on { background: var(--nc, var(--accent)); box-shadow: 0 0 0 3px color-mix(in srgb, var(--nc, var(--accent)) 22%, transparent); }
-.wf-node-dot.off { background: var(--fg-faint); }
+.wf-chip-k { color: var(--fg-mute); font-weight: 400; }
+.wf-chip.st-off { color: var(--fg-dim); }
+.wf-chip.st-standby { color: var(--fg-dim); }
+.wf-chip.st-advisory { color: var(--warn); }
+.wf-chip.is-pro { color: var(--purple); }
 
-/* Read-only status chip (in place of the on/off dot) on always-on / advisory
-   nodes — the steps the agent runs unconditionally. */
-.wf-node-badge {
-  flex: 0 0 auto; padding: 2px 6px;
-  font-family: var(--mono); font-size: 9px; letter-spacing: 0.04em; text-transform: uppercase;
-  border: 1px solid var(--line-2); color: var(--fg-mute); white-space: nowrap;
+/* Edge label chip (bold label + muted tag pills), rendered above the edge. */
+.wf-edge-chip {
+  position: absolute; z-index: 5; pointer-events: none;
+  display: inline-flex; align-items: center; gap: 6px;
+  height: 26px; padding: 0 8px 0 10px;
+  background: var(--wf-card); border: 1px solid var(--wf-card-line);
+  font-family: var(--sans); font-size: 12px; color: var(--fg); white-space: nowrap;
 }
-.wf-node-badge.always-on { color: var(--green); border-color: color-mix(in srgb, var(--green) 45%, transparent); }
-.wf-node-badge.advisory { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 45%, transparent); }
-/* Second entry lane (maintainer feedback): tint its trigger tab so the two
-   entry points read as distinct. */
-.wf-node.wf-lane-m .wf-node-tab { color: var(--info); border-color: color-mix(in srgb, var(--info) 45%, transparent); }
-
-/* Branch / loop edge labels. labelStyle (inline) sets the fill; this tightens
-   the chip background + is a fallback if inline props are dropped. */
-.react-flow__edge-text { font-family: var(--mono); font-size: 10px; fill: var(--fg-dim); }
-.react-flow__edge-textbg { fill: var(--bg-1); }
-
+.wf-edge-chip b { font-weight: 600; }
+.wf-edge-chip.is-loop { border-style: dashed; }
+.wf-edge-tag {
+  display: inline-flex; align-items: center; height: 18px; padding: 0 6px;
+  background: #1a1a1a; color: var(--fg-dim); font-size: 11px;
+}
+.react-flow__edge-path { stroke: var(--wf-edge); }
 .react-flow__attribution { background: transparent; color: var(--fg-faint); font-size: 9px; }
 .react-flow__attribution a { color: var(--fg-faint); }
 
@@ -5265,8 +5256,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
    (capped to the viewport, with the body scrolling if it gets tall). */
 .wf-panel {
   position: absolute; right: 16px; top: 16px; z-index: 5;
-  width: 340px; max-height: calc(100% - 32px);
-  display: flex; flex-direction: column; min-height: 0;
+  width: var(--wf-panel-w, 340px); max-height: calc(100% - 32px);
+  display: flex; flex-direction: column; min-height: 0; overflow: hidden;
 }
 .wf-panel-head {
   display: flex; align-items: center; gap: 10px;
@@ -5289,7 +5280,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-field { margin-top: 16px; display: flex; flex-direction: column; gap: 6px; }
 .wf-field .input { font-family: var(--mono); }
 .wf-ctl {
-  display: flex; align-items: flex-start; gap: 10px;
+  display: flex; align-items: center; gap: 10px;
   padding: 10px 0; cursor: pointer;
 }
 .wf-ctl + .wf-prompt { margin-top: 4px; }
@@ -5299,15 +5290,12 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .wf-ctl-desc { font-size: 11px; margin-top: 3px; line-height: 1.45; }
 
-/* Custom-prompt editor */
+/* Locked-feature notice (guidance materials / GitHub Action for free plans) */
 .wf-prompt { margin-top: 16px; padding-top: 16px; border-top: 1px solid var(--line); }
-.wf-prompt-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 8px; }
+.wf-prompt-head { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 4px 8px; margin-bottom: 8px; }
 .wf-label {
   font-family: var(--mono); font-size: 11px; letter-spacing: 0.05em;
   text-transform: uppercase; color: var(--fg-dim);
-}
-.wf-textarea {
-  height: auto; min-height: 150px; padding: 10px; line-height: 1.5; resize: vertical;
 }
 .wf-prompt-foot { font-size: 10px; margin-top: 6px; text-align: right; }
 .wf-prompt-locked {
@@ -5322,7 +5310,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-guidance-list { list-style: none; margin: 12px 0 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .wf-guidance-item {
   display: flex; align-items: center; gap: 8px;
-  padding: 8px 10px; border: 1px solid var(--line); border-radius: 4px;
+  padding: 8px 10px; border: 1px solid var(--line);
   background: var(--bg-2); color: var(--fg-dim);
 }
 .wf-guidance-meta { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
@@ -5332,7 +5320,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 }
 .wf-guidance-x {
   flex-shrink: 0; display: grid; place-items: center;
-  width: 20px; height: 20px; padding: 0; border: none; border-radius: 3px;
+  width: 20px; height: 20px; padding: 0; border: none;
   background: transparent; color: var(--fg-mute); cursor: pointer;
 }
 .wf-guidance-x:hover { background: var(--line); color: var(--fg); }
@@ -5341,18 +5329,98 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .wf-guidance-add .btn { flex-shrink: 0; }
 .wf-guidance-err { margin-top: 10px; font-size: 11px; color: var(--danger); line-height: 1.45; }
 
+/* ── Workflow header: repo picker (in the breadcrumb) + repo details (right) ── */
+.wf-repo-pick { position: relative; display: inline-flex; min-width: 0; }
+.wf-repo-btn {
+  display: inline-flex; align-items: center; gap: 6px; height: 26px; padding: 0 8px; margin: -4px 0;
+  background: transparent; border: 1px solid transparent;
+  color: var(--fg); font-family: var(--mono); font-size: 12px; cursor: pointer; max-width: 320px; min-width: 0;
+}
+.wf-repo-btn:hover, .wf-repo-btn.is-open { background: var(--bg-1); border-color: var(--line-2); }
+.wf-repo-btn:disabled { color: var(--fg-mute); cursor: default; }
+.wf-repo-btn-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-repo-owner { color: var(--fg-mute); }
+.wf-repo-menu {
+  position: absolute; top: calc(100% + 8px); left: 0; z-index: 60; width: 320px;
+  background: var(--bg-1); border: 1px solid var(--line-2); overflow: hidden;
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.4);
+  animation: notifPopIn 120ms ease-out;
+}
+.wf-repo-search { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--line); color: var(--fg-mute); }
+.wf-repo-search .input { height: 22px; font-size: 12px; }
+.wf-repo-list { max-height: 320px; overflow: auto; padding: 4px; }
+.wf-repo-none { padding: 14px 12px; font-size: 12px; font-family: var(--mono); }
+.wf-repo-opt {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; width: 100%;
+  padding: 8px 10px; border: none; background: transparent; color: var(--fg);
+  font-family: var(--mono); font-size: 12px; text-align: left; cursor: pointer;
+}
+.wf-repo-opt:hover { background: var(--bg-2); }
+.wf-repo-opt.is-picked { color: var(--accent); }
+.wf-repo-opt-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.wf-repo-opt-meta { display: inline-flex; align-items: center; gap: 8px; flex: 0 0 auto; color: var(--fg-mute); font-size: 11px; }
+
+.wf-head-details { display: flex; align-items: center; gap: 12px; margin-right: 2px; min-width: 0; }
+/* Trailing divider between the repo details and the bell / settings / avatar. */
+.wf-head-details > .wf-head-sep:last-child { margin: 0; }
+.wf-head-stat { display: inline-flex; align-items: center; gap: 6px; font-family: var(--mono); font-size: 11px; color: var(--fg-mute); white-space: nowrap; }
+.wf-head-stat b { color: var(--fg); font-weight: 500; }
+.wf-head-sep { width: 1px; height: 12px; background: var(--line-2); margin: 0 2px; }
+.wf-verify { position: relative; }
+.wf-verify-btn { gap: 7px; white-space: nowrap; flex-shrink: 0; }
+.wf-verify-btn.is-active { background: var(--bg-2); border-color: var(--line-3); }
+.wf-verify-state { color: var(--fg-mute); }
+.wf-verify-dot { width: 6px; height: 6px; background: var(--fg-faint); flex: 0 0 auto; }
+.wf-verify-dot.verified { background: var(--lemon); }
+.wf-verify-dot.pr_open, .wf-verify-dot.pr_merged { background: var(--info); }
+.wf-verify-dot.pr_closed { background: var(--warn); }
+.wf-verify-pop {
+  position: absolute; top: calc(100% + 8px); right: 0; z-index: 60; width: 360px;
+  background: var(--bg-1); border: 1px solid var(--line-2);
+  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.4);
+  animation: notifPopIn 120ms ease-out;
+}
+.wf-verify-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
+.wf-verify-title { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-dim); }
+.wf-verify-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.wf-verify-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.wf-verify-link { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-decoration: underline; }
+.wf-verify-facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 11px; line-height: 1.45; }
+.wf-verify-facts dt { font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em; text-transform: uppercase; color: var(--fg-mute); padding-top: 1px; }
+.wf-verify-facts dd { margin: 0; color: var(--fg-dim); }
+.wf-verify-warn { font-family: var(--mono); font-size: 11px; color: var(--warn); line-height: 1.45; }
+.wf-verify-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; padding-top: 2px; }
+/* Selects and the action button share one exact box; the native select chrome
+   would otherwise paint a taller control than the button beside it. */
+.wf-verify-actions > * { height: 26px; line-height: 24px; box-sizing: border-box; margin: 0; }
+.wf-verify-actions .input {
+  width: auto; font-size: 11px; padding: 0 24px 0 8px;
+  appearance: none; -webkit-appearance: none;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 16 16' fill='none' stroke='%23a0a6ad' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6l5 5 5-5'/%3E%3C/svg%3E");
+  background-repeat: no-repeat; background-position: right 8px center;
+}
+
 /* Mobile: drop the floating overlay and stack the sections; canvas is desktop-first. */
 .is-mobile .wf-layout { display: flex; flex-direction: column; overflow: auto; }
-.is-mobile .wf-rail,
 .is-mobile .wf-panel,
 .is-mobile .wf-toolbar {
   position: static; inset: auto; transform: none; width: auto; z-index: auto;
   box-shadow: none; margin: 8px;
 }
-.is-mobile .wf-rail { max-height: 180px; order: 1; }
-.is-mobile .wf-toolbar { order: 2; }
-.is-mobile .wf-flow { position: relative; inset: auto; height: 52vh; flex: 0 0 auto; order: 3; }
-.is-mobile .wf-panel { order: 4; }
+.is-mobile .wf-toolbar { order: 1; }
+.is-mobile .wf-flow { position: relative; inset: auto; height: 52vh; flex: 0 0 auto; order: 2; }
+.is-mobile .wf-panel { order: 3; }
+.is-mobile .crumbs { flex: 1; min-width: 0; }
+.is-mobile .wf-repo-pick { flex: 1; }
+.is-mobile .wf-repo-btn { min-width: 96px; max-width: 100%; }
+.is-mobile .wf-repo-menu { width: min(320px, calc(100vw - 28px)); }
+.is-mobile .wf-head-details { gap: 6px; margin-right: 0; }
+.is-mobile .wf-head-stat { display: none; }
+.is-mobile .wf-verify-btn { padding: 0 8px; }
+.is-mobile .wf-verify-btn > span { display: none; }
+/* Narrow desktop windows: shed the header details before anything overflows. */
+@media (max-width: 1280px) { .wf-head-stat { display: none; } }
+@media (max-width: 1080px) { .wf-verify-state { display: none; } .wf-repo-btn { max-width: 220px; } }
 
 /* ═══ Bounties page (redesign) ═══════════════════════════════════════════════ */
 .bnty-page { padding-bottom: 40px; }
@@ -6262,6 +6330,3 @@ pre.vln-code, .vln-code {
 .acv-revision-head a { color: var(--fg-dim); text-decoration: underline; }
 .acv-revision-changes { list-style: none; margin: 4px 0 0; padding: 0 0 0 10px; border-left: 2px solid var(--line-2); font-size: 11px; }
 
-.wf-verify-setup { margin-top: 8px; padding: 8px; border: 1px solid var(--line); background: var(--bg-1); cursor: default; }
-.wf-verify-setup a { color: var(--fg-dim); text-decoration: underline; }
-.wf-verify-setup select { background: var(--bg-2); color: var(--fg); border: 1px solid var(--line-2); padding: 2px 4px; }

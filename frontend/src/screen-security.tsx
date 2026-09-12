@@ -96,8 +96,8 @@ const ConfTag = ({ conf }: { conf: SecurityConfidence }) =>
       className="vln-tag conf"
       title={
         conf === "probable"
-          ? "Strong evidence, but an assumption is unverified — severity capped at medium"
-          : "Depends on something outside the scanned file — severity capped at medium"
+          ? "Strong evidence, but an assumption is unverified, so severity is capped at medium"
+          : "Depends on something outside the scanned file, so severity is capped at medium"
       }
     >
       {conf.replace("_", " ")}
@@ -129,7 +129,7 @@ const ProLock = () => (
 // Persistent banner shown above findings a locked account can still read.
 const LockedNotice = () => (
   <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>
-    Security audits are a Pro/Max feature — scans, triage and the merge gate are paused on
+    Security audits are a Pro/Max feature. Scans, triage and the merge gate are paused on
     your plan.{" "}
     <button className="btn sm" style={{ marginLeft: 8 }} onClick={goUpgrade}>
       Upgrade
@@ -517,7 +517,7 @@ const PageHead = ({
           <div className="page-sub">
             {overview.repos.length} repo{overview.repos.length === 1 ? "" : "s"} ·{" "}
             {overview.locked ? (
-              <>audits paused — Pro/Max feature</>
+              <>audits paused, Pro/Max feature</>
             ) : (
               <>
                 audit on every merge to{" "}
@@ -678,7 +678,7 @@ const RescanModal = ({
           <div className="cb-eyebrow">Security</div>
           <h2 className="cb-modal-title">Re-scan repositories</h2>
           <div className="cb-modal-sub">
-            Pick the repositories to audit — one, several, or all of them. Each runs a full
+            Pick the repositories to audit: one, several, or all of them. Each runs a full
             re-scan and refreshes the findings below.
           </div>
         </div>
@@ -771,13 +771,13 @@ const FirstRunEmpty = ({ overview }: { overview: SecurityOverview }) => {
         {hasRepos ? (
           <>
             The security agents run their first audit automatically when you merge a pull
-            request to <b>{branch}</b>. Merge one to see findings appear here — or hit{" "}
+            request to <b>{branch}</b>. Merge one to see findings appear here, or hit{" "}
             <b>Re-scan</b> above to run an audit against the current code now.
           </>
         ) : (
           <>
             Connect a repository to get started. Once it's linked, the security agents run an
-            audit automatically every time a pull request merges — no setup required.
+            audit automatically every time a pull request merges, with no setup required.
           </>
         )}
       </div>
@@ -1033,7 +1033,7 @@ const Dashboard = ({
           </div>
           <div className="vln-pnl-body vln-mg-body">
             {series.length === 0 ? (
-              <div className="vln-empty">No completed scans yet — merge a PR or hit Re-scan.</div>
+              <div className="vln-empty">No completed scans yet. Merge a PR or hit Re-scan.</div>
             ) : (
               <>
                 <div className="vln-mg">
@@ -1100,7 +1100,7 @@ const Dashboard = ({
                   {flatSeries && (
                     <div className="vln-mg-flat">
                       {series.every((c) => c.skipped)
-                        ? "No scan in this window actually ran — hover a column for the reason."
+                        ? "No scan in this window actually ran. Hover a column for the reason."
                         : `No findings introduced or resolved in the last ${series.length} scan${
                             series.length === 1 ? "" : "s"
                           }.`}
@@ -1320,7 +1320,7 @@ const Dashboard = ({
         {shown.length === 0 && (
           <div className="vln-empty">
             {overview.findings.length === 0 ? (
-              "No findings yet. The audit runs automatically when a PR merges — or hit Re-scan."
+              "No findings yet. The audit runs automatically when a PR merges, or hit Re-scan."
             ) : query.trim() !== "" ? (
               <>
                 No findings match “{query.trim()}”.{" "}
@@ -1385,7 +1385,7 @@ const FindingDetail = ({
     return (
       <div className="page vln-page">
         <div className="tu-notice">
-          Finding not found — it may have been resolved and pruned.{" "}
+          Finding not found. It may have been resolved and pruned.{" "}
           <button className="btn sm" onClick={onBack}>
             Back to findings
           </button>
@@ -1618,7 +1618,7 @@ const FindingDetail = ({
                 <span className="t mono">{ageLabel(h.at, now)} ago</span>
                 <span>
                   {h.detail}
-                  {h.actor && h.actor !== "audit-agent" ? ` — @${h.actor}` : ""}
+                  {h.actor && h.actor !== "audit-agent" ? ` by @${h.actor}` : ""}
                 </span>
               </div>
             ))}
@@ -2026,7 +2026,7 @@ const RulingsView = ({
 
             {needs && (
               <div className="tu-notice" style={{ marginTop: 8 }}>
-                Needs another look — {needs} It has stopped suppressing anything until you re-confirm it.
+                Needs another look: {needs} It has stopped suppressing anything until you re-confirm it.
               </div>
             )}
 
@@ -2161,7 +2161,7 @@ const GateRepoDetail = ({
           <div className="vln-verdict-s">
             {blocked
               ? "Unresolved block-gated findings fail the devasign/security check on every open PR."
-              : "All required gate rules pass — the devasign/security check reports success on open PRs."}{" "}
+              : "All required gate rules pass. The devasign/security check reports success on open PRs."}{" "}
             Mark the <span className="mono" style={{ color: "var(--fg-dim)" }}>devasign/security</span> check
             as required on <span className="mono" style={{ color: "var(--fg-dim)" }}>{repo.defaultBranch}</span>{" "}
             to enforce it.
@@ -2306,7 +2306,7 @@ const PolicyRepoEditor = ({
   };
 
   const TRIGGERS: Array<{ k: keyof RepoSecurityPolicy["triggers"]; label: React.ReactNode; sub: string }> = [
-    { k: "onMerge", label: <>audit every merge to <b>{repo.defaultBranch}</b></>, sub: "differential — only changed files pay" },
+    { k: "onMerge", label: <>audit every merge to <b>{repo.defaultBranch}</b></>, sub: "differential, only changed files pay" },
     { k: "onPrPush", label: "publish the devasign/security check on PRs", sub: "fails while block-gated findings exist" },
     { k: "nightly", label: "nightly sweep", sub: "cache-driven; unchanged repos cost nothing" },
     { k: "advisories", label: "dependency advisory feed", sub: "coming soon" },
@@ -2414,7 +2414,7 @@ const PolicyRepoEditor = ({
         )}
         {saved && !dirty && (
           <span className="mono" style={{ fontSize: 11, color: "var(--green)" }}>
-            saved — gate republished across open PRs
+            saved, gate republished across open PRs
           </span>
         )}
       </div>

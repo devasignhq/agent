@@ -11,6 +11,7 @@ import { useTweaks, TweaksPanel, TweakSection, TweakColor, TweakRadio, TweakSele
 import { Auth, Onboarding } from "./screens-onboarding";
 import { AgentPage } from "./screen-agent";
 import { WorkflowPage } from "./screen-workflow";
+import { RepoPicker, RepoDetails } from "./workflow-header";
 import { BountiesPage } from "./screen-bounties";
 import { FundBountyPage } from "./screen-fund-bounty";
 import { SettingsPage } from "./screens-rest";
@@ -419,13 +420,12 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
   );
 };
 
-const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowRepo, securityCrumbs, onCrumbNavigate }) => {
+const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowHeader, securityCrumbs, onCrumbNavigate }) => {
   const labels = {
     agent: "Agents", workflow: "Workflow", bounty: "Bounty", security: "Security", settings: "Settings"
   };
-  // On the Workflow page the selected repo becomes the final crumb:
-  // user / Workflow / repo-name.
-  const showRepoCrumb = current === "workflow" && !!workflowRepo;
+  // On the Workflow page the final crumb is the repo picker: user / Workflow / [repo ▾].
+  const showRepoCrumb = current === "workflow" && !!workflowHeader;
   // On the Security page the sub-view (and, inside a finding, where it was opened
   // from) becomes a clickable trail: user / Security / Merge gate / VLN-… — each
   // earlier segment navigates back. Reported by the screen via onCrumbs.
@@ -457,7 +457,7 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
         ) : showRepoCrumb ? (
           <>
             {!isMobile && <><span>{labels[current]}</span><span className="sep">/</span></>}
-            <span className="now">{workflowRepo}</span>
+            <RepoPicker {...workflowHeader} />
           </>
         ) : (
           <span className="now">{labels[current]}</span>
@@ -465,6 +465,7 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
       </div>
       <div className="topbar-spacer"></div>
       <div className="topbar-actions">
+        {showRepoCrumb && workflowHeader.repo && <RepoDetails key={workflowHeader.repo.id} repo={workflowHeader.repo} />}
         <div style={{ position: "relative" }}>
           <button className={`btn ghost sm icon-sq ${notifOpen ? "is-active" : ""}`}
                   style={{ position: "relative" }}
@@ -585,9 +586,9 @@ const AppContent = () => {
   const seg = rawSeg === "bounties" ? "bounty" : rawSeg;
   const current = PAGE_KEYS.includes(seg) ? seg : "agent";
   const setCurrent = React.useCallback((key) => navigate("/" + key), [navigate]);
-  // The Workflow screen's selected repo name, surfaced for the header breadcrumb
-  // (WorkflowPage reports it via onRepoChange).
-  const [workflowRepo, setWorkflowRepo] = React.useState<string | null>(null);
+  // The Workflow screen's repo picker + selected repo, surfaced to the header
+  // (WorkflowPage reports it via onHeader).
+  const [workflowHeader, setWorkflowHeader] = React.useState(null);
   // The Security screen's breadcrumb trail (Security → Merge gate → finding …),
   // reported via onCrumbs so the header reflects navigation within the section.
   const [securityCrumbs, setSecurityCrumbs] = React.useState(null);
@@ -836,7 +837,7 @@ const AppContent = () => {
           <h2 style={{ marginBottom: 8 }}>Your account is temporarily unavailable</h2>
           <p className="mute" style={{ fontSize: 13, lineHeight: 1.5, marginBottom: 16 }}>
             You’re still signed in, but we couldn’t load your account just now. This is usually
-            temporary — please try again in a moment. Your data hasn’t been deleted.
+            temporary. Please try again in a moment. Your data hasn’t been deleted.
           </p>
           <button className="btn primary" onClick={() => auth.reload()}>Try again</button>
         </div>
@@ -879,7 +880,7 @@ const AppContent = () => {
           onNavigate={(k, path) => (path ? navigate(path) : setCurrent(k))}
           user={auth.user}
           notifications={notifications}
-          workflowRepo={workflowRepo}
+          workflowHeader={workflowHeader}
           securityCrumbs={securityCrumbs}
           onCrumbNavigate={(path) => navigate(path)}
         />
@@ -887,7 +888,7 @@ const AppContent = () => {
           <Routes>
             <Route path={ROUTE_PATHS.agent}    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.review}   element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
-            <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage onRepoChange={setWorkflowRepo} />} />
+            <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage onHeader={setWorkflowHeader} isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.bounty}   element={<BountiesPage isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.fundBounty} element={<FundBountyPage />} />
             <Route path={ROUTE_PATHS.cancelBounty} element={<BountiesPage isMobile={isMobile} isCancelling />} />

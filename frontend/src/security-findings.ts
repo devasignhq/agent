@@ -213,10 +213,10 @@ export const SKIP_REASON_LABEL: Record<
   NonNullable<SecurityScanSummary["skipped"]>,
   string
 > = {
-  no_install: "skipped — no GitHub installation",
-  plan_locked: "skipped — audits are a Pro/Max feature",
-  index_not_built: "skipped — repo index not built yet",
-  repo_not_found: "failed — repository not found",
+  no_install: "skipped: no GitHub installation",
+  plan_locked: "skipped: audits are a Pro/Max feature",
+  index_not_built: "skipped: repo index not built yet",
+  repo_not_found: "failed: repository not found",
 };
 
 // Last `limit` scan runs (any trigger), oldest → newest, as chart columns.

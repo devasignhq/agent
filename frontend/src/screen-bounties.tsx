@@ -306,7 +306,7 @@ export const BountiesPage = ({
               </div>
               <div className="bounty-pager">
                 <span className="mono mute" style={{ fontSize: 11 }}>
-                  Showing {filtered.length === 0 ? 0 : start + 1}–{Math.min(start + PAGE_SIZE, filtered.length)} of {filtered.length}
+                  Showing {filtered.length === 0 ? 0 : start + 1} to {Math.min(start + PAGE_SIZE, filtered.length)} of {filtered.length}
                 </span>
                 <Pager cur={cur} pages={pages} onGo={setPage} />
               </div>
@@ -349,7 +349,7 @@ export const BountiesPage = ({
               </div>
               <div className="bounty-pager">
                 <span className="mono mute" style={{ fontSize: 11 }}>
-                  Showing {txns.length === 0 ? 0 : txStart + 1}–{Math.min(txStart + TX_PAGE_SIZE, txns.length)} of {txns.length}
+                  Showing {txns.length === 0 ? 0 : txStart + 1} to {Math.min(txStart + TX_PAGE_SIZE, txns.length)} of {txns.length}
                 </span>
                 <Pager cur={txCur} pages={txPages} onGo={setTxPage} />
               </div>
@@ -414,7 +414,7 @@ const BountyRow = ({ b, onClick, hidden }: { b: Bounty; onClick: () => void; hid
         {pendingExt && extDays !== undefined && (
           <span
             className="ext-badge"
-            title={`Timeline extension requested — ${extDays} day${extDays === 1 ? "" : "s"}`}
+            title={`Timeline extension requested: ${extDays} day${extDays === 1 ? "" : "s"}`}
           >
             <Icon name="clock" size={11} /> +{extDays}d
           </span>
@@ -710,7 +710,7 @@ const ExtensionCard = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) => 
       </div>
       {pastDue && (
         <div className="mono" style={{ fontSize: 11, marginTop: 8, padding: "0 14px", color: "var(--warn, #d6a354)" }}>
-          <Icon name="warn" size={11} /> Past due — the automatic refund is on hold until you respond.
+          <Icon name="warn" size={11} /> Past due. The automatic refund is on hold until you respond.
         </div>
       )}
       {err && <div className="mono" style={{ fontSize: 11, color: "var(--danger)", marginTop: 8, padding: "0 14px" }}>{err}</div>}
@@ -757,7 +757,7 @@ const SubmissionsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =>
       {b.extension?.status === "approved" && (
         <div className="mono mute" style={{ fontSize: 11, marginBottom: 14 }}>
           <Icon name="check" size={11} /> Deadline extended by {b.extension.days} day{b.extension.days === 1 ? "" : "s"}
-          {b.extension.respondedAt ? ` on ${fmtDay(b.extension.respondedAt)}` : ""}{b.deadlineAt ? ` — now due ${fmtDay(b.deadlineAt)}` : ""}.
+          {b.extension.respondedAt ? ` on ${fmtDay(b.extension.respondedAt)}` : ""}{b.deadlineAt ? `, now due ${fmtDay(b.deadlineAt)}` : ""}.
         </div>
       )}
       {b.prNumber ? (
@@ -776,7 +776,7 @@ const SubmissionsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =>
                 </div>
               </div>
               <div className="sub-card-note">
-                Status: {ST_LABEL[b.status]}. When you merge the PR, the escrowed {money(b.amountUsdc)} USDC is released automatically — no extra action needed.
+                Status: {ST_LABEL[b.status]}. When you merge the PR, the escrowed {money(b.amountUsdc)} USDC is released automatically, with no extra action needed.
               </div>
               <div className="sub-card-actions">
                 <a className="btn sm" href={prUrl(b.repo, b.prNumber)} target="_blank" rel="noreferrer"><Icon name="github" size={11} /> View PR <Icon name="external" size={10} /></a>
@@ -786,7 +786,7 @@ const SubmissionsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =>
         </>
       ) : (
         <div className="mono mute" style={{ fontSize: 11 }}>
-          No pull request yet — when the contributor opens one against this bounty it appears here.
+          No pull request yet. When the contributor opens one against this bounty it appears here.
         </div>
       )}
     </>
@@ -823,11 +823,11 @@ const ApplicationsTab = ({ b, onChanged }: { b: Bounty; onChanged: (b: Bounty) =
       const whoLabel = who ? `@${who}` : "This contributor";
       setErr(
         code === "contributor_trustline_lapsed"
-          ? `${whoLabel}'s payout wallet can no longer receive USDC — ask them to restore their USDC trustline (or re-apply), then delegate again.`
+          ? `${whoLabel}'s payout wallet can no longer receive USDC. Ask them to restore their USDC trustline (or re-apply), then delegate again.`
           : code === "no_contributor_wallet"
-            ? `${whoLabel} hasn't set a payout wallet — ask them to re-apply with one before you can delegate.`
+            ? `${whoLabel} hasn't set a payout wallet. Ask them to re-apply with one before you can delegate.`
             : code === "no_such_application"
-              ? "That application is no longer available — refresh and try again."
+              ? "That application is no longer available. Refresh and try again."
               : e?.message || "Action failed."
       );
     } finally {
@@ -972,7 +972,7 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
       }
       if (e?.message === "funding_in_flight") {
         // The funding tx hasn't confirmed yet — retriable, don't dead-end.
-        setMsg("Your funding transaction is still confirming on Stellar. Try again in a minute — cancelling then refunds the escrow.");
+        setMsg("Your funding transaction is still confirming on Stellar. Try again in a minute. Cancelling then refunds the escrow.");
         setPhase("ready");
         return;
       }
@@ -992,7 +992,7 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
           <h2 className="cb-modal-title">Cancel & refund</h2>
           <div className="cb-modal-sub">
             {bounty
-              ? <>Cancel <span className="mono">{bounty.code}</span> — {bounty.title}. Any escrowed funds are refunded to your wallet.</>
+              ? <>Cancel <span className="mono">{bounty.code}</span>: {bounty.title}. Any escrowed funds are refunded to your wallet.</>
               : "Cancel this bounty and refund any escrowed funds to your wallet."}
           </div>
           {bounty && bounty.issueUrl && bounty.issueNumber > 0 ? (
@@ -1011,7 +1011,7 @@ const CancelBountyModal = ({ id, token, onClose }: { id?: string; token: string 
               {refunded ? (
                 <>
                   The escrowed {bounty ? `${money(bounty.amountUsdc)} USDC` : "funds"} are being refunded to your wallet
-                  {hash ? <> — tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a></> : null}. This completes within about a minute.
+                  {hash ? <>, tx <a className="mono" href={stellarTxUrl(hash)} target="_blank" rel="noreferrer">{shortHash(hash)}</a></> : null}. This completes within about a minute.
                 </>
               ) : (
                 "No funds were in escrow."
@@ -1129,7 +1129,7 @@ const CreateBountyModal = ({ onClose }: { onClose: () => void }) => {
             When you merge the linked PR, escrow auto-releases to the developer's wallet. No extra action required.
           </CBRule>
           <CBRule num="04" title="Close without merging? Dev can retry">
-            If you close the PR instead of merging, the developer can open a new PR and resubmit — as long as the deadline hasn't elapsed.
+            If you close the PR instead of merging, the developer can open a new PR and resubmit, as long as the deadline hasn't elapsed.
           </CBRule>
           <CBRule num="05" title="Deadline elapses → bounty closes, funds refunded" accent>
             If no PR is merged within the deadline, the bounty auto-closes and the escrowed <span className="accent">$100</span> is refunded to your wallet.

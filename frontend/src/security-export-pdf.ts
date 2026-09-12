@@ -180,7 +180,7 @@ export async function downloadFindingsPdf(
     y += 14;
 
     setStyle(10.5, { bold: true });
-    const heading = doc.splitTextToSize(`${displayId(f)} — ${f.title}`, CONTENT_W) as string[];
+    const heading = doc.splitTextToSize(`${displayId(f)}: ${f.title}`, CONTENT_W) as string[];
     for (const line of heading) {
       ensure(14);
       doc.text(line, M, y);
@@ -225,7 +225,7 @@ export async function downloadFindingsPdf(
 
   doc.setProperties({
     title: "DevAsign security findings",
-    subject: `Security findings export — ${scopeLabel}`,
+    subject: `Security findings export: ${scopeLabel}`,
     creator: "DevAsign",
   });
   doc.save(filename);
