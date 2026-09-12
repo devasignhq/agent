@@ -438,10 +438,20 @@ test("runnerAvailable only judges the runners that come from the repo's own node
   });
   assert.equal(runnerAvailable("vitest", setup(["jest"])), false);
   assert.equal(runnerAvailable("jest", setup(["jest"])), true);
-  assert.equal(runnerAvailable("vitest", setup([])), true, "nothing detected — do not enforce");
+  assert.equal(runnerAvailable("vitest", setup([])), true, "nothing detected and no dependency list — do not enforce");
+  assert.equal(runnerAvailable("vitest", { ...setup([]), dependencies: [] }), false, "a list we read that holds no vitest is an answer");
+  assert.equal(runnerAvailable("vitest", { ...setup([]), dependencies: ["react"] }), false);
   for (const r of ["playwright", "node-test", "bundled", "pytest", "go"] as const) {
     assert.equal(runnerAvailable(r, setup(["jest"])), true, `${r} does not come from the repo's node_modules`);
   }
+});
+
+test("a monorepo with no root manifest cannot spawn vitest, so a generated test is coerced onto the bundled runner", () => {
+  const setup: DetectedSetup = {
+    languages: ["typescript"], packageManager: null, monorepo: null, frameworks: [], dependencies: [], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [],
+  };
+  const raw = { tests: [{ path: "canvas.test.tsx", content: "export const x = 1;\n", criterionIds: ["1"], level: "component", origin: "generated", runner: "vitest", targetFiles: [] }] };
+  assert.equal(normalizeRawTests(raw, new Set(["1"]), "bundled", setup)[0].runner, "bundled");
 });
 
 test("a python test is never coerced onto a JS runner", () => {
