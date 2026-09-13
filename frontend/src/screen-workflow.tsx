@@ -32,7 +32,7 @@ import { api, type Repository, type RepoWorkflow, type ActionWorkflow, type Repo
 import { runSave } from "./optimistic-save";
 import { useAuth } from "./auth-context";
 import type { WorkflowHeaderState } from "./workflow-header";
-import { EDGES, LAYOUT, NODE_W, edgeHandles, usedHandles, type EdgeKind, type NodeId } from "./workflow-graph";
+import { EDGES, FIT_MAX_ZOOM, LAYOUT, NODE_W, edgeHandles, initialFitPadding, usedHandles, type EdgeKind, type NodeId } from "./workflow-graph";
 
 type StageKey = "holistic" | "defects" | "deferrals" | "docs" | "crossRepo";
 
@@ -269,15 +269,18 @@ function StageNode({ data }: NodeProps) {
 }
 const nodeTypes = { stage: StageNode };
 
-// Keep the fitted graph clear of the floating panel (right) and mode bar (top);
-// on mobile the panel stacks below the canvas instead. The panel sits outside
-// the canvas' un-zoomed box, so its size is scaled by the app zoom.
+// Keep the fitted graph clear of the floating panel and mode bar; on mobile the panel
+// stacks below the canvas instead. Client rects match the canvas' un-zoomed px.
 const uiZoom = () => parseFloat(getComputedStyle(document.body).zoom as string) || 1;
 const PANEL_W = 340;
-const fitViewFor = (isMobile: boolean, panelW: number) =>
-  isMobile
-    ? { padding: "16px", maxZoom: 1 }
-    : { padding: { top: `${56 * uiZoom()}px`, right: `${(panelW + 32) * uiZoom()}px`, bottom: "24px", left: "24px" }, maxZoom: 1 };
+function fitViewFor(isMobile: boolean, canvas: HTMLElement, panel: HTMLElement, toolbar: HTMLElement | null) {
+  if (isMobile) return { padding: "16px", maxZoom: FIT_MAX_ZOOM };
+  const c = canvas.getBoundingClientRect();
+  const p = panel.getBoundingClientRect();
+  const toolbarBottom = toolbar ? toolbar.getBoundingClientRect().bottom - c.top : 0;
+  const pad = initialFitPadding(c, { left: p.left - c.left, bottom: p.bottom - c.top }, toolbarBottom);
+  return { padding: { top: `${pad.top}px`, right: `${pad.right}px`, bottom: `${pad.bottom}px`, left: `${pad.left}px` }, maxZoom: FIT_MAX_ZOOM };
+}
 
 // The detail panel's left edge lines up with the header's Verification button,
 // whose width follows the repo's verification state — so measure, don't guess.
@@ -786,7 +789,10 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
   const [rfNodes, setRfNodes, onNodesChange] = useNodesState([]);
   const [rfEdges, setRfEdges, onEdgesChange] = useEdgesState([]);
   const flowRef = React.useRef<HTMLDivElement>(null);
+  const panelRef = React.useRef<HTMLElement>(null);
+  const toolbarRef = React.useRef<HTMLDivElement>(null);
   const rfInst = React.useRef<any>(null);
+  const [fit, setFit] = React.useState<ReturnType<typeof fitViewFor> | null>(null);
 
   // Cmd/Ctrl + wheel zooms about the pointer. Handled here (capture phase, ahead
   // of React Flow's own wheel handler) so it works whatever key state RF tracks.
@@ -860,6 +866,12 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
     });
     setRfEdges(edges);
   }, [wf, selectedId, advancedLocked, setRfNodes, setRfEdges]);
+
+  // The first fit tucks the graph under the detail panel, so the canvas mounts only once the
+  // panel has laid out its first node. A layout effect, so no frame paints with a stale fit.
+  React.useLayoutEffect(() => {
+    if (wf && !fit) setFit(fitViewFor(isMobile, flowRef.current!, panelRef.current!, toolbarRef.current));
+  }, [wf, fit, isMobile]);
 
   // Optimistic save with durability-aware error handling: paint `next` immediately,
   // keep it on a transient `not_durable` (re-confirming once), revert on a hard
@@ -935,7 +947,6 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
   const noRepos = repos.length === 0 && !loading;
   const mode = wf ? activeMode(wf) : null;
   const panelW = usePanelWidth();
-  const fit = React.useMemo(() => fitViewFor(isMobile, panelW), [isMobile, panelW]);
 
   const select = React.useCallback(
     (id: string) => {
@@ -965,7 +976,7 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
               </div>
             </div>
           </div>
-        ) : !wf ? (
+        ) : !wf || !fit ? (
           <div className="wf-canvas-empty mono mute">loading…</div>
         ) : (
           <ReactFlow
@@ -994,7 +1005,7 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
 
       {/* Mode selector — floats top-left over the canvas. */}
       {!noRepos && (
-        <div className="wf-toolbar">
+        <div className="wf-toolbar" ref={toolbarRef}>
           <div className="wf-toolbar-left">
             <span className="mute" style={{ fontSize: 11 }}>Mode</span>
             {([
@@ -1031,7 +1042,7 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
       )}
 
       {/* Floating right section — node detail / edit */}
-      <aside className="wf-panel wf-float">
+      <aside className="wf-panel wf-float" ref={panelRef}>
         {wf && selectedDef && !noRepos ? (
           <NodeDetails
             def={selectedDef}
