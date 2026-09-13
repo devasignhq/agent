@@ -91,3 +91,27 @@ export function usedHandles(edges: EdgeDef[]): Map<NodeId, Set<HandleId>> {
   }
   return m;
 }
+
+const POINTS = Object.values(LAYOUT);
+export const GRAPH_SIZE = {
+  width: Math.max(...POINTS.map((p) => p.x)) - Math.min(...POINTS.map((p) => p.x)) + NODE_W,
+  height: Math.max(...POINTS.map((p) => p.y)) - Math.min(...POINTS.map((p) => p.y)) + NODE_H,
+};
+
+export const FIT_MAX_ZOOM = 1;
+const FIT_GAP = 24;
+
+type Size = { width: number; height: number };
+type Insets = { top: number; right: number; bottom: number; left: number };
+
+export const fitZoom = (canvas: Size, p: Insets) =>
+  Math.min(FIT_MAX_ZOOM, (canvas.width - p.left - p.right) / GRAPH_SIZE.width, (canvas.height - p.top - p.bottom) / GRAPH_SIZE.height);
+
+// First desktop fit, as px padding (panel/toolbar canvas-relative): span the full width below the
+// detail panel, unless the canvas is too short for that to beat the strip left of the panel.
+export function initialFitPadding(canvas: Size, panel: { left: number; bottom: number }, toolbarBottom: number): Insets {
+  const side = canvas.width * 0.05;
+  const below = { top: panel.bottom + FIT_GAP, right: side, bottom: FIT_GAP, left: side };
+  const beside = { top: toolbarBottom + FIT_GAP, right: canvas.width - panel.left + FIT_GAP, bottom: FIT_GAP, left: FIT_GAP };
+  return fitZoom(canvas, below) >= fitZoom(canvas, beside) ? below : beside;
+}

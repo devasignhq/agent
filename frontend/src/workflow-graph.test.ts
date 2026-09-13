@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { EDGES, HANDLE_IDS, LAYOUT, NODE_H, NODE_W, edgeHandles, usedHandles, type NodeId } from "./workflow-graph.ts";
+import { EDGES, GRAPH_SIZE, HANDLE_IDS, LAYOUT, NODE_H, NODE_W, edgeHandles, fitZoom, initialFitPadding, usedHandles, type NodeId } from "./workflow-graph.ts";
 
 const ids = Object.keys(LAYOUT) as NodeId[];
 
@@ -55,4 +55,24 @@ test("the pipeline is one connected graph with both entry points reaching the ve
   assert.ok(reach("trigger").has("actions"));
   assert.ok(reach("mtrigger").has("verdict"));
   assert.equal(reach("mtrigger").size, ids.length);
+});
+
+// Canvas geometry measured in the app (2056×1200 window, trigger panel open).
+const canvas = { width: 1801, height: 1147 };
+const panel = { left: 1422, bottom: 424 };
+const toolbarBottom = 46;
+
+test("the first fit spans the canvas width, centred below the detail panel", () => {
+  const p = initialFitPadding(canvas, panel, toolbarBottom);
+  assert.equal(p.left, p.right);
+  assert.ok(p.top >= panel.bottom, "graph starts under the panel");
+  assert.ok(fitZoom(canvas, p) * GRAPH_SIZE.width > 0.85 * canvas.width, "graph spans nearly the full width");
+});
+
+test("a canvas too short to fit under the panel falls back to the strip left of it", () => {
+  const short = { width: 1665, height: 567 };
+  const side = { left: 1286, bottom: 424 };
+  const p = initialFitPadding(short, side, toolbarBottom);
+  assert.ok(p.right >= short.width - side.left, "graph ends left of the panel");
+  assert.ok(p.top < side.bottom, "graph uses the height beside the panel");
 });
