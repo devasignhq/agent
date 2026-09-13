@@ -5,12 +5,15 @@ import { createRequire } from "node:module";
 // Substituted from package.json at build time (scripts/build.mjs), which folds this
 // to a literal and drops the tsx-only fallback below. Hand-maintaining it drifted once.
 declare const __CLI_VERSION__: string | undefined;
+// The commit scripts/build.mjs bundled from (-dirty if uncommitted); null under tsx or outside git.
+declare const __CLI_COMMIT__: string | null | undefined;
 
 function manifestVersion(): string {
   return createRequire(import.meta.url)("../package.json").version;
 }
 
 export const CLI_VERSION: string = typeof __CLI_VERSION__ === "string" ? __CLI_VERSION__ : manifestVersion();
+export const CLI_COMMIT: string | null = typeof __CLI_COMMIT__ === "string" ? __CLI_COMMIT__ : null;
 export const API_VERSION = 1;
 
 export type TestLevel = "unit" | "integration" | "component" | "e2e";
