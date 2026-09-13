@@ -114,7 +114,8 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
   const deps: Record<string, string> = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
   const dep = (name: string) => (name in deps ? String(deps[name]).replace(/^[\^~>=<\s]+/, "") : undefined);
   // A generated test resolves against the whole install, so a workspace package's
-  // dependencies — and its own name — are as reachable as the root's.
+  // dependencies — and its own name — are as reachable as the root's. With no root
+  // manifest nothing hoists here, so the honest answer is an empty list, not silence.
   const dependencies = pkg
     ? [
         ...new Set(
@@ -123,7 +124,9 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
             .reduce((acc, p) => acc.concat(manifestNames(readText(root, p))), Object.keys(deps))
         ),
       ].sort()
-    : undefined;
+    : pkgText == null
+      ? []
+      : undefined;
 
   const langCounts = new Map<string, number>();
   for (const p of paths) {

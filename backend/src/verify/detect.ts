@@ -113,9 +113,9 @@ export function inferSetupFromTree(
     packageManager,
     monorepo,
     frameworks,
-    // Absent means "not collected", which switches the import allow-list off; an
-    // empty array means the manifest really declared nothing.
-    ...(pkg ? { dependencies: Object.keys(deps).sort() } : {}),
+    // Absent means "not collected", which switches the import allow-list off. No root
+    // manifest is not that: nothing is installed where a relocated test resolves from.
+    ...(pkg ? { dependencies: Object.keys(deps).sort() } : has("package.json") ? {} : { dependencies: [] }),
     testCommands,
     envExampleVars: envVars,
     existingWorkflows: paths.filter((p) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p)),

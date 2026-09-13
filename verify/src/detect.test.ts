@@ -34,8 +34,15 @@ test("dependencies: root-only repo, and a repo with no package.json at all", asy
   const empty = await detectSetup(repo({ "package.json": { name: "x" } }), { probeRuntimes: false });
   assert.deepEqual(empty.dependencies, [], "a manifest declaring nothing is still a known set");
 
+  // No root manifest means no root node_modules: the set a relocated test resolves
+  // against is genuinely empty, however many manifests sit in subdirectories.
   const none = await detectSetup(repo({ "main.go": "package main" }), { probeRuntimes: false });
-  assert.equal(none.dependencies, undefined, "unknown, not empty — this is what switches enforcement off");
+  assert.deepEqual(none.dependencies, []);
+  const subdirs = await detectSetup(repo({ "frontend/package.json": { dependencies: { react: "^18" } }, "frontend/src/a.tsx": "export const A = () => null;" }), { probeRuntimes: false });
+  assert.deepEqual(subdirs.dependencies, []);
+
+  const unreadable = await detectSetup(repo({ "package.json": "{ not json" }), { probeRuntimes: false });
+  assert.equal(unreadable.dependencies, undefined, "unknown, not empty — this is what switches enforcement off");
 });
 
 test("manifestNames tolerates malformed or absent manifests", () => {

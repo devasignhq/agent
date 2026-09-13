@@ -46,6 +46,15 @@ test("inferSetupFromTree: python + go + node --test, and an empty repo", () => {
   assert.deepEqual(envVarNames(null), []);
 });
 
+test("inferSetupFromTree: dependencies are absent only when a root manifest exists but was not read", () => {
+  const unread = inferSetupFromTree(["package.json", "src/a.ts"]);
+  assert.equal(unread.dependencies, undefined, "a manifest we could not read is a blind spot");
+  const subdirsOnly = inferSetupFromTree(["frontend/package.json", "frontend/src/a.tsx", "backend/package.json"]);
+  assert.deepEqual(subdirsOnly.dependencies, [], "nothing installs at a root with no manifest");
+  const read = inferSetupFromTree(["package.json", "src/a.ts"], { packageJson: JSON.stringify({ dependencies: { react: "^18" } }) });
+  assert.deepEqual(read.dependencies, ["react"]);
+});
+
 test("parseDevasignVerify reads the verify block and ignores the rest", () => {
   const cfg = parseDevasignVerify(`
 version: 2

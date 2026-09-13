@@ -249,9 +249,11 @@ const REPO_INSTALLED_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vi
 const JS_RUNNERS: ReadonlySet<TestRunner> = new Set<TestRunner>(["vitest", "jest", "node-test", "bundled"]);
 
 export function runnerAvailable(runner: TestRunner, setup: DetectedSetup): boolean {
-  // No frameworks detected at all is a blind spot, not a repo without test tooling.
-  if (!REPO_INSTALLED_RUNNERS.has(runner) || !setup.frameworks.length) return true;
-  return setup.frameworks.some((f) => f.name === runner);
+  if (!REPO_INSTALLED_RUNNERS.has(runner)) return true;
+  if (setup.frameworks.some((f) => f.name === runner)) return true;
+  // Nothing detected AND no dependency list read is a blind spot; a list we did read
+  // and that holds no runner is an answer — npx would cancel on the missing package.
+  return !setup.frameworks.length && setup.dependencies == null;
 }
 
 /** The runner a JS test can actually be spawned with. Never a python or go one. */
@@ -458,7 +460,11 @@ function renderSetup(setup: DetectedSetup, yml: DevasignVerifyConfig | null): st
     `- Languages: ${setup.languages.join(", ") || "unknown"}`,
     `- Package manager: ${setup.packageManager ?? "unknown"}`,
     `- Test frameworks: ${fw}`,
-    deps.length ? `- Installed packages (the ONLY ones a test may import): ${deps.join(", ")}` : "- Installed packages: unknown (no package.json seen)",
+    setup.dependencies == null
+      ? "- Installed packages: unknown (no package.json seen)"
+      : deps.length
+        ? `- Installed packages (the ONLY ones a test may import): ${deps.join(", ")}`
+        : "- Installed packages: none — nothing is installed where these tests run, so a test may use only Node builtins and the runner's own assertions.",
     `- Test commands: ${setup.testCommands.join("; ") || "none"}`,
     `- Services: ${setup.services.join(", ") || "none"}`,
     setup.monorepo ? `- Monorepo: ${setup.monorepo.tool} (${setup.monorepo.packages.join(", ")})` : "",
