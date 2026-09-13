@@ -1091,12 +1091,17 @@ export function testPlannerSystemPrompt(): string {
     "Never put a criterion in `unverifiable` while its `max level` still allows a rung you have not attempted. That " +
     "the cheap level cannot see the behaviour is the reason to climb the ladder, not to opt out of it; a headless or " +
     "shimmed DOM being unable to decide something is an argument for the browser, which the policy may already allow. " +
-    "Reserve `unverifiable` for criteria no test at any allowed level could decide.\n" +
+    "Reserve `unverifiable` for criteria no test at any allowed level could decide. A criterion about the change's " +
+    "own footprint — which files it touches, or that nothing else was modified — is always one: every test runs on " +
+    "a checkout of the PR head alone, one commit deep, with no parent commit or base branch to compare against. A " +
+    "criterion that existing behaviour is unchanged is not footprint; test that behaviour.\n" +
     "\n## Generated tests\n" +
     "`path` is relative to the repository root, and every generated file is relocated under .devasign/tests/ " +
     "before it runs. `targetFiles` lists the repo files the test exercises. Honour every `Flake history` " +
     "instruction: a quarantined signature must be regenerated with a different strategy; a retired one must not " +
-    "be generated at all.\n" +
+    "be generated at all. Plan each test to assert on the code and files as the PR head has them, never on git " +
+    "history: a criterion worded as a change, such as an entry added or a flag removed, is proven by the state the " +
+    "change leaves.\n" +
     "\n## Output\n" +
     "Only the tool call. Never use emoji in any text you output."
   );
@@ -1114,7 +1119,11 @@ export function testFileSystemPrompt(): string {
     "re-anchored for you. In every other language import the code under test the way the repo's own suite does, " +
     "by package or module name, never by a path relative to your file — nothing re-anchors those. Never read " +
     "files relative to the test's own location — no __dirname, import.meta.url or readFileSync of a fixture; " +
-    "inline any fixture data. Import only the packages listed under `Installed packages` in the shared context, " +
+    "inline any fixture data. The checkout is the PR head alone, one commit deep, so never read git history — no " +
+    "git log, diff, show or blame, and no HEAD^, HEAD~1, merge-base or origin/ ref — since each fails there or reads " +
+    "the head as the first commit. Assert on what the files in the checkout hold, and give code under test that " +
+    "runs git a repository the test creates itself with `git init` in a temporary directory. " +
+    "Import only the packages listed under `Installed packages` in the shared context, " +
     "the runner's own module, and Node builtins: nothing is installed for you, so a package the repository does " +
     "not have makes the whole suite fail to load and proves nothing. Where no matcher or render library is " +
     "available, use the runner's own assertions. Deterministic; no network; seed data isolated per test; one " +
