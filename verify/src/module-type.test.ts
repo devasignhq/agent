@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { runCommand } from "./exec.js";
 import { detectModuleSyntax, inheritedModuleType, planModuleTypeShims, writeModuleTypeShims } from "./module-type.js";
+import { executePlan } from "./run.js";
 import { commandForFile } from "./runners/index.js";
 import type { PlanTest } from "./types.js";
 import { Workspace } from "./workspace.js";
@@ -62,10 +63,41 @@ test("detectModuleSyntax reads the file's own top-level syntax", () => {
 });
 
 test("detectModuleSyntax: dynamic import is not ESM, and ESM wins over a createRequire", () => {
-  assert.equal(detectModuleSyntax('const { plan } = await import("./plan.js");\n'), null);
+  assert.equal(detectModuleSyntax('const load = () => import("./plan.js");\n'), null);
   assert.equal(detectModuleSyntax('exports.x = 1;\nconst m = import("./x.js");\n'), "commonjs");
   // createRequire is how an ESM file reads a CJS one; the imports still decide.
   assert.equal(detectModuleSyntax('import { createRequire } from "node:module";\nconst require = createRequire(import.meta.url);\n'), "module");
+});
+
+test("detectModuleSyntax: an await outside every async function is module syntax", () => {
+  for (const topLevel of [
+    'const { test } = await import("node:test");',
+    'const {\n  plan,\n} = await import("./plan.js");',
+    "assert.equal(await total(), 3);",
+    "for await (const row of rows()) console.log(row);",
+    "if (process.env.CI) {\n  await seed();\n}",
+    "const ping = async (): Promise<void> => {\n  await fetch(url);\n};\nawait ping();",
+    "const ping = async () => await fetch(url);\nawait ping();",
+  ]) {
+    assert.equal(detectModuleSyntax(`// criteria 1\n${topLevel}\n`), "module", topLevel);
+  }
+
+  for (const nested of [
+    'test("x", async () => {\n  const { plan } = await import("./plan.js");\n});',
+    'test("x", async () => await run());',
+    'test("x", async (t) => {\n  await t.test("y", async () => {\n    await run();\n  });\n});',
+    'describe("x", () => {\n  it("y", async function () {\n    await ping();\n  });\n});',
+    "async function setup(): Promise<{ ok: boolean }> {\n  return { ok: await ping() };\n}",
+    "const api = {\n  async load() {\n    await ping();\n  },\n};",
+    "class Suite {\n  async run(): Promise<void> {\n    await ping();\n  }\n}",
+    "const settle = async <T,>(p: Promise<T>): Promise<T> => await p;",
+    "const id = async x => await x;",
+    'const note = "await import(x)"; // then await it',
+  ]) {
+    assert.equal(detectModuleSyntax(`// criteria 1\n${nested}\n`), null, nested);
+  }
+
+  assert.equal(detectModuleSyntax('const { total } = require("./total.js");\nconst re = /await total/;\n'), "commonjs", "a real require outranks an await the scan misreads");
 });
 
 test("detectModuleSyntax ignores module syntax quoted inside the test", () => {
@@ -170,32 +202,66 @@ test("writeModuleTypeShims writes through the workspace, so cleanup takes them a
 
 // The regression itself: on the runner this threw ERR_REQUIRE_CYCLE_MODULE on every
 // generated test, before a single assertion ran.
-test("a relocated ESM test runs against an ESM package the repo root does not declare", async () => {
+test("relocated ESM tests run against an ESM package the repo root does not declare", async () => {
   const root = repo({
     // No root package.json — devasignhq/agent has none, so .devasign/tests/ is a CommonJS scope.
     "backend/package.json": { type: "module" },
     "backend/src/plan.ts": 'import { judge } from "./judge.js";\nexport const plan = () => `planned:${typeof judge}`;\n',
     "backend/src/judge.ts": 'import { plan } from "./plan.js";\nexport const judge = () => `judged:${typeof plan}`;\n',
   });
-  const rel = ".devasign/tests/backend/src/plan.test.ts";
-  const content = [
-    "// criteria 1",
-    'import test from "node:test";',
-    'import assert from "node:assert/strict";',
-    'import { plan } from "../../../../backend/src/plan.js";',
-    'test("plan", () => assert.match(plan(), /^planned:/));',
-    "",
-  ].join("\n");
+  const tests = [
+    planTest({
+      id: "imports",
+      path: ".devasign/tests/backend/src/plan.test.ts",
+      content: [
+        "// criteria 1",
+        'import test from "node:test";',
+        'import assert from "node:assert/strict";',
+        'import { plan } from "../../../../backend/src/plan.js";',
+        'test("plan", () => assert.match(plan(), /^planned:/));',
+        "",
+      ].join("\n"),
+    }),
+    // Its only module syntax is a top-level await, and no other test shares its directory.
+    planTest({
+      id: "awaits",
+      path: ".devasign/tests/loaded/plan.test.ts",
+      content: [
+        "// criteria 1",
+        'const { test } = await import("node:test");',
+        'const { default: assert } = await import("node:assert/strict");',
+        'const { plan } = await import("../../../backend/src/plan.js");',
+        'test("plan", () => assert.match(plan(), /^planned:/));',
+        "",
+      ].join("\n"),
+    }),
+  ];
   const ws = new Workspace(root);
-  ws.write(rel, content);
-  const { cmd, args } = commandForFile("node-test", rel, root);
+  for (const t of tests) {
+    ws.write(t.path, t.content!);
+    const { cmd, args } = commandForFile("node-test", t.path, root);
+    const before = await runCommand({ cmd, args, cwd: root, timeoutMs: 60_000 });
+    assert.notEqual(before.code, 0, `${t.id}: without a declared scope Node loads the test as CommonJS and it never reaches an assertion`);
+  }
 
-  const before = await runCommand({ cmd, args, cwd: root, timeoutMs: 60_000 });
-  assert.notEqual(before.code, 0, "without a declared scope Node loads the test as CommonJS and it never reaches an assertion");
-
-  writeModuleTypeShims(ws, [planTest({ path: rel, content })]);
-  const after = await runCommand({ cmd, args, cwd: root, timeoutMs: 60_000 });
-  assert.equal(after.code, 0, `${after.stdout}\n${after.stderr}`);
-  assert.match(after.stdout, /# pass 1/);
+  // Through executePlan, as the CLI runs them, so the shims have to be wired in and not only planned.
+  const { results } = await executePlan(
+    {
+      planId: "plan-mt",
+      criteriaRevision: 1,
+      criteria: [{ id: "1", text: "The plan loads", kind: "code" }],
+      tests,
+      commands: [],
+      playwright: null,
+      retries: { generated: 0, existing: 0 },
+      uploadLimits: { maxFileBytes: 1e6, maxTotalBytes: 1e6, maxFiles: 10 },
+    },
+    ws,
+    { yml: null, testTimeoutMs: 60_000, setup: undefined }
+  );
+  assert.deepEqual(results.map((r) => [r.testId, r.status]), [["imports", "pass"], ["awaits", "pass"]], JSON.stringify(results.map((r) => r.error)));
+  for (const dir of [".devasign/tests/backend/src", ".devasign/tests/loaded"]) {
+    assert.deepEqual(JSON.parse(readFileSync(path.join(root, dir, "package.json"), "utf8")), { type: "module" }, dir);
+  }
   ws.cleanup();
 });
