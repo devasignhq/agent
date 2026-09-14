@@ -154,6 +154,38 @@ test("doctor follow-up comments on the open onboarding PR and pushes the mechani
   }
 });
 
+test("a regenerated setup PR that merges parks the repo on pr_merged, and the next clean run verifies it again", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    const review = db.insert("prReviews", { id: uuid(), repoId: s.repo.id, prNumber: 8, prTitle: "t", headSha: "abc", baseSha: "d", status: "reviewing", verdict: null, criteria: [], taskId: null, additions: 0, deletions: 0, changedFiles: 0, createdAt: 0, updatedAt: 0 } as any);
+    snapshotCriteriaRevision(review.id, [], null);
+    const onboarding = () => db.find("repositories", (r) => r.id === s.repo.id)!.verify!.onboarding;
+    const first = createVerifyRun({ review, repo: s.repo, status: "completed", triggeredBy: { kind: "pr_event" } });
+    noteRunSucceeded(first);
+    assert.equal(onboarding().state, "verified");
+
+    const again = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps);
+    assert.equal(again.status, "opened");
+    assert.equal(onboarding().state, "pr_open");
+    noteOnboardingPrClosed(s.repo.id, again.prNumber!, true);
+    assert.equal(onboarding().state, "pr_merged");
+
+    const second = createVerifyRun({ review, repo: s.repo, status: "completed", triggeredBy: { kind: "pr_event" } });
+    noteRunSucceeded(second);
+    assert.equal(onboarding().state, "verified");
+    assert.equal(onboarding().firstSuccessfulRunId, first.id, "the first success stays on record");
+    assert.equal(onboarding().lastDiagnosis, null);
+    noteRunSucceeded(second);
+    assert.equal(onboarding().firstSuccessfulRunId, first.id);
+    db.remove("verifyRuns", (r) => r.reviewId === review.id);
+    db.remove("criteriaRevisions", (c) => c.reviewId === review.id);
+    db.remove("prReviews", (r) => r.id === review.id);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("adopt: generated tests land under tests/devasign/ on a branch off the PR head, PR targets the PR's branch", async () => {
   const s = seed();
   try {

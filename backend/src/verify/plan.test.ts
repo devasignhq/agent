@@ -297,6 +297,28 @@ test("two generated tests given one path both ship, under distinct names, neithe
   }
 });
 
+test("a node:test body written in CommonJS is repaired once, told the runner loads it as an ES module", async () => {
+  const s = seed([crit("1")]);
+  const cjs = "// criteria 1\nconst { test } = require('node:test');\nconst { shape } = require('../../src/shape.js');\ntest('shape', () => {});\n";
+  const esm = "// criteria 1\nimport { test } from 'node:test';\nimport { shape } from '../../src/shape.js';\ntest('shape', () => {});\n";
+  const { deps: d, bodyPrompts } = deps({
+    responses: [{ tests: [gen("1", "unit", { path: "src/shape.test.ts" })] }],
+    bodies: { "src/shape.test.ts": [{ path: "src/shape.test.ts", content: cjs }, { path: "src/shape.test.ts", content: esm }] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    const attempts = (log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/src/shape.test.ts`];
+    assert.match(attempts[0].reason, /CommonJS syntax \(`const \{ test \} = require\('node:test'\);`\)[^;]*loads as an ES module/);
+    assert.equal(attempts[1].kind, "repair");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.tests[0].content, esm);
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("a browser spec that does not parse is repaired once, told the error and its line, before it can sink its batch", async () => {
   const s = seed([crit("1", "ui")]);
   // The live case: one bad regex flag made Playwright fail two passing specs loaded beside it.

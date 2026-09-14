@@ -2,7 +2,7 @@
 // repo root's rather than its target's. Declare the scope its own syntax needs.
 import { existsSync, readFileSync } from "node:fs";
 import path from "node:path";
-import type { PlanTest } from "./types.js";
+import type { PlanTest, TestRunner } from "./types.js";
 import type { Workspace } from "./workspace.js";
 
 export type ModuleType = "module" | "commonjs";
@@ -10,6 +10,17 @@ export type ModuleTypeShim = { dir: string; type: ModuleType };
 
 // .mjs/.cjs/.mts/.cts already carry their format; .py and .go have no scope to set.
 const SCOPED_EXT = /\.[jt]sx?$/;
+
+// Only these run through `--import tsx/esm`, where .mts/.cts settle the format per file; jest resolves neither.
+const PER_FILE_RUNNERS = new Set<TestRunner>(["node-test", "bundled"]);
+const RENAMABLE_EXT = /\.([jt]s)$/;
+
+/** Where a generated test is written: an extension carrying its own syntax's format, else its plan path. */
+export function onDiskPath(t: Pick<PlanTest, "path" | "content" | "origin" | "runner">): string {
+  if (t.origin !== "generated" || !t.content || !PER_FILE_RUNNERS.has(t.runner) || !RENAMABLE_EXT.test(t.path)) return t.path;
+  const type = detectModuleSyntax(t.content);
+  return type ? t.path.replace(RENAMABLE_EXT, type === "module" ? ".m$1" : ".c$1") : t.path;
+}
 
 const ESM_SYNTAX = /^[ \t]*(?:import|export)(?:[ \t]+[A-Za-z_$*{"']|[ \t]*[{*"'])/m;
 const CJS_SYNTAX = /(?:^|[^.\w$])require[ \t]*\(|^[ \t]*(?:module\.exports\b|exports\.[A-Za-z_$])/m;

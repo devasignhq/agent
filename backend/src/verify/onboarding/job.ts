@@ -173,11 +173,12 @@ export function noteOnboardingPrClosed(repoId: string, prNumber: number, merged:
   setOnboarding(repo, { state: merged ? "pr_merged" : "pr_closed" });
 }
 
-/** First run that completed without a setup problem marks the repo verified. */
+/** A run that completed without a setup problem marks the repo verified — again after a regenerated setup PR merges. */
 export function noteRunSucceeded(run: VerifyRun): void {
   const repo = db.find("repositories", (r) => r.id === run.repoId);
-  if (!repo || repo.verify?.onboarding?.firstSuccessfulRunId) return;
-  setOnboarding(repo, { state: "verified", firstSuccessfulRunId: run.id, lastDiagnosis: null });
+  const ob = repo?.verify?.onboarding;
+  if (!repo || ob?.state === "verified") return;
+  setOnboarding(repo, { state: "verified", firstSuccessfulRunId: ob?.firstSuccessfulRunId ?? run.id, lastDiagnosis: null });
 }
 
 /** Doctor diagnosis → comment on the open onboarding PR (+ a mechanical fix commit when we have one). */

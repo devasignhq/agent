@@ -35,6 +35,7 @@ import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
 import { specLint } from "./spec-lint.js";
 import { historyLint } from "./history-lint.js";
+import { moduleSyntaxLint } from "./module-syntax-lint.js";
 import { withDomEnvironment } from "./dom-env.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
@@ -603,17 +604,18 @@ const manifestRepair = (reason: string) => `Your previous answer could not be us
 
 // retryStructured allows exactly one repair pass, so the reason has to carry everything
 // the model needs to rewrite the file — including what it may import instead.
-export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void, path?: string): (input: unknown) => Validation<{ content: string }> {
+export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void, path?: string, runner?: TestRunner): (input: unknown) => Validation<{ content: string }> {
   let calls = 0;
   return (input) => {
     const given = input as { content?: unknown; path?: unknown } | null;
     const content = given?.content;
     if (typeof content !== "string" || !content.trim()) return { ok: false, reason: "content is empty" };
     const bad = disallowedImports(content, allow);
-    const unparsable = syntaxError(path ?? (typeof given?.path === "string" ? given.path : ""), content);
+    const file = path ?? (typeof given?.path === "string" ? given.path : "");
+    const unparsable = syntaxError(file, content);
     // First answer only: a pattern check is a nudge, and a spec that insists may be right.
     // Asked later, it would drop a file whose only repair went to a syntax error.
-    const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content)] : [];
+    const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content), ...moduleSyntaxLint(file, content, runner)] : [];
     if (!bad.length && !unparsable && !patterns.length) return { ok: true, value: { content } };
     // Reported every failure, empty included, so a later syntax-only miss is not blamed on a package.
     onReject?.(bad);
@@ -953,7 +955,8 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             (bad) => {
               rejected = bad;
             },
-            t.rebaseFrom ?? t.path
+            t.rebaseFrom ?? t.path,
+            t.runner
           );
           try {
             // vitest reads the Vite config when it has none of its own, and a Vite app keeps its

@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import os from "node:os";
 import path from "node:path";
 import { runCommand } from "./exec.js";
-import { detectModuleSyntax, inheritedModuleType, planModuleTypeShims, writeModuleTypeShims } from "./module-type.js";
+import { detectModuleSyntax, inheritedModuleType, onDiskPath, planModuleTypeShims, writeModuleTypeShims } from "./module-type.js";
 import { executePlan } from "./run.js";
 import { commandForFile } from "./runners/index.js";
 import type { PlanTest } from "./types.js";
@@ -261,7 +261,81 @@ test("relocated ESM tests run against an ESM package the repo root does not decl
   );
   assert.deepEqual(results.map((r) => [r.testId, r.status]), [["imports", "pass"], ["awaits", "pass"]], JSON.stringify(results.map((r) => r.error)));
   for (const dir of [".devasign/tests/backend/src", ".devasign/tests/loaded"]) {
-    assert.deepEqual(JSON.parse(readFileSync(path.join(root, dir, "package.json"), "utf8")), { type: "module" }, dir);
+    assert.equal(existsSync(path.join(root, dir, "plan.test.mts")), true, `${dir}: the file itself carries the ES-module format`);
+    assert.equal(existsSync(path.join(root, dir, "package.json")), false, `${dir}: no scope to declare once the extension settles it`);
   }
   ws.cleanup();
+});
+
+const ESM = 'import test from "node:test";\n';
+const CJS = 'const test = require("node:test");\n';
+
+test("onDiskPath gives a generated node:test file the extension its own syntax needs", () => {
+  assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.ts", content: ESM })), ".devasign/tests/a.test.mts");
+  assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.ts", content: CJS })), ".devasign/tests/a.test.cts");
+  assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.js", content: ESM })), ".devasign/tests/a.test.mjs");
+  assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.js", content: CJS })), ".devasign/tests/a.test.cjs");
+  assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.ts", content: ESM, runner: "bundled" })), ".devasign/tests/a.test.mts");
+});
+
+test("onDiskPath leaves alone whatever an extension cannot settle", () => {
+  const untouched: PlanTest[] = [
+    planTest({ path: ".devasign/tests/a.test.ts", content: "test();\n" }),
+    planTest({ path: ".devasign/tests/a.test.ts", content: null }),
+    planTest({ path: ".devasign/tests/a.test.tsx", content: ESM }),
+    planTest({ path: ".devasign/tests/a.test.mts", content: ESM }),
+    planTest({ path: ".devasign/tests/a_test.py", content: "import os\n" }),
+    planTest({ path: "src/a.test.ts", content: ESM, origin: "existing" }),
+    ...(["jest", "vitest", "pytest", "go", "playwright"] as const).map((runner) => planTest({ path: ".devasign/tests/a.test.ts", content: ESM, runner })),
+  ];
+  for (const t of untouched) assert.equal(onDiskPath(t), t.path, `${t.path} ${t.origin} ${t.runner}`);
+});
+
+// The live failure on 1.5.1: two require() tests and one import test in .devasign/tests/ — the
+// directory vote went to CommonJS, and the import test threw ERR_REQUIRE_CYCLE_MODULE.
+test("a directory mixing require() and import tests runs every file, with no scope left to vote on", async () => {
+  const root = repo({
+    "backend/package.json": { type: "module" },
+    "backend/src/plan.ts": 'export const plan = () => "planned";\n',
+    "lib/total.cjs": "module.exports.total = (xs) => xs.reduce((a, b) => a + b, 0);\n",
+  });
+  const cjs = (id: string) =>
+    planTest({
+      id,
+      path: `.devasign/tests/${id}.test.ts`,
+      content: ["// criteria 1", 'const { test } = require("node:test");', 'const assert = require("node:assert/strict");', 'const { total } = require("../../lib/total.cjs");', 'test("total", () => assert.equal(total([1, 2]), 3));', ""].join("\n"),
+    });
+  const tests = [
+    cjs("a"),
+    cjs("b"),
+    planTest({
+      id: "c",
+      path: ".devasign/tests/c.test.ts",
+      content: ["// criteria 1", 'import test from "node:test";', 'import assert from "node:assert/strict";', 'import { plan } from "../../backend/src/plan.js";', 'test("plan", () => assert.equal(plan(), "planned"));', ""].join("\n"),
+    }),
+  ];
+  const ws = new Workspace(root);
+  const { results, artifacts } = await executePlan(
+    {
+      planId: "plan-mixed",
+      criteriaRevision: 1,
+      criteria: [{ id: "1", text: "Both load", kind: "code" }],
+      tests,
+      commands: [],
+      playwright: null,
+      retries: { generated: 0, existing: 0 },
+      uploadLimits: { maxFileBytes: 1e6, maxTotalBytes: 1e6, maxFiles: 10 },
+    },
+    ws,
+    { yml: null, testTimeoutMs: 60_000, setup: undefined }
+  );
+  assert.deepEqual(results.map((r) => [r.testId, r.status, r.test]), [["a", "pass", ".devasign/tests/a.test.ts"], ["b", "pass", ".devasign/tests/b.test.ts"], ["c", "pass", ".devasign/tests/c.test.ts"]], JSON.stringify(results.map((r) => r.error)));
+  assert.deepEqual(
+    artifacts.filter((a) => a.kind === "test_file").map((a) => [a.displayPath, path.relative(root, a.path)]),
+    [[".devasign/tests/a.test.ts", ".devasign/tests/a.test.cts"], [".devasign/tests/b.test.ts", ".devasign/tests/b.test.cts"], [".devasign/tests/c.test.ts", ".devasign/tests/c.test.mts"]],
+    "evidence keeps the plan path, the bytes come from the file that ran"
+  );
+  assert.equal(existsSync(path.join(root, ".devasign/tests/package.json")), false);
+  ws.cleanup();
+  assert.equal(existsSync(path.join(root, ".devasign/tests")), false);
 });

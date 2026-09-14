@@ -43,15 +43,17 @@ export async function runFileTests(args: {
   maxAttempts: (t: PlanTest) => number;
   timeoutMs: number;
   artifacts: LocalArtifact[];
+  fileOf?: (t: PlanTest) => string;
 }): Promise<RunnerResult[]> {
   const results: RunnerResult[] = [];
   for (const t of args.tests) {
     const max = Math.max(1, args.maxAttempts(t));
     const attempts: RunnerAttempt[] = [];
     const attemptRefs: string[][] = [];
-    log.group(`${t.origin} ${t.level} ${t.path} (${t.runner})`);
+    const file = args.fileOf?.(t) ?? t.path;
+    log.group(`${t.origin} ${t.level} ${t.path}${file !== t.path ? ` → ${file}` : ""} (${t.runner})`);
     for (let n = 1; n <= max; n++) {
-      const { cmd, args: argv } = commandForFile(t.runner, t.path, args.ws.root);
+      const { cmd, args: argv } = commandForFile(t.runner, file, args.ws.root);
       const logFile = path.join(args.ws.artifactsDir, "logs", `${t.id}-${n}.log`);
       const r = await runCommand({ cmd, args: argv, cwd: args.ws.root, timeoutMs: args.timeoutMs, logFile, onLine: (l) => console.log(`  ${l}`) });
       const c = classifyAttempt(t.runner, r);
