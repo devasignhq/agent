@@ -11,13 +11,14 @@ export type ModuleTypeShim = { dir: string; type: ModuleType };
 // .mjs/.cjs/.mts/.cts already carry their format; .py and .go have no scope to set.
 const SCOPED_EXT = /\.[jt]sx?$/;
 
-// Only these run through `--import tsx/esm`, where .mts/.cts settle the format per file; jest resolves neither.
-const PER_FILE_RUNNERS = new Set<TestRunner>(["node-test", "bundled"]);
+// Runners with a loader of their own; jest resolves neither .mts nor .cts. Anything else, a missing
+// runner included, is what commandForFile runs through `--import tsx/esm`, where the extension settles the format.
+const OWN_LOADER = new Set<TestRunner>(["vitest", "jest", "pytest", "go", "playwright"]);
 const RENAMABLE_EXT = /\.([jt]s)$/;
 
 /** Where a generated test is written: an extension carrying its own syntax's format, else its plan path. */
 export function onDiskPath(t: Pick<PlanTest, "path" | "content" | "origin" | "runner">): string {
-  if (t.origin !== "generated" || !t.content || !PER_FILE_RUNNERS.has(t.runner) || !RENAMABLE_EXT.test(t.path)) return t.path;
+  if (t.origin !== "generated" || !t.content || OWN_LOADER.has(t.runner) || !RENAMABLE_EXT.test(t.path)) return t.path;
   const type = detectModuleSyntax(t.content);
   return type ? t.path.replace(RENAMABLE_EXT, type === "module" ? ".m$1" : ".c$1") : t.path;
 }
