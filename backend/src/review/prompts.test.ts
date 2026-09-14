@@ -94,6 +94,10 @@ test("the verifier's planner and test author both know CI checks out the PR head
   assert.match(testFileSystemPrompt(), /one commit deep, so never read git history/);
 });
 
+test("the test author is told to write ES-module syntax for the runners that load files as ES modules", () => {
+  assert.match(testFileSystemPrompt(), /node:test, the bundled runner or vitest, write ES-module syntax only[\s\S]*never `require\(\)`/);
+});
+
 test("emoji ban is stated in every stage prompt", () => {
   for (const [prompt] of CASES) {
     assert.match(prompt, /Never use emoji/);

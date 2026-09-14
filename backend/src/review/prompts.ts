@@ -1116,7 +1116,10 @@ export function testFileSystemPrompt(): string {
     "\n## Rules\n" +
     "The file is relocated under .devasign/tests/ before it runs, whatever the language. For JavaScript and " +
     "TypeScript, import the code under test with paths relative to the given `path` and that relocation is " +
-    "re-anchored for you. In every other language import the code under test the way the repo's own suite does, " +
+    "re-anchored for you. For JavaScript and TypeScript run by node:test, the bundled runner or vitest, write " +
+    "ES-module syntax only — `import`/`export`, never `require()`, `module.exports` or `exports.` — since the " +
+    "file is loaded as an ES module; under jest, use the module style the repository's own tests use. " +
+    "In every other language import the code under test the way the repo's own suite does, " +
     "by package or module name, never by a path relative to your file — nothing re-anchors those. Never read " +
     "files relative to the test's own location — no __dirname, import.meta.url or readFileSync of a fixture; " +
     "inline any fixture data. The checkout is the PR head alone, one commit deep, so never read git history — no " +
