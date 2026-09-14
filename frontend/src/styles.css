@@ -5950,7 +5950,9 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .tst-attempts th { text-align: left; font-weight: 500; font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); padding: 6px 8px; border-bottom: 1px solid var(--line); }
 .tst-attempts td { padding: 7px 8px; border-bottom: 1px solid var(--line); vertical-align: top; color: var(--fg-dim); }
 .tst-attempts tr:last-child td { border-bottom: 0; }
-.tst-crit { display: grid; grid-template-columns: auto minmax(0,1fr); gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--line); align-items: start; }
+.tst-crit { padding: 9px 0; border-bottom: 1px solid var(--line); }
+.tst-kv a { color: var(--accent); text-decoration: none; }
+.tst-kv a:hover { text-decoration: underline; }
 .tst-crit:last-child { border-bottom: 0; }
 .tst-runs { display: flex; flex-direction: column; gap: 2px; }
 .tst-run { display: flex; gap: 10px; align-items: center; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); padding: 6px 8px; border: 1px solid transparent; background: none; cursor: pointer; text-align: left; }

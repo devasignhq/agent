@@ -23,9 +23,9 @@ export const RecordingBlock = ({ rec, testName, durationMs, initiallyOpen, onSta
         title={rec.expired ? "Recording expired" : open ? "Collapse" : "Watch recording"}
         onClick={() => setOpen((v) => !v)}
       >
-        {rec.posterUrl && !rec.expired
+        {(!open || rec.expired) && (rec.posterUrl && !rec.expired
           ? <img className="acv-rec-thumb" src={rec.posterUrl} alt="" />
-          : <div className="acv-rec-thumb placeholder"><Icon name="doc" size={12} /></div>}
+          : <div className="acv-rec-thumb placeholder"><Icon name="doc" size={12} /></div>)}
         <span className="acv-rec-title mono">{label}</span>
         {durationMs > 0 && <span className="mute mono acv-rec-dur">{formatDuration(durationMs)}</span>}
         {rec.expired

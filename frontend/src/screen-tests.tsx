@@ -7,7 +7,7 @@ import { Icon } from "./icons";
 import { api } from "./api";
 import { useLiveTopic } from "./live-context";
 import { RecordingBlock } from "./recording-block";
-import { formatDuration, verdictLabel, verdictTone } from "./verify-view";
+import { formatDuration } from "./verify-view";
 import {
   EMPTY_FILTERS,
   categoryLabel,
@@ -302,7 +302,6 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted }) => {
                 {d.criteria.length === 0 && <div className="mono mute" style={{ fontSize: 12 }}>No acceptance criteria linked.</div>}
                 {d.criteria.map((cr) => (
                   <div key={cr.id} className="tst-crit">
-                    <span className={`pill ${verdictTone(cr.verdict)}`} title={cr.reason || undefined}><i className="dot"></i> {cr.verdict === "pending" ? "verifying" : verdictLabel(cr.verdict)}</span>
                     <div style={{ minWidth: 0 }}>
                       <div style={{ fontSize: 13 }}>{cr.text}</div>
                       {cr.reason && <div className="mono mute" style={{ fontSize: 11.5, marginTop: 3 }}>{cr.reason}</div>}
@@ -353,7 +352,7 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted }) => {
 
               <div className="drawer-section">
                 <div className="drawer-label">run</div>
-                <div className="kv-grid" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 0 }}>
+                <div className="kv-grid tst-kv" style={{ gridTemplateColumns: "1fr 1fr", marginBottom: 0 }}>
                   <div className="kv"><div className="kv-k">pull request</div><div className="kv-v mono" style={{ fontSize: 12 }}><a href={`/reviews/${row.review.id}`} onClick={(e) => { e.preventDefault(); navigate(`/reviews/${row.review.id}`); }}>#{row.review.prNumber} {row.review.prTitle}</a></div></div>
                   <div className="kv"><div className="kv-k">commit</div><div className="kv-v mono" style={{ fontSize: 12 }}>{shortSha(view.run.sha)}</div></div>
                   <div className="kv"><div className="kv-k">run status</div><div className="kv-v mono" style={{ fontSize: 12 }}>{view.run.status}</div></div>
