@@ -276,6 +276,8 @@ test("onDiskPath gives a generated node:test file the extension its own syntax n
   assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.js", content: ESM })), ".devasign/tests/a.test.mjs");
   assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.js", content: CJS })), ".devasign/tests/a.test.cjs");
   assert.equal(onDiskPath(planTest({ path: ".devasign/tests/a.test.ts", content: ESM, runner: "bundled" })), ".devasign/tests/a.test.mts");
+  // A plan that names no runner still runs through node --import tsx (commandForFile's default), so it is named the same way.
+  assert.equal(onDiskPath({ ...planTest({ path: ".devasign/tests/a.test.ts", content: ESM }), runner: undefined as unknown as PlanTest["runner"] }), ".devasign/tests/a.test.mts");
 });
 
 test("onDiskPath leaves alone whatever an extension cannot settle", () => {
