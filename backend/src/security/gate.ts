@@ -60,12 +60,12 @@ export function gateOutput(
       title: "Security gate passed",
       summary:
         "All required security gate rules pass.\n\n" +
-        `Details: ${config.webOrigin}/security/gate`,
+        `Details: ${config.webOrigin}/security/config?tab=gate`,
     };
   }
   const failedRules = gate.rules.filter((r) => r.required && !r.pass);
   const counts = failedRules.map((r) => `✗ ${r.label} — ${r.count} found`).join("\n");
-  const link = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/gate`;
+  const link = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/config?tab=gate`;
 
   if (!repo.private) {
     // Conditional: an R2-only failure (an open PR introduces a finding) leaves

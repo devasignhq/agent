@@ -1,0 +1,126 @@
+// Pure view logic for the Tests page (filters, sort, evidence chips, drawer
+// detail). React-free so node --test drives it offline.
+import type { ResultStatus, RunView, RunViewArtifact, TestAdoption, TestEvidenceKind, TestOrigin, VerifyTestRow } from "./api.ts";
+import { recordingFromVideo, type Recording } from "./verify-view.ts";
+
+export type TestStatus = ResultStatus | "not_run";
+export type TestCategory = "unit" | "e2e";
+
+export type TestFilters = {
+  repo: string | null;
+  category: TestCategory | null;
+  status: TestStatus | null;
+  origin: TestOrigin | null;
+  review: string | null;
+  q: string;
+};
+
+export const EMPTY_FILTERS: TestFilters = { repo: null, category: null, status: null, origin: null, review: null, q: "" };
+
+export function testName(path: string): string {
+  const seg = path.split("/").filter(Boolean);
+  return seg[seg.length - 1] ?? path;
+}
+
+export function statusTone(status: TestStatus): "ok" | "danger" | "warn" | "nit" | "mute" {
+  if (status === "pass") return "ok";
+  if (status === "fail" || status === "error") return "danger";
+  if (status === "flaky") return "warn";
+  if (status === "skipped") return "nit";
+  return "mute";
+}
+
+export function statusLabel(status: TestStatus): string {
+  if (status === "fail") return "FAIL";
+  if (status === "not_run") return "not run";
+  return status;
+}
+
+export function categoryLabel(c: TestCategory): string {
+  return c === "e2e" ? "e2e" : "unit";
+}
+
+export function filterRows(rows: VerifyTestRow[], f: TestFilters): VerifyTestRow[] {
+  const q = f.q.trim().toLowerCase();
+  return rows.filter((r) => {
+    if (f.repo && r.repo.id !== f.repo) return false;
+    if (f.category && r.category !== f.category) return false;
+    if (f.status && r.status !== f.status) return false;
+    if (f.origin && r.origin !== f.origin) return false;
+    if (f.review && r.review.id !== f.review) return false;
+    if (q && !`${r.path} ${r.repo.name} #${r.review.prNumber} ${r.review.prTitle}`.toLowerCase().includes(q)) return false;
+    return true;
+  });
+}
+
+const FAIL_FIRST = new Set<TestStatus>(["fail", "error"]);
+export function sortRows(rows: VerifyTestRow[]): VerifyTestRow[] {
+  return [...rows].sort((a, b) => {
+    if (a.run.createdAt !== b.run.createdAt) return b.run.createdAt - a.run.createdAt;
+    const af = FAIL_FIRST.has(a.status) ? 0 : 1;
+    const bf = FAIL_FIRST.has(b.status) ? 0 : 1;
+    if (af !== bf) return af - bf;
+    return a.path.localeCompare(b.path);
+  });
+}
+
+const EVIDENCE_ORDER: TestEvidenceKind[] = ["video", "trace", "screenshot", "log"];
+/** One chip per evidence kind, taken from the highest attempt that has it. */
+export function pickEvidence(row: VerifyTestRow): Array<{ artifactId: string; kind: TestEvidenceKind; expired: boolean }> {
+  const out: Array<{ artifactId: string; kind: TestEvidenceKind; expired: boolean }> = [];
+  for (const kind of EVIDENCE_ORDER) {
+    const best = row.evidence.filter((e) => e.kind === kind).sort((a, b) => (b.attempt ?? 0) - (a.attempt ?? 0))[0];
+    if (best) out.push({ artifactId: best.artifactId, kind, expired: best.expired });
+  }
+  return out;
+}
+
+export function repoOptions(rows: VerifyTestRow[]): Array<{ id: string; name: string }> {
+  const seen = new Map<string, string>();
+  for (const r of rows) seen.set(r.repo.id, r.repo.name);
+  return [...seen].map(([id, name]) => ({ id, name })).sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export function markAdopted(rows: VerifyTestRow[], key: string, adopted: TestAdoption): VerifyTestRow[] {
+  return rows.map((r) => (r.key === key ? { ...r, adopted } : r));
+}
+
+export type TestDetail = {
+  test: { id: string; path: string; level: string; origin: TestOrigin; runner: string; adopted: TestAdoption | null };
+  criteria: Array<{ id: string; text: string; verdict: "pass" | "fail" | "unverifiable" | "pending"; reason: string }>;
+  result: { status: ResultStatus; durationMs: number; error: string | null; attempts: Array<{ n: number; status: string; durationMs: number; error: string | null }> } | null;
+  recordings: Recording[];
+  others: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; getUrl: string | null; expired: boolean }>;
+};
+
+/** Everything the drawer shows for one test of a fully loaded run view. */
+export function testDetail(view: RunView | null, testId: string, now: number = Date.now()): TestDetail | null {
+  const test = view?.plan?.tests.find((t) => t.id === testId);
+  if (!view || !test) return null;
+  const mine = view.artifacts.filter((a) => a.testId === testId);
+  const videos = mine.filter((a) => a.kind === "video").sort((a, b) => (a.attempt ?? 0) - (b.attempt ?? 0));
+  const isExpired = (a: RunViewArtifact) => a.state === "expired" || a.expiresAt <= now;
+  const r = (view.results ?? []).find((x) => x.testId === testId) ?? null;
+  const terminal = ["completed", "failed", "lost", "timed_out", "skipped"].includes(view.run.status);
+  return {
+    test: { id: test.id, path: test.path, level: test.level, origin: test.origin, runner: test.runner, adopted: test.adopted ?? null },
+    criteria: test.criterionIds.map((id) => {
+      const c = view.criteria.find((x) => x.id === id);
+      const v = view.run.verdicts.find((x) => x.criterionId === id);
+      return { id, text: c?.text ?? id, verdict: v?.verdict ?? (terminal ? "unverifiable" : "pending"), reason: v?.reason ?? "" };
+    }),
+    result: r
+      ? {
+          status: r.status,
+          durationMs: r.durationMs,
+          error: r.error ?? null,
+          attempts: r.attempts.map((a) => ({ n: a.n, status: a.status, durationMs: a.durationMs, error: a.error ?? null })),
+        }
+      : null,
+    recordings: videos.map((v) => recordingFromVideo(view, v, mine, now)),
+    others: mine
+      .filter((a) => a.kind === "trace" || a.kind === "screenshot" || a.kind === "log")
+      .sort((a, b) => (a.attempt ?? 0) - (b.attempt ?? 0))
+      .map((a) => ({ artifactId: a.id, kind: a.kind as TestEvidenceKind, attempt: a.attempt ?? null, getUrl: isExpired(a) ? null : a.getUrl, expired: isExpired(a) })),
+  };
+}

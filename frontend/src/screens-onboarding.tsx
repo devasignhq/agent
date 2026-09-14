@@ -282,7 +282,7 @@ const Onboarding = ({ onDone }) => {
 export { Onboarding };
 
 // Step 0 — plan selection. Reuses the PLANS data + plan-card styles from
-// Settings → Billing. Free advances in-app (no backend call, the user is already
+// Billing. Free advances in-app (no backend call, the user is already
 // on Free); Pro/Max launch Stripe Checkout with the 14-day trial and the
 // onboarding return marker (?ob=billing → resume at the repository step).
 const OBPricing = ({ onChooseFree }) => {
@@ -652,7 +652,7 @@ const OBInteg = ({ integ, setInteg }) => {
   }, [refresh]);
 
   // Connect = open the Linear OAuth popup (whole-workspace auth, same flow as
-  // Settings → Integrations); disconnect = drop the integration row. Free users
+  // Integrations); disconnect = drop the integration row. Free users
   // never reach the connect path — the card renders a Pro/Max lock instead.
   const toggle = async (key) => {
     if (busy) return;
@@ -746,7 +746,7 @@ const OBInteg = ({ integ, setInteg }) => {
       )}
       {planKnown && isFree && (
         <p className="mute mono" style={{ fontSize: 11, marginTop: 12, lineHeight: 1.6 }}>
-          Linear is a Pro &amp; Max feature. Connect it any time from Settings → Integrations after upgrading.
+          Linear is a Pro &amp; Max feature. Connect it any time from the Integrations page after upgrading.
         </p>
       )}
     </>

@@ -12,6 +12,7 @@ import type {
   SecurityRulingCode,
   SecurityScanRun,
   User,
+  VerifyArtifact,
 } from "../types.js";
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
 import { effectiveSecurityPolicy, normalizeSecurityPolicy } from "../security/policy.js";
@@ -48,6 +49,7 @@ import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 import { buildRunView } from "../verify/runs.js";
+import { buildTestRows, latestRunPerReview, summarizeTestRows } from "../verify/test-rows.js";
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
 import { enqueueVerifyOnboard } from "../queue.js";
@@ -124,6 +126,22 @@ export async function deleteAccountHandler(
 // Wrap so Express's (req, res, next) never leaks `next` into the deps slot —
 // the route always runs with the real implementations.
 api.delete("/me", (req, res) => deleteAccountHandler(req, res));
+
+// Per-user preferences. Exported for unit tests; the route binds it directly.
+export function updateMeHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const body = req.body ?? {};
+  const patch: Partial<Pick<User, "bountiesEnabled">> = {};
+  if ("bountiesEnabled" in body) {
+    if (typeof body.bountiesEnabled !== "boolean") return void res.status(400).json({ error: "invalid_preferences" });
+    patch.bountiesEnabled = body.bountiesEnabled;
+  }
+  const updated = db.update("users", (u) => u.id === user.id, patch) ?? user;
+  const sub = db.find("subscriptions", (s) => s.userId === user.id);
+  res.json({ user: updated, subscription: sub });
+}
+api.patch("/me", updateMeHandler);
 
 api.get("/health", (_req, res) => {
   const write = dbHealth();
@@ -1278,6 +1296,54 @@ api.get("/reviews/:id/verify", async (req, res) => {
     flakeRate: repoFlakeRate(repo.id),
   });
 });
+
+// Every planned test from the newest verify run of each PR across the user's
+// repos. Evidence is metadata only; the drawer signs URLs via /reviews/:id/verify.
+const VERIFY_TESTS_MAX_RUNS = 300;
+export function verifyTestsHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const installIds = new Set(installationsForUser(user.id).map((i) => i.id));
+  const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
+  const repoIds = new Set(repos.map((r) => r.id));
+  const repoNameById = new Map(repos.map((r) => [r.id, `${r.owner}/${r.name}`]));
+  const latest = latestRunPerReview(db.filter("verifyRuns", (r) => repoIds.has(r.repoId))).filter((r) => r.planId);
+  const runs = latest.slice(0, VERIFY_TESTS_MAX_RUNS);
+  const runIds = new Set(runs.map((r) => r.id));
+  const planIds = new Set(runs.map((r) => r.planId));
+  const resultIds = new Set(runs.map((r) => r.resultsId).filter(Boolean));
+  const reviewIds = new Set(runs.map((r) => r.reviewId));
+  const plans = new Map(db.filter("verifyPlans", (p) => planIds.has(p.id)).map((p) => [p.id, p]));
+  const results = new Map(db.filter("verifyResults", (r) => resultIds.has(r.id)).map((r) => [r.id, r]));
+  const reviews = new Map(db.filter("prReviews", (r) => reviewIds.has(r.id)).map((r) => [r.id, r]));
+  const artifactsByRun = new Map<string, VerifyArtifact[]>();
+  for (const a of db.filter("verifyArtifacts", (a) => runIds.has(a.runId))) {
+    const list = artifactsByRun.get(a.runId) ?? [];
+    list.push(a);
+    artifactsByRun.set(a.runId, list);
+  }
+  const now = Date.now();
+  const rows = runs.flatMap((run) => {
+    const plan = plans.get(run.planId!);
+    const review = reviews.get(run.reviewId);
+    if (!plan || !review) return [];
+    return buildTestRows(
+      run,
+      plan,
+      run.resultsId ? results.get(run.resultsId) ?? null : null,
+      artifactsByRun.get(run.id) ?? [],
+      { repoName: repoNameById.get(run.repoId) ?? "", review: { id: review.id, prNumber: review.prNumber, prTitle: review.prTitle } },
+      now
+    );
+  });
+  res.json({
+    rows,
+    counts: summarizeTestRows(rows),
+    repos: repos.map((r) => ({ id: r.id, name: `${r.owner}/${r.name}` })).sort((a, b) => a.name.localeCompare(b.name)),
+    truncated: latest.length > runs.length,
+  });
+}
+api.get("/verify/tests", verifyTestsHandler);
 
 // Verification setup checklist for a repo, and "Regenerate setup PR".
 api.get("/repositories/:id/verify/setup", (req, res) => {

@@ -85,7 +85,7 @@ const blockedGate = (blockingFindingIds: string[]): GateResult => ({
   blockingFindingIds,
 });
 
-const LINK = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/gate`;
+const LINK = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/config?tab=gate`;
 const COUNTS = "✗ No unresolved critical findings on the default branch — 1 found";
 
 test("gateOutput: a public repo's blocked summary leaks no path, line, title or severity", () => {
@@ -134,7 +134,7 @@ test("gateOutput: the pass branch is identical on public and private repos", () 
   assert.equal(pub.title, "Security gate passed");
   assert.equal(
     pub.summary,
-    `All required security gate rules pass.\n\nDetails: ${config.webOrigin}/security/gate`
+    `All required security gate rules pass.\n\nDetails: ${config.webOrigin}/security/config?tab=gate`
   );
 });
 

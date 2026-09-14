@@ -173,6 +173,10 @@ test("adopt: generated tests land under tests/devasign/ on a branch off the PR h
     assert.equal(s.calls.prs[0].base, "feature/refunds");
     assert.match(s.calls.prs[0].title, /Adopt DevAsign generated tests \(PR #7\)/);
     assert.equal(db.find("verifyRuns", (r) => r.id === run.id)?.report?.adoptPrUrl, "https://github.com/acme/shop/pull/41");
+    const stamped = db.find("verifyPlans", (p) => p.id === plan.id)!.tests;
+    assert.equal(stamped[0].adopted?.prNumber, 41, "the adopted test remembers its PR");
+    assert.equal(stamped[1].adopted, undefined);
+    assert.equal((await adoptGeneratedTests(run.id, ["t1"], s.deps)).status, "skipped", "an adopted test is never re-committed");
     const all = await adoptGeneratedTests(run.id, null, s.deps);
     assert.equal(all.status, "opened");
     assert.equal(Object.keys(s.calls.files).length, 2, "existing tests are never re-committed");

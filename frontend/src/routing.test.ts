@@ -27,22 +27,29 @@ test("the URL surface is exactly this — bookmarks and backend deep links depen
   assert.deepEqual({ ...ROUTE_PATHS }, {
     agent: "/agent",
     review: "/reviews/:reviewId",
+    tests: "/tests",
     workflow: "/workflow",
     bounty: "/bounty",
     fundBounty: "/bounties/:id/fund",
     cancelBounty: "/bounties/:id/cancel",
     security: "/security",
     securityFinding: "/security/findings/:findingId",
+    securityConfig: "/security/config",
     securityGate: "/security/gate",
     securityRulings: "/security/rulings",
     securityPolicy: "/security/policy",
+    repository: "/repository",
+    integrations: "/integrations",
+    billing: "/billing",
+    account: "/account",
+    help: "/help",
     settings: "/settings",
     settingsSection: "/settings/:section",
     root: "/",
     catchAll: "*",
   });
   assert.equal(DEFAULT_ROUTE, "/agent");
-  assert.equal(DEFAULT_SETTINGS_PATH, "/settings/account");
+  assert.equal(DEFAULT_SETTINGS_PATH, "/account");
 });
 
 test("app.tsx renders exactly this table, and never a literal path", () => {
@@ -80,8 +87,22 @@ test("the money deep links the backend mints still resolve", () => {
 test("a bare /settings reaches its redirect rather than :section", () => {
   // Not a ranking test: /settings/:section requires a segment, so the two never compete.
   assert.equal(match("/settings").path, "/settings");
+  assert.equal(match("/settings/support").path, "/settings/:section");
+});
+
+test("the security config page and the legacy sub-page redirects all resolve", () => {
+  assert.equal(match("/security/config").path, "/security/config");
+  assert.equal(match("/security/config?tab=gate").path, "/security/config");
+  // The merge-gate check comment links here; it must keep landing somewhere.
   assert.equal(match("/security/gate").path, "/security/gate");
   assert.equal(match("/security/rulings").path, "/security/rulings");
+  assert.equal(match("/security/policy").path, "/security/policy");
+});
+
+test("the settings sections are top-level pages now", () => {
+  for (const p of ["/repository", "/integrations", "/billing", "/account", "/help", "/tests"]) {
+    assert.equal(match(p).path, p);
+  }
 });
 
 test("the catch-all takes unknown URLs and nothing else", () => {
@@ -93,9 +114,7 @@ test("the catch-all takes unknown URLs and nothing else", () => {
 
 test("both redirect targets are themselves routable", () => {
   assert.equal(match(DEFAULT_ROUTE).path, "/agent");
-  const settings = match(DEFAULT_SETTINGS_PATH);
-  assert.equal(settings.path, "/settings/:section");
-  assert.equal(settings.params.section, "account", "SettingsPage falls back to account, so the redirect must land there");
+  assert.equal(match(DEFAULT_SETTINGS_PATH).path, "/account");
 });
 
 test("generatePath round-trips every param route", () => {

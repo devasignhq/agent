@@ -236,7 +236,7 @@ export async function adoptGeneratedTests(runId: string, testIds: string[] | nul
   const repo = run ? db.find("repositories", (r) => r.id === run.repoId) : null;
   const install = repo ? db.find("installations", (i) => i.id === repo.installationId) : null;
   if (!run || !plan || !repo || !install) return { status: "skipped", reason: "run, plan, or installation missing" };
-  const tests = plan.tests.filter((t) => t.origin === "generated" && t.content && adoptedPath(t.path) && (!testIds || testIds.includes(t.id)));
+  const tests = plan.tests.filter((t) => t.origin === "generated" && t.content && !t.adopted && adoptedPath(t.path) && (!testIds || testIds.includes(t.id)));
   if (!tests.length) return { status: "skipped", reason: "no generated tests to adopt" };
   try {
     const base = await d.prHeadRef(install, repo, run.prNumber);
@@ -257,6 +257,9 @@ export async function adoptGeneratedTests(runId: string, testIds: string[] | nul
       base,
     });
     updateRun(run.id, { report: { ...(run.report || {}), adoptPrUrl: pr.html_url } as VerifyRun["report"] });
+    const adopted = { prUrl: pr.html_url, prNumber: pr.number, at: Date.now() };
+    const chosen = new Set(tests.map((t) => t.id));
+    db.update("verifyPlans", (p) => p.id === plan.id, { tests: plan.tests.map((t) => (chosen.has(t.id) ? { ...t, adopted } : t)) });
     db.insert("reviewLogs", { id: uuid(), reviewId: run.reviewId, kind: "verify", at: Date.now(), action: `Opened PR #${pr.number} adopting ${tests.length} generated test(s)`, meta: { runId: run.id, prUrl: pr.html_url } });
     return { status: "opened", prNumber: pr.number, prUrl: pr.html_url };
   } catch (err) {

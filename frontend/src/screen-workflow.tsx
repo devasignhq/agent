@@ -971,7 +971,7 @@ const WorkflowPage = ({ onHeader, isMobile = false }: { onHeader?: (s: WorkflowH
             <div className="card" style={{ maxWidth: 460 }}>
               <div className="card-body mute" style={{ fontSize: 13 }}>
                 No repositories connected yet. Install the DevAsign GitHub App under{" "}
-                <span className="mono" style={{ color: "var(--fg)" }}>Settings → Repository</span>{" "}
+                <span className="mono" style={{ color: "var(--fg)" }}>Repository</span>{" "}
                 to start customizing review workflows.
               </div>
             </div>

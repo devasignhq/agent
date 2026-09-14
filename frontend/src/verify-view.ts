@@ -70,6 +70,24 @@ export type CriterionVerification = {
   logs: Array<{ artifactId: string; getUrl: string | null; attempt?: number }>;
 };
 
+/** One video artifact (plus its same-attempt trace among `siblings`) as a player-ready Recording. */
+export function recordingFromVideo(view: RunView, video: RunViewArtifact, siblings: RunViewArtifact[], now: number): Recording {
+  const trace = siblings.find((a) => a.kind === "trace" && a.testId === video.testId && a.attempt === video.attempt) ?? null;
+  const expired = video.state === "expired" || video.expiresAt <= now;
+  const poster = video.posterArtifactId ? view.artifacts.find((a) => a.id === video.posterArtifactId) : null;
+  return {
+    artifactId: video.id,
+    getUrl: expired ? null : video.getUrl,
+    posterUrl: expired ? null : video.posterUrl ?? poster?.getUrl ?? null,
+    urlExpiresAt: video.urlExpiresAt,
+    expired,
+    expiredAfterDays: retentionDays(video, view.run.createdAt),
+    bytes: video.bytes,
+    attempt: video.attempt,
+    trace: trace ? { artifactId: trace.id, getUrl: trace.state === "expired" || trace.expiresAt <= now ? null : trace.getUrl, expired: trace.state === "expired" || trace.expiresAt <= now } : null,
+  };
+}
+
 export function verificationForCriterion(view: RunView | null, criterionId: string, now: number = Date.now()): CriterionVerification | null {
   if (!view) return null;
   const v = view.run.verdicts.find((x) => x.criterionId === criterionId) ?? null;
@@ -77,24 +95,8 @@ export function verificationForCriterion(view: RunView | null, criterionId: stri
   const results = (view.results ?? []).filter((r) => r.criterionIds.includes(criterionId));
   const testIds = new Set(tests.map((t) => t.id));
   const mine = view.artifacts.filter((a) => a.criterionIds.includes(criterionId) || (a.testId != null && testIds.has(a.testId)));
-  const byId = new Map(view.artifacts.map((a) => [a.id, a]));
-  const toRecording = (video: RunViewArtifact): Recording => {
-    const trace = mine.find((a) => a.kind === "trace" && a.testId === video.testId && a.attempt === video.attempt) ?? null;
-    const expired = video.state === "expired" || video.expiresAt <= now;
-    return {
-      artifactId: video.id,
-      getUrl: expired ? null : video.getUrl,
-      posterUrl: expired ? null : video.posterUrl ?? (video.posterArtifactId ? byId.get(video.posterArtifactId)?.getUrl ?? null : null),
-      urlExpiresAt: video.urlExpiresAt,
-      expired,
-      expiredAfterDays: retentionDays(video, view.run.createdAt),
-      bytes: video.bytes,
-      attempt: video.attempt,
-      trace: trace ? { artifactId: trace.id, getUrl: trace.state === "expired" || trace.expiresAt <= now ? null : trace.getUrl, expired: trace.state === "expired" || trace.expiresAt <= now } : null,
-    };
-  };
   const videos = mine.filter((a) => a.kind === "video").sort((a, b) => (a.attempt ?? 0) - (b.attempt ?? 0));
-  const attemptRecordings = videos.map(toRecording);
+  const attemptRecordings = videos.map((v) => recordingFromVideo(view, v, mine, now));
   const primary = tests[0] ?? null;
   const terminal = ["completed", "failed", "lost", "timed_out", "skipped"].includes(view.run.status);
   const planned = view.plan?.unverifiable?.find((u) => u.criterionId === criterionId) ?? null;

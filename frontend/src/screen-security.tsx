@@ -1,20 +1,18 @@
-// Security page — the dedicated surface for the security audit agent's
+// Security pages — the dedicated surface for the security audit agent's
 // findings (they no longer render in GitHub PR comments; the review comment
-// only links here). Four views under one component, keyed by route:
-//   /security                     — findings dashboard (stats, charts, table)
+// only links here). Three views under one component, keyed by route:
+//   /security                     — Reports: findings dashboard (stats, charts, table)
 //   /security/findings/:findingId — finding detail (tabs + one-click issue)
-//   /security/gate                — merge gate (rules, blocking, scan terminal)
-//   /security/policy              — per-repo scan policy (triggers/engines/gates)
+//   /security/config              — Config: scan policy, merge gate, rulings (?tab=)
 //
-// Data: ONE aggregate endpoint (api.securityOverview) powers everything; the
-// scan terminal fetches its log separately (the only heavy field). Live: the
-// "security" topic refetches the overview whenever the backend writes a
-// finding or scan row — which is also how the terminal streams during a run.
-// Pure logic (filters, stats, chart series) lives in security-findings.ts so
-// node --test drives it offline.
+// Data: ONE aggregate endpoint (api.securityOverview) powers everything. Live:
+// the "security" topic refetches the overview whenever the backend writes a
+// finding or scan row. Pure logic (filters, stats, chart series) lives in
+// security-findings.ts so node --test drives it offline.
 import React from "react";
 import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { Icon } from "./icons";
+import { Toggle } from "./toggle";
 import { useLiveTopic } from "./live-context";
 import {
   api,
@@ -166,7 +164,14 @@ const LockedEmpty = () => (
 
 // ─── main page ────────────────────────────────────────────────────────────────
 
-type ViewKey = "dashboard" | "detail" | "gate" | "policy" | "rulings";
+type ViewKey = "dashboard" | "detail" | "config";
+type ConfigTab = "policy" | "gate" | "rulings";
+const CONFIG_TABS: Array<{ key: ConfigTab; label: string }> = [
+  { key: "policy", label: "Scan policy" },
+  { key: "gate", label: "Merge gate" },
+  { key: "rulings", label: "Rulings" },
+];
+const configPath = (tab: ConfigTab) => `/security/config?tab=${tab}`;
 
 // One segment of the top-bar breadcrumb. A segment with a `path` is a link back;
 // the last (pathless) segment is the current page.
@@ -189,6 +194,8 @@ export const SecurityPage = ({
   // breadcrumb shows the path in — "Security / Merge gate / VLN-…" — and Back
   // returns there rather than always to the findings list.
   const origin = (location.state as { from?: string } | null)?.from;
+  const tabParam = searchParams.get("tab");
+  const tab: ConfigTab = CONFIG_TABS.some((t) => t.key === tabParam) ? (tabParam as ConfigTab) : "policy";
 
   const [overview, setOverview] = React.useState<SecurityOverview | null>(null);
   const [loading, setLoading] = React.useState(true);
@@ -282,16 +289,14 @@ export const SecurityPage = ({
       : "";
   const crumbs = React.useMemo<SecurityCrumb[]>(() => {
     const root: SecurityCrumb = { label: "Security", path: "/security" };
-    if (view === "gate") return [root, { label: "Merge gate" }];
-    if (view === "rulings") return [root, { label: "Rulings" }];
-    if (view === "policy") return [root, { label: "Scan policy" }];
+    if (view === "config") return [root, { label: "Configuration" }];
     if (view === "detail") {
       const leaf: SecurityCrumb = { label: detailLabel };
       return origin === "gate"
-        ? [root, { label: "Merge gate", path: "/security/gate" }, leaf]
-        : [root, leaf];
+        ? [root, { label: "Configuration", path: configPath("gate") }, leaf]
+        : [root, { label: "Reports", path: "/security" }, leaf];
     }
-    return [{ label: "Security" }]; // dashboard — Security is the current page
+    return [root, { label: "Reports" }];
   }, [view, origin, detailLabel]);
   const crumbKey = crumbs.map((c) => `${c.label}|${c.path ?? ""}`).join(">");
   React.useEffect(() => {
@@ -302,24 +307,15 @@ export const SecurityPage = ({
   // change — a per-change clear would flash the default label between screens.
   React.useEffect(() => () => onCrumbs?.(null), [onCrumbs]);
 
-  const subNav = (
+  const subNav = view === "config" ? (
     <div className="vln-subnav">
-      {[
-        { key: "dashboard", label: "Findings", path: "/security" },
-        { key: "gate", label: "Merge gate", path: "/security/gate" },
-        { key: "rulings", label: "Rulings", path: "/security/rulings" },
-        { key: "policy", label: "Scan policy", path: "/security/policy" },
-      ].map((t) => (
-        <button
-          key={t.key}
-          className={`vln-subtab ${view === t.key || (view === "detail" && t.key === "dashboard") ? "on" : ""}`}
-          onClick={() => navigate(t.path)}
-        >
+      {CONFIG_TABS.map((t) => (
+        <button key={t.key} className={`vln-subtab ${tab === t.key ? "on" : ""}`} onClick={() => navigate(configPath(t.key))}>
           {t.label}
         </button>
       ))}
     </div>
-  );
+  ) : null;
 
   if (loading && !overview) {
     return (
@@ -359,7 +355,7 @@ export const SecurityPage = ({
         finding={finding}
         all={overview.findings}
         repos={overview.repos}
-        onBack={() => navigate(origin === "gate" ? "/security/gate" : "/security")}
+        onBack={() => navigate(origin === "gate" ? configPath("gate") : "/security")}
         onOpen={(id) => navigate(`/security/findings/${id}`, { state: { from: origin } })}
         applyFinding={applyFinding}
         refresh={refresh}
@@ -402,11 +398,11 @@ export const SecurityPage = ({
               precedents={precedents}
               repoFilter={repoFilter}
               onOpen={(id) => navigate(`/security/findings/${id}`)}
-              onManage={() => navigate("/security/rulings")}
+              onManage={() => navigate(configPath("rulings"))}
             />
           </>
         ))}
-      {view === "rulings" &&
+      {view === "config" && tab === "rulings" &&
         (overview.locked && overview.findings.length === 0 ? (
           <LockedEmpty />
         ) : (
@@ -418,17 +414,17 @@ export const SecurityPage = ({
             locked={overview.locked}
           />
         ))}
-      {(view === "gate" || view === "policy") && overview.locked && overview.findings.length === 0 && (
+      {view === "config" && tab !== "rulings" && overview.locked && overview.findings.length === 0 && (
         <LockedEmpty />
       )}
-      {(view === "gate" || view === "policy") && !(overview.locked && overview.findings.length === 0) && (() => {
+      {view === "config" && tab !== "rulings" && !(overview.locked && overview.findings.length === 0) && (() => {
         // Gate/policy show ONE repo at a time, chosen by the left rail. The
         // header's "all" default (and any unknown id) resolves to the first
         // repo so the body always has a concrete repo to render.
         const selectedRepoId =
           overview.repos.find((r) => r.id === repoFilter)?.id ?? overview.repos[0]?.id;
         const body =
-          view === "gate" ? (
+          tab === "gate" ? (
             <GateView
               overview={overview}
               repoFilter={selectedRepoId}
@@ -513,7 +509,7 @@ const PageHead = ({
     <>
       <div className="page-head" style={{ marginBottom: 12 }}>
         <div>
-          <h1 className="page-title">Security</h1>
+          <h1 className="page-title">{view === "config" ? "Configuration" : "Reports"}</h1>
           <div className="page-sub">
             {overview.repos.length} repo{overview.repos.length === 1 ? "" : "s"} ·{" "}
             {overview.locked ? (
@@ -2226,16 +2222,6 @@ const GateRepoDetail = ({
 
 // ─── scan policy ──────────────────────────────────────────────────────────────
 
-const Tog = ({ on, onClick, disabled }: { on: boolean; onClick: () => void; disabled?: boolean }) => (
-  <button
-    className={`vln-sw ${on ? "" : "off"}`}
-    onClick={onClick}
-    disabled={disabled}
-    aria-pressed={on}
-  >
-    <i />
-  </button>
-);
 
 // Scan policy is per-repo. The rail picks one repo; this resolves it (falling
 // back to the first) and edits that repo's policy.
@@ -2336,7 +2322,7 @@ const PolicyRepoEditor = ({
                 <div className="vln-eng-n">{t.label}</div>
                 <div className="vln-eng-d">{t.sub}</div>
               </div>
-              <Tog
+              <Toggle
                 on={policy.triggers[t.k]}
                 disabled={locked}
                 onClick={() => edit((p) => ({ ...p, triggers: { ...p.triggers, [t.k]: !p.triggers[t.k] } }))}
@@ -2361,7 +2347,7 @@ const PolicyRepoEditor = ({
                 <div className="vln-eng-n">{e.n}</div>
                 <div className="vln-eng-d">{e.d}</div>
               </div>
-              <Tog
+              <Toggle
                 on={policy.engines[e.k]}
                 disabled={locked}
                 onClick={() => edit((p) => ({ ...p, engines: { ...p.engines, [e.k]: !p.engines[e.k] } }))}

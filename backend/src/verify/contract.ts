@@ -28,6 +28,8 @@ export type PlanTest = {
   testSignature: string; // sha256(criterion text + level + target files)
   strategyVersion: number; // bumps each time a flaky signature is regenerated
   targetFiles: string[]; // repo files the test exercises (part of the signature)
+  // App-only: set by adoptGeneratedTests once the test is committed via a PR.
+  adopted?: { prUrl: string; prNumber: number; at: number } | null;
 };
 
 export type PlanCommand = {
