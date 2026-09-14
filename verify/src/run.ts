@@ -11,7 +11,7 @@ import type { TokenSource } from "./oidc.js";
 import { writeModuleTypeShims } from "./module-type.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
-import { CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
+import { CLI_COMMIT, CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
 import { Workspace } from "./workspace.js";
 
 export type RunOptions = {
@@ -162,7 +162,7 @@ export async function run(opts: RunOptions): Promise<number> {
   const ws = new Workspace(opts.cwd);
   const yml = readDevasignVerify(ws.root);
   const setup = await detectSetup(ws.root);
-  log.info(`@devasign/verify ${CLI_VERSION} — ${setup.frameworks.map((f) => f.name).join(", ") || "no test framework detected (bundled runner)"}`);
+  log.info(`@devasign/verify ${CLI_VERSION}${CLI_COMMIT ? ` (${CLI_COMMIT})` : ""} — ${setup.frameworks.map((f) => f.name).join(", ") || "no test framework detected (bundled runner)"}`);
 
   let plan: RunnerPlan;
   let runId: string;
