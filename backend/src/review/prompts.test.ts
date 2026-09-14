@@ -89,6 +89,11 @@ test("prompts reference only context sections the pipeline actually emits", () =
   }
 });
 
+test("the verifier's planner and test author both know CI checks out the PR head one commit deep", () => {
+  assert.match(testPlannerSystemPrompt(), /change's own footprint[\s\S]*one commit deep[\s\S]*never on git history/);
+  assert.match(testFileSystemPrompt(), /one commit deep, so never read git history/);
+});
+
 test("emoji ban is stated in every stage prompt", () => {
   for (const [prompt] of CASES) {
     assert.match(prompt, /Never use emoji/);

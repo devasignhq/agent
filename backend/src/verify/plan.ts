@@ -34,6 +34,7 @@ import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-so
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
 import { specLint } from "./spec-lint.js";
+import { historyLint } from "./history-lint.js";
 import { withDomEnvironment } from "./dom-env.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
@@ -612,7 +613,7 @@ export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: s
     const unparsable = syntaxError(path ?? (typeof given?.path === "string" ? given.path : ""), content);
     // First answer only: a pattern check is a nudge, and a spec that insists may be right.
     // Asked later, it would drop a file whose only repair went to a syntax error.
-    const patterns = calls++ === 0 ? specLint(content, allow.names) : [];
+    const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content)] : [];
     if (!bad.length && !unparsable && !patterns.length) return { ok: true, value: { content } };
     // Reported every failure, empty included, so a later syntax-only miss is not blamed on a package.
     onReject?.(bad);

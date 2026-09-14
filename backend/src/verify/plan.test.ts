@@ -350,6 +350,28 @@ test("a browser spec that clicks a line is sent back once with how to select it,
   }
 });
 
+test("a test that reads git history is sent back once with what a one-commit checkout holds, and ships if the author insists", async () => {
+  // The live miss: CI's depth-1 checkout has no HEAD^, so this errored on all three attempts.
+  const diffs = 'import { test } from "node:test";\nimport { execFileSync } from "node:child_process";\ntest("the lockfile was updated", () => {\n  execFileSync("git", ["diff", "--name-only", "HEAD^", "HEAD"]);\n});\n';
+  const reads = 'import { test } from "node:test";\nimport { readFileSync } from "node:fs";\ntest("the lockfile pins 1.55.0", () => {\n  readFileSync("verify/package-lock.json", "utf8");\n});\n';
+  for (const second of [reads, diffs]) {
+    const s = seed([crit("1")]);
+    const { deps: d, bodyPrompts } = deps({
+      responses: [{ tests: [gen("1", "integration")] }],
+      bodies: { "criterion-1.test.ts": [{ path: "criterion-1.test.ts", content: diffs }, { path: "criterion-1.test.ts", content: second }] },
+    });
+    try {
+      await runVerifyPlan(s.run.id, d);
+      assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+      const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+      assert.match((log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/criterion-1.test.ts`][0].reason, /it reads git history \(`git diff --name-only HEAD\^ HEAD`\), but CI checks out the PR head alone, one commit deep/);
+      assert.equal(db.find("verifyPlans", (p) => p.runId === s.run.id)!.tests[0].content, second);
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
 test("a criterion covered only by a browser test is re-asked, in the same re-plan, for a fallback below e2e", async () => {
   const s = seed([crit("1", "ui"), crit("2")]);
   const { deps: d, prompts } = deps({
