@@ -25,6 +25,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }: IconProps) => {
     case "loom":       return <svg {...p}><circle cx="8" cy="8" r="6"/><path d="M8 4v8M4 8h8M5 5l6 6M5 11l6-6"/></svg>;
     case "doc":        return <svg {...p}><path d="M4 1.5h5l3 3V14a.5.5 0 01-.5.5h-7a.5.5 0 01-.5-.5V2a.5.5 0 01.5-.5z"/><path d="M9 1.5v3h3M5.5 8h5M5.5 10.5h5M5.5 5.5h2"/></svg>;
     case "image":      return <svg {...p}><rect x="2" y="3" width="12" height="10"/><circle cx="5.5" cy="6.5" r="1"/><path d="M2 11l3-3 3 3 2-2 4 4"/></svg>;
+    case "repo":       return <svg {...p}><path d="M4.5 1.5h8v12h-8a1.5 1.5 0 01-1.5-1.5V3a1.5 1.5 0 011.5-1.5z"/><path d="M3 11.5a1.5 1.5 0 011.5-1.5h8M6 4.5h4"/></svg>;
     case "git":        return <svg {...p}><circle cx="4" cy="4" r="1.5"/><circle cx="12" cy="8" r="1.5"/><circle cx="4" cy="12" r="1.5"/><path d="M4 5.5v5M5.5 4h2a3 3 0 013 3v.5"/></svg>;
     case "code":       return <svg {...p}><path d="M5 4l-3 4 3 4M11 4l3 4-3 4M9.5 3l-3 10"/></svg>;
     case "link":       return <svg {...p}><path d="M7 9a3 3 0 004.2 0l2.3-2.3a3 3 0 00-4.2-4.2L8 3.8M9 7a3 3 0 00-4.2 0L2.5 9.3a3 3 0 004.2 4.2L8 12.2"/></svg>;

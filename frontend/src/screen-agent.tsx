@@ -11,15 +11,9 @@ import { useLiveTopic } from "./live-context";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import {
   commentUrl,
-  formatDuration,
-  isSignedUrlStale,
   parseDeepLink,
   revisionRows,
-  traceViewerUrl,
-  verdictLabel,
-  verdictTone,
   verificationCounts,
-  verificationForCriterion,
 } from "./verify-view";
 import {
   canMessageAgent,
@@ -535,58 +529,13 @@ const TerminalFor = ({ pr, lines }) =>
 // One acceptance-criterion row. The agent's reasoning note can run to a dozen
 // lines, which pushes the rest of the criteria off-screen — so it collapses to
 // a single line by default and expands in place on click.
-// A Playwright recording for one criterion: collapsed (poster, test, duration)
-// by default, an inline player with full-screen + trace viewer when opened.
-// Expired recordings keep the block (with the retention note) but no player.
-const RecordingBlock = ({ rec, testName, durationMs, initiallyOpen, onStale }) => {
-  const [open, setOpen] = React.useState(!!initiallyOpen);
-  const videoRef = React.useRef(null);
-  React.useEffect(() => { if (initiallyOpen) setOpen(true); }, [initiallyOpen]);
-  const stale = !rec.expired && isSignedUrlStale(rec.urlExpiresAt, Date.now());
-  React.useEffect(() => { if (open && stale && onStale) onStale(); }, [open, stale]); // eslint-disable-line react-hooks/exhaustive-deps
-  const label = rec.attempt ? `${testName} · attempt ${rec.attempt}` : testName;
-  return (
-    <div className={`acv-rec ${open && !rec.expired ? "open" : ""} ${rec.expired ? "expired" : ""}`}>
-      <button
-        type="button"
-        className="acv-rec-head"
-        aria-expanded={open && !rec.expired}
-        disabled={rec.expired}
-        title={rec.expired ? "Recording expired" : open ? "Collapse" : "Watch recording"}
-        onClick={() => setOpen((v) => !v)}
-      >
-        {rec.posterUrl && !rec.expired
-          ? <img className="acv-rec-thumb" src={rec.posterUrl} alt="" />
-          : <div className="acv-rec-thumb placeholder"><Icon name="doc" size={12} /></div>}
-        <span className="acv-rec-title mono">{label}</span>
-        {durationMs > 0 && <span className="mute mono acv-rec-dur">{formatDuration(durationMs)}</span>}
-        {rec.expired
-          ? <span className="pill nit">expired after {rec.expiredAfterDays} {rec.expiredAfterDays === 1 ? "day" : "days"}</span>
-          : <span className="acv-rec-chev"><Icon name={open ? "chevron-d" : "chevron-r"} size={11} /></span>}
-      </button>
-      {open && !rec.expired && (
-        <div className="acv-rec-body">
-          <video ref={videoRef} className="acv-rec-video" controls playsInline preload="metadata" poster={rec.posterUrl || undefined} src={rec.getUrl || undefined} />
-          <div className="acv-rec-actions">
-            <button type="button" className="btn sm ghost" onClick={() => { const el = videoRef.current; if (el && el.requestFullscreen) el.requestFullscreen(); }}>Full screen</button>
-            {rec.trace?.getUrl && <a className="btn sm ghost" href={traceViewerUrl(rec.trace.getUrl)} target="_blank" rel="noreferrer">Open trace</a>}
-            {rec.getUrl && <a className="btn sm ghost" href={rec.getUrl} target="_blank" rel="noreferrer">Download</a>}
-          </div>
-        </div>
-      )}
-    </div>
-  );
-};
-
-const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
+const AcceptanceRow = ({ a, expanded }) => {
   const [open, setOpen] = React.useState(false);
-  const [adopt, setAdopt] = React.useState(null); // null | "busy" | { url } | { error }
   const hasNote = Boolean(a.note);
   const rowRef = React.useRef(null);
   React.useEffect(() => {
     if (expanded && rowRef.current && rowRef.current.scrollIntoView) rowRef.current.scrollIntoView({ block: "center", behavior: "smooth" });
   }, [expanded]);
-  const attemptRecs = v?.flaky ? v.attemptRecordings : [];
   return (
     <div ref={rowRef} className={`ac-row ${a.regressed ? "regressed" : a.met ? "met" : "unmet"} ${expanded ? "acv-target" : ""}`} data-criterion-id={a.criterionId}>
       <div className="ac-check">
@@ -595,42 +544,11 @@ const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
       <div style={{ minWidth: 0 }}>
         <div style={{ fontSize: 13, color: "var(--fg)" }}>{a.text}</div>
         {a.regressed && <div className="t-warn mono" style={{ fontSize: 12, marginTop: 3 }}>Was met by an earlier commit, then broken by a later change</div>}
-        {v && (
+        {a.implied && (
           <div className="acv-badges">
-            <span className={`pill ${verdictTone(v.verdict)}`} title={v.reason || undefined}>
-              <i className="dot"></i> {v.verdict === "pending" ? "verifying" : verdictLabel(v.verdict)}
-            </span>
-            {v.flaky && <span className="pill warn" title="The test's outcome changed between attempts; quarantined, never a fail">flaky test</span>}
-            {v.retired && <span className="pill nit" title="Three flaky runs of this test signature; DevAsign stopped generating it">could not verify reliably</span>}
-            {a.implied && <span className="pill nit" title="Implied by the ticket, not stated in it">implied</span>}
-            {v.test && <span className="mono mute acv-test">{v.test.level}{v.test.origin === "existing" ? " (existing)" : ""} · {v.test.name}</span>}
-            {v.attempts > 1 && <span className="mono mute acv-test">{v.attempts} {v.test?.runner === "playwright" ? "results" : "attempts"}</span>}
-            {v.test?.origin === "generated" && onAdopt && v.verdict !== "pending" && (
-              adopt && adopt.url
-                ? <a className="mono acv-test" href={adopt.url} target="_blank" rel="noreferrer">adopt PR opened</a>
-                : <button type="button" className="btn sm ghost" disabled={adopt === "busy"} title="Commit this generated test into the repository's own suite via a PR" onClick={async () => { setAdopt("busy"); try { const r = await onAdopt(v.test.id); setAdopt(r?.prUrl ? { url: r.prUrl } : { error: r?.reason || r?.status || "failed" }); } catch (e) { setAdopt({ error: e?.message || "failed" }); } }}>
-                    {adopt === "busy" ? "Opening PR…" : adopt && adopt.error ? `Adopt failed: ${adopt.error}` : "Adopt this test"}
-                  </button>
-            )}
+            <span className="pill nit" title="Implied by the ticket, not stated in it">implied</span>
           </div>
         )}
-        {v && v.reason && v.verdict !== "pending" && (
-          <div className="mute mono acv-reason">
-            {v.reason}
-            {v.fixUrl && (
-              <>
-                {" · "}
-                <a href={v.fixUrl}>configure app start</a>
-              </>
-            )}
-          </div>
-        )}
-        {v && v.recording && !v.flaky && (
-          <RecordingBlock rec={v.recording} testName={v.test?.name || "recording"} durationMs={v.durationMs} initiallyOpen={expanded} onStale={onStale} />
-        )}
-        {attemptRecs.map((rec) => (
-          <RecordingBlock key={rec.artifactId} rec={rec} testName={v.test?.name || "recording"} durationMs={0} initiallyOpen={expanded && rec === attemptRecs[attemptRecs.length - 1]} onStale={onStale} />
-        ))}
         {hasNote && (
           <button
             type="button"
@@ -652,7 +570,8 @@ const AcceptanceRow = ({ a, v, expanded, onStale, onAdopt }) => {
 // ────────────────────────────────────────────────────────────────────────────
 // Goal panel (right column) — same layout as the previous pop-up
 // ────────────────────────────────────────────────────────────────────────────
-const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deepLink, onRefreshVerify, onAdopt }) => {
+const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deepLink, reviewId }) => {
+  const navigate = useNavigate();
   // Local-only hide set for constraints without a backend attachment id
   // (legacy attachments persisted before we added `id`, or static demo
   // strings). Click → fade out, no network round-trip.
@@ -854,8 +773,8 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
               const c = verificationCounts(verification, live.criteria || []);
               return (
                 <span className="mute mono acv-summary" style={{ textTransform: "none", letterSpacing: 0 }}>
-                  · verified {c.pass} pass · {c.fail} fail · {c.unverifiable} unverifiable{c.pending ? ` · ${c.pending} pending` : ""}
-                  {verification.report?.checkRunUrl && <> · <a href={verification.report.checkRunUrl} target="_blank" rel="noreferrer">check run</a></>}
+                  · {c.pass} pass · {c.fail} fail · {c.unverifiable} unverifiable{c.pending ? ` · ${c.pending} pending` : ""}
+                  {reviewId && <> · <a href={`/tests?review=${encodeURIComponent(reviewId)}`} onClick={(e) => { e.preventDefault(); navigate(`/tests?review=${encodeURIComponent(reviewId)}`); }}>View tests</a></>}
                 </span>
               );
             })()}
@@ -876,10 +795,7 @@ const GoalPanel = ({ pr, live, onDeleteConstraint, verification, revisions, deep
               <AcceptanceRow
                 key={a.criterionId || a.id}
                 a={a}
-                v={liveMode && verification ? verificationForCriterion(verification, a.criterionId) : null}
                 expanded={!!deepLink?.criterionId && deepLink.criterionId === a.criterionId}
-                onStale={onRefreshVerify}
-                onAdopt={onAdopt}
               />
             ))}
           </div>
@@ -2142,8 +2058,7 @@ const AgentPage = ({ logStyle, isMobile } = {}) => {
           verification={verifyView}
           revisions={revisions}
           deepLink={deepLink}
-          onRefreshVerify={refreshVerify}
-          onAdopt={async (testId) => api.adoptTests(pickedId, verifyView?.run?.id, [testId])}
+          reviewId={pickedId}
           onDeleteConstraint={async (attachmentId) => {
             if (!detail?.task?.id) return;
             try {

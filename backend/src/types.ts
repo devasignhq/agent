@@ -39,6 +39,8 @@ export type User = {
   // MEMO_TEXT semantics: ≤ 28 bytes UTF-8 (see stellar/memo.ts). Cleared together
   // with the address when the contributor removes their wallet.
   stellarPayoutMemo?: string;
+  // Shows the Bounties page in the sponsor app's nav; undefined = off.
+  bountiesEnabled?: boolean;
 };
 
 export type Installation = {

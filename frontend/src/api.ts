@@ -180,6 +180,8 @@ export type User = {
   // "maintainer" — the same GitHub identity has a separate "contributor" account
   // on the contributor app. Optional here so older payloads type-check.
   accountKind?: "maintainer" | "contributor";
+  // Shows Bounties in the sidebar. Off until the user turns it on (Account page).
+  bountiesEnabled?: boolean;
 };
 
 export type Plan = "free" | "pro" | "max";
@@ -377,6 +379,13 @@ export type Criterion = {
 };
 
 // ---- verification (backend/src/verify/contract.ts RunView) ----
+export type TestLevel = "unit" | "integration" | "component" | "e2e";
+export type TestRunner = "vitest" | "jest" | "pytest" | "playwright" | "go" | "node-test" | "bundled";
+export type TestOrigin = "existing" | "generated";
+export type ResultStatus = "pass" | "fail" | "flaky" | "error" | "skipped";
+export type VerifyRunStatus = "setup_pending" | "planning" | "awaiting_runner" | "running" | "judging" | "completed" | "timed_out" | "lost" | "skipped" | "failed";
+export type TestAdoption = { prUrl: string; prNumber: number; at: number };
+
 export type CriterionVerdict = {
   criterionId: string;
   verdict: "pass" | "fail" | "unverifiable";
@@ -418,10 +427,38 @@ export type RunView = {
   };
   criteria: Criterion[];
   revision: number;
-  plan: { id: string; tests: Array<{ id: string; path: string; criterionIds: string[]; level: string; origin: "existing" | "generated"; runner: string }>; unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }> } | null;
-  results: Array<{ id: string; testId: string; criterionIds: string[]; status: string; attempts: Array<{ n: number; status: string; durationMs: number; error?: string; artifactIds: string[] }>; durationMs: number; error?: string }> | null;
+  plan: { id: string; tests: Array<{ id: string; path: string; criterionIds: string[]; level: TestLevel; origin: TestOrigin; runner: TestRunner; adopted?: TestAdoption | null }>; unverifiable: Array<{ criterionId: string; reason: string; fixUrl?: string }> } | null;
+  results: Array<{ id: string; testId: string; criterionIds: string[]; test: string; runner: TestRunner; level: TestLevel; origin: TestOrigin; status: ResultStatus; attempts: Array<{ n: number; status: "pass" | "fail" | "error"; durationMs: number; error?: string; artifactIds: string[] }>; durationMs: number; error?: string; artifactIds: string[] }> | null;
   artifacts: RunViewArtifact[];
   report: { checkRunUrl?: string; commentUrl?: string };
+};
+
+// ---- Tests page (backend/src/verify/test-rows.ts) ----
+export type TestEvidenceKind = "video" | "trace" | "screenshot" | "log";
+export type VerifyTestRow = {
+  key: string;
+  testId: string;
+  path: string;
+  level: TestLevel;
+  category: "unit" | "e2e";
+  origin: TestOrigin;
+  runner: TestRunner;
+  criterionIds: string[];
+  status: ResultStatus | "not_run";
+  attempts: number;
+  durationMs: number;
+  evidence: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; expired: boolean }>;
+  adopted: TestAdoption | null;
+  repo: { id: string; name: string };
+  review: { id: string; prNumber: number; prTitle: string };
+  run: { id: string; sha: string; status: VerifyRunStatus; createdAt: number; checkRunUrl: string | null };
+};
+export type VerifyTestCounts = { ran: number; e2e: number; unit: number; passed: number; failed: number };
+export type VerifyTestsResponse = {
+  rows: VerifyTestRow[];
+  counts: VerifyTestCounts;
+  repos: Array<{ id: string; name: string }>;
+  truncated: boolean;
 };
 
 export type CriteriaRevision = {
@@ -798,6 +835,8 @@ export const api = {
   // Delete the account immediately and permanently. The backend cancels billing,
   // uninstalls the GitHub App, wipes every row, and clears the session cookie —
   // so the caller should sign out afterward. There is no restore window.
+  updatePreferences: (patch: { bountiesEnabled?: boolean }) =>
+    request<{ user: User; subscription: Subscription | null }>("/api/me", { method: "PATCH", body: JSON.stringify(patch) }),
   deleteAccount: () =>
     request<{ ok: true }>("/api/me", { method: "DELETE" }),
 
@@ -924,6 +963,7 @@ export const api = {
     request<{ latest: RunView | null; runs: Array<{ id: string; sha: string; attempt: number; status: string; createdAt: number; verdicts: number }>; flakeRate: { rate: number; flaky: number; total: number } }>(
       `/api/reviews/${reviewId}/verify${runId ? `?run=${encodeURIComponent(runId)}` : ""}`
     ),
+  verifyTests: () => request<VerifyTestsResponse>("/api/verify/tests"),
   adoptTests: (reviewId: string, runId: string | undefined, testIds: string[] | null) =>
     request<{ status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string }>(`/api/reviews/${reviewId}/verify/adopt`, {
       method: "POST",

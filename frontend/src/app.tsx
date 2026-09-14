@@ -1,7 +1,7 @@
 // @ts-nocheck
 // Main App shell + sidebar + routing
 import React from "react";
-import { useLocation, useNavigate, Routes, Route, Navigate } from "react-router-dom";
+import { useLocation, useNavigate, useParams, Routes, Route, Navigate } from "react-router-dom";
 import { ROUTE_PATHS, DEFAULT_ROUTE, DEFAULT_SETTINGS_PATH } from "./routes";
 import { StatsigProvider, useClientAsyncInit } from "@statsig/react-bindings";
 import { StatsigAutoCapturePlugin } from "@statsig/web-analytics";
@@ -14,13 +14,14 @@ import { WorkflowPage } from "./screen-workflow";
 import { RepoPicker, RepoDetails } from "./workflow-header";
 import { BountiesPage } from "./screen-bounties";
 import { FundBountyPage } from "./screen-fund-bounty";
-import { SettingsPage } from "./screens-rest";
+import { RepositoryPage, IntegrationsPage, BillingPage, AccountPage, HelpPage } from "./screens-rest";
+import { TestsPage } from "./screen-tests";
 import { SecurityPage } from "./screen-security";
 import { useAuth } from "./auth-context";
 import { api, oauthStartUrl } from "./api";
 import { LiveProvider, useLiveTopic } from "./live-context";
 import { registerPopup, closePopup } from "./popup-registry";
-import { useRecentReviews } from "./recent-reviews";
+import { activeNavKey, HELP_ITEM, ACCOUNT_ITEM, MOBILE_TAB_KEYS, navItem, pageTitle, settingsRedirect, visibleNavGroups } from "./nav";
 
 const MOBILE_BREAKPOINT = 820;
 const useIsMobile = () => {
@@ -36,58 +37,36 @@ const useIsMobile = () => {
 };
 export { useIsMobile };
 
-const NAV = [
-  { key: "agent",     name: "Agents",    icon: "agent" },
-  { key: "workflow",  name: "Workflow",  icon: "workflow" },
-  { key: "security",  name: "Security",  icon: "shield" },
-  { key: "bounty",    name: "Bounty",    icon: "bounties" },
-];
+const SbItem = ({ n, current, setCurrent, count }) => (
+  <div className={`sb-item ${current === n.key ? "active" : ""}`} onClick={() => setCurrent(n.key)}>
+    <span className="icon"><Icon name={n.icon} size={15}/></span>
+    <span className="sb-label">{n.name}</span>
+    {count > 0 && (
+      <span className="sb-badge" aria-label={`${count} unread`}>
+        {count > 99 ? "99+" : count}
+      </span>
+    )}
+  </div>
+);
 
-const Sidebar = ({ current, setCurrent, iconOnly, user, counts }) => {
-  const recents = useRecentReviews(user?.id, 3);
-  return (
+const Sidebar = ({ current, setCurrent, iconOnly, user, counts }) => (
   <div className={`sidebar ${iconOnly ? "icon-only" : ""}`}>
     <div className="sb-head">
       <img src={(typeof window !== "undefined" && window.__resources && window.__resources.logo) || "devasign-logo.svg"} alt="DevAsign" className="sb-logo-img" />
     </div>
 
-    <div className="sb-section">workspace</div>
-    <div className="sb-list">
-      {NAV.map(n => {
-        const count = counts?.[n.key] || 0;
-        return (
-        <div key={n.key}
-             className={`sb-item ${current === n.key ? "active" : ""}`}
-             onClick={() => setCurrent(n.key)}>
-          <span className="icon"><Icon name={n.icon} size={15}/></span>
-          <span className="sb-label">{n.name}</span>
-          {count > 0 && (
-            <span className="sb-badge" aria-label={`${count} unread`}>
-              {count > 99 ? "99+" : count}
-            </span>
-          )}
+    {visibleNavGroups(user).map((g) => (
+      <React.Fragment key={g.label}>
+        <div className="sb-section">{g.label}</div>
+        <div className="sb-list">
+          {g.items.map((n) => <SbItem key={n.key} n={n} current={current} setCurrent={setCurrent} count={counts?.[n.key] || 0} />)}
         </div>
-        );
-      })}
-    </div>
+      </React.Fragment>
+    ))}
 
-    <div className="sb-section">recent</div>
-    <div className="sb-list">
-      {recents.length === 0 ? (
-        <div className="sb-item" style={{ opacity: 0.5, cursor: "default" }}>
-          <span className="sb-label" style={{ fontSize: 12 }}>No recent reviews</span>
-        </div>
-      ) : recents.map((r) => (
-        <div key={r.id} className="sb-item" onClick={() => setCurrent("agent")} title={r.title}>
-          <span className="icon">
-            <i style={{
-              width: 6, height: 6,
-              background: r.flag === "blocker" ? "var(--danger)" : r.flag === "review" ? "var(--warn)" : "var(--accent)"
-            }}></i>
-          </span>
-          <span className="sb-label mono" style={{ fontSize: 12 }}>{`${r.repo.split("/").pop()}/${r.uiId}`}</span>
-        </div>
-      ))}
+    <div className="sb-spacer" />
+    <div className="sb-list sb-help">
+      <SbItem n={HELP_ITEM} current={current} setCurrent={setCurrent} count={0} />
     </div>
 
     <div className="sb-foot">
@@ -97,8 +76,7 @@ const Sidebar = ({ current, setCurrent, iconOnly, user, counts }) => {
       </div>
     </div>
   </div>
-  );
-};
+);
 
 const NOTIF_DOT = {
   review:  "var(--info)",
@@ -329,7 +307,7 @@ const NotificationsPopover = ({ onClose, items, unreadCount, onMarkAllRead, onNa
 };
 
 const USER_MENU = [
-  { id: "settings", label: "Account settings", meta: "Profile · Billing",  icon: "settings", kind: "nav" },
+  { id: "account",  label: "Account settings", meta: "Profile · Bounties · Delete account", icon: "user", kind: "nav" },
   { id: "signout",  label: "Sign out",         meta: "End session",      icon: "logout",   kind: "danger" },
 ];
 
@@ -346,7 +324,7 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
 
   const handle = (item) => {
     if (item.id === "signout") { setConfirming(true); return; }
-    if (item.id === "settings") { onNavigate?.("settings"); onClose(); return; }
+    if (item.id === "account") { onNavigate?.("account"); onClose(); return; }
     onClose();
   };
 
@@ -421,15 +399,12 @@ const UserPopover = ({ onClose, onSignOut, onNavigate, user }) => {
 };
 
 const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications, workflowHeader, securityCrumbs, onCrumbNavigate }) => {
-  const labels = {
-    agent: "Agents", workflow: "Workflow", bounty: "Bounty", security: "Security", settings: "Settings"
-  };
   // On the Workflow page the final crumb is the repo picker: user / Workflow / [repo ▾].
   const showRepoCrumb = current === "workflow" && !!workflowHeader;
   // On the Security page the sub-view (and, inside a finding, where it was opened
   // from) becomes a clickable trail: user / Security / Merge gate / VLN-… — each
   // earlier segment navigates back. Reported by the screen via onCrumbs.
-  const showSecurityTrail = current === "security" && Array.isArray(securityCrumbs) && securityCrumbs.length > 0;
+  const showSecurityTrail = (current === "security" || current === "securityConfig") && Array.isArray(securityCrumbs) && securityCrumbs.length > 0;
   const [notifOpen, setNotifOpen] = React.useState(false);
   const [userOpen, setUserOpen] = React.useState(false);
   const unread = notifications?.unreadCount ?? 0;
@@ -456,11 +431,11 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
           })
         ) : showRepoCrumb ? (
           <>
-            {!isMobile && <><span>{labels[current]}</span><span className="sep">/</span></>}
+            {!isMobile && <><span>{pageTitle(current)}</span><span className="sep">/</span></>}
             <RepoPicker {...workflowHeader} />
           </>
         ) : (
-          <span className="now">{labels[current]}</span>
+          <span className="now">{pageTitle(current)}</span>
         )}
       </div>
       <div className="topbar-spacer"></div>
@@ -489,12 +464,6 @@ const TopBar = ({ current, isMobile, onSignOut, onNavigate, user, notifications,
             />
           )}
         </div>
-        <button
-          className={`btn ghost sm icon-sq ${current === "settings" ? "is-active" : ""}`}
-          onClick={() => onNavigate?.("settings")}
-          aria-label="Settings">
-          <Icon name="settings" size={13}/>
-        </button>
         <div style={{ position: "relative" }}>
           <button
             className={`sb-avatar avatar-btn ${userOpen ? "is-active" : ""}`}
@@ -538,32 +507,93 @@ const FONT_OPTIONS = {
   "Fira Code": "'Fira Code', ui-monospace, monospace",
 };
 
-const MobileTabBar = ({ current, setCurrent, counts }) => (
-  <nav className="mtab-bar" role="navigation" aria-label="Primary">
-    <div className="mtab-glass" aria-hidden="true"></div>
-    <div className="mtab-row">
-      {NAV.map(n => {
-        const count = counts?.[n.key] || 0;
-        return (
-        <button
-          key={n.key}
-          type="button"
-          className={`mtab ${current === n.key ? "active" : ""}`}
-          onClick={() => setCurrent(n.key)}
-          aria-current={current === n.key ? "page" : undefined}
-          aria-label={count > 0 ? `${n.name}, ${count} unread` : n.name}
-        >
-          <span className="mtab-icon">
-            <Icon name={n.icon} size={19}/>
-            {count > 0 && <span className="mtab-badge">{count > 9 ? "9+" : count}</span>}
-          </span>
-          <span className="mtab-label">{n.name}</span>
-        </button>
-        );
-      })}
+const MobileTabBar = ({ current, setCurrent, counts, user, onSignOut }) => {
+  const [more, setMore] = React.useState(false);
+  const tabs = MOBILE_TAB_KEYS.map(navItem);
+  const moreActive = !MOBILE_TAB_KEYS.includes(current);
+  const go = (key) => { setMore(false); setCurrent(key); };
+  return (
+    <>
+      <nav className="mtab-bar" role="navigation" aria-label="Primary">
+        <div className="mtab-row">
+          {tabs.map(n => {
+            const count = counts?.[n.key] || 0;
+            return (
+            <button
+              key={n.key}
+              type="button"
+              className={`mtab ${current === n.key ? "active" : ""}`}
+              onClick={() => go(n.key)}
+              aria-current={current === n.key ? "page" : undefined}
+              aria-label={count > 0 ? `${n.name}, ${count} unread` : n.name}
+            >
+              <span className="mtab-icon">
+                <Icon name={n.icon} size={21}/>
+                {count > 0 && <span className="mtab-badge">{count > 9 ? "9+" : count}</span>}
+              </span>
+              <span className="mtab-label">{n.name}</span>
+            </button>
+            );
+          })}
+          <button
+            type="button"
+            className={`mtab ${moreActive ? "active" : ""}`}
+            onClick={() => setMore(true)}
+            aria-label="More pages"
+            aria-haspopup="dialog"
+          >
+            <span className="mtab-icon"><Icon name="dashboard" size={21}/></span>
+            <span className="mtab-label">More</span>
+          </button>
+        </div>
+      </nav>
+      {more && <MobileMoreSheet current={current} counts={counts} user={user} onGo={go} onClose={() => setMore(false)} onSignOut={onSignOut} />}
+    </>
+  );
+};
+
+// Everything the five-tab bar can't fit, plus the account actions the hidden
+// avatar menu would otherwise hold.
+const MobileMoreSheet = ({ current, counts, user, onGo, onClose, onSignOut }) => {
+  const [confirming, setConfirming] = React.useState(false);
+  React.useEffect(() => {
+    const onKey = (e) => { if (e.key === "Escape") onClose(); };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
+  const groups = visibleNavGroups(user)
+    .map((g) => ({ ...g, items: g.items.filter((i) => !MOBILE_TAB_KEYS.includes(i.key)) }))
+    .filter((g) => g.items.length > 0);
+  return (
+    <div className="drawer-scrim sheet-scrim" onClick={onClose}>
+      <div className="sheet" role="dialog" aria-label="More pages" onClick={(e) => e.stopPropagation()}>
+        {groups.map((g) => (
+          <React.Fragment key={g.label}>
+            <div className="sb-section">{g.label}</div>
+            <div className="sb-list">
+              {g.items.map((n) => <SbItem key={n.key} n={n} current={current} setCurrent={onGo} count={counts?.[n.key] || 0} />)}
+            </div>
+          </React.Fragment>
+        ))}
+        <div className="sb-section">You</div>
+        <div className="sb-list">
+          <SbItem n={HELP_ITEM} current={current} setCurrent={onGo} count={0} />
+          <SbItem n={ACCOUNT_ITEM} current={current} setCurrent={onGo} count={0} />
+          <div className="sb-item danger" onClick={() => (confirming ? onSignOut() : setConfirming(true))}>
+            <span className="icon"><Icon name="logout" size={15}/></span>
+            <span className="sb-label">{confirming ? "Tap again to sign out" : "Sign out"}</span>
+          </div>
+        </div>
+      </div>
     </div>
-  </nav>
-);
+  );
+};
+
+// Old /settings/:section links land on the page that section became.
+const SettingsRedirect = () => {
+  const { section } = useParams();
+  return <Navigate to={settingsRedirect(section)} replace />;
+};
 
 const AppContent = () => {
   const auth = useAuth();
@@ -573,19 +603,13 @@ const AppContent = () => {
   const [forceStage, setForceStage] = React.useState<null | "onboarding" | "app">(null);
   const [hasInstall, setHasInstall] = React.useState<null | boolean>(null);
   // The visible page is derived from the URL rather than held in state. `current`
-  // is the first path segment (agent|workflow|bounty|settings, default agent);
+  // is the nav key for the path (see nav.ts activeNavKey, default agent);
   // `setCurrent` is a shim that navigates, so every existing setCurrent(key) call
   // site (sidebar, mobile tabs, popovers, keyboard chords) keeps working unchanged.
   const location = useLocation();
   const navigate = useNavigate();
-  const PAGE_KEYS = ["agent", "workflow", "bounty", "security", "settings"];
-  const rawSeg = location.pathname.split("/")[1];
-  // The bounty deep links from the bot comment (/bounties/:id/fund|cancel|apply)
-  // are PLURAL, so they miss the singular nav key and would fall through to the
-  // "agent" default — highlighting the wrong sidebar item on arrival.
-  const seg = rawSeg === "bounties" ? "bounty" : rawSeg;
-  const current = PAGE_KEYS.includes(seg) ? seg : "agent";
-  const setCurrent = React.useCallback((key) => navigate("/" + key), [navigate]);
+  const current = activeNavKey(location.pathname);
+  const setCurrent = React.useCallback((key) => navigate(navItem(key)?.path || "/" + key), [navigate]);
   // The Workflow screen's repo picker + selected repo, surfaced to the header
   // (WorkflowPage reports it via onHeader).
   const [workflowHeader, setWorkflowHeader] = React.useState(null);
@@ -651,7 +675,7 @@ const AppContent = () => {
   // Top-level fallback for the Linear connect round-trip. If popups were blocked,
   // /api/auth/linear/callback redirected the whole tab to /?linear=connected|error.
   // On success just strip the marker (Integrations/Repository tabs refresh on mount).
-  // On error, route to Settings → Integrations, which reads ?linear=error for its
+  // On error, route to Integrations, which reads ?linear=error for its
   // inline notice and strips the marker itself.
   React.useEffect(() => {
     const url = new URL(window.location.href);
@@ -660,26 +684,26 @@ const AppContent = () => {
       url.searchParams.delete("linear");
       window.history.replaceState({}, "", url.pathname + url.search);
     } else if (linear === "error") {
-      navigate("/settings/integrations", { replace: true });
+      navigate("/integrations", { replace: true });
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Return from Stripe Checkout/Portal (or an "upgrade" link from a PR comment):
   // /?billing=success|cancel|portal|upgrade. Strip the marker, reload the
-  // session (the webhook may have changed the plan), and open Settings → Billing.
+  // session (the webhook may have changed the plan), and open Billing.
   React.useEffect(() => {
     const url = new URL(window.location.href);
     if (!url.searchParams.get("billing")) return;
     url.searchParams.delete("billing");
     window.history.replaceState({}, "", url.pathname + url.search);
     auth.reload();
-    navigate("/settings/billing", { replace: true });
+    navigate("/billing", { replace: true });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Return from an onboarding-initiated Stripe Checkout. Unlike `?billing=...`
-  // (which opens Settings → Billing), `?ob=billing` keeps the user in onboarding:
+  // (which opens Billing), `?ob=billing` keeps the user in onboarding:
   // we just reload the session so the now-paid plan is reflected, and the
   // Onboarding component auto-advances from pricing to the repository step.
   // `?ob=cancel` returns them to the pricing step (still on Free).
@@ -888,23 +912,38 @@ const AppContent = () => {
           <Routes>
             <Route path={ROUTE_PATHS.agent}    element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.review}   element={<AgentPage logStyle={t.logStyle} isMobile={isMobile} />} />
+            <Route path={ROUTE_PATHS.tests}    element={<TestsPage isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage onHeader={setWorkflowHeader} isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.bounty}   element={<BountiesPage isMobile={isMobile} />} />
             <Route path={ROUTE_PATHS.fundBounty} element={<FundBountyPage />} />
             <Route path={ROUTE_PATHS.cancelBounty} element={<BountiesPage isMobile={isMobile} isCancelling />} />
             <Route path={ROUTE_PATHS.security} element={<SecurityPage view="dashboard" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
             <Route path={ROUTE_PATHS.securityFinding} element={<SecurityPage view="detail" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path={ROUTE_PATHS.securityGate} element={<SecurityPage view="gate" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path={ROUTE_PATHS.securityRulings} element={<SecurityPage view="rulings" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
-            <Route path={ROUTE_PATHS.securityPolicy} element={<SecurityPage view="policy" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityConfig} element={<SecurityPage view="config" isMobile={isMobile} onCrumbs={setSecurityCrumbs} />} />
+            <Route path={ROUTE_PATHS.securityGate} element={<Navigate to="/security/config?tab=gate" replace />} />
+            <Route path={ROUTE_PATHS.securityRulings} element={<Navigate to="/security/config?tab=rulings" replace />} />
+            <Route path={ROUTE_PATHS.securityPolicy} element={<Navigate to="/security/config?tab=policy" replace />} />
+            <Route path={ROUTE_PATHS.repository} element={<RepositoryPage />} />
+            <Route path={ROUTE_PATHS.integrations} element={<IntegrationsPage />} />
+            <Route path={ROUTE_PATHS.billing} element={<BillingPage />} />
+            <Route path={ROUTE_PATHS.account} element={<AccountPage />} />
+            <Route path={ROUTE_PATHS.help} element={<HelpPage />} />
             <Route path={ROUTE_PATHS.settings} element={<Navigate to={DEFAULT_SETTINGS_PATH} replace />} />
-            <Route path={ROUTE_PATHS.settingsSection} element={<SettingsPage />} />
+            <Route path={ROUTE_PATHS.settingsSection} element={<SettingsRedirect />} />
             <Route path={ROUTE_PATHS.root} element={<Navigate to={DEFAULT_ROUTE} replace />} />
             <Route path={ROUTE_PATHS.catchAll} element={<Navigate to={DEFAULT_ROUTE} replace />} />
           </Routes>
         </div>
       </div>
-      {isMobile && <MobileTabBar current={current} setCurrent={setCurrent} counts={navCounts} />}
+      {isMobile && (
+        <MobileTabBar
+          current={current}
+          setCurrent={setCurrent}
+          counts={navCounts}
+          user={auth.user}
+          onSignOut={async () => { await auth.signOut(); setForceStage(null); setHasInstall(null); }}
+        />
+      )}
       <TweaksUI t={t} setTweak={setTweak} />
     </div>
   );

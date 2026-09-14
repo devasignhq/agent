@@ -1,56 +1,24 @@
 // @ts-nocheck
-// Settings page (and its sub-sections)
+// Settings pages: Repository, Integrations, Billing, Account, Help & Resources
 import React from "react";
-import { useParams, useNavigate } from "react-router-dom";
 import { Icon } from "./icons";
+import { Toggle } from "./toggle";
 import { api, installRedirectUrl, linearConnectUrl, type LinearTeamsView } from "./api";
 import { useAuth } from "./auth-context";
 import { registerPopup, closePopup } from "./popup-registry";
 
-// ─── Settings ───────────────────────────────────────────────────────────────
-const SET_SECTIONS = [
-{ key: "account", name: "Account" },
-{ key: "install", name: "Repository" },
-{ key: "integrations", name: "Integrations" },
-{ key: "billing", name: "Billing" },
-{ key: "support", name: "Support" }];
-
-
-const SettingsPage = () => {
-  // The active sub-section comes from the URL (/settings/:section), so tabs are
-  // linkable and back/forward moves between them. Unknown/missing → account.
-  const { section } = useParams();
-  const navigate = useNavigate();
-  const sec = SET_SECTIONS.some((s) => s.key === section) ? section : "account";
-  return (
-    <div className="page" style={{ maxWidth: "none" }}>
-      <div className="page-head">
-        <div>
-          <h1 className="page-title">Settings</h1>
-          <div className="page-sub">admin: you</div>
-        </div>
+// ─── Page frame ─────────────────────────────────────────────────────────────
+const Page = ({ title, sub, children }) => (
+  <div className="page page-narrow">
+    <div className="page-head">
+      <div>
+        <h1 className="page-title">{title}</h1>
+        <div className="page-sub">{sub}</div>
       </div>
-
-      <div className="set-grid">
-        <div className="set-nav">
-          {SET_SECTIONS.map((s) =>
-          <div key={s.key}
-          className={`set-nav-item ${sec === s.key ? "active" : ""}`}
-          onClick={() => navigate("/settings/" + s.key)}>{s.name}</div>
-          )}
-        </div>
-
-        <div>
-          {sec === "install" && <SetInstall />}
-          {sec === "integrations" && <SetIntegrations />}
-          {sec === "billing" && <SetBilling />}
-          {sec === "support" && <SetSupport />}
-          {sec === "account" && <SetAccount />}
-        </div>
-      </div>
-    </div>);
-
-};
+    </div>
+    {children}
+  </div>
+);
 
 // ─── Integrations ───────────────────────────────────────────────────────
 const INTEGRATIONS = [
@@ -608,7 +576,7 @@ const SetInstall = () => {
           <div className="mute" style={{ fontSize: 12, marginBottom: 12 }}>
             {linear?.connected
               ? "Teams in the Linear workspace you connected DevAsign to."
-              : "Connect Linear under Settings → Integrations to list workspace teams."}
+              : "Connect Linear on the Integrations page to list workspace teams."}
           </div>
 
           {linear?.connected && linear.teams.length > 0 && (
@@ -993,7 +961,26 @@ const DELETE_ERRORS = {
 };
 
 const SetAccount = () => {
-  const { user, signOut } = useAuth();
+  const { user, signOut, reload } = useAuth();
+  const [bountyOn, setBountyOn] = React.useState(!!user?.bountiesEnabled);
+  const [bountyBusy, setBountyBusy] = React.useState(false);
+  const [bountyErr, setBountyErr] = React.useState(null);
+  React.useEffect(() => { setBountyOn(!!user?.bountiesEnabled); }, [user?.bountiesEnabled]);
+  const toggleBounties = async () => {
+    const next = !bountyOn;
+    setBountyOn(next);
+    setBountyErr(null);
+    setBountyBusy(true);
+    try {
+      await api.updatePreferences({ bountiesEnabled: next });
+      await reload();
+    } catch (e) {
+      setBountyOn(!next);
+      setBountyErr(e?.message || "Couldn't save. Please try again.");
+    } finally {
+      setBountyBusy(false);
+    }
+  };
   const [step, setStep] = React.useState("idle"); // idle | confirm | done
   const [confirmText, setConfirmText] = React.useState("");
   const [confirmName, setConfirmName] = React.useState("");
@@ -1056,6 +1043,24 @@ const SetAccount = () => {
               <div className="kv-v mono" style={{ fontSize: 13 }}>{memberSince}</div>
             </div>
           </div>
+        </div>
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <h3 className="card-title">Bounties</h3>
+          <Toggle on={bountyOn} onClick={toggleBounties} disabled={bountyBusy} label="Show Bounties in the sidebar" />
+        </div>
+        <div className="card-body">
+          <div style={{ fontSize: 13, lineHeight: 1.55, maxWidth: 640 }}>
+            Bounties let you attach a USDC reward to a GitHub issue. The funds sit in escrow on Stellar
+            until you release them to the contributor whose pull request you accept, or refund them.
+          </div>
+          <div className="mute" style={{ fontSize: 12, lineHeight: 1.55, marginTop: 8, maxWidth: 640 }}>
+            Turn this on to add Bounties to the sidebar. Turning it off hides the page only. Existing
+            bounties and escrow are not affected.
+          </div>
+          {bountyErr && <div className="tu-notice page-notice" style={{ marginTop: 10 }}>{bountyErr}</div>}
         </div>
       </div>
 
@@ -1164,4 +1169,10 @@ const SetSupport = () =>
     </div>
   </div>;
 
-export { SettingsPage };
+const RepositoryPage = () => <Page title="Repository" sub="GitHub accounts and repositories DevAsign can review."><SetInstall /></Page>;
+const IntegrationsPage = () => <Page title="Integrations" sub="Connect Linear, Slack and Discord."><SetIntegrations /></Page>;
+const BillingPage = () => <Page title="Billing" sub="Your plan, usage and invoices."><SetBilling /></Page>;
+const AccountPage = () => <Page title="Account" sub="Your profile, feature switches and account deletion."><SetAccount /></Page>;
+const HelpPage = () => <Page title="Help & Resources" sub="Docs, community and support."><SetSupport /></Page>;
+
+export { RepositoryPage, IntegrationsPage, BillingPage, AccountPage, HelpPage };
