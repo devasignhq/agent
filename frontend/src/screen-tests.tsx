@@ -11,8 +11,10 @@ import { formatDuration } from "./verify-view";
 import {
   EMPTY_FILTERS,
   categoryLabel,
+  countRows,
   filterRows,
   markAdopted,
+  markArchived,
   pickEvidence,
   repoOptions,
   sortRows,
@@ -49,6 +51,8 @@ export const TestsPage = ({ isMobile }) => {
   const [error, setError] = React.useState(null);
   const [filters, setFilters] = React.useState({ ...EMPTY_FILTERS, review: searchParams.get("review") });
   const [open, setOpen] = React.useState(null); // { key, focusArtifactId? }
+  const [selected, setSelected] = React.useState(() => new Set()); // row keys
+  const [archiveBusy, setArchiveBusy] = React.useState(false);
 
   const load = React.useCallback(async (silent) => {
     if (!silent) setLoading(true);
@@ -80,6 +84,52 @@ export const TestsPage = ({ isMobile }) => {
   const openRow = open && data ? data.rows.find((r) => r.key === open.key) : null;
   const reviewRow = filters.review && data ? data.rows.find((r) => r.review.id === filters.review) : null;
   const onAdopted = (key, adopted) => setData((d) => (d ? { ...d, rows: markAdopted(d.rows, key, adopted) } : d));
+  const selectedShown = rows.filter((r) => selected.has(r.key));
+  const allPicked = rows.length > 0 && selectedShown.length === rows.length;
+  const toggle = (key) => setSelected((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    return next;
+  });
+  const toggleAll = () => setSelected(allPicked ? new Set() : new Set(rows.map((r) => r.key)));
+
+  // Optimistic: flip the rows now, one request per PR, revert a PR's rows if it fails.
+  const setArchived = async (targets, archived) => {
+    const byReview = new Map();
+    for (const r of targets) byReview.set(r.review.id, [...(byReview.get(r.review.id) || []), r.path]);
+    setArchiveBusy(true);
+    setData((d) => {
+      if (!d) return d;
+      let next = d.rows;
+      for (const [reviewId, paths] of byReview) next = markArchived(next, reviewId, paths, archived);
+      return { ...d, rows: next };
+    });
+    setSelected(new Set());
+    const failed = [];
+    await Promise.all([...byReview].map(async ([reviewId, paths]) => {
+      try {
+        await api.archiveTests(reviewId, paths, archived);
+      } catch {
+        failed.push([reviewId, paths]);
+      }
+    }));
+    if (failed.length > 0) {
+      setData((d) => {
+        if (!d) return d;
+        let next = d.rows;
+        for (const [reviewId, paths] of failed) next = markArchived(next, reviewId, paths, !archived);
+        return { ...d, rows: next };
+      });
+      setError(archived ? "Couldn't archive some tests. Try again." : "Couldn't restore some tests. Try again.");
+    } else {
+      setError(null);
+    }
+    setArchiveBusy(false);
+  };
+  const setView = (archived) => {
+    set({ archived });
+    setSelected(new Set());
+  };
 
   if (loading && !data) {
     return (
@@ -97,8 +147,8 @@ export const TestsPage = ({ isMobile }) => {
     );
   }
   if (!data) return null;
-  const c = data.counts;
-  const filtered = filters.repo || filters.category || filters.status || filters.origin || filters.review || filters.q.trim();
+  const c = countRows(data.rows);
+  const filtered = filters.repo || filters.category || filters.status || filters.origin || filters.review || filters.archived || filters.q.trim();
 
   return (
     <div className="page vln-page">
@@ -111,7 +161,7 @@ export const TestsPage = ({ isMobile }) => {
       {error && <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>{error}</div>}
 
       <div className="vln-stats tst-stats">
-        <div className="vln-stat"><div className="k">tests ran</div><div className="vln-stat-row"><div className="v">{c.ran}</div><div className="d">of {data.rows.length} planned</div></div></div>
+        <div className="vln-stat"><div className="k">tests ran</div><div className="vln-stat-row"><div className="v">{c.ran}</div><div className="d">of {data.rows.length - c.archived} planned</div></div></div>
         <div className="vln-stat"><div className="k">end-to-end</div><div className="vln-stat-row"><div className="v">{c.e2e}</div></div></div>
         <div className="vln-stat"><div className="k">unit</div><div className="vln-stat-row"><div className="v">{c.unit}</div></div></div>
         <div className="vln-stat"><div className="k">passed</div><div className="vln-stat-row"><div className="v" style={{ color: c.passed > 0 ? "var(--green)" : undefined }}>{c.passed}</div></div></div>
@@ -143,6 +193,15 @@ export const TestsPage = ({ isMobile }) => {
                   <button key={ch.key} className={`vln-chip ${filters.origin === ch.key ? "on" : ""}`} onClick={() => set({ origin: filters.origin === ch.key ? null : ch.key })}>{ch.label}</button>
                 ))}
               </div>
+              <span className="tst-divider" aria-hidden="true" />
+              <button
+                className={`vln-chip tst-archived-chip ${filters.archived ? "on" : ""}`}
+                aria-pressed={filters.archived}
+                title={filters.archived ? "Back to active tests" : "Show archived tests"}
+                onClick={() => setView(!filters.archived)}
+              >
+                <Icon name="archive" size={11} /> Archived <b>{c.archived}</b>
+              </button>
               {reviewRow && (
                 <button className="vln-chip on" onClick={() => { set({ review: null }); searchParams.delete("review"); setSearchParams(searchParams, { replace: true }); }} title="Clear">
                   PR #{reviewRow.review.prNumber} <Icon name="x" size={10} />
@@ -164,8 +223,33 @@ export const TestsPage = ({ isMobile }) => {
             </div>
           </div>
 
+          {(selectedShown.length > 0 || filters.archived) && (
+            <div className="tst-selbar">
+              {selectedShown.length > 0 ? (
+                <>
+                  <span className="mono" style={{ fontSize: 11 }}>{selectedShown.length} selected</span>
+                  <button className="btn sm" disabled={archiveBusy} onClick={() => void setArchived(selectedShown, !filters.archived)}>
+                    <Icon name="archive" size={12} /> {filters.archived ? "Restore" : "Archive"}
+                  </button>
+                  <button className="btn ghost sm" onClick={() => setSelected(new Set())}>Clear</button>
+                </>
+              ) : (
+                <span className="mono mute" style={{ fontSize: 11 }}>Viewing archived tests. Select tests to restore them to the list.</span>
+              )}
+            </div>
+          )}
           <div className="tst-table">
           <div className="tst-head">
+            <span className="vln-fx-sel">
+              <input
+                type="checkbox"
+                aria-label="Select all shown tests"
+                checked={allPicked}
+                disabled={rows.length === 0}
+                ref={(el) => { if (el) el.indeterminate = !allPicked && selectedShown.length > 0; }}
+                onChange={toggleAll}
+              />
+            </span>
             <span>test</span>
             <span>type</span>
             <span>repository</span>
@@ -175,27 +259,30 @@ export const TestsPage = ({ isMobile }) => {
             <span>action</span>
           </div>
           {rows.map((r) => (
-            <TestRow key={r.key} r={r} onOpen={(focusArtifactId) => setOpen({ key: r.key, focusArtifactId })} onAdopted={onAdopted} navigate={navigate} />
+            <TestRow key={r.key} r={r} picked={selected.has(r.key)} onToggle={() => toggle(r.key)} onOpen={(focusArtifactId) => setOpen({ key: r.key, focusArtifactId })} onAdopted={onAdopted} navigate={navigate} />
           ))}
           </div>
           {rows.length === 0 && (
             <div className="vln-empty">
-              <div>No tests match these filters.</div>
-              {filtered && <button className="btn sm ghost" style={{ marginTop: 8 }} onClick={() => { setFilters(EMPTY_FILTERS); searchParams.delete("review"); setSearchParams(searchParams, { replace: true }); }}>Clear filters</button>}
+              <div>{filters.archived && c.archived === 0 ? "No archived tests." : "No tests match these filters."}</div>
+              {filtered && !(filters.archived && c.archived === 0) && <button className="btn sm ghost" style={{ marginTop: 8 }} onClick={() => { setFilters(EMPTY_FILTERS); searchParams.delete("review"); setSearchParams(searchParams, { replace: true }); }}>Clear filters</button>}
             </div>
           )}
         </div>
       )}
 
       {openRow && (
-        <TestDrawer row={openRow} focusArtifactId={open.focusArtifactId} onClose={() => setOpen(null)} onAdopted={onAdopted} />
+        <TestDrawer row={openRow} focusArtifactId={open.focusArtifactId} onClose={() => setOpen(null)} onAdopted={onAdopted} onArchive={(archived) => void setArchived([openRow], archived)} archiveBusy={archiveBusy} />
       )}
     </div>
   );
 };
 
-const TestRow = ({ r, onOpen, onAdopted, navigate }) => (
+const TestRow = ({ r, picked, onToggle, onOpen, onAdopted, navigate }) => (
   <div className={`tst-row ${r.status}`} onClick={() => onOpen(undefined)}>
+    <span className="vln-fx-sel" onClick={(e) => e.stopPropagation()}>
+      <input type="checkbox" aria-label={`Select ${testName(r.path)}`} checked={picked} onChange={onToggle} />
+    </span>
     <div className="tst-name">
       <span className="vln-fx-t">{testName(r.path)}</span>
       <span className="vln-fx-l" title={r.path}>{r.path}{r.origin === "existing" ? " · existing" : ""}</span>
@@ -247,7 +334,7 @@ const AdoptAction = ({ r, onAdopted, size = "sm" }) => {
   );
 };
 
-const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted }) => {
+const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted, onArchive, archiveBusy }) => {
   const navigate = useNavigate();
   const [runId, setRunId] = React.useState(row.run.id);
   const [view, setView] = React.useState(null);
@@ -286,6 +373,7 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted }) => {
             <div className="mono mute" style={{ fontSize: 11, marginTop: 4, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <span className={`pill ${statusTone(row.status)}`}><i className="dot"></i> {statusLabel(row.status)}</span>
               <span>{row.level} · {row.runner}{row.origin === "existing" ? " · existing test" : " · generated"}</span>
+              {row.archived && <span className="pill mute">archived</span>}
             </div>
           </div>
           <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>
@@ -388,6 +476,9 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted }) => {
           </span>
           <div className="drawer-foot-actions">
             {current && <AdoptAction r={adoptRow} onAdopted={onAdopted} size="" />}
+            <button className="btn ghost" disabled={archiveBusy} onClick={() => onArchive(!row.archived)}>
+              <Icon name="archive" size={13} /> {row.archived ? "Restore" : "Archive"}
+            </button>
             <a className="btn" href={`/reviews/${row.review.id}`} onClick={(e) => { e.preventDefault(); navigate(`/reviews/${row.review.id}`); }}><Icon name="agent" size={13} /> Open review</a>
           </div>
         </div>

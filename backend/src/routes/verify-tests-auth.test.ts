@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { signSession } from "../github/oauth.js";
-import { verifyTestsHandler } from "./api.js";
+import { archiveTestsHandler, verifyTestsHandler } from "./api.js";
 
 function fakeRes() {
   const res: any = { statusCode: 200, body: undefined };
@@ -78,10 +78,39 @@ test("only the caller's repos appear, and only the newest run per review", () =>
     assert.equal(row.status, "pass");
     assert.equal(row.evidence.length, 1);
     assert.equal(row.adopted.prNumber, 3);
-    assert.deepEqual(res.body.counts, { ran: 1, e2e: 1, unit: 0, passed: 1, failed: 0 });
+    assert.deepEqual(res.body.counts, { ran: 1, e2e: 1, unit: 0, passed: 1, failed: 0, archived: 0 });
     assert.deepEqual(res.body.repos, [{ id: mine.repoId, name: "owner/r" }]);
     assert.equal(res.body.truncated, false);
     assert.equal(JSON.stringify(res.body).includes("hidden"), false, "test content never leaves the server");
+  } finally {
+    mine.cleanup();
+    theirs.cleanup();
+  }
+});
+
+const archive = (userId: string | undefined, reviewId: string, body: unknown) => {
+  const res = fakeRes();
+  archiveTestsHandler({ cookies: userId ? { devasign_session: signSession(userId) } : {}, params: { id: reviewId }, body } as any, res);
+  return res;
+};
+
+test("archiving marks rows across later runs, restoring clears it, and other tenants are refused", () => {
+  const mine = tenant("archiver");
+  const theirs = tenant("stranger");
+  try {
+    mine.addRun(100, "a.spec.ts");
+    assert.equal(archive(undefined, mine.reviewId, { paths: ["a.spec.ts"] }).statusCode, 401);
+    assert.equal(archive(theirs.userId, mine.reviewId, { paths: ["a.spec.ts"] }).statusCode, 403);
+    assert.equal(archive(mine.userId, mine.reviewId, { paths: [] }).statusCode, 400);
+    assert.equal(archive(mine.userId, mine.reviewId, { paths: ["a.spec.ts"] }).statusCode, 200);
+    mine.addRun(200, "a.spec.ts");
+    let body = call(mine.userId).body;
+    assert.ok(body.rows[0].archived);
+    assert.equal(body.counts.archived, 1);
+    assert.equal(body.counts.ran, 0);
+    assert.equal(archive(mine.userId, mine.reviewId, { paths: ["a.spec.ts"], archived: false }).statusCode, 200);
+    body = call(mine.userId).body;
+    assert.equal(body.rows[0].archived, null);
   } finally {
     mine.cleanup();
     theirs.cleanup();

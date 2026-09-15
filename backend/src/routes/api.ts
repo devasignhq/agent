@@ -1334,7 +1334,7 @@ export function verifyTestsHandler(req: Request, res: Response) {
       plan,
       run.resultsId ? results.get(run.resultsId) ?? null : null,
       artifactsByRun.get(run.id) ?? [],
-      { repoName: repoNameById.get(run.repoId) ?? "", review: { id: review.id, prNumber: review.prNumber, prTitle: review.prTitle } },
+      { repoName: repoNameById.get(run.repoId) ?? "", review: { id: review.id, prNumber: review.prNumber, prTitle: review.prTitle }, archived: review.archivedTests },
       now
     );
   });
@@ -1346,6 +1346,31 @@ export function verifyTestsHandler(req: Request, res: Response) {
   });
 }
 api.get("/verify/tests", verifyTestsHandler);
+
+// Archive (or restore) tests of one PR on the Tests page. Keyed by path, so a
+// later run of the same PR keeps them archived.
+export function archiveTestsHandler(req: Request, res: Response) {
+  const user = getSessionUser(req);
+  if (!user) return void res.status(401).json({ error: "not_signed_in" });
+  const review = db.find("prReviews", (r) => r.id === req.params.id);
+  if (!review) return void res.status(404).json({ error: "review_not_found" });
+  const repo = db.find("repositories", (r) => r.id === review.repoId);
+  if (!repo || !installationsForUser(user.id).some((i) => i.id === repo.installationId)) {
+    return void res.status(403).json({ error: "forbidden" });
+  }
+  const raw = req.body?.paths;
+  if (!Array.isArray(raw) || raw.length === 0 || raw.length > 500 || !raw.every((p) => typeof p === "string" && p.length > 0 && p.length <= 1000)) {
+    return void res.status(400).json({ error: "invalid_paths" });
+  }
+  const paths = new Set<string>(raw);
+  const archived = req.body?.archived !== false;
+  const kept = (review.archivedTests ?? []).filter((a) => !paths.has(a.path));
+  const now = Date.now();
+  const archivedTests = archived ? [...kept, ...[...paths].map((path) => ({ path, at: now, by: user.id }))] : kept;
+  db.update("prReviews", (r) => r.id === review.id, { archivedTests });
+  res.json({ ok: true, archivedTests: archivedTests.map(({ path, at }) => ({ path, at })) });
+}
+api.post("/reviews/:id/verify/archive", archiveTestsHandler);
 
 // Verification setup checklist for a repo, and "Regenerate setup PR".
 api.get("/repositories/:id/verify/setup", (req, res) => {

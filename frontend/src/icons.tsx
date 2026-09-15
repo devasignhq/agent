@@ -37,6 +37,7 @@ const Icon = ({ name, size = 16, color = "currentColor" }: IconProps) => {
     case "send":       return <svg {...p}><path d="M14 2L2 8l5 2 1 4 6-12z"/></svg>;
     case "message":    return <svg {...p}><path d="M2 3h12v8H6l-3 3V3z"/></svg>;
     case "copy":       return <svg {...p}><rect x="5" y="5" width="8" height="8"/><path d="M3 11V3h8"/></svg>;
+    case "archive":    return <svg {...p}><path d="M2 3h12v3H2zM3 6v7h10V6M6.5 9h3"/></svg>;
     case "download":   return <svg {...p}><path d="M8 2v8M4 7l4 4 4-4M2 13h12"/></svg>;
     case "external":   return <svg {...p}><path d="M6 3H3v10h10V10M9 3h4v4M8 8l5-5"/></svg>;
     case "slack":      return <svg {...p}><rect x="2" y="6" width="3" height="3"/><rect x="6" y="2" width="3" height="3"/><rect x="11" y="6" width="3" height="3"/><rect x="6" y="11" width="3" height="3"/><rect x="6" y="6" width="3" height="3"/></svg>;

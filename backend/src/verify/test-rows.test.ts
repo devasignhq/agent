@@ -72,12 +72,18 @@ test("a run with no results marks every test not_run", () => {
 
 test("counts: ran excludes not_run, failed = fail|error, flaky/skipped count in neither", () => {
   const rows = buildTestRows(run, plan, results, artifacts, ctx, NOW);
-  assert.deepEqual(summarizeTestRows(rows), { ran: 2, e2e: 1, unit: 2, passed: 1, failed: 1 });
+  assert.deepEqual(summarizeTestRows(rows), { ran: 2, e2e: 1, unit: 2, passed: 1, failed: 1, archived: 0 });
   const extra: any = { payload: { results: [...results.payload.results, { id: "r3", testId: "t3", status: "flaky", attempts: [], durationMs: 0 }] } };
   const rows2 = buildTestRows(run, plan, extra, artifacts, ctx, NOW);
-  assert.deepEqual(summarizeTestRows(rows2), { ran: 3, e2e: 1, unit: 2, passed: 1, failed: 1 });
+  assert.deepEqual(summarizeTestRows(rows2), { ran: 3, e2e: 1, unit: 2, passed: 1, failed: 1, archived: 0 });
   const errored: any = { payload: { results: [{ id: "r1", testId: "t1", status: "error", attempts: [], durationMs: 0 }] } };
   assert.equal(summarizeTestRows(buildTestRows(run, plan, errored, [], ctx, NOW)).failed, 1);
+});
+
+test("archived paths mark their rows and drop out of the other counts", () => {
+  const rows = buildTestRows(run, plan, results, artifacts, { ...ctx, archived: [{ path: "src/cart.test.ts", at: 42 }] }, NOW);
+  assert.deepEqual(rows.map((r) => r.archived), [null, { at: 42 }, null]);
+  assert.deepEqual(summarizeTestRows(rows), { ran: 1, e2e: 1, unit: 1, passed: 1, failed: 0, archived: 1 });
 });
 
 test("latestRunPerReview keeps the newest run per review, newest first overall", () => {

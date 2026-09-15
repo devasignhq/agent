@@ -1,6 +1,6 @@
 // Pure view logic for the Tests page (filters, sort, evidence chips, drawer
 // detail). React-free so node --test drives it offline.
-import type { ResultStatus, RunView, RunViewArtifact, TestAdoption, TestEvidenceKind, TestOrigin, VerifyTestRow } from "./api.ts";
+import type { ResultStatus, RunView, RunViewArtifact, TestAdoption, TestEvidenceKind, TestOrigin, VerifyTestCounts, VerifyTestRow } from "./api.ts";
 import { recordingFromVideo, type Recording } from "./verify-view.ts";
 
 export type TestStatus = ResultStatus | "not_run";
@@ -12,26 +12,30 @@ export type TestFilters = {
   status: TestStatus | null;
   origin: TestOrigin | null;
   review: string | null;
+  archived: boolean;
   q: string;
 };
 
-export const EMPTY_FILTERS: TestFilters = { repo: null, category: null, status: null, origin: null, review: null, q: "" };
+export const EMPTY_FILTERS: TestFilters = { repo: null, category: null, status: null, origin: null, review: null, archived: false, q: "" };
 
 export function testName(path: string): string {
   const seg = path.split("/").filter(Boolean);
   return seg[seg.length - 1] ?? path;
 }
 
+// A runner "error" is a test that threw — to the user that is a failure.
+const isFailure = (s: TestStatus) => s === "fail" || s === "error";
+
 export function statusTone(status: TestStatus): "ok" | "danger" | "warn" | "nit" | "mute" {
   if (status === "pass") return "ok";
-  if (status === "fail" || status === "error") return "danger";
+  if (isFailure(status)) return "danger";
   if (status === "flaky") return "warn";
   if (status === "skipped") return "nit";
   return "mute";
 }
 
 export function statusLabel(status: TestStatus): string {
-  if (status === "fail") return "FAIL";
+  if (isFailure(status)) return "FAIL";
   if (status === "not_run") return "not run";
   return status;
 }
@@ -45,7 +49,8 @@ export function filterRows(rows: VerifyTestRow[], f: TestFilters): VerifyTestRow
   return rows.filter((r) => {
     if (f.repo && r.repo.id !== f.repo) return false;
     if (f.category && r.category !== f.category) return false;
-    if (f.status && r.status !== f.status) return false;
+    if (!!r.archived !== f.archived) return false;
+    if (f.status && r.status !== f.status && !(f.status === "fail" && isFailure(r.status))) return false;
     if (f.origin && r.origin !== f.origin) return false;
     if (f.review && r.review.id !== f.review) return false;
     if (q && !`${r.path} ${r.repo.name} #${r.review.prNumber} ${r.review.prTitle}`.toLowerCase().includes(q)) return false;
@@ -53,12 +58,11 @@ export function filterRows(rows: VerifyTestRow[], f: TestFilters): VerifyTestRow
   });
 }
 
-const FAIL_FIRST = new Set<TestStatus>(["fail", "error"]);
 export function sortRows(rows: VerifyTestRow[]): VerifyTestRow[] {
   return [...rows].sort((a, b) => {
     if (a.run.createdAt !== b.run.createdAt) return b.run.createdAt - a.run.createdAt;
-    const af = FAIL_FIRST.has(a.status) ? 0 : 1;
-    const bf = FAIL_FIRST.has(b.status) ? 0 : 1;
+    const af = isFailure(a.status) ? 0 : 1;
+    const bf = isFailure(b.status) ? 0 : 1;
     if (af !== bf) return af - bf;
     return a.path.localeCompare(b.path);
   });
@@ -83,6 +87,27 @@ export function repoOptions(rows: VerifyTestRow[]): Array<{ id: string; name: st
 
 export function markAdopted(rows: VerifyTestRow[], key: string, adopted: TestAdoption): VerifyTestRow[] {
   return rows.map((r) => (r.key === key ? { ...r, adopted } : r));
+}
+
+export function countRows(rows: VerifyTestRow[]): VerifyTestCounts {
+  const c: VerifyTestCounts = { ran: 0, e2e: 0, unit: 0, passed: 0, failed: 0, archived: 0 };
+  for (const r of rows) {
+    if (r.archived) {
+      c.archived++;
+      continue;
+    }
+    if (r.status !== "not_run") c.ran++;
+    c[r.category]++;
+    if (r.status === "pass") c.passed++;
+    if (isFailure(r.status)) c.failed++;
+  }
+  return c;
+}
+
+/** Applies an archive toggle to every row of `reviewId` whose path is in `paths`. */
+export function markArchived(rows: VerifyTestRow[], reviewId: string, paths: string[], archived: boolean, at: number = Date.now()): VerifyTestRow[] {
+  const set = new Set(paths);
+  return rows.map((r) => (r.review.id === reviewId && set.has(r.path) ? { ...r, archived: archived ? { at } : null } : r));
 }
 
 export type TestDetail = {

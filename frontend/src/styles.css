@@ -5921,8 +5921,8 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .tst-table { overflow-x: auto; }
 .tst-head, .tst-row {
   display: grid;
-  grid-template-columns: minmax(200px,1fr) 48px 140px 52px 84px 150px 120px;
-  min-width: 860px;
+  grid-template-columns: 16px minmax(200px,1fr) 48px 140px 52px 84px minmax(240px,1fr) 120px;
+  min-width: 1010px;
   align-items: center; gap: 12px; padding: 0 14px;
 }
 .tst-head { height: 30px; background: var(--bg); border-bottom: 1px solid var(--line); font-family: var(--mono); font-size: 9px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--fg-mute); }
@@ -5934,7 +5934,7 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .tst-row.flaky { border-left-color: var(--warn); }
 .tst-row > * { min-width: 0; }
 .tst-row > .pill { justify-self: start; width: max-content; }
-.tst-ev { display: flex; gap: 4px; flex-wrap: wrap; }
+.tst-ev { display: flex; gap: 4px; flex-wrap: nowrap; }
 .tst-ev-btn {
   font-family: var(--mono); font-size: 10px; padding: 2px 7px; line-height: 1.5;
   border: 1px solid var(--line); background: var(--bg); color: var(--fg-dim); cursor: pointer;
@@ -5959,11 +5959,34 @@ button:disabled, button[disabled], [aria-disabled="true"] { cursor: not-allowed;
 .tst-run:hover { background: var(--bg-2); }
 .tst-run.on { border-color: rgba(255,122,61,.45); color: var(--fg); }
 .tst-filters { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+/* Archived is a view switch, not a filter — the rule sets it apart from the chips. */
+.tst-divider { width: 1px; height: 18px; background: var(--line-2); margin: 0 2px; }
+.tst-archived-chip { border-style: dashed; }
+.tst-archived-chip.on { border-style: solid; }
+.tst-table .vln-fx-sel input {
+  appearance: none; -webkit-appearance: none;
+  width: 14px; height: 14px; flex: none;
+  background: var(--bg-3) center / 10px 10px no-repeat; border: 1px solid var(--line-3); border-radius: 2px;
+}
+.tst-table .vln-fx-sel input:hover:not(:disabled) { border-color: var(--fg-mute); }
+.tst-table .vln-fx-sel input:checked {
+  background-color: var(--bg-2); border-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2 5.2l2 2L8 3' fill='none' stroke='%23ff7a3d' stroke-width='1.6'/%3E%3C/svg%3E");
+}
+.tst-table .vln-fx-sel input:indeterminate {
+  background-color: var(--bg-2); border-color: var(--accent);
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 10'%3E%3Cpath d='M2.5 5h5' stroke='%23ff7a3d' stroke-width='1.6'/%3E%3C/svg%3E");
+}
+.tst-table .vln-fx-sel input:disabled { opacity: 0.4; cursor: default; }
+.tst-table .vln-fx-sel input:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+.tst-selbar { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--line); background: var(--bg); }
 @media (max-width: 820px) {
   .tst-stats { grid-template-columns: repeat(2, 1fr); }
   .tst-head { display: none; }
   .tst-row { grid-template-columns: 1fr 1fr; min-width: 0; padding: 10px 14px; gap: 6px 12px; }
+  .tst-row { position: relative; padding-left: 38px; }
   .tst-row > .tst-name { grid-column: 1 / -1; }
+  .tst-row > .vln-fx-sel { position: absolute; left: 14px; top: 12px; }
 }
 
 /* findings table */

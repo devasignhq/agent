@@ -21,12 +21,13 @@ export type VerifyTestRow = {
   durationMs: number;
   evidence: Array<{ artifactId: string; kind: EvidenceKind; attempt: number | null; expired: boolean }>;
   adopted: TestAdoption | null;
+  archived: { at: number } | null;
   repo: { id: string; name: string };
   review: { id: string; prNumber: number; prTitle: string };
   run: { id: string; sha: string; status: VerifyRunStatus; createdAt: number; checkRunUrl: string | null };
 };
 
-export type VerifyTestCounts = { ran: number; e2e: number; unit: number; passed: number; failed: number };
+export type VerifyTestCounts = { ran: number; e2e: number; unit: number; passed: number; failed: number; archived: number };
 
 export type VerifyTestsResponse = {
   rows: VerifyTestRow[];
@@ -46,7 +47,7 @@ export function buildTestRows(
   plan: VerifyPlan,
   results: VerifyResults | null,
   artifacts: VerifyArtifact[],
-  ctx: { repoName: string; review: { id: string; prNumber: number; prTitle: string } },
+  ctx: { repoName: string; review: { id: string; prNumber: number; prTitle: string }; archived?: Array<{ path: string; at: number }> },
   now = Date.now()
 ): VerifyTestRow[] {
   const resultByTest = new Map((results?.payload.results ?? []).map((r) => [r.testId, r]));
@@ -57,8 +58,10 @@ export function buildTestRows(
     list.push(a);
     artifactsByTest.set(a.testId, list);
   }
+  const archivedAt = new Map((ctx.archived ?? []).map((a) => [a.path, a.at]));
   return plan.tests.map((t) => {
     const r = resultByTest.get(t.id);
+    const at = archivedAt.get(t.path);
     return {
       key: `${run.id}:${t.id}`,
       testId: t.id,
@@ -80,6 +83,7 @@ export function buildTestRows(
           expired: a.state === "expired" || a.expiresAt <= now,
         })),
       adopted: t.adopted ?? null,
+      archived: at === undefined ? null : { at },
       repo: { id: run.repoId, name: ctx.repoName },
       review: ctx.review,
       run: {
@@ -94,8 +98,12 @@ export function buildTestRows(
 }
 
 export function summarizeTestRows(rows: VerifyTestRow[]): VerifyTestCounts {
-  const counts: VerifyTestCounts = { ran: 0, e2e: 0, unit: 0, passed: 0, failed: 0 };
+  const counts: VerifyTestCounts = { ran: 0, e2e: 0, unit: 0, passed: 0, failed: 0, archived: 0 };
   for (const r of rows) {
+    if (r.archived) {
+      counts.archived++;
+      continue;
+    }
     if (r.status !== "not_run") counts.ran++;
     counts[r.category]++;
     if (r.status === "pass") counts.passed++;
