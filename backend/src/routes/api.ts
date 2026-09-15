@@ -1383,13 +1383,21 @@ api.post("/reviews/:id/verify/archive", archiveTestsHandler);
 
 // Verification setup checklist for a repo, and "Regenerate setup PR". Tests pass deps so the
 // default-branch yml refresh never reaches GitHub; a slow GitHub gets the stored snapshot after waitMs.
-export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: number } = {}) {
+export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: number; refresh?: typeof refreshDefaultYml } = {}) {
+  const refresh = opts.refresh ?? refreshDefaultYml;
   return async function verifySetupHandler(req: Request, res: Response): Promise<void> {
     const ctx = ownedRepo(req, res);
     if (!ctx) return;
     let timer: NodeJS.Timeout | undefined;
+    // The refresh can outlive the wait; whenever it fails, early or late, it is logged and the stored snapshot answers.
+    const refreshed = Promise.resolve()
+      .then(() => refresh(ctx.repo.id, { deps }))
+      .catch((err) => {
+        console.warn(`[verify] default-yml refresh failed for repo ${ctx.repo.id}:`, err instanceof Error ? err.message : err);
+        return null;
+      });
     await Promise.race([
-      refreshDefaultYml(ctx.repo.id, { deps }),
+      refreshed,
       new Promise((resolve) => { timer = setTimeout(resolve, opts.waitMs ?? 4_000); }),
     ]);
     clearTimeout(timer);

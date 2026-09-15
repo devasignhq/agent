@@ -239,6 +239,40 @@ test("concurrent opens share one refresh, and a slow GitHub still gets an answer
   }
 });
 
+test("a refresh that fails, before or after the wait, is logged and never an unhandled rejection", async () => {
+  const mine = tenant("setup-refresh-fails");
+  const unhandled: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  const warned: string[] = [];
+  const warn = console.warn;
+  process.on("unhandledRejection", onUnhandled);
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try {
+    const late = makeVerifySetupHandler(undefined, { waitMs: 5, refresh: () => new Promise((_, reject) => setTimeout(() => reject(new Error("late boom")), 25)) });
+    const lateRes = await getSetup(late, mine.userId, mine.repoId);
+    assert.equal(lateRes.statusCode, 200);
+    assert.equal(lateRes.body.browserTests.status, "unknown", "answered from the stored snapshot while the refresh is still running");
+    await new Promise((r) => setTimeout(r, 60));
+
+    const early = makeVerifySetupHandler(undefined, { waitMs: 1_000, refresh: () => Promise.reject(new Error("early boom")) });
+    const earlyRes = await getSetup(early, mine.userId, mine.repoId);
+    assert.equal(earlyRes.statusCode, 200, "a rejection that beats the wait does not throw out of the handler");
+
+    const sync = makeVerifySetupHandler(undefined, { waitMs: 1_000, refresh: () => { throw new Error("sync boom"); } });
+    assert.equal((await getSetup(sync, mine.userId, mine.repoId)).statusCode, 200);
+
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(unhandled, []);
+    for (const boom of ["late boom", "early boom", "sync boom"]) {
+      assert.ok(warned.some((w) => w.includes("default-yml refresh failed") && w.includes(boom)), `${boom} is logged`);
+    }
+  } finally {
+    console.warn = warn;
+    process.off("unhandledRejection", onUnhandled);
+    mine.cleanup();
+  }
+});
+
 test("a detected Playwright config counts as boot config, as it does for the planner", async () => {
   const detected = { languages: ["ts"], frameworks: [{ name: "playwright", configPath: "playwright.config.ts" }], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] } as any;
   const configured = tenant("setup-playwright", { onboarding: { state: "verified" }, detected });
