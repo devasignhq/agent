@@ -10,6 +10,7 @@ import { RecordingBlock } from "./recording-block";
 import { deletionCountdown, formatDuration } from "./verify-view";
 import {
   EMPTY_FILTERS,
+  browserBanner,
   categoryLabel,
   countRows,
   filterRows,
@@ -149,6 +150,7 @@ export const TestsPage = ({ isMobile }) => {
   }
   if (!data) return null;
   const c = countRows(data.rows);
+  const banner = browserBanner(data.browserSetup);
   const filtered = filters.repo || filters.category || filters.status || filters.origin || filters.review || filters.archived || filters.q.trim();
 
   return (
@@ -159,6 +161,15 @@ export const TestsPage = ({ isMobile }) => {
           <div className="page-sub">Tests DevAsign generated or ran to verify your pull requests.</div>
         </div>
       </div>
+      {banner && (
+        <div className="tu-notice page-notice" style={{ marginBottom: 12 }} title={banner.repos.join(", ")}>
+          <Icon name="warn" size={13} />
+          <span>
+            {banner.text} —{" "}
+            <a href={banner.href} onClick={(e) => { e.preventDefault(); navigate(banner.href); }}>{banner.action}</a>
+          </span>
+        </div>
+      )}
       {error && <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>{error}</div>}
 
       <div className="vln-stats tst-stats">

@@ -20,7 +20,7 @@ import {
   VERIFICATION_START,
   verifyCheckRunPayload,
 } from "./report.js";
-import type { Criterion, Repository, VerifyArtifact, VerifyRun } from "../types.js";
+import type { Criterion, CriterionVerdict, Repository, VerifyArtifact, VerifyRun } from "../types.js";
 import { formatSummaryCard } from "../review/comment.js";
 
 const EMOJI = /[\u{1F000}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{FE0F}]/u;
@@ -198,6 +198,9 @@ test("completed: an unverifiable row keeps the planner's reason and renders its 
   const check = verifyCheckRunPayload(view, "abc");
   assert.match(check.output.text, /unverifiable — 1\. Refunds line[^\n]*\[configure app start\]\(https:\/\/app\/workflow\?repo=repo\)/);
   assert.equal(check.conclusion, "neutral");
+  const body = formatTestsComment(view, "acme/widgets");
+  assert.match(body, /No app start was configured\.\n\n\[fix setup\]\(https:\/\/app\/workflow\?repo=repo\) · \[details\]\(/);
+  assert.equal(body.split("[fix setup]").length, 2, "only the row that carries a fix link renders one");
 });
 
 // ─── the "Tests by DevAsign" comment ───────────────────────────────────────
@@ -336,6 +339,12 @@ test("refreshCardHead edits the review body only for the card's own sha and a fi
     assert.match(String(put!.body.body), /Merge score: 90\/100/);
     assert.match(String(put!.body.body), /Tests failing \(1\)/);
     assert.equal(String(put!.body.body).split("<!-- devasign:card-head -->").length, 2);
+    assert.doesNotMatch(String(put!.body.body), /without a browser/);
+    const fixUrl = "https://app.test/workflow?repo=r&setup=browser";
+    const browserless = { count: 2, criterionIds: ["1", "2"], reason: "not_configured", fixUrl };
+    await refreshCardHead({ install, repo: repoRow as any, reviewId: row.id, sha: "abc1234", view: { ...view("completed", 0), browserless } });
+    const last = calls.filter((c) => c.method === "PUT").at(-1);
+    assert.ok(String(last!.body.body).includes(`· 2 UI criteria checked without a browser ([set up](${fixUrl}))`), "the view's browserless count reaches the card");
   } finally {
     globalThis.fetch = original;
   }
@@ -347,6 +356,127 @@ test("a doctor diagnosis carries its fix into the check-run summary", () => {
   const check = verifyCheckRunPayload(view, "abc", { doctor });
   assert.equal(check.conclusion, "neutral");
   assert.equal(check.output.title, "Setup needs attention");
-  assert.equal(check.output.summary, "dependencies are not installed on this runner for backend/ (dotenv) — criteria are unverifiable, not failed. Fix: Add an install step before the DevAsign verify step: `npm ci --prefix backend`.");
+  assert.equal(check.output.summary, "dependencies are not installed on this runner for backend/ \\(dotenv\\) — criteria are unverifiable, not failed. Fix: Add an install step before the DevAsign verify step: \\`npm ci --prefix backend\\`.");
   assert.equal(verifyCheckRunPayload(view, "abc", { doctor: { code: "x", message: "m" } }).output.summary, "m — criteria are unverifiable, not failed.");
+});
+
+test("a doctor message renders inert: no link, no mention, no fence — in the summary, the comment and the check-run text", () => {
+  const hostile = "[x](https://evil) @org/team ```";
+  const run = baseRun({
+    status: "completed",
+    verdicts: [{ criterionId: "1", verdict: "unverifiable", reason: `setup needs attention: ${hostile}`, evidenceRefs: [] }],
+  });
+  const view = buildVerificationView({ run, review, repo, criteria, plan: null, results: [], artifacts: [] });
+  const check = verifyCheckRunPayload(view, "abc", { doctor: { code: "unknown", message: hostile, suggestedFix: { instructions: hostile } } });
+  const inert = (s: string, where: string) => {
+    assert.doesNotMatch(s, /(?<!\\)\]\(https:\/\/evil/, `${where}: no live link`);
+    assert.doesNotMatch(s, /@org\/team/, `${where}: no team mention`);
+    assert.doesNotMatch(s, /``/, `${where}: no fence`);
+    assert.ok(s.includes("\\[x\\]\\(https:\u200b//evil\\)"), `${where}: the text is still readable, and no bare URL autolinks`);
+  };
+  inert(check.output.summary, "summary");
+  assert.equal(check.output.summary.split("\\[x\\]").length, 3, "message and instructions both escaped");
+  inert(check.output.text, "check-run text");
+  inert(formatTestsComment(view, "acme/widgets"), "comment");
+  // The escape is ours: a benign reason keeps its words.
+  assert.match(formatTestsComment(completedView(), "acme/widgets"), /\n\ntotal renders as a bare number\n/);
+});
+
+// ─── UI criteria checked without a browser ──────────────────────────────────
+
+const FIX = "https://app.test/workflow?repo=repo&setup=browser";
+const uiCriteria: Criterion[] = [
+  { id: "1", text: "Refunds line shows", met: null, evidence: null, kind: "ui" },
+  { id: "2", text: "Empty state renders", met: null, evidence: null, kind: "ui" },
+  { id: "3", text: "Menu closes on escape", met: null, evidence: null, kind: "ui" },
+  { id: "4", text: "Checkout button disables", met: null, evidence: null, kind: "ui" },
+  { id: "5", text: "Total is formatted as currency", met: null, evidence: null, kind: "code" },
+];
+const browserPlan = (browser: Record<string, unknown> | null, over: Record<string, unknown> = {}) =>
+  ({
+    id: "p", schemaVersion: 1, runId: "run1", repoId: "repo", criteriaRevision: 1, commands: [], tests: [], unverifiable: [], createdAt: 0,
+    ...(browser ? { browser: { policy: "auto", allowed: false, bootConfigured: false, reason: "no_boot", fixUrl: FIX, ...browser } } : {}),
+    ...over,
+  }) as any;
+const verdict = (criterionId: string, v: CriterionVerdict["verdict"], browser?: CriterionVerdict["browser"]): CriterionVerdict => ({
+  criterionId, verdict: v, reason: v === "unverifiable" ? "no test ran for this criterion" : "the test passed", evidenceRefs: [], ...(browser ? { browser } : {}),
+});
+const judgedView = (verdicts: VerifyRun["verdicts"], plan: any, run: Partial<VerifyRun> = {}) =>
+  buildVerificationView({ run: baseRun({ status: "completed", timings: { forkedAt: 1, resolvedAt: 2 }, verdicts, ...run }), review, repo, criteria: uiCriteria, plan, results: [], artifacts: [] });
+
+test("UI criteria decided without a browser get a note in the comment, the check-run summary and text; the conclusion is unchanged", () => {
+  // Criterion 4 stayed unverifiable, so it was not checked at all; 5 is not a UI criterion.
+  const verdicts = [verdict("1", "pass"), verdict("2", "fail"), verdict("3", "pass"), verdict("4", "unverifiable"), verdict("5", "pass")];
+  const note = `3 UI criteria were checked without a browser — [set up browser tests](${FIX})`;
+  const view = judgedView(verdicts, browserPlan({}, { prAuthoredTests: ["src/menu.test.tsx"] }));
+  assert.deepEqual(view.browserless, { count: 3, criterionIds: ["1", "2", "3"], reason: "not_configured", fixUrl: FIX });
+  const without = judgedView(verdicts, browserPlan(null, { prAuthoredTests: ["src/menu.test.tsx"] }));
+  assert.equal(without.browserless, undefined);
+
+  const body = formatTestsComment(view, "acme/widgets");
+  const lines = body.split("\n");
+  const own = lines.findIndex((l) => l.startsWith("This PR adds or changes 1 test file of its own"));
+  assert.ok(own > 0);
+  assert.deepEqual(lines.slice(own + 1, own + 3), ["", note], "the note follows the PR-authored tests note");
+  assert.ok(body.indexOf(note) < body.indexOf(VERIFICATION_START));
+  assert.equal(body.split(note).length, 2, "said once");
+
+  const check = verifyCheckRunPayload(view, "abc");
+  const plain = verifyCheckRunPayload(without, "abc");
+  assert.equal(check.conclusion, "failure");
+  assert.equal(check.conclusion, plain.conclusion);
+  assert.equal(check.output.title, plain.output.title);
+  assert.equal(check.output.summary, `${plain.output.summary}\n\n${note}`);
+  assert.deepEqual(check.output.text.split("\n").slice(0, 4), [plain.output.text.split("\n")[0], "", note, ""]);
+
+  const allPass = judgedView(verdicts.map((v) => ({ ...v, verdict: v.verdict === "fail" ? "pass" : v.verdict })), browserPlan({}));
+  assert.equal(verifyCheckRunPayload(allPass, "abc").conclusion, "neutral", "still neutral for the unverifiable criterion, not failure");
+  const doctor = { code: "boot_failed", message: "the app did not start" };
+  const withDoctor = verifyCheckRunPayload(view, "abc", { doctor });
+  assert.equal(withDoctor.conclusion, verifyCheckRunPayload(without, "abc", { doctor }).conclusion);
+  assert.equal(withDoctor.output.summary, `the app did not start — criteria are unverifiable, not failed.\n\n${note}`);
+});
+
+test("one UI criterion reads singular; browser tests that could not run say the app did not start", () => {
+  const one = judgedView([verdict("1", "pass"), verdict("5", "pass")], browserPlan({}));
+  assert.match(formatTestsComment(one, "acme/widgets"), new RegExp(`\\n1 UI criterion was checked without a browser — \\[set up browser tests\\]\\(${FIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)\\n`));
+  assert.doesNotMatch(formatTestsComment(one, "acme/widgets"), /criteria were/);
+
+  const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" });
+  const didNotStart = judgedView([verdict("1", "pass", "fallback"), verdict("2", "fail", "fallback"), verdict("3", "pass", "ran"), verdict("4", "pass")], allowed);
+  assert.equal(didNotStart.browserless?.reason, "did_not_start");
+  const note = `2 UI criteria were checked without a browser because the app did not start in CI — [see setup](${FIX})`;
+  assert.ok(formatTestsComment(didNotStart, "acme/widgets").includes(`\n${note}\n`));
+  assert.ok(verifyCheckRunPayload(didNotStart, "abc").output.summary.endsWith(`\n\n${note}`));
+  assert.ok(verifyCheckRunPayload(didNotStart, "abc").output.text.includes(`\n\n${note}\n\n`));
+  assert.doesNotMatch(formatTestsComment(didNotStart, "acme/widgets"), /set up browser tests/);
+});
+
+test("under e2e: always a fallback the judge refused is still noted; criteria withheld for want of boot config and flaky browser runs are not", () => {
+  const strict = browserPlan({ policy: "always", allowed: true, bootConfigured: true, reason: "ok" });
+  const refused: CriterionVerdict = { ...verdict("1", "unverifiable", "fallback"), reason: "the app did not start for browser tests", fixUrl: FIX };
+  const view = judgedView([refused, verdict("2", "pass", "ran"), verdict("5", "pass")], strict);
+  assert.deepEqual(view.browserless, { count: 1, criterionIds: ["1"], reason: "did_not_start", fixUrl: FIX });
+  assert.ok(formatTestsComment(view, "acme/widgets").includes(`\n1 UI criterion was checked without a browser because the app did not start in CI — [see setup](${FIX})\n`));
+
+  assert.equal(judgedView([{ ...verdict("1", "unverifiable", "ran"), flaky: true }, verdict("5", "pass")], strict).browserless, undefined);
+  const withheld = judgedView([verdict("1", "unverifiable"), verdict("2", "unverifiable"), verdict("5", "pass")], browserPlan({ policy: "always" }));
+  assert.equal(withheld.browserless, undefined);
+});
+
+test("no note under e2e: never, on a plan older than the policy, for a component-level pass with browsers allowed, or before the run completes", () => {
+  const verdicts = [verdict("1", "pass"), verdict("2", "pass"), verdict("5", "pass")];
+  const cases: Array<[string, ReturnType<typeof judgedView>]> = [
+    ["never", judgedView(verdicts, browserPlan({ policy: "never", reason: "never" }))],
+    ["old plan", judgedView(verdicts, browserPlan(null))],
+    ["component level with browsers allowed", judgedView(verdicts, browserPlan({ allowed: true, bootConfigured: true, reason: "ok" }))],
+    ["still running", buildVerificationView({ run: baseRun({ status: "running", verdicts }), review, repo, criteria: uiCriteria, plan: browserPlan({}), results: [], artifacts: [] })],
+  ];
+  for (const [label, view] of cases) {
+    assert.equal(view.browserless, undefined, label);
+    const check = verifyCheckRunPayload(view, "abc");
+    for (const s of [formatTestsComment(view, "acme/widgets"), check.output.summary, check.output.text]) {
+      assert.doesNotMatch(s, /without a browser/, label);
+    }
+  }
 });

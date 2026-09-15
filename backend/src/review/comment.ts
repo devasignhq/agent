@@ -17,6 +17,7 @@ import {
 } from "./render.js";
 import { countByChip } from "./items.js";
 import { applyVerification, scoreHeader, type VerificationCounts } from "./score.js";
+import { mdInline } from "../verify/md.js";
 
 export const CARD_TITLE = "## DevAsign Code Review";
 export const TESTS_TITLE = "## Tests by DevAsign";
@@ -372,6 +373,7 @@ export type CardVerification = {
   state: string;
   counts: VerificationCounts;
   rows: Array<{ id: string; text: string; verdict: string; reason?: string; testName?: string }>;
+  browserless?: { count: number; fixUrl: string };
 };
 
 export type CardHeadInputs = {
@@ -388,20 +390,27 @@ export type CardHeadInputs = {
 const MAX_FAILING_BULLETS = 10;
 const REASON_CLIP = 200;
 
+function browserlessSuffix(b: CardVerification["browserless"]): string {
+  if (!b?.count) return "";
+  return ` · ${b.count} UI ${b.count === 1 ? "criterion" : "criteria"} checked without a browser ([set up](${b.fixUrl}))`;
+}
+
 function verificationLines(v: CardVerification, allFailing: boolean): string[] {
   const { pass, fail, unverifiable } = v.counts;
+  const browserless = browserlessSuffix(v.browserless);
   if (fail <= 0) {
-    return [`**Tests:** ${pass} passed, ${unverifiable} unverifiable — see the "Tests by DevAsign" comment.`];
+    return [`**Tests:** ${pass} passed, ${unverifiable} unverifiable${browserless} — see the "Tests by DevAsign" comment.`];
   }
   if (!allFailing) {
     return [
-      `⚠️ **${fail} of ${fail + pass} verified tests are failing** — check the "Tests by DevAsign" comment before merging.`,
+      `⚠️ **${fail} of ${fail + pass} verified tests are failing**${browserless} — check the "Tests by DevAsign" comment before merging.`,
     ];
   }
-  const lines = [`🔴 **Do not merge.** Every verified acceptance-criterion test failed (${fail} of ${fail}).`, ""];
+  const lines = [`🔴 **Do not merge.** Every verified acceptance-criterion test failed (${fail} of ${fail})${browserless}.`, ""];
   for (const r of v.rows.filter((r) => r.verdict === "fail").slice(0, MAX_FAILING_BULLETS)) {
     const reason = (r.reason || "").trim().replace(/\s+/g, " ");
-    const why = reason ? `: ${reason.length > REASON_CLIP ? reason.slice(0, REASON_CLIP - 1) + "…" : reason}` : "";
+    const clipped = reason.length > REASON_CLIP ? reason.slice(0, REASON_CLIP - 1) + "…" : reason;
+    const why = reason ? `: ${mdInline(clipped, REASON_CLIP)}` : "";
     lines.push(`- **${r.id}** — ${r.text}${why}${r.testName ? ` (\`${r.testName}\`)` : ""}`);
   }
   lines.push(

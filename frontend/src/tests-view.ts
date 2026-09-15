@@ -1,6 +1,6 @@
 // Pure view logic for the Tests page (filters, sort, evidence chips, drawer
 // detail). React-free so node --test drives it offline.
-import type { ResultStatus, RunView, RunViewArtifact, TestAdoption, TestEvidenceKind, TestOrigin, VerifyTestCounts, VerifyTestRow } from "./api.ts";
+import type { BrowserSetupEntry, ResultStatus, RunView, RunViewArtifact, TestAdoption, TestEvidenceKind, TestOrigin, VerifyTestCounts, VerifyTestRow } from "./api.ts";
 import { recordingFromVideo, type Recording } from "./verify-view.ts";
 
 export type TestStatus = ResultStatus | "not_run";
@@ -108,6 +108,36 @@ export function countRows(rows: VerifyTestRow[]): VerifyTestCounts {
 export function markArchived(rows: VerifyTestRow[], reviewId: string, paths: string[], archived: boolean, at: number = Date.now()): VerifyTestRow[] {
   const set = new Set(paths);
   return rows.map((r) => (r.review.id === reviewId && set.has(r.path) ? { ...r, archived: archived ? { at } : null } : r));
+}
+
+export type BrowserBanner = { text: string; action: string; href: string; repos: string[] };
+
+// Fix links are absolute on the app's origin; the banner navigates in-app, and only to the setup panel.
+function setupPath(fixUrl: string, repoId: string): string {
+  try {
+    const u = new URL(fixUrl, "http://app.invalid");
+    if (u.pathname === "/workflow" && u.searchParams.get("setup") === "browser") return `${u.pathname}${u.search}`;
+  } catch {
+    // fall through to the path built from the repo id
+  }
+  return `/workflow?${new URLSearchParams({ repo: repoId, setup: "browser" })}`;
+}
+
+/** Repos whose latest run checked UI criteria without a browser and still need setup, newest first. */
+export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): BrowserBanner | null {
+  const hit = (setup ?? [])
+    .filter((e) => (e.status === "not_configured" || e.status === "failing") && (e.lastBrowserless?.count ?? 0) > 0)
+    .sort((a, b) => b.lastBrowserless!.at - a.lastBrowserless!.at);
+  if (hit.length === 0) return null;
+  const repos = hit.map((e) => e.repo);
+  const didNotStart = hit.every((e) => e.status === "failing");
+  const where = repos.length === 1 ? repos[0] : `${repos.length} repositories`;
+  return {
+    text: `UI criteria on ${where} were checked without a browser${didNotStart ? " because the app did not start in CI" : ""}`,
+    action: didNotStart ? "see setup" : "set up browser tests",
+    href: setupPath(hit[0].fixUrl, hit[0].repoId),
+    repos,
+  };
 }
 
 export type TestDetail = {

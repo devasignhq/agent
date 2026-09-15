@@ -223,9 +223,9 @@ export function guessVerifyConfig(setup: DetectedSetup, hints: StackHints, pkg: 
 
 export const DEVASIGN_YML_HEADER =
   "# .devasign.yml — DevAsign verification settings for this repository.\n" +
-  "# verify.start/url tell the runner how to boot the app for end-to-end tests;\n" +
-  "# without them UI criteria are reported as unverifiable (never as failed).\n" +
-  "# e2e: auto | always | never.\n";
+  "# verify.start/url tell the runner how to boot the app for browser tests. Until\n" +
+  "# they are set, UI criteria are checked below browser level with a note on each PR.\n" +
+  "# e2e: auto | always (no browser = unverifiable) | never (no browser tests, no note).\n";
 
 /** Merge the `verify:` block into an existing .devasign.yml (comments kept) or create one. */
 export function generateDevasignYml(existing: string | null, verify: DevasignVerifyConfig): string {
@@ -321,14 +321,14 @@ export function prBody(args: {
     "### End-to-end tests",
     args.verify.start && args.verify.url
       ? `The runner will start the app with \`${args.verify.start}\` and wait for \`${args.verify.url}${args.verify.ready ?? ""}\`. If that is wrong, fix \`verify.start\` / \`verify.url\` in \`.devasign.yml\`.`
-      : "No start command could be inferred. UI criteria will be reported as **unverifiable** (never failed) until `verify.start` and `verify.url` are set in `.devasign.yml`.",
+      : "No start command could be inferred. Until `verify.start` and `verify.url` are set in `.devasign.yml`, UI criteria are checked below browser level and each PR carries a note saying so. With `e2e: always` they are reported as **unverifiable** instead.",
     "",
     "Merging this PR enables verification. Until then, DevAsign posts each PR's criteria with a neutral \"Setup pending\" check.",
   ];
   return lines.join("\n");
 }
 
-const PLAIN_DIR = /^[A-Za-z0-9_.-]+$/;
+export const PLAIN_DIR = /^[A-Za-z0-9_.-]+$/;
 
 /** Exactly the shapes installCommandFor produces, for this directory and no other. */
 export function isKnownInstallCommand(install: string, dir: string): boolean {
@@ -362,4 +362,38 @@ export function patchWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): s
     return next === text ? null : next;
   }
   return null;
+}
+
+/** patchWorkflowForDoctor for a customer's own workflow: edits only the job that runs DevAsign verify. */
+export function patchExtendedWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): string | null {
+  const doc = parseDocument(text);
+  const jobs = doc.errors.length ? null : doc.get("jobs");
+  if (!isMap(jobs)) return null;
+  const isVerify = (s: unknown) => isMap(s) && String(s.get("uses") ?? "").startsWith(ACTION_REF.split("@")[0]);
+  const job = jobs.items.map((i) => i.value).find((j): j is YAMLMap => isMap(j) && isSeq(j.get("steps")) && (j.get("steps") as YAMLSeq).items.some(isVerify));
+  if (!job) return null;
+  const steps = job.get("steps") as YAMLSeq;
+  const jobText = stringify(job.toJSON());
+  const insert = (nodes: object[]) => steps.items.splice(steps.items.findIndex(isVerify), 0, ...nodes.map((n) => doc.createNode(n)));
+  if (doctor.code === "wrong_runtime_version") {
+    const want = majorFromRange(/Node ([^ ]+) but/.exec(doctor.message)?.[1], "");
+    const setupNode = steps.items.find((s) => isMap(s) && String(s.get("uses") ?? "").startsWith("actions/setup-node"));
+    const withMap = isMap(setupNode) ? setupNode.get("with") : null;
+    const current = isMap(withMap) ? String(withMap.get("node-version") ?? "") : null;
+    // A matrix or other expression is the customer's to change.
+    if (!isMap(withMap) || !want || current === want || current!.includes("${{")) return null;
+    withMap.set("node-version", want);
+  } else if (doctor.code === "browser_install_failed") {
+    if (/playwright install/.test(jobText)) return null;
+    insert([{ name: "Install Playwright browsers", run: "npx playwright install --with-deps chromium" }]);
+  } else if (doctor.code === "missing_dependencies") {
+    const wanted = (doctor.packages ?? []).filter(
+      (p) => PLAIN_DIR.test(p.dir) && isKnownInstallCommand(p.install, p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(jobText)
+    );
+    if (!wanted.length) return null;
+    insert(wanted.map((p) => ({ name: `Install ${p.dir} dependencies`, run: p.install })));
+  } else {
+    return null;
+  }
+  return doc.toString({ lineWidth: 0 });
 }

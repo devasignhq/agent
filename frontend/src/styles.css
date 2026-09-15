@@ -1811,6 +1811,7 @@ input[type="checkbox"]:focus-visible { outline: 1px solid var(--accent); outline
 }
 .tu-notice svg { color: var(--warn); flex-shrink: 0; margin-top: 1px; }
 .tu-notice b { color: var(--fg); }
+.tu-notice a { color: var(--fg); text-decoration: underline; text-underline-offset: 2px; }
 /* The side margins above are the modal gutter this callout was written for. In
    page flow the banner has to line up with the widgets around it instead. */
 .tu-notice.page-notice { margin-left: 0; margin-right: 0; }

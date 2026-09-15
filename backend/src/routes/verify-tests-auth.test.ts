@@ -6,6 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
+import type { RepoVerifyState } from "../types.js";
 import { signSession } from "../github/oauth.js";
 import { archiveTestsHandler, verifyTestsHandler } from "./api.js";
 
@@ -16,12 +17,12 @@ function fakeRes() {
   return res;
 }
 
-function tenant(login: string) {
+function tenant(login: string, verify?: RepoVerifyState) {
   const userId = uuid(), installId = uuid(), repoId = uuid(), reviewId = uuid();
   const gh = Math.floor(Math.random() * 1e9);
   db.insert("users", { id: userId, githubId: gh, githubLogin: login, email: `${login}@x.z`, plan: "pro", createdAt: Date.now() } as any);
   db.insert("installations", { id: installId, userId, accountId: gh, accountLogin: login, installationId: gh, repoIds: [] } as any);
-  db.insert("repositories", { id: repoId, installationId: installId, owner: login, name: "r", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true } as any);
+  db.insert("repositories", { id: repoId, installationId: installId, owner: login, name: "r", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true, ...(verify ? { verify } : {}) } as any);
   db.insert("prReviews", { id: reviewId, repoId, prNumber: 7, prTitle: "Refunds", headSha: "a", baseSha: "b", status: "passed", verdict: null, criteria: [], taskId: null, additions: null, deletions: null, changedFiles: null, createdAt: Date.now(), updatedAt: Date.now() } as any);
   const runIds: string[] = [];
   const planIds: string[] = [];
@@ -47,7 +48,7 @@ function tenant(login: string) {
     db.remove("installations", (i) => i.id === installId);
     db.remove("users", (u) => u.id === userId);
   };
-  return { userId, repoId, reviewId, addRun, cleanup };
+  return { userId, installId, repoId, reviewId, addRun, cleanup };
 }
 
 const call = (userId?: string) => {
@@ -112,6 +113,35 @@ test("archiving marks rows across later runs, restoring clears it, and other ten
     body = call(mine.userId).body;
     assert.equal(body.rows[0].archived, null);
   } finally {
+    mine.cleanup();
+    theirs.cleanup();
+  }
+});
+
+test("browserSetup lists only the caller's repos that had UI criteria checked without a browser", () => {
+  const notConfigured = { count: 3, reason: "not_configured" as const, runId: "run-a", prNumber: 7, at: 10 };
+  const mine = tenant("zeta-owner", { onboarding: { state: "none" }, lastBrowserless: notConfigured });
+  const theirs = tenant("intruder", { onboarding: { state: "none" }, lastBrowserless: { ...notConfigured, runId: "run-x" } });
+  const quietId = uuid(), failingId = uuid();
+  const repo = (id: string, name: string, verify: RepoVerifyState) =>
+    db.insert("repositories", { id, installationId: mine.installId, owner: "zeta-owner", name, defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true, verify } as any);
+  const didNotStart = { count: 1, reason: "did_not_start" as const, runId: "run-b", prNumber: 8, at: 20 };
+  repo(quietId, "quiet", { onboarding: { state: "verified" }, lastBrowserless: null });
+  repo(failingId, "app", { onboarding: { state: "verified" }, lastBrowserless: didNotStart });
+  try {
+    const body = call(mine.userId).body;
+    assert.equal(body.browserSetup.length, 2);
+    const [failing, bare] = body.browserSetup;
+    assert.equal(failing.repoId, failingId);
+    assert.equal(failing.repo, "zeta-owner/app");
+    assert.equal(failing.status, "failing");
+    assert.deepEqual(failing.lastBrowserless, didNotStart);
+    assert.ok(failing.fixUrl.endsWith(`/workflow?repo=${failingId}&setup=browser`));
+    assert.deepEqual({ ...bare, fixUrl: undefined }, { repoId: mine.repoId, repo: "zeta-owner/r", status: "not_configured", missing: [], lastBrowserless: notConfigured, fixUrl: undefined });
+    assert.equal(JSON.stringify(body.browserSetup).includes("run-x"), false, "another tenant's repo never appears");
+    assert.deepEqual(call(theirs.userId).body.browserSetup.map((b: { repoId: string }) => b.repoId), [theirs.repoId]);
+  } finally {
+    db.remove("repositories", (r) => r.id === quietId || r.id === failingId);
     mine.cleanup();
     theirs.cleanup();
   }

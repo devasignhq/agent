@@ -90,11 +90,11 @@ test("extend mode appends to the existing CI job; a repo that already runs the a
     assert.equal(ci.jobs.test.steps[2].uses, ACTION_REF);
     assert.equal(ci.jobs.test.permissions["id-token"], "write");
     assert.match(s.calls.prs[0].body, /appended to the `test` job/);
-    noteOnboardingPrClosed(s.repo.id, 41, false);
+    noteOnboardingPrClosed(s.repo.id, 41, false, s.deps);
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding.state, "pr_closed");
-    noteOnboardingPrClosed(s.repo.id, 41, true);
+    noteOnboardingPrClosed(s.repo.id, 41, true, s.deps);
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding.state, "pr_merged");
-    noteOnboardingPrClosed(s.repo.id, 999, true);
+    noteOnboardingPrClosed(s.repo.id, 999, true, s.deps);
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding.state, "pr_merged", "another PR closing is ignored");
 
     // Already set up on main: an automatic trigger leaves it alone and marks it merged.
@@ -141,6 +141,8 @@ test("doctor follow-up comments on the open onboarding PR and pushes the mechani
     const human = await postDoctorFollowup(run, { stage: "start", code: "no_start_command", message: "no start", missingSecrets: undefined, suggestedFix: { kind: "yml_patch", patch: "verify:\n  start: npm run dev\n", instructions: "Set start/url." } }, s.deps);
     assert.deepEqual(human, { commented: true, patched: false });
     assert.match(s.calls.comments[1], /```yaml\nverify:\n  start: npm run dev\n```/);
+    assert.doesNotMatch(s.calls.comments[1], /unverifiable, not failed/, "the comment no longer promises what auto mode does not do");
+    assert.match(s.calls.comments[1], /checked below browser level with a note on each PR, and reported as unverifiable only under `e2e: always`/);
     noteRunSucceeded(run);
     const repo = db.find("repositories", (r) => r.id === s.repo.id)!;
     assert.equal(repo.verify?.onboarding.state, "verified");
@@ -168,7 +170,7 @@ test("a regenerated setup PR that merges parks the repo on pr_merged, and the ne
     const again = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps);
     assert.equal(again.status, "opened");
     assert.equal(onboarding().state, "pr_open");
-    noteOnboardingPrClosed(s.repo.id, again.prNumber!, true);
+    noteOnboardingPrClosed(s.repo.id, again.prNumber!, true, s.deps);
     assert.equal(onboarding().state, "pr_merged");
 
     const second = createVerifyRun({ review, repo: s.repo, status: "completed", triggeredBy: { kind: "pr_event" } });
@@ -257,4 +259,127 @@ test("regenerating while the setup PR is open reuses it instead of 422-ing on a 
 test("the generated workflow carries a version marker so a stale copy can be spotted", () => {
   const wf = generateWorkflow({ languages: ["ts"], frameworks: [], testCommands: [], services: [], envExampleVars: [], packageManager: "npm" } as any, { node: true, nodeVersion: "20" } as any, [], ["package.json"]);
   assert.match(wf, new RegExp(`# devasign-workflow: v${WORKFLOW_VERSION}`));
+});
+
+const settle = () => new Promise((r) => setImmediate(r));
+const repoRow = (id: string) => db.find("repositories", (r) => r.id === id)!;
+const diagnosis = { stage: "start" as const, code: "app_not_ready" as const, message: "the app did not become reachable" };
+
+test("a clean run clears a stale diagnosis on an already-verified repo without re-stamping it", () => {
+  const s = seed();
+  try {
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "verified", firstSuccessfulRunId: "first-run", lastDiagnosis: diagnosis } } });
+    noteRunSucceeded({ id: "later-run", repoId: s.repo.id } as any);
+    const ob = repoRow(s.repo.id).verify!.onboarding;
+    assert.equal(ob.lastDiagnosis, null, "a later clean run means the diagnosis no longer applies");
+    assert.equal(ob.state, "verified");
+    assert.equal(ob.firstSuccessfulRunId, "first-run");
+
+    const before = repoRow(s.repo.id);
+    noteRunSucceeded({ id: "another-run", repoId: s.repo.id } as any);
+    assert.equal(repoRow(s.repo.id), before, "nothing to clear: the row is not rewritten");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("setOnboarding patches the live row: a devasignYml, lastBrowserless or detected written mid-job survives", async () => {
+  const s = seed();
+  try {
+    const devasignYml = { raw: "verify:\n  e2e: auto\n", parsed: { e2e: "auto" as const }, sha: "planned" };
+    const lastBrowserless = { count: 2, reason: "not_configured" as const, runId: "r", prNumber: 5, at: 1 };
+    const detected = { languages: ["go"], frameworks: [], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] };
+    const deps: OnboardDeps = {
+      ...s.deps,
+      createPr: async (i, r, args) => {
+        const cur = repoRow(s.repo.id).verify!;
+        db.update("repositories", (x) => x.id === s.repo.id, { verify: { ...cur, devasignYml, lastBrowserless, detected } });
+        return s.deps.createPr!(i, r, args);
+      },
+    };
+    assert.equal((await runVerifyOnboard(s.repo.id, { trigger: "install" }, deps)).status, "opened");
+    const v = repoRow(s.repo.id).verify!;
+    assert.equal(v.onboarding.state, "pr_open");
+    assert.deepEqual(v.devasignYml, devasignYml);
+    assert.deepEqual(v.lastBrowserless, lastBrowserless);
+    assert.deepEqual(v.detected, detected, "the runner's own report beats the tree inference");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("extend mode: the doctor follow-up reads and patches the customer's workflow, not devasign-verify.yml", async () => {
+  const s = seed();
+  try {
+    const reads: string[] = [];
+    const deps: OnboardDeps = { ...s.deps, read: async (i, r, path, ref) => { reads.push(`${path}@${ref}`); return s.deps.read!(i, r, path, ref); } };
+    await runVerifyOnboard(s.repo.id, { trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml" }, deps);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.workflowPath, ".github/workflows/ci.yml");
+    const run = { id: "run-x", repoId: s.repo.id, prNumber: 9 } as any;
+    const out = await postDoctorFollowup(run, { stage: "install", code: "missing_dependencies", message: "m", packages: [{ dir: "backend", install: "npm ci --prefix backend" }] }, deps);
+    assert.deepEqual(out, { commented: true, patched: true });
+    assert.ok(reads.includes(`.github/workflows/ci.yml@${ONBOARDING_BRANCH}`));
+    assert.ok(!reads.includes(`${WORKFLOW_PATH}@${ONBOARDING_BRANCH}`), "the separate-mode path is never consulted");
+    assert.equal(s.calls.files[WORKFLOW_PATH], undefined, "no stray devasign-verify.yml is committed");
+    const steps = parse(s.calls.files[".github/workflows/ci.yml"]).jobs.test.steps.map((x: any) => x.uses || x.run);
+    assert.deepEqual(steps.slice(-2), ["npm ci --prefix backend", ACTION_REF]);
+
+    // Their CI file, as it stands on the setup branch, with a Node pin in an unrelated job first.
+    s.calls.files[".github/workflows/ci.yml"] = "jobs:\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n    - uses: actions/setup-node@v4\n      with:\n        node-version: 18\n  test:\n    runs-on: ubuntu-latest\n    steps:\n    - uses: actions/setup-node@v4\n      with:\n        node-version: ${{ matrix.node }}\n    - name: DevAsign verify\n      uses: " + ACTION_REF + "\n";
+    const before = s.calls.files[".github/workflows/ci.yml"];
+    const runtime = await postDoctorFollowup(run, { stage: "install", code: "wrong_runtime_version", message: "the repository wants Node >=22 but the runner has v20.1.0" }, deps);
+    assert.deepEqual(runtime, { commented: true, patched: false }, "neither the lint job's pin nor the verify job's matrix is ours to rewrite");
+    assert.equal(s.calls.files[".github/workflows/ci.yml"], before);
+    assert.deepEqual(await postDoctorFollowup(run, { stage: "browsers", code: "browser_install_failed", message: "no chromium" }, deps), { commented: true, patched: true }, "the file parses, so a fix scoped to the verify job still lands");
+    assert.equal(parse(s.calls.files[".github/workflows/ci.yml"]).jobs.lint.steps.length, 1);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the doctor comment renders runner-reported text inert", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    const run = { id: "run-y", repoId: s.repo.id, prNumber: 9 } as any;
+    const message = "boom**\n\n[click me](https://evil.example) @acme/admins <img src=x onerror=alert(1)> `code`";
+    await postDoctorFollowup(run, { stage: "start", code: "unknown", message, suggestedFix: { kind: "manual", instructions: "![pixel](https://evil.example/p.png) ping @octocat" } }, s.deps);
+    const body = s.calls.comments[0];
+    assert.doesNotMatch(body, /\[click me\]\(https/, "no live link");
+    assert.doesNotMatch(body, /!\[pixel\]\(/, "no image");
+    assert.doesNotMatch(body, /<img/, "no raw HTML");
+    assert.doesNotMatch(body, /@acme\/admins|@octocat/, "no mention pings anyone");
+    assert.match(body, /\*\*boom\\\*\\\* \\\[click me\\\]/, "the message stays on one bold line with its markup escaped");
+    assert.match(body, /&lt;img src=x/);
+
+    // A stored diagnosis from before the normalizer can still carry a fence of its own.
+    await postDoctorFollowup(run, { stage: "start", code: "unknown", message: "m", suggestedFix: { kind: "yml_patch", instructions: "i", patch: "verify:\n```\n[x](https://evil.example)\n````" } }, s.deps);
+    assert.match(s.calls.comments[1], /\n`````yaml\nverify:\n```\n\[x\]\(https:\/\/evil\.example\)\n````\n`````\n/, "the fence outlasts every backtick run in the patch");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a merged setup PR force-refreshes the default-branch yml snapshot; a closed one does not", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    const stale = { sha: "before-merge", parsed: null, bootHash: null, at: Date.now() };
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { ...repoRow(s.repo.id).verify!, defaultYml: stale } });
+    const deps: OnboardDeps = { ...s.deps, branchSha: async () => "merge-sha" };
+
+    noteOnboardingPrClosed(s.repo.id, 41, false, deps);
+    await settle();
+    assert.deepEqual(repoRow(s.repo.id).verify!.defaultYml, stale, "closing without merging changes nothing on the default branch");
+
+    noteOnboardingPrClosed(s.repo.id, 41, true, deps);
+    await settle();
+    const snap = repoRow(s.repo.id).verify!.defaultYml!;
+    assert.equal(snap.sha, "merge-sha", "refreshed even inside the throttle window");
+    assert.equal(snap.parsed?.url, "http://localhost:5173", "read from the merged .devasign.yml");
+    assert.ok(snap.bootHash);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.state, "pr_merged");
+  } finally {
+    s.cleanup();
+  }
 });

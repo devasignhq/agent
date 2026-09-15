@@ -9,7 +9,7 @@ import { extractJSON } from "../review/parse.js";
 import { verificationJudgmentSystemPrompt } from "../review/prompts.js";
 import { withMaintainerInstructions } from "../review/decisions.js";
 import { effectiveWorkflow } from "../review/workflow.js";
-import type { Criterion, CriterionVerdict, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
+import type { Criterion, CriterionVerdict, RepoVerifyState, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { DoctorDiagnosis, RunnerResult } from "./contract.js";
 import { recordFlakeOutcome } from "./flake.js";
 import { usageByProvider } from "./plan.js";
@@ -19,9 +19,12 @@ import { artifactStorage } from "./storage.js";
 import { notifyForReview } from "../notifications.js";
 import { afterFeedbackRunSettled } from "./feedback.js";
 import { noteRunSucceeded, postDoctorFollowup } from "./onboarding/job.js";
+import { browserlessSummary } from "./browserless.js";
+import { patchRepoVerify } from "./repo-state.js";
 import { v4 as uuid } from "uuid";
 
 export const FLAKY_REASON = "flaky test — quarantined";
+export const NO_BROWSER_REASON = "the app did not start for browser tests";
 
 const EVIDENCE_KIND_ORDER: VerifyArtifact["kind"][] = ["log", "screenshot", "test_file", "video", "trace", "poster"];
 
@@ -58,6 +61,7 @@ export function computeVerdicts(args: {
 }): CriterionVerdict[] {
   const out: CriterionVerdict[] = [];
   const planned = new Map((args.plan?.unverifiable ?? []).map((u) => [u.criterionId, u]));
+  const strict = args.plan?.browser?.policy === "always" ? args.plan.browser : null;
   for (const c of args.criteria) {
     if (!isVerifiable(c)) continue;
     const all = args.results.filter((r) => r.criterionIds.includes(c.id));
@@ -66,10 +70,20 @@ export function computeVerdicts(args: {
     // the browser saw.
     const browserRan = all.some((r) => r.level === "e2e" && r.status !== "error" && r.status !== "skipped");
     const covering = browserRan ? all.filter((r) => r.level === "e2e") : all;
+    const stamp = c.kind !== "ui" ? null : browserRan ? "ran" : all.some((r) => r.level === "e2e") ? "fallback" : null;
+    // A fallback stamps only a pass or fail the lower tests decided. `e2e: always` refuses every
+    // verdict its browser tests could not decide, whichever way the tests below them went.
+    const decided = (v: CriterionVerdict): CriterionVerdict => {
+      if (stamp === "fallback" && strict) {
+        return { criterionId: v.criterionId, verdict: "unverifiable", reason: NO_BROWSER_REASON, evidenceRefs: v.evidenceRefs, fixUrl: strict.fixUrl, ...(v.verdict !== "unverifiable" ? { browser: stamp } : {}) };
+      }
+      if (!stamp || (stamp === "fallback" && v.verdict === "unverifiable")) return v;
+      return { ...v, browser: stamp };
+    };
     // A doctor diagnosis covers the tests that could not run (usually the e2e
     // subset); criteria whose own tests ran keep their real pass/fail.
     if (args.doctor && (!covering.length || covering.every((r) => r.status === "error" || r.status === "skipped"))) {
-      out.push({ criterionId: c.id, verdict: "unverifiable", reason: `setup needs attention: ${args.doctor.message}`.slice(0, 300), evidenceRefs: args.doctor.logArtifactId ? [{ artifactId: args.doctor.logArtifactId }] : [] });
+      out.push(decided({ criterionId: c.id, verdict: "unverifiable", reason: `setup needs attention: ${args.doctor.message}`.slice(0, 300), evidenceRefs: args.doctor.logArtifactId ? [{ artifactId: args.doctor.logArtifactId }] : [] }));
       continue;
     }
     if (!covering.length) {
@@ -87,36 +101,36 @@ export function computeVerdicts(args: {
         ...artifactsFor(r, args.artifacts, attemptsOnly).map((artifactId) => ({ artifactId, testId: r.testId, resultId: r.id })),
       ]);
     if (flaky.length && !failed.length) {
-      out.push({ criterionId: c.id, verdict: "unverifiable", reason: FLAKY_REASON, evidenceRefs: refs(flaky), flaky: true });
+      out.push(decided({ criterionId: c.id, verdict: "unverifiable", reason: FLAKY_REASON, evidenceRefs: refs(flaky), flaky: true }));
       continue;
     }
     if (failed.length) {
       const first = failed[0];
       // Attempts from separate Playwright test() blocks are not retries of one test.
       const allRetriesFailed = first.runner !== "playwright" && first.attempts.length > 1 && first.attempts.every((a) => a.status === "fail");
-      out.push({
+      out.push(decided({
         criterionId: c.id,
         verdict: "fail",
         reason: `assertion failed on ${allRetriesFailed ? `all ${first.attempts.length} attempts` : "the test run"}: ${(statusMessage(first) || "see log").split("\n")[0]}`.slice(0, 300),
         evidenceRefs: refs(failed),
-      });
+      }));
       continue;
     }
     if (passed.length && !errored.length) {
-      out.push({ criterionId: c.id, verdict: "pass", reason: `${passed.length === 1 ? "the test" : `${passed.length} tests`} passed`, evidenceRefs: refs(passed) });
+      out.push(decided({ criterionId: c.id, verdict: "pass", reason: `${passed.length === 1 ? "the test" : `${passed.length} tests`} passed`, evidenceRefs: refs(passed) }));
       continue;
     }
     if (passed.length && errored.length) {
-      out.push({ criterionId: c.id, verdict: "pass", reason: `${passed.length} test(s) passed; ${errored.length} could not run`, evidenceRefs: refs([...passed, ...errored]) });
+      out.push(decided({ criterionId: c.id, verdict: "pass", reason: `${passed.length} test(s) passed; ${errored.length} could not run`, evidenceRefs: refs([...passed, ...errored]) }));
       continue;
     }
     const e = errored[0];
-    out.push({
+    out.push(decided({
       criterionId: c.id,
       verdict: "unverifiable",
       reason: `test could not run: ${(statusMessage(e) || e.status).split("\n")[0]}`.slice(0, 300),
       evidenceRefs: refs(errored),
-    });
+    }));
   }
   return out;
 }
@@ -138,8 +152,32 @@ export function mergeModelVerdicts(code: CriterionVerdict[], model: ModelVerdict
     if (v.verdict !== "unverifiable" && m.verdict === "unverifiable") {
       return { ...v, verdict: "unverifiable", reason, evidenceRefs };
     }
-    return { ...v, reason: v.verdict === "unverifiable" && v.flaky ? v.reason : reason, evidenceRefs };
+    // Flaky and strict-browser reasons are fixed wording the model may not rewrite.
+    return { ...v, reason: v.verdict === "unverifiable" && (v.flaky || v.reason === NO_BROWSER_REASON) ? v.reason : reason, evidenceRefs };
   });
+}
+
+/** repo.verify.lastBrowserless after a judged run; a run with no UI criteria, or one the doctor flagged, leaves another PR's flag alone. */
+function noteBrowserless(run: VerifyRun, criteria: Criterion[], verdicts: CriterionVerdict[], results: RunnerResult[], doctor: DoctorDiagnosis | null, plan: VerifyPlan | null, at: number): void {
+  const browser = plan?.browser;
+  if (!browser) return;
+  const s = browserlessSummary({ criteria, verdicts, plan });
+  const cur = db.find("repositories", (r) => r.id === run.repoId)?.verify?.lastBrowserless ?? null;
+  let next: RepoVerifyState["lastBrowserless"] = s ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at } : null;
+  if (!s) {
+    const ui = new Set(criteria.filter((c) => c.kind === "ui").map((c) => c.id));
+    const e2e = results.filter((r) => r.level === "e2e");
+    // No test below decided these criteria, but the app still did not start: keep a did_not_start flag, or record one.
+    const noBrowserRan = e2e.some((r) => r.criterionIds.some((id) => ui.has(id))) && e2e.every((r) => r.status === "error" || r.status === "skipped");
+    if (browser.policy !== "never" && noBrowserRan) {
+      if (cur?.reason === "did_not_start") return;
+      next = { count: 0, reason: "did_not_start", runId: run.id, prNumber: run.prNumber, at };
+    } else {
+      if (browser.policy !== "never" && (doctor || !verdicts.some((v) => ui.has(v.criterionId)))) return;
+      if (cur == null) return;
+    }
+  }
+  patchRepoVerify(run.repoId, (v) => ({ ...v, lastBrowserless: next }));
 }
 
 export type JudgeDeps = {
@@ -285,6 +323,11 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
         timings: { ...run.timings, judgedAt },
         tokenUsage: { ...run.tokenUsage, judge: usageByProvider() },
       });
+      try {
+        noteBrowserless(run, criteria, verdicts, results.payload.results, doctor, plan, judgedAt);
+      } catch (err) {
+        console.warn("[verify] lastBrowserless update failed:", err);
+      }
       const counts = { pass: 0, fail: 0, unverifiable: 0 };
       for (const v of verdicts) counts[v.verdict] += 1;
       db.insert("reviewLogs", {

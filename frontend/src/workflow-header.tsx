@@ -2,8 +2,10 @@
 // Workflow header widgets: the repo picker rendered inside the breadcrumb and
 // the selected repo's details (reviews, flake, verification setup) on the right.
 import React from "react";
+import { useSearchParams } from "react-router-dom";
 import { Icon } from "./icons";
 import { api, type Repository } from "./api";
+import { VERIFY_YML_REFERENCE, browserTestsRow, opensBrowserSetup, withoutBrowserSetup } from "./verify-setup-view";
 
 export type WorkflowHeaderState = {
   repos: Repository[];
@@ -117,6 +119,7 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
   const ob = setup.onboarding || { state: "none" };
   const workflows = setup.detected?.existingWorkflows || [];
   const frameworks = (setup.detected?.frameworks || []).map((f) => f.name).join(", ");
+  const browser = browserTestsRow(setup);
   const pillClass = ob.state === "verified" ? "ok" : ob.state === "pr_open" || ob.state === "pr_merged" ? "info" : "nit";
   const stateText =
     ob.state === "verified" ? "verified, a run succeeded" :
@@ -137,13 +140,15 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
         <span className={`pill ${pillClass}`}>{stateText}</span>
         {ob.prUrl && <a className="wf-verify-link" href={ob.prUrl} target="_blank" rel="noreferrer">open PR <Icon name="external" size={10} /></a>}
       </div>
-      {setup.detected && (
-        <dl className="wf-verify-facts">
-          <dt>Stack</dt><dd>{frameworks || "no test framework (bundled runner)"}</dd>
-          <dt>App start</dt>
-          <dd>{setup.devasignYml?.start ? <span className="mono">{setup.devasignYml.start}</span> : <span className="t-warn">not configured. Set verify.start and verify.url in .devasign.yml to enable browser tests</span>}</dd>
-        </dl>
-      )}
+      <dl className="wf-verify-facts">
+        {setup.detected && <><dt>Stack</dt><dd>{frameworks || "no test framework (bundled runner)"}</dd></>}
+        <dt>Browser tests</dt>
+        <dd>
+          <span className={browser.tone === "warn" ? "t-warn" : browser.tone === "mute" ? "mute" : undefined}>{browser.text}</span>
+          {browser.last && <div className="mute">{browser.last}</div>}
+          <div><a className="wf-verify-link" href={VERIFY_YML_REFERENCE} target="_blank" rel="noreferrer">verify block reference <Icon name="external" size={10} /></a></div>
+        </dd>
+      </dl>
       {ob.missingSecrets && ob.missingSecrets.length > 0 && <div className="wf-verify-warn">missing secrets: {ob.missingSecrets.join(", ")}</div>}
       {ob.lastDiagnosis && <div className="wf-verify-warn">setup needs attention: {ob.lastDiagnosis.message}</div>}
       {ob.lastError && <div className="wf-verify-warn">{ob.lastError}</div>}
@@ -171,8 +176,14 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
 }
 
 export function RepoDetails({ repo }: { repo: Repository }) {
-  const [open, setOpen] = React.useState(false);
-  const close = React.useCallback(() => setOpen(false), []);
+  const [searchParams, setSearchParams] = useSearchParams();
+  const deepLinked = opensBrowserSetup(searchParams, repo.id);
+  const [open, setOpen] = React.useState(deepLinked);
+  React.useEffect(() => { if (deepLinked) setOpen(true); }, [deepLinked]);
+  const close = React.useCallback(() => {
+    setOpen(false);
+    if (searchParams.has("setup")) setSearchParams(withoutBrowserSetup(searchParams), { replace: true });
+  }, [searchParams, setSearchParams]);
   const ref = usePopover(open, close);
   const s = repo.reviewStats;
   const flake = repo.flakeRate && repo.flakeRate.total > 0 ? repo.flakeRate : null;
@@ -197,7 +208,7 @@ export function RepoDetails({ repo }: { repo: Repository }) {
         <button
           type="button"
           className={`btn ghost sm wf-verify-btn ${open ? "is-active" : ""}`}
-          onClick={() => setOpen((o) => !o)}
+          onClick={() => (open ? close() : setOpen(true))}
           aria-haspopup="dialog"
           aria-expanded={open}
           aria-label={`Verification setup: ${VERIFY_LABEL[state] || state}`}

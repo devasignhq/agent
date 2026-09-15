@@ -52,6 +52,8 @@ import { buildRunView } from "../verify/runs.js";
 import { buildTestRows, latestRunPerReview, summarizeTestRows } from "../verify/test-rows.js";
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
+import { refreshDefaultYml, type DefaultYmlDeps } from "../verify/default-yml.js";
+import { browserTestsStatus, setupFixUrl } from "../verify/repo-state.js";
 import { enqueueVerifyOnboard } from "../queue.js";
 
 export const api = Router();
@@ -1338,11 +1340,18 @@ export function verifyTestsHandler(req: Request, res: Response) {
       now
     );
   });
+  const browserSetup = repos
+    .flatMap((r) => {
+      const last = r.verify?.lastBrowserless;
+      return last ? [{ repoId: r.id, repo: `${r.owner}/${r.name}`, ...browserTestsStatus(r.verify), lastBrowserless: last, fixUrl: setupFixUrl(r.id) }] : [];
+    })
+    .sort((a, b) => a.repo.localeCompare(b.repo));
   res.json({
     rows,
     counts: summarizeTestRows(rows),
     repos: repos.map((r) => ({ id: r.id, name: `${r.owner}/${r.name}` })).sort((a, b) => a.name.localeCompare(b.name)),
     truncated: latest.length > runs.length,
+    browserSetup,
   });
 }
 api.get("/verify/tests", verifyTestsHandler);
@@ -1372,26 +1381,53 @@ export function archiveTestsHandler(req: Request, res: Response) {
 }
 api.post("/reviews/:id/verify/archive", archiveTestsHandler);
 
-// Verification setup checklist for a repo, and "Regenerate setup PR".
-api.get("/repositories/:id/verify/setup", (req, res) => {
-  const ctx = ownedRepo(req, res);
-  if (!ctx) return;
-  const v = ctx.repo.verify;
-  res.json({
-    onboarding: v?.onboarding ?? { state: "none" },
-    detected: v?.detected ?? null,
-    devasignYml: v?.devasignYml?.parsed ?? null,
-    runnerSeen: !!v?.detected || !!v?.onboarding?.firstSuccessfulRunId,
-  });
-});
-api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, (req, res) => {
+// Verification setup checklist for a repo, and "Regenerate setup PR". Tests pass deps so the
+// default-branch yml refresh never reaches GitHub; a slow GitHub gets the stored snapshot after waitMs.
+export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: number; refresh?: typeof refreshDefaultYml } = {}) {
+  const refresh = opts.refresh ?? refreshDefaultYml;
+  return async function verifySetupHandler(req: Request, res: Response): Promise<void> {
+    const ctx = ownedRepo(req, res);
+    if (!ctx) return;
+    let timer: NodeJS.Timeout | undefined;
+    // The refresh can outlive the wait; whenever it fails, early or late, it is logged and the stored snapshot answers.
+    const refreshed = Promise.resolve()
+      .then(() => refresh(ctx.repo.id, { deps }))
+      .catch((err) => {
+        console.warn(`[verify] default-yml refresh failed for repo ${ctx.repo.id}:`, err instanceof Error ? err.message : err);
+        return null;
+      });
+    await Promise.race([
+      refreshed,
+      new Promise((resolve) => { timer = setTimeout(resolve, opts.waitMs ?? 4_000); }),
+    ]);
+    clearTimeout(timer);
+    const v = db.find("repositories", (r) => r.id === ctx.repo.id)?.verify ?? ctx.repo.verify;
+    res.json({
+      onboarding: v?.onboarding ?? { state: "none" },
+      detected: v?.detected ?? null,
+      devasignYml: v?.devasignYml?.parsed ?? null,
+      runnerSeen: !!v?.detected || !!v?.onboarding?.firstSuccessfulRunId,
+      browserTests: {
+        ...browserTestsStatus(v),
+        lastBrowserless: v?.lastBrowserless ?? null,
+        fixUrl: setupFixUrl(ctx.repo.id),
+        defaultYml: v?.defaultYml?.parsed ?? null,
+      },
+    });
+  };
+}
+export const verifySetupHandler = makeVerifySetupHandler();
+api.get("/repositories/:id/verify/setup", verifySetupHandler);
+
+export function setupPrHandler(req: Request, res: Response) {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   const mode = req.body?.mode === "extend" ? "extend" : "separate";
   const workflow = typeof req.body?.workflow === "string" ? req.body.workflow.slice(0, 200) : undefined;
   enqueueVerifyOnboard({ repoId: ctx.repo.id, trigger: "manual", mode, workflow });
   res.json({ ok: true, queued: true });
-});
+}
+api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, setupPrHandler);
 // "Adopt this test": commit generated tests from a run into the customer's suite via a PR.
 export async function adoptTestsHandler(req: Request, res: Response): Promise<void> {
   const user = getSessionUser(req);
