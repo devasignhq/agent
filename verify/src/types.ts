@@ -70,9 +70,10 @@ export type DetectedSetup = {
   services: Array<"postgres" | "mysql" | "redis">;
 };
 
-export type DoctorStage = "checkout" | "install" | "build" | "services" | "start" | "browsers" | "tests";
+export type DoctorStage = "checkout" | "install" | "build" | "services" | "start" | "login" | "browsers" | "tests";
 export type DoctorCode =
   | "no_start_command"
+  | "login_failed"
   | "missing_service"
   | "missing_secret"
   | "wrong_runtime_version"
@@ -102,10 +103,25 @@ export type DevasignVerifyConfig = {
   url?: string;
   ready?: string;
   seed?: string;
+  // Seconds each step of a managed boot (servers or a login script) may take.
+  timeout?: number;
+  // Started in order before `start`; `start`/`url` stay the app the browser opens.
+  servers?: Array<{ name: string; start: string; url: string; ready?: string }>;
   services?: Array<{ name: "postgres" | "mysql" | "redis"; image?: string; env?: Record<string, string> }>;
-  login?: { strategy: "none" | "storage_state" | "form" | "cookie"; storageState?: string; form?: { url: string; user: string; pass: string; submit?: string } };
+  login?: {
+    // Writes a Playwright storageState JSON to $DEVASIGN_STORAGE_STATE; generated browser tests start with it.
+    script?: string;
+    // A path on `url`, or an absolute URL, that must answer 2xx with that session.
+    check?: string;
+    // Legacy strategies: parsed, but nothing applies them.
+    strategy?: "none" | "storage_state" | "form" | "cookie";
+    storageState?: string;
+    form?: { url: string; user: string; pass: string; submit?: string };
+  };
   env?: string[];
 };
+
+export type RunnerCapability = "managed_boot" | "boot_probe";
 
 export type ResolveEvent = "pull_request" | "repository_dispatch" | "workflow_dispatch";
 
@@ -118,6 +134,7 @@ export type ResolveRequest = {
   actions?: { runId: string; jobUrl?: string; runnerOs?: string };
   cliVersion?: string;
   giveUp?: boolean;
+  capabilities?: RunnerCapability[];
 };
 
 export type RunnerPlan = {
@@ -134,6 +151,8 @@ export type RunnerPlan = {
   failOn?: FailOn;
   // The base branch's verify block, for a checkout cut before onboarding that has none.
   verifyConfig?: DevasignVerifyConfig;
+  // false: the backend switched managed boot off, so keep Playwright's webServer. Absent: the yml decides.
+  managedBoot?: boolean;
 };
 
 export type FailOn = "never" | "verdict" | "unverifiable";

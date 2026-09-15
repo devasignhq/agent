@@ -1,0 +1,14 @@
+verify:
+  e2e: auto
+  timeout: 30
+  servers:
+    - name: api
+      start: node api.mjs
+      url: http://localhost:4180
+      ready: /healthz
+  start: node web.mjs
+  url: http://localhost:4181
+  ready: /healthz
+  login:
+    script: node scripts/devasign-login.mjs
+    check: http://localhost:4180/api/me

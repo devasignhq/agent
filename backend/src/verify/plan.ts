@@ -41,7 +41,7 @@ import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
 import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, RUNNER_GONE_MS, updateRun } from "./runs.js";
-import { hasBootConfig, parseDevasignVerify } from "./yml.js";
+import { BOOT_KEYS, hasBootConfig, parseDevasignVerify } from "./yml.js";
 import { patchRepoVerify, setupFixUrl } from "./repo-state.js";
 
 export const LEVELS: TestLevel[] = ["unit", "integration", "component", "e2e"];
@@ -479,6 +479,19 @@ export function buildCommands(tests: PlanTest[]): PlanCommand[] {
   return out;
 }
 
+// A login script and form credentials can carry secrets, so the prompt only learns that they exist.
+function renderVerifyBlock(yml: DevasignVerifyConfig | null): string {
+  if (!yml) return "none";
+  const { servers, login, ...rest } = yml;
+  return [
+    JSON.stringify({ ...rest, ...(login?.strategy ? { login: { strategy: login.strategy } } : {}) }),
+    servers?.length ? `servers: ${servers.map((s) => s.name).join(", ")}` : "",
+    login?.script ? "login script: yes" : "",
+  ]
+    .filter(Boolean)
+    .join("; ");
+}
+
 function renderSetup(setup: DetectedSetup, yml: DevasignVerifyConfig | null): string {
   const fw = setup.frameworks.map((f) => `${f.name}${f.version ? `@${f.version}` : ""}${f.configPath ? ` (${f.configPath})` : ""}`).join(", ") || "none detected";
   const deps = setup.dependencies ?? [];
@@ -497,7 +510,7 @@ function renderSetup(setup: DetectedSetup, yml: DevasignVerifyConfig | null): st
       : "",
     `- Services: ${setup.services.join(", ") || "none"}`,
     setup.monorepo ? `- Monorepo: ${setup.monorepo.tool} (${setup.monorepo.packages.join(", ")})` : "",
-    `- .devasign.yml verify: ${yml ? JSON.stringify({ ...yml, login: yml.login ? { strategy: yml.login.strategy } : undefined }) : "none"}`,
+    `- .devasign.yml verify: ${renderVerifyBlock(yml)}`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -521,7 +534,7 @@ function renderCriteria(criteria: Criterion[]): string {
   return criteria.map((c) => `- [${c.id}] (${c.kind ?? "code"})${c.implied ? " [implied]" : ""} ${c.text}`).join("\n");
 }
 
-function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup): string {
+function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup, yml: DevasignVerifyConfig | null): string {
   const hasPlaywright = setup.frameworks.some((f) => f.name === "playwright");
   return [
     ...ids.map((id) => `- [${id}]: max level ${policy.maxLevel.get(id)}`),
@@ -540,6 +553,7 @@ function renderPolicy(policy: PlanPolicy, ids: string[], setup: DetectedSetup): 
     policy.e2eAllowed && !policy.apiOnly
       ? "- A criterion capped at component may still be planned at e2e when only a real browser can observe it, if levelReason says what component cannot see."
       : "",
+    policy.e2eAllowed && yml?.login?.script ? "- Browser tests start signed in (the runner applies a saved session); never sign in inside a test." : "",
   ]
     .filter(Boolean)
     .join("\n");
@@ -554,7 +568,7 @@ export type PlanContext = {
   treePaths: Set<string>;
   setup: DetectedSetup;
   yml: DevasignVerifyConfig | null;
-  ymlFrom: "head" | "base" | null;
+  ymlFrom: "head" | "base" | "base_boot" | null;
   policy: PlanPolicy;
   // UI criteria kept from the model: `e2e: always` with nothing to boot forbids proving them below the browser.
   withheld: Criterion[];
@@ -599,7 +613,7 @@ export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: Replan
     renderCriteria(target),
     "",
     "## Level policy",
-    renderPolicy(ctx.policy, target.map((c) => c.id), ctx.setup),
+    renderPolicy(ctx.policy, target.map((c) => c.id), ctx.setup, ctx.yml),
     "",
     ...renderChanged(ctx),
     "## Repository test setup",
@@ -759,14 +773,26 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
 }
 
 // A branch cut before onboarding carries no verify block, so every PR it opens would plan as
-// if the app could not boot; the base branch's block is the one in force for it.
-async function readVerifyYml(headRaw: string | null, headSha: string, baseRef: string | undefined, read: (ref: string) => Promise<string | null>) {
+// if the app could not boot; the base branch's block is the one in force for it. A head block
+// without `start` keeps its other keys but boots the way base does.
+async function readVerifyYml(
+  headRaw: string | null,
+  headSha: string,
+  baseRef: string | undefined,
+  read: (ref: string) => Promise<string | null>
+): Promise<{ raw: string | null; sha: string; yml: DevasignVerifyConfig | null; from: PlanContext["ymlFrom"] }> {
   const head = parseDevasignVerify(headRaw);
-  if (head || !baseRef) return { raw: headRaw, sha: headSha, yml: head, from: head ? ("head" as const) : null };
+  if (head?.start || !baseRef) return { raw: headRaw, sha: headSha, yml: head, from: head ? "head" : null };
   const baseRaw = await read(baseRef);
   const base = parseDevasignVerify(baseRaw);
-  return base ? { raw: baseRaw, sha: baseRef, yml: base, from: "base" as const } : { raw: headRaw, sha: headSha, yml: null, from: null };
+  if (!head) return base ? { raw: baseRaw, sha: baseRef, yml: base, from: "base" } : { raw: headRaw, sha: headSha, yml: null, from: null };
+  if (!base?.start) return { raw: headRaw, sha: headSha, yml: head, from: "head" };
+  return { raw: headRaw, sha: headSha, yml: { ...bootGroup(head, false), ...bootGroup(base, true) }, from: "base_boot" };
 }
+
+const BOOT_KEY_SET: ReadonlySet<string> = new Set(BOOT_KEYS);
+const bootGroup = (cfg: DevasignVerifyConfig, boot: boolean): DevasignVerifyConfig =>
+  Object.fromEntries(Object.entries(cfg).filter(([k]) => BOOT_KEY_SET.has(k) === boot));
 
 async function gatherContext(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<PlanContext> {
   const review = db.find("prReviews", (r) => r.id === run.reviewId);
@@ -1159,6 +1185,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           detail: [
             `planned in ${secs(totalMs)} (queued ${secs(queuedMs)}, gather ${secs(gatherMs)}, llm ${secs(firstLlmMs)}${replanMs ? `, re-plan ${secs(replanMs)}` : ""}${bodiesMs ? `, bodies ${secs(bodiesMs)}` : ""})`,
             ...(ctx.ymlFrom === "base" ? ["app start read from the base branch's .devasign.yml — this PR's head has no verify block of its own"] : []),
+            ...(ctx.ymlFrom === "base_boot" ? ["boot keys read from the base branch's .devasign.yml — this PR's head block has no start"] : []),
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
             ...(!first || first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),

@@ -5,6 +5,7 @@ import path from "node:path";
 import { promisify } from "node:util";
 import { parse as parseYaml } from "yaml";
 import type { DetectedFramework, DetectedSetup, DevasignVerifyConfig } from "./types.js";
+import { normalizeVerify } from "./yml.js";
 
 const execFileP = promisify(execFile);
 
@@ -83,8 +84,8 @@ export function readDevasignVerify(root: string): DevasignVerifyConfig | null {
   const raw = readText(root, ".devasign.yml");
   if (!raw) return null;
   try {
-    const doc = parseYaml(raw) as { verify?: DevasignVerifyConfig } | null;
-    return doc && typeof doc === "object" && doc.verify && typeof doc.verify === "object" ? doc.verify : null;
+    const doc = parseYaml(raw) as { verify?: unknown } | null;
+    return doc && typeof doc === "object" ? normalizeVerify(doc.verify) : null;
   } catch {
     return null;
   }

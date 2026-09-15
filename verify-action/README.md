@@ -35,6 +35,7 @@ How it behaves:
 - The step exits 0 regardless of the verdict — the `DevAsign · Verify` check run carries it. Set `fail-on: verdict` to fail the job on a failed criterion, or `fail-on: unverifiable` to also fail when a criterion could not be verified.
 - Every criterion the plan could not cover is announced as a workflow warning with its reason, and the step summary lists all criteria with their test or the reason none ran.
 - Set `verify.start` / `verify.url` in `.devasign.yml` so end-to-end tests can boot your app; without them, UI criteria are checked below browser level where possible, with a note on the PR saying so, and otherwise reported as unverifiable, not failed. With `e2e: always`, a UI criterion no browser test could check is reported as unverifiable; `e2e: never` turns browser tests and the note off.
+- An app that needs more than one process or a signed-in user can list extra `verify.servers`, a `verify.login.script` that saves a Playwright session, and a per-step `verify.timeout`. The runner then starts everything itself, ignoring any `webServer` in your Playwright config, and redacts secrets, auth headers and the saved session from the logs and traces it uploads. See [Booting the app for browser tests](../verify/README.md#booting-the-app-for-browser-tests).
 - Outputs: `run-id`, `outcome`, and `browsers` (`true` when Playwright browsers were installed, which is when the browser cache is saved).
 
 | Input | Default | Meaning |

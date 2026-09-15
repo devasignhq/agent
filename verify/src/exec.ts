@@ -15,6 +15,7 @@ export type ExecResult = {
 };
 
 const MAX_CAPTURE = 5 * 1024 * 1024;
+const MAX_LINE = 64 * 1024;
 const DRAIN_MS = 2_000;
 
 export async function runCommand(opts: {
@@ -24,7 +25,7 @@ export async function runCommand(opts: {
   env?: NodeJS.ProcessEnv;
   timeoutMs: number;
   logFile?: string;
-  onLine?: (line: string) => void;
+  onLine?: (line: string, stream: "out" | "err") => void;
 }): Promise<ExecResult> {
   const started = Date.now();
   return new Promise((resolve) => {
@@ -63,12 +64,22 @@ export async function runCommand(opts: {
       timedOut = true;
       killAll();
     }, opts.timeoutMs);
+    // A pipe chunk can end mid-line; onLine only ever sees whole lines, so a scrub can match them.
+    const partial = { out: "", err: "" };
     const take = (chunk: Buffer, which: "out" | "err") => {
       const s = chunk.toString("utf8");
       if (which === "out") stdout = (stdout + s).slice(-MAX_CAPTURE);
       else stderr = (stderr + s).slice(-MAX_CAPTURE);
       output = (output + s).slice(-MAX_CAPTURE);
-      if (opts.onLine) for (const line of s.split("\n")) if (line) opts.onLine(line);
+      if (opts.onLine) {
+        const lines = (partial[which] + s).split("\n");
+        partial[which] = lines.pop()!;
+        if (partial[which].length > MAX_LINE) {
+          lines.push(partial[which]);
+          partial[which] = "";
+        }
+        for (const line of lines) if (line) opts.onLine(line, which);
+      }
       armDrain();
     };
     child.stdout?.on("data", (c) => take(c, "out"));
@@ -78,6 +89,7 @@ export async function runCommand(opts: {
       settled = true;
       clearTimeout(timer);
       clearTimeout(drain);
+      for (const which of ["out", "err"] as const) if (partial[which]) opts.onLine?.(partial[which], which);
       const full: ExecResult = { ...result, stdout, stderr, output, durationMs: Date.now() - started };
       if (opts.logFile) {
         try {

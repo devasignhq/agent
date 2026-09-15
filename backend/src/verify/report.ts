@@ -185,7 +185,7 @@ export function buildVerificationView(args: {
   for (const r of rows) counts[r.verdict] += 1;
   const browserless =
     state === "completed" && run?.verdicts.length
-      ? browserlessSummary({ criteria: args.criteria.filter(isVerifiable), verdicts: run.verdicts, plan })
+      ? browserlessSummary({ criteria: args.criteria.filter(isVerifiable), verdicts: run.verdicts, plan, withheld: run.runnerMeta?.e2eWithheld })
       : null;
   return {
     state,
@@ -207,10 +207,15 @@ export function buildVerificationView(args: {
 
 // Runner-reported text (test errors, doctor messages) lands in these reasons.
 const REASON_CAP = 600;
+const VERIFY_NPM_URL = "https://www.npmjs.com/package/@devasign/verify";
 
 function browserlessNote(b: BrowserlessSummary | null | undefined): string | null {
   if (!b?.count) return null;
   const subject = b.count === 1 ? "1 UI criterion was" : `${b.count} UI criteria were`;
+  if (b.reason === "paused") return `${subject} checked without a browser because DevAsign has paused browser tests that boot verify.servers or verify.login`;
+  if (b.reason === "runner_outdated") {
+    return `${subject} checked without a browser because the runner in CI is too old for verify.servers or verify.login — [update @devasign/verify](${VERIFY_NPM_URL})`;
+  }
   return b.reason === "did_not_start"
     ? `${subject} checked without a browser because the app did not start in CI — [see setup](${b.fixUrl})`
     : `${subject} checked without a browser — [set up browser tests](${b.fixUrl})`;

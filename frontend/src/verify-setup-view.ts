@@ -34,6 +34,8 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
     if (missing.length) text += ` (missing: ${missing.map((k) => `verify.${k}`).join(", ")})`;
   } else if (status === "failing") {
     text = last?.prNumber ? `The app did not start in CI on PR #${last.prNumber}` : "The app did not start in CI";
+  } else if (status === "runner_outdated") {
+    text = "The runner in CI is too old for verify.servers or verify.login — update @devasign/verify";
   } else if (status === "unproven") {
     text = "Configured";
     tone = "ok";

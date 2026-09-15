@@ -53,3 +53,14 @@ test("a normal command still resolves with its exit code and output", async () =
   const missing = await runCommand({ cmd: path.join(root, "nope"), args: [], cwd: root, timeoutMs: 10_000 });
   assert.ok(missing.spawnError, "a spawn failure is reported, not thrown");
 });
+
+test("onLine gets whole lines tagged with their stream, even when a line arrives split across pipe chunks", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-exec-lines-"));
+  // The pauses force separate chunks: the header, then its value, then a final line with no newline.
+  const src = `const w = (s) => process.stdout.write(s); w("Set-Cookie: sid="); setTimeout(() => { w("s3cr3t-value\\nnext line\\n"); process.stderr.write("oops\\n"); setTimeout(() => w("tail without newline"), 150); }, 150);`;
+  const lines: Array<[string, string]> = [];
+  const res = await runCommand({ cmd: process.execPath, args: ["-e", src], cwd: root, timeoutMs: 10_000, onLine: (l, stream) => lines.push([stream, l]) });
+  assert.equal(res.code, 0);
+  assert.deepEqual(lines.filter(([s]) => s === "out").map(([, l]) => l), ["Set-Cookie: sid=s3cr3t-value", "next line", "tail without newline"]);
+  assert.deepEqual(lines.filter(([s]) => s === "err"), [["err", "oops"]]);
+});

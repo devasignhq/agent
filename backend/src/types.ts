@@ -163,9 +163,9 @@ export type Repository = {
   verify?: RepoVerifyState;
 }
 
-// Why a judged run's UI criteria were decided without a browser: no boot config at all,
-// or boot config whose browser tests could not run.
-export type BrowserlessReason = "not_configured" | "did_not_start";
+// Why a judged run's UI criteria were decided without a browser: no boot config at all, boot
+// config whose browser tests could not run, or a runner too old to boot servers or log in.
+export type BrowserlessReason = "not_configured" | "did_not_start" | "runner_outdated";
 
 export type RepoVerifyState = {
   detected?: DetectedSetup | null;
@@ -1299,6 +1299,9 @@ export type VerifyRun = {
     jobUrl?: string;
     workflowSha?: string;
     eventName?: string;
+    capabilities?: string[];
+    // The plan's browser tests were held back from this runner, which could not boot the app they need.
+    e2eWithheld?: "runner_outdated" | "managed_boot_off";
   };
   doctor?: DoctorDiagnosis | null;
   triggeredBy: { kind: "pr_event" | "comment" | "rerun" | "dispatch"; commentId?: number };
@@ -1378,7 +1381,8 @@ export type VerifyPlan = {
   prAuthoredTests?: string[];
   // The `verify:` block the plan assumed; "base" when the PR head carries none of its own.
   verifyConfig?: DevasignVerifyConfig;
-  verifyConfigFrom?: "head" | "base";
+  // "base_boot": head has a verify block without `start`, so the boot keys came from the base branch.
+  verifyConfigFrom?: "head" | "base" | "base_boot";
   // The browser policy the plan was made under; absent on plans older than the field.
   browser?: VerifyPlanBrowser;
   createdAt: number;

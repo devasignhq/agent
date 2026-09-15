@@ -21,7 +21,7 @@ export class Workspace {
     this.testsDir = path.join(this.dir, "tests");
     this.preexistingDir = existsSync(this.dir);
     // A previous interrupted or --keep run must not leak state into this one.
-    for (const sub of ["tests", "artifacts", "node_modules", "playwright.config.ts", "playwright.existing.config.ts"]) {
+    for (const sub of ["tests", "artifacts", "node_modules", "auth", "playwright.config.ts", "playwright.existing.config.ts"]) {
       rmSync(path.join(this.dir, sub), { recursive: true, force: true });
     }
   }
@@ -64,7 +64,7 @@ export class Workspace {
   /** Remove what we created. A pre-existing `.devasign/` (hooks, config) stays. */
   cleanup(): void {
     for (const p of [...this.created].reverse()) rmSync(p, { recursive: true, force: true });
-    for (const sub of ["tests", "artifacts", "node_modules"]) rmSync(path.join(this.dir, sub), { recursive: true, force: true });
+    for (const sub of ["tests", "artifacts", "node_modules", "auth"]) rmSync(path.join(this.dir, sub), { recursive: true, force: true });
     if (!this.preexistingDir) rmSync(this.dir, { recursive: true, force: true });
     this.created = [];
   }

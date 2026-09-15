@@ -4,9 +4,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, runVerifyJudge } from "./judge.js";
+import { BOOT_PAUSED_REASON, buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, NO_BROWSER_REASON, RUNNER_OUTDATED_REASON, runVerifyJudge } from "./judge.js";
 import { createVerifyRun, snapshotCriteriaRevision, updateRun } from "./runs.js";
-import type { Criterion, VerifyArtifact, VerifyPlan } from "../types.js";
+import type { Criterion, CriterionVerdict, RepoVerifyState, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { DoctorDiagnosis, RunnerAttempt, RunnerResult } from "./contract.js";
 
 const crit = (id: string, kind: Criterion["kind"] = "code"): Criterion => ({ id, text: `criterion ${id}`, met: null, evidence: null, kind });
@@ -289,6 +289,93 @@ test("e2e: always turns every verdict the browser could not decide into unverifi
   assert.equal(merged[7].browser, "fallback");
 });
 
+test("browser tests withheld from the runner: covered UI criteria fall back, e2e: always refuses them, and one nothing checked links to setup", () => {
+  const fixUrl = "https://app/workflow?repo=r&setup=browser";
+  const plan = (policy: "auto" | "always") => ({
+    unverifiable: [],
+    tests: [
+      { id: "b1", level: "e2e", runner: "playwright", criterionIds: ["1", "2", "3"] },
+      { id: "b4", level: "e2e", runner: "playwright", criterionIds: ["4"] },
+      { id: "u5", level: "unit", criterionIds: ["5"] },
+      { id: "b6", level: "e2e", runner: "playwright", criterionIds: ["6"] },
+      { id: "c7", level: "component", runner: "playwright", criterionIds: ["7"] },
+    ],
+    browser: { policy, allowed: true, bootConfigured: true, reason: "ok", fixUrl },
+  }) as unknown as VerifyPlan;
+  const unit = (testId: string, id: string, status: RunnerResult["status"]) => result({ testId, criterionIds: [id], status, ...(status === "fail" ? { error: "expected 1 to be 2" } : {}) });
+  const args = {
+    criteria: [crit("1", "ui"), crit("2", "ui"), crit("3", "ui"), crit("4"), crit("5", "ui"), crit("6", "ui"), crit("7", "ui")],
+    results: [unit("u1", "1", "pass"), unit("u2", "2", "fail"), unit("u5", "5", "pass"), result({ testId: "b6", criterionIds: ["6"], status: "pass", runner: "playwright", level: "e2e" })],
+    doctor: null,
+    artifacts: [art("f1", "test_file", "u1")],
+  };
+  const row = (v: CriterionVerdict) => [v.criterionId, v.verdict, v.browser, v.fixUrl];
+
+  const auto = computeVerdicts({ ...args, plan: plan("auto"), withheld: "runner_outdated" });
+  assert.deepEqual(auto.map(row), [
+    ["1", "pass", "fallback", undefined],
+    ["2", "fail", "fallback", undefined],
+    ["3", "unverifiable", undefined, fixUrl],
+    ["4", "unverifiable", undefined, undefined],
+    ["5", "pass", undefined, undefined],
+    ["6", "pass", "ran", undefined],
+    ["7", "unverifiable", undefined, fixUrl],
+  ]);
+  assert.equal(auto[6].reason, RUNNER_OUTDATED_REASON, "a withheld Playwright test below e2e level was held back too");
+  assert.equal(auto[0].reason, "the test passed", "the lower test's verdict stands");
+  assert.equal(auto[2].reason, RUNNER_OUTDATED_REASON);
+  assert.equal(auto[3].reason, "no test ran for this criterion", "a non-UI criterion is untouched");
+
+  const strict = computeVerdicts({ ...args, plan: plan("always"), withheld: "runner_outdated" });
+  assert.deepEqual(strict.map(row), [
+    ["1", "unverifiable", "fallback", fixUrl],
+    ["2", "unverifiable", "fallback", fixUrl],
+    ["3", "unverifiable", undefined, fixUrl],
+    ["4", "unverifiable", undefined, undefined],
+    ["5", "pass", undefined, undefined],
+    ["6", "pass", "ran", undefined],
+    ["7", "unverifiable", undefined, fixUrl],
+  ]);
+  for (const i of [0, 1, 2, 6]) assert.equal(strict[i].reason, RUNNER_OUTDATED_REASON, `criterion ${strict[i].criterionId}`);
+  assert.ok(strict[0].evidenceRefs.some((r) => r.artifactId === "f1"), "the fallback's evidence stays cited");
+
+  const off = computeVerdicts({ ...args, plan: plan("always"), withheld: "managed_boot_off" });
+  assert.deepEqual(off.map(row), [
+    ["1", "unverifiable", "fallback", undefined],
+    ["2", "unverifiable", "fallback", undefined],
+    ["3", "unverifiable", undefined, undefined],
+    ["4", "unverifiable", undefined, undefined],
+    ["5", "pass", undefined, undefined],
+    ["6", "pass", "ran", undefined],
+    ["7", "unverifiable", undefined, undefined],
+  ], "a pause is DevAsign's switch: no setup link");
+  for (const i of [0, 1, 2, 6]) assert.equal(off[i].reason, BOOT_PAUSED_REASON, `criterion ${off[i].criterionId}`);
+  const offAuto = computeVerdicts({ ...args, plan: plan("auto"), withheld: "managed_boot_off" });
+  assert.deepEqual([offAuto[0].verdict, offAuto[0].browser, offAuto[2].reason, offAuto[2].fixUrl], ["pass", "fallback", BOOT_PAUSED_REASON, undefined]);
+  assert.ok(!off.some((v) => v.reason === NO_BROWSER_REASON), "never reads as an app that did not start");
+  assert.equal(mergeModelVerdicts(off, [{ criterionId: "1", verdict: "unverifiable", reason: "Browser missing.", evidenceArtifactIds: [] }], [])[0].reason, BOOT_PAUSED_REASON);
+
+  const notWithheld = computeVerdicts({ ...args, plan: plan("always") });
+  assert.deepEqual(notWithheld.map(row), [
+    ["1", "pass", undefined, undefined],
+    ["2", "fail", undefined, undefined],
+    ["3", "unverifiable", undefined, undefined],
+    ["4", "unverifiable", undefined, undefined],
+    ["5", "pass", undefined, undefined],
+    ["6", "pass", "ran", undefined],
+    ["7", "unverifiable", undefined, undefined],
+  ], "a planned browser test with no result is not a withheld one");
+  assert.equal(notWithheld[2].reason, "no test ran for this criterion");
+  assert.deepEqual(computeVerdicts({ ...args, plan: plan("always"), withheld: null }), notWithheld);
+
+  const merged = mergeModelVerdicts(strict, [
+    { criterionId: "1", verdict: "unverifiable", reason: "The runner is old.", evidenceArtifactIds: [] },
+    { criterionId: "3", verdict: "unverifiable", reason: "Nothing ran.", evidenceArtifactIds: [] },
+  ], []);
+  assert.deepEqual([merged[0].reason, merged[2].reason], [RUNNER_OUTDATED_REASON, RUNNER_OUTDATED_REASON], "fixed wording the model may not rewrite");
+  assert.equal(merged[2].fixUrl, fixUrl);
+});
+
 test("a planned fix link rides on the no-result verdict and survives the model's reason rewrite", () => {
   const plan = { unverifiable: [{ criterionId: "1", reason: "no app start / login configured", fixUrl: "https://app/workflow?repo=r" }] } as unknown as VerifyPlan;
   const code = computeVerdicts({ criteria: [crit("1", "ui")], results: [], plan, doctor: null, artifacts: [] });
@@ -357,8 +444,10 @@ async function judgeWithBrowserPlan(args: {
   criteria: Criterion[];
   results: RunnerResult[];
   browser?: VerifyPlan["browser"];
-  lastBrowserless?: { count: number; reason: "not_configured" | "did_not_start"; runId: string; prNumber: number; at: number };
+  lastBrowserless?: NonNullable<RepoVerifyState["lastBrowserless"]>;
   doctor?: DoctorDiagnosis;
+  tests?: VerifyPlan["tests"];
+  withheld?: NonNullable<VerifyRun["runnerMeta"]>["e2eWithheld"];
 }) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" })) as any;
@@ -368,12 +457,12 @@ async function judgeWithBrowserPlan(args: {
   const review = db.insert("prReviews", { id: uuid(), repoId: repo.id, prNumber: 7, prTitle: "t", headSha: "abc", baseSha: "d", status: "reviewing", verdict: null, criteria: args.criteria, taskId: null, additions: 0, deletions: 0, changedFiles: 0, createdAt: 0, updatedAt: 0 } as any);
   snapshotCriteriaRevision(review.id, review.criteria, null);
   const run = createVerifyRun({ review, repo, status: "judging", triggeredBy: { kind: "pr_event" } });
-  const plan = db.insert("verifyPlans", { id: uuid(), schemaVersion: 1, runId: run.id, repoId: repo.id, criteriaRevision: 1, commands: [], unverifiable: [], createdAt: 0, tests: [], ...(args.browser ? { browser: args.browser } : {}) });
+  const plan = db.insert("verifyPlans", { id: uuid(), schemaVersion: 1, runId: run.id, repoId: repo.id, criteriaRevision: 1, commands: [], unverifiable: [], createdAt: 0, tests: args.tests ?? [], ...(args.browser ? { browser: args.browser } : {}) });
   const results = db.insert("verifyResults", {
     id: uuid(), schemaVersion: 1, runId: run.id, createdAt: 0,
     payload: { runId: run.id, sha: "abc", planId: plan.id, cliVersion: "0.1", existingTestsTouchingDiff: [], timings: { startedAt: 0, finishedAt: 1 }, results: args.results, ...(args.doctor ? { doctor: args.doctor } : {}) },
   });
-  updateRun(run.id, { planId: plan.id, resultsId: results.id });
+  updateRun(run.id, { planId: plan.id, resultsId: results.id, ...(args.withheld ? { runnerMeta: { e2eWithheld: args.withheld } } : {}) });
   try {
     const out = await runVerifyJudge(run.id, { llm: async () => "{}" });
     return { run: out!, verify: db.find("repositories", (r) => r.id === repo.id)?.verify };
@@ -441,4 +530,34 @@ test("a judged run records which UI criteria went without a browser on the repo,
 
   const nothingToClear = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "pass")], browser: browser({ allowed: true }) });
   assert.ok(nothingToClear.verify && !("lastBrowserless" in nothingToClear.verify), "no write when there is nothing to clear");
+});
+
+test("a run whose browser tests were withheld flags the repo's runner as outdated, and a kill-switch pause records nothing", async () => {
+  const booted = { policy: "auto", allowed: true, bootConfigured: true, reason: "ok", fixUrl: "https://app/workflow?repo=r&setup=browser" } as NonNullable<VerifyPlan["browser"]>;
+  const tests = [{ id: "b1", level: "e2e", runner: "playwright", criterionIds: ["1"] }] as unknown as VerifyPlan["tests"];
+  const unitPass = (id: string) => result({ testId: `u${id}`, criterionIds: [id], status: "pass" });
+  const earlier = { count: 2, reason: "not_configured" as const, runId: "earlier", prNumber: 1, at: 1 };
+
+  const outdated = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [unitPass("1")], browser: booted, tests, withheld: "runner_outdated", lastBrowserless: earlier });
+  assert.deepEqual([outdated.run.verdicts[0].verdict, outdated.run.verdicts[0].browser], ["pass", "fallback"]);
+  assert.deepEqual({ ...outdated.verify?.lastBrowserless, at: 0 }, { count: 1, reason: "runner_outdated", runId: outdated.run.id, prNumber: 7, at: 0 });
+
+  const nothingRan = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [], browser: booted, tests, withheld: "runner_outdated", lastBrowserless: earlier });
+  assert.equal(nothingRan.run.verdicts[0].reason, RUNNER_OUTDATED_REASON);
+  assert.deepEqual([nothingRan.verify?.lastBrowserless?.reason, nothingRan.verify?.lastBrowserless?.count], ["runner_outdated", 0], "nothing below the browser ran, but the runner is still why");
+  const keptCount = { count: 4, reason: "runner_outdated" as const, runId: "pr-a", prNumber: 3, at: 1 };
+  const again = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [], browser: booted, tests, withheld: "runner_outdated", lastBrowserless: keptCount });
+  assert.deepEqual(again.verify?.lastBrowserless, keptCount, "an existing runner flag keeps its count");
+
+  const off = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [unitPass("1")], browser: booted, tests, withheld: "managed_boot_off", lastBrowserless: keptCount });
+  assert.deepEqual([off.run.verdicts[0].verdict, off.run.verdicts[0].browser], ["pass", "fallback"]);
+  assert.deepEqual(off.verify?.lastBrowserless, keptCount, "a paused run leaves the repo's last real finding alone");
+  const offNothingRan = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [], browser: booted, tests, withheld: "managed_boot_off" });
+  assert.equal(offNothingRan.run.verdicts[0].reason, BOOT_PAUSED_REASON);
+  assert.ok(offNothingRan.verify && !("lastBrowserless" in offNothingRan.verify), "and never records did_not_start");
+
+  const updated = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [result({ testId: "b1", criterionIds: ["1"], status: "pass", runner: "playwright", level: "e2e" })], browser: booted, tests, lastBrowserless: keptCount });
+  assert.equal(updated.verify?.lastBrowserless, null, "a runner that ran the browser test clears the flag");
+  const noUiE2e = await judgeWithBrowserPlan({ criteria: [crit("1", "ui"), crit("2")], results: [unitPass("1")], browser: booted, tests: [{ id: "b2", level: "e2e", runner: "playwright", criterionIds: ["2"] }] as unknown as VerifyPlan["tests"], withheld: "runner_outdated", lastBrowserless: keptCount });
+  assert.equal(noUiE2e.verify?.lastBrowserless, null, "withheld browser tests for a non-UI criterion leave the UI criteria unflagged");
 });

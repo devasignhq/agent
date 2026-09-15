@@ -480,3 +480,35 @@ test("no note under e2e: never, on a plan older than the policy, for a component
     }
   }
 });
+
+test("browser tests withheld from an outdated runner say to update it, singular and plural; the kill switch says DevAsign paused them", () => {
+  const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" });
+  const npm = "https://www.npmjs.com/package/@devasign/verify";
+  const outdated = { runnerMeta: { e2eWithheld: "runner_outdated" as const } };
+  const verdicts = [verdict("1", "pass", "fallback"), verdict("2", "fail", "fallback"), verdict("3", "unverifiable"), verdict("5", "pass")];
+  const two = judgedView(verdicts, allowed, outdated);
+  assert.deepEqual(two.browserless, { count: 2, criterionIds: ["1", "2"], reason: "runner_outdated", fixUrl: FIX });
+  const note = `2 UI criteria were checked without a browser because the runner in CI is too old for verify.servers or verify.login — [update @devasign/verify](${npm})`;
+  const body = formatTestsComment(two, "acme/widgets");
+  assert.ok(body.includes(`\n${note}\n`));
+  assert.doesNotMatch(body, /did not start|set up browser tests/);
+  const check = verifyCheckRunPayload(two, "abc");
+  assert.ok(check.output.summary.endsWith(`\n\n${note}`));
+  assert.ok(check.output.text.includes(`\n\n${note}\n\n`));
+  assert.equal(check.conclusion, verifyCheckRunPayload(judgedView(verdicts, allowed), "abc").conclusion, "the note never changes the conclusion");
+
+  const one = judgedView([verdict("1", "pass", "fallback"), verdict("5", "pass")], allowed, outdated);
+  assert.ok(formatTestsComment(one, "acme/widgets").includes(`\n1 UI criterion was checked without a browser because the runner in CI is too old for verify.servers or verify.login — [update @devasign/verify](${npm})\n`));
+
+  const off = judgedView([verdict("1", "pass", "fallback"), verdict("2", "unverifiable"), verdict("5", "pass")], allowed, { runnerMeta: { e2eWithheld: "managed_boot_off" } });
+  assert.deepEqual(off.browserless, { count: 1, criterionIds: ["1"], reason: "paused", fixUrl: "" });
+  const paused = "1 UI criterion was checked without a browser because DevAsign has paused browser tests that boot verify.servers or verify.login";
+  const offBody = formatTestsComment(off, "acme/widgets");
+  assert.ok(offBody.includes(`\n${paused}\n`), offBody);
+  assert.doesNotMatch(offBody, /too old|did not start|see setup|set up browser tests/, "the kill switch never blames the repo's setup");
+  const offCheck = verifyCheckRunPayload(off, "abc");
+  assert.ok(offCheck.output.summary.endsWith(`\n\n${paused}`));
+  assert.ok(offCheck.output.text.includes(`\n\n${paused}\n\n`));
+  const unconfigured = judgedView([verdict("1", "pass"), verdict("5", "pass")], browserPlan({}), outdated);
+  assert.equal(unconfigured.browserless?.reason, "not_configured", "no boot config is still the thing to fix");
+});

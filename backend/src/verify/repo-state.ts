@@ -4,6 +4,7 @@ import { db } from "../db.js";
 import { config } from "../config.js";
 import type { RepoVerifyState } from "../types.js";
 import type { DevasignVerifyConfig } from "./contract.js";
+import { BOOT_KEYS } from "./yml.js";
 
 const EMPTY: RepoVerifyState = { onboarding: { state: "none" } };
 
@@ -21,16 +22,23 @@ export function setupFixUrl(repoId: string): string {
   return `${config.webOrigin.replace(/\/+$/, "")}/workflow?${new URLSearchParams({ repo: repoId, setup: "browser" })}`;
 }
 
-const BOOT_KEYS = ["install", "build", "seed", "start", "url", "ready"] as const;
+// Object keys sorted at every depth, so the same config always serializes the same way.
+function stableJson(v: unknown): string {
+  if (Array.isArray(v)) return `[${v.map(stableJson).join(",")}]`;
+  if (v && typeof v === "object") {
+    return `{${Object.keys(v).sort().filter((k) => (v as Record<string, unknown>)[k] !== undefined).map((k) => `${JSON.stringify(k)}:${stableJson((v as Record<string, unknown>)[k])}`).join(",")}}`;
+  }
+  return JSON.stringify(v);
+}
 
 /** A stable fingerprint of the keys that boot the app; null when there is nothing to boot. */
 export function bootHash(cfg: DevasignVerifyConfig | null | undefined): string | null {
   if (!cfg?.start || !cfg?.url) return null;
   const picked = BOOT_KEYS.filter((k) => cfg[k]).map((k) => [k, cfg[k]]);
-  return createHash("sha256").update(JSON.stringify(picked)).digest("hex").slice(0, 16);
+  return createHash("sha256").update(stableJson(picked)).digest("hex").slice(0, 16);
 }
 
-export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "unproven" | "unknown";
+export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "unproven" | "unknown";
 
 export function browserTestsStatus(v: RepoVerifyState | null | undefined): { status: BrowserTestsStatus; missing: Array<"start" | "url"> } {
   const last = v?.lastBrowserless ?? null;
@@ -42,10 +50,12 @@ export function browserTestsStatus(v: RepoVerifyState | null | undefined): { sta
     const missing = (["start", "url"] as const).filter((k) => !parsed?.[k]);
     if (missing.length && !playwrightConfig) return { status: "not_configured", missing };
     if (last?.reason === "did_not_start") return { status: "failing", missing: [] };
+    if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
     return { status: "unproven", missing: [] };
   }
   // No default-branch snapshot yet: the last judged run is the only evidence.
   if (last?.reason === "not_configured") return { status: "not_configured", missing: [] };
   if (last?.reason === "did_not_start") return { status: "failing", missing: [] };
+  if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
   return { status: "unknown", missing: [] };
 }

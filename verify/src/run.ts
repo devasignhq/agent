@@ -3,6 +3,7 @@ import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { ApiClient, ApiError } from "./api.js";
 import { resolveArtifactRefs, uploadArtifacts } from "./artifacts.js";
+import { bootManaged, cleanupAuth, redact, redactFile, type StorageState } from "./boot.js";
 import { readContext, type RunContext } from "./context.js";
 import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js";
 import { diagnoseMissingDependencies, diagnosePlaywrightOutput, preflight } from "./doctor.js";
@@ -12,7 +13,9 @@ import { onDiskPath, writeModuleTypeShims } from "./module-type.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
 import { CLI_COMMIT, CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
+import { redactTrace } from "./trace-redact.js";
 import { Workspace } from "./workspace.js";
+import { mergeBootConfig, needsManagedBoot } from "./yml.js";
 
 export type RunOptions = {
   apiUrl: string;
@@ -57,6 +60,7 @@ export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: Runner
       setup: polls === 0 ? setup : undefined,
       actions: { runId: ctx.runId, jobUrl: ctx.jobUrl, runnerOs: ctx.runnerOs },
       cliVersion: CLI_VERSION,
+      capabilities: ["managed_boot"],
       // Tells the server this job is leaving, so a plan landing later re-dispatches CI
       // instead of stranding the run until it times out.
       ...(finalPoll ? { giveUp: true } : {}),
@@ -72,10 +76,11 @@ export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: Runner
   }
 }
 
-export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: ReturnType<typeof readDevasignVerify>; testTimeoutMs: number; setup: RunnerResults["setup"] }): Promise<{ results: RunnerResult[]; artifacts: LocalArtifact[]; doctor: DoctorDiagnosis | null }> {
+export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: ReturnType<typeof readDevasignVerify>; testTimeoutMs: number; setup: RunnerResults["setup"] }): Promise<{ results: RunnerResult[]; artifacts: LocalArtifact[]; doctor: DoctorDiagnosis | null; doctorLogRef?: string }> {
   const artifacts: LocalArtifact[] = [];
   const results: RunnerResult[] = [];
   let doctor: DoctorDiagnosis | null = null;
+  let doctorLogRef: string | undefined;
 
   // Generated files go under .devasign/ only; their content is evidence too.
   const disk = new Map(plan.tests.map((t) => [t.id, onDiskPath(t)]));
@@ -104,10 +109,15 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
 
   if (pw.length) {
     const repoCfg = opts.setup?.frameworks.find((f) => f.name === "playwright")?.configPath ?? null;
-    doctor = doctor ?? preflight({ tests: pw, setup: opts.setup!, yml: opts.yml, repoHasPlaywrightConfig: !!repoCfg, env: process.env, nodeVersion: process.version });
+    const managed = needsManagedBoot(opts.yml) && plan.managedBoot !== false;
+    const errorAll = (message: string) => {
+      for (const t of pw) results.push({ id: `r-${t.id}`, testId: t.id, criterionIds: t.criterionIds, test: t.path, runner: "playwright", level: t.level, origin: t.origin, status: "error", attempts: [], durationMs: 0, error: message, artifactIds: [] });
+    };
+    // A managed boot ignores the repo's webServer, so only start/url can say how the app starts.
+    doctor = doctor ?? preflight({ tests: pw, setup: opts.setup!, yml: opts.yml, repoHasPlaywrightConfig: !!repoCfg && !managed, env: process.env, nodeVersion: process.version });
     if (doctor) {
       log.warn(`setup needs attention: ${doctor.message}`);
-      for (const t of pw) results.push({ id: `r-${t.id}`, testId: t.id, criterionIds: t.criterionIds, test: t.path, runner: "playwright", level: t.level, origin: t.origin, status: "error", attempts: [], durationMs: 0, error: doctor.message, artifactIds: [] });
+      errorAll(doctor.message);
     } else {
       if (plan.playwright?.installBrowsers || !repoHasPlaywright(ws.root)) {
         const inst = await ensureBrowsers(ws.root, ws);
@@ -116,22 +126,57 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
       }
       const generated = pw.filter((t) => t.origin === "generated");
       const existing = pw.filter((t) => t.origin === "existing");
-      let combinedOutput = "";
-      if (generated.length) {
-        const r = await runPlaywright({ tests: generated, ws, baseConfigRel: repoCfg, retries: plan.retries.generated, yml: opts.yml, timeoutMs: opts.testTimeoutMs * 2, artifacts, configName: "playwright.config.ts" });
-        results.push(...r.results);
-        combinedOutput += r.output;
+      let state: StorageState | null = null;
+      const scrub = (text: string) => redact(text, { envNames: opts.yml?.env, state });
+      const logFiles: string[] = [];
+      let boot: Awaited<ReturnType<typeof bootManaged>> | null = null;
+      try {
+        let booted: { baseUrl: string; storageState?: string } | null = null;
+        if (managed) {
+          const servers = opts.yml!.servers?.length ?? 0;
+          log.info(`starting ${servers ? `${servers} server(s), then the app` : "the app"}${opts.yml!.login?.script ? ", then signing in" : ""}`);
+          boot = await bootManaged(opts.yml!, ws);
+          for (const f of boot.handle?.logFiles ?? []) {
+            const ref = `log:boot:${path.basename(f, ".log").replace(/^boot-/, "")}`;
+            logFiles.push(f);
+            artifacts.push({ clientRef: ref, kind: "log", path: f, displayPath: ws.relative(f), contentType: "text/plain", criterionIds: [] });
+            if (!boot.ok) doctorLogRef = ref;
+          }
+          if (boot.ok) {
+            state = boot.state;
+            booted = { baseUrl: boot.baseUrl, ...(boot.storageStatePath ? { storageState: boot.storageStatePath } : {}) };
+            log.info(`app is up at ${boot.baseUrl}${boot.storageStatePath ? `, signed in (session ${boot.sessionChecked ? "checked" : "not checked"})` : ""}`);
+          } else {
+            doctor = boot.diagnosis;
+            log.warn(`setup needs attention: ${doctor.message}`);
+            errorAll(doctor.message);
+          }
+        }
+        if (!managed || booted) {
+          let combinedOutput = "";
+          const runs = [
+            { tests: generated, retries: plan.retries.generated, configName: "playwright.config.ts" },
+            { tests: existing, retries: plan.retries.existing, configName: "playwright.existing.config.ts" },
+          ];
+          for (const r of runs.filter((x) => x.tests.length)) {
+            logFiles.push(path.join(ws.artifactsDir, "logs", `${r.configName}.log`));
+            const out = await runPlaywright({ ...r, ws, baseConfigRel: repoCfg, yml: opts.yml, timeoutMs: opts.testTimeoutMs * 2, artifacts, booted, scrub });
+            results.push(...out.results);
+            combinedOutput += out.output;
+          }
+          const allErrored = results.filter((r) => r.runner === "playwright").every((r) => r.status === "error");
+          if (allErrored) doctor = diagnosePlaywrightOutput(combinedOutput);
+        }
+      } finally {
+        if (boot?.handle) await boot.handle.stop();
+        if (managed) cleanupAuth(ws);
+        // Every log that leaves this job is scrubbed of secrets and the session first, and so is a signed-in trace.
+        for (const f of logFiles) redactFile(f, { envNames: opts.yml?.env, state });
+        if (state) for (const f of new Set(artifacts.filter((a) => a.kind === "trace").map((a) => a.path))) redactTrace(f, { envNames: opts.yml?.env, state });
       }
-      if (existing.length) {
-        const r = await runPlaywright({ tests: existing, ws, baseConfigRel: repoCfg, retries: plan.retries.existing, yml: opts.yml, timeoutMs: opts.testTimeoutMs * 2, artifacts, configName: "playwright.existing.config.ts" });
-        results.push(...r.results);
-        combinedOutput += r.output;
-      }
-      const allErrored = results.filter((r) => r.runner === "playwright").every((r) => r.status === "error");
-      if (allErrored) doctor = diagnosePlaywrightOutput(combinedOutput);
     }
   }
-  return { results, artifacts, doctor };
+  return { results, artifacts, doctor, ...(doctorLogRef ? { doctorLogRef } : {}) };
 }
 
 const cell = (s: string) => s.replace(/\|/g, "\\|").replace(/\r?\n/g, " ");
@@ -209,18 +254,19 @@ export async function run(opts: RunOptions): Promise<number> {
   announceUnverifiable(plan);
   const failOn: FailOn = opts.failOn ?? plan.failOn ?? "never";
   // A branch cut before onboarding has no verify block of its own; boot from the plan's.
-  const bootYml = yml ?? plan.verifyConfig ?? null;
+  const bootYml = mergeBootConfig(yml, plan.verifyConfig);
   if (!yml && plan.verifyConfig) log.info("no verify block in this checkout's .devasign.yml; starting the app with the one the plan was made from");
+  else if (yml && bootYml !== yml) log.info("this checkout's verify block has no start; starting the app the way the plan's block does");
 
   try {
-    const { results, artifacts, doctor } = await executePlan(plan, ws, { yml: bootYml, testTimeoutMs: opts.testTimeoutMs, setup });
+    const { results, artifacts, doctor, doctorLogRef } = await executePlan(plan, ws, { yml: bootYml, testTimeoutMs: opts.testTimeoutMs, setup });
     let finalResults = results;
     if (api && ctx) {
       const ids = await uploadArtifacts(api, runId, artifacts, plan.uploadLimits, fetchImpl);
       finalResults = resolveArtifactRefs(results, ids);
-      if (doctor?.logArtifactId === undefined) {
-        const pwLog = [...ids.entries()].find(([ref]) => ref.startsWith("log:pw:"))?.[1];
-        if (doctor && pwLog) doctor.logArtifactId = pwLog;
+      if (doctor && doctor.logArtifactId === undefined) {
+        const logId = doctorLogRef ? ids.get(doctorLogRef) : [...ids.entries()].find(([ref]) => ref.startsWith("log:pw:"))?.[1];
+        if (logId) doctor.logArtifactId = logId;
       }
     }
     const payload: RunnerResults = {

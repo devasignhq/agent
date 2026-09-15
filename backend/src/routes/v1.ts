@@ -21,6 +21,7 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildRunView,
+  e2eGate,
   latestRunForReview,
   forgetRunnerPoll,
   noteRunnerGone,
@@ -31,6 +32,7 @@ import {
   TERMINAL_STATUSES,
   updateRun,
 } from "../verify/runs.js";
+import { RUNNER_CAPABILITIES } from "../verify/contract.js";
 import type {
   ApiError,
   ArtifactSignFile,
@@ -39,6 +41,7 @@ import type {
   ResolveRequest,
   ResolveResponse,
   ResultsResponse,
+  RunnerCapability,
   RunnerResults,
 } from "../verify/contract.js";
 import type { Plan } from "../billing/plans.js";
@@ -103,7 +106,9 @@ export function makeRunnerAuth(deps: { verify: (token: string) => Promise<OidcRe
 
 const runnerAuth = makeRunnerAuth();
 
-function parseResolveBody(body: unknown): ResolveRequest | null {
+const CAPABILITIES: ReadonlySet<string> = new Set(RUNNER_CAPABILITIES);
+
+export function parseResolveBody(body: unknown): ResolveRequest | null {
   const b = (body || {}) as Record<string, unknown>;
   const sha = typeof b.sha === "string" ? b.sha.trim() : "";
   const pr = Number(b.pr);
@@ -117,6 +122,9 @@ function parseResolveBody(body: unknown): ResolveRequest | null {
     actions: b.actions && typeof b.actions === "object" ? (b.actions as ResolveRequest["actions"]) : undefined,
     cliVersion: typeof b.cliVersion === "string" ? b.cliVersion.slice(0, 40) : undefined,
     giveUp: b.giveUp === true,
+    capabilities: Array.isArray(b.capabilities)
+      ? [...new Set(b.capabilities.filter((c): c is RunnerCapability => typeof c === "string" && CAPABILITIES.has(c)))].slice(0, 10)
+      : undefined,
   };
 }
 
@@ -239,6 +247,7 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
       if (!plan) return fail(res, 500, "plan_missing");
       forgetRunnerPoll(runner.repo.id, body.pr, body.sha);
       const now = Date.now();
+      const e2eWithheld = e2eGate(plan, body.capabilities) ?? undefined;
       updateRun(run.id, {
         status: "running",
         timings: { ...run.timings, resolvedAt: run.timings.resolvedAt ?? now },
@@ -249,11 +258,13 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
           runnerOs: body.actions?.runnerOs,
           jobUrl: body.actions?.jobUrl,
           cliVersion: body.cliVersion,
+          capabilities: body.capabilities,
+          e2eWithheld,
           workflowSha: runner.claims.sha,
           eventName: runner.claims.event_name,
         },
       });
-      const out: ResolveResponse = { ok: true, status: "ready", runId: run.id, plan: runnerPlanFor(run, plan, runner.repo) };
+      const out: ResolveResponse = { ok: true, status: "ready", runId: run.id, plan: runnerPlanFor(run, plan, runner.repo, { capabilities: body.capabilities }) };
       return void res.json(out);
     }
     default: {

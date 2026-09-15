@@ -218,6 +218,8 @@ export const config = {
     // Planner model, independent of the judge/feedback tier. Empty inherits.
     // Any id set here MUST have a row in ANTHROPIC_PRICES or cost records $0.
     plannerModel: process.env.VERIFY_PLANNER_MODEL || "claude-sonnet-5",
+    // Kill switch for the runner's managed boot (servers / login script): "off" withholds those browser tests.
+    managedBoot: process.env.VERIFY_MANAGED_BOOT !== "off",
   },
   // Private S3-compatible bucket (Cloudflare R2) for run artifacts. When unset,
   // runs still verify but produce no recordings (artifacts are rejected as

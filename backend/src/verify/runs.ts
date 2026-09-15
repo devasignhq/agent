@@ -10,6 +10,7 @@ import type {
   Installation,
   PRReview,
   Repository,
+  VerifyArtifact,
   VerifyPlan,
   VerifyRun,
   VerifyRunStatus,
@@ -18,6 +19,7 @@ import type {
 import type { RunnerPlan, RunView, RunViewArtifact } from "./contract.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { artifactStorage, UPLOAD_LIMITS } from "./storage.js";
+import { needsManagedBoot } from "./yml.js";
 
 export const TERMINAL_STATUSES: ReadonlySet<VerifyRunStatus> = new Set([
   "completed",
@@ -197,9 +199,34 @@ export function criteriaForRun(run: Pick<VerifyRun, "reviewId" | "criteriaRevisi
   return { criteria: review?.criteria ?? [], revision: run.criteriaRevision };
 }
 
-export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository): RunnerPlan {
+export type E2eWithheld = NonNullable<NonNullable<VerifyRun["runnerMeta"]>["e2eWithheld"]>;
+
+/** Why this runner must not get the plan's browser tests: they need servers, a login or base-branch boot keys it cannot handle. */
+export function e2eGate(
+  plan: Pick<VerifyPlan, "tests" | "verifyConfig" | "verifyConfigFrom">,
+  capabilities: readonly string[] | undefined,
+  managedBootOn: boolean = config.verify.managedBoot
+): E2eWithheld | null {
+  if (!plan.tests.some((t) => t.runner === "playwright")) return null;
+  const managed = needsManagedBoot(plan.verifyConfig);
+  if (!managed && plan.verifyConfigFrom !== "base_boot") return null;
+  // Base-branch start/url alone boots through Playwright's webServer, which the switch leaves on.
+  if (managed && !managedBootOn) return "managed_boot_off";
+  return capabilities?.includes("managed_boot") ? null : "runner_outdated";
+}
+
+export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository, opts: { capabilities?: readonly string[] } = {}): RunnerPlan {
   const { criteria } = criteriaForRun(run);
-  const hasPlaywrightTests = plan.tests.some((t) => t.runner === "playwright");
+  const withheld = e2eGate(plan, opts.capabilities);
+  const dropped = new Set(withheld ? plan.tests.filter((t) => t.runner === "playwright").map((t) => t.id) : []);
+  const tests = dropped.size ? plan.tests.filter((t) => !dropped.has(t.id)) : plan.tests;
+  const commands = dropped.size
+    ? plan.commands.flatMap((c) => {
+        const testIds = c.testIds.filter((id) => !dropped.has(id));
+        return testIds.length || !c.testIds.length ? [{ ...c, testIds }] : [];
+      })
+    : plan.commands;
+  const hasPlaywrightTests = tests.some((t) => t.runner === "playwright");
   const detected = repo.verify?.detected?.frameworks.find((f) => f.name === "playwright") ?? null;
   return {
     planId: plan.id,
@@ -207,8 +234,8 @@ export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository
     criteria: criteria
       .filter((c) => !c.supersededBy && !c.notApplicable)
       .map((c) => ({ id: c.id, text: c.text, kind: c.kind ?? "code" })),
-    tests: plan.tests,
-    commands: plan.commands,
+    tests,
+    commands,
     playwright: hasPlaywrightTests
       ? { record: true, configFrom: detected?.configPath ?? null, installBrowsers: !detected }
       : null,
@@ -217,6 +244,7 @@ export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository
     unverifiable: plan.unverifiable,
     failOn: failOnFor(repo),
     ...(plan.verifyConfig ? { verifyConfig: plan.verifyConfig } : {}),
+    ...(config.verify.managedBoot ? {} : { managedBoot: false }),
   };
 }
 
@@ -224,6 +252,14 @@ export function runnerPlanFor(run: VerifyRun, plan: VerifyPlan, repo: Repository
 function failOnFor(repo: Repository): RunnerPlan["failOn"] {
   const stored = effectiveWorkflow(repo).verify?.failOn;
   return stored === "verdict" || stored === "unverifiable" ? stored : "never";
+}
+
+// A signed-in run's trace replays what that session could see, so its link is short-lived.
+export const SIGNED_IN_TRACE_TTL_SECONDS = 300;
+
+function getUrlTtlSeconds(a: Pick<VerifyArtifact, "kind">, plan: Pick<VerifyPlan, "verifyConfig"> | null): number {
+  const ttl = config.artifacts.getUrlTtlSeconds;
+  return a.kind === "trace" && plan?.verifyConfig?.login?.script ? Math.min(ttl, SIGNED_IN_TRACE_TTL_SECONDS) : ttl;
 }
 
 export async function buildRunView(run: VerifyRun, opts: { includeUsage: boolean }): Promise<RunView> {
@@ -240,14 +276,13 @@ export async function buildRunView(run: VerifyRun, opts: { includeUsage: boolean
         .filter((a) => a.state === "uploaded" && a.expiresAt > now)
         .map(async (a) => {
           try {
-            urlById.set(a.id, await storage.signGet(a.storageKey, config.artifacts.getUrlTtlSeconds));
+            urlById.set(a.id, await storage.signGet(a.storageKey, getUrlTtlSeconds(a, plan)));
           } catch (err) {
             console.warn(`[verify] signGet failed for ${a.id}:`, err);
           }
         })
     );
   }
-  const urlExpiresAt = now + config.artifacts.getUrlTtlSeconds * 1000;
   const artifacts: RunViewArtifact[] = rows.map((a) => ({
     id: a.id,
     kind: a.kind,
@@ -261,7 +296,7 @@ export async function buildRunView(run: VerifyRun, opts: { includeUsage: boolean
     attempt: a.attempt,
     getUrl: urlById.get(a.id) ?? null,
     posterUrl: a.posterArtifactId ? urlById.get(a.posterArtifactId) ?? null : null,
-    urlExpiresAt: urlById.has(a.id) ? urlExpiresAt : null,
+    urlExpiresAt: urlById.has(a.id) ? now + getUrlTtlSeconds(a, plan) * 1000 : null,
   }));
   const { tokenUsage, ...rest } = run;
   return {
