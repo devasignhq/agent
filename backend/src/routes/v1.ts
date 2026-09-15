@@ -427,6 +427,23 @@ function parseResults(body: unknown, runId: string): RunnerResults | null {
   } as RunnerResults;
 }
 
+// Pending artifacts the results confirm. Results reference logs, screenshots and
+// videos by id, but no CLI lists a test's own file, so it is confirmed by testId.
+export function uploadedOnResults(pending: VerifyArtifact[], payload: RunnerResults): string[] {
+  const referenced = new Set<string>();
+  const reported = new Set<string>();
+  for (const r of payload.results) {
+    reported.add(r.testId);
+    for (const id of r.artifactIds) referenced.add(id);
+    for (const a of r.attempts) for (const id of a.artifactIds) referenced.add(id);
+  }
+  if (payload.stdoutArtifactId) referenced.add(payload.stdoutArtifactId);
+  if (payload.doctor?.logArtifactId) referenced.add(payload.doctor.logArtifactId);
+  return pending
+    .filter((a) => referenced.has(a.id) || a.kind === "poster" || (a.kind === "test_file" && !!a.testId && reported.has(a.testId)))
+    .map((a) => a.id);
+}
+
 export async function resultsHandler(req: RunnerRequest, res: Response): Promise<void> {
   const run = runForRunner(req, res);
   if (!run) return;
@@ -438,15 +455,9 @@ export async function resultsHandler(req: RunnerRequest, res: Response): Promise
   rememberSetup(req.runner!.repo, payload.setup);
 
   const now = Date.now();
-  const referenced = new Set<string>();
-  for (const r of payload.results) {
-    for (const id of r.artifactIds) referenced.add(id);
-    for (const a of r.attempts) for (const id of a.artifactIds) referenced.add(id);
-  }
-  if (payload.stdoutArtifactId) referenced.add(payload.stdoutArtifactId);
-  if (payload.doctor?.logArtifactId) referenced.add(payload.doctor.logArtifactId);
-  for (const a of db.filter("verifyArtifacts", (a) => a.runId === run.id && a.state === "pending_upload")) {
-    if (referenced.has(a.id) || a.kind === "poster") db.update("verifyArtifacts", (x) => x.id === a.id, { state: "uploaded", uploadedAt: now });
+  const pending = db.filter("verifyArtifacts", (a) => a.runId === run.id && a.state === "pending_upload");
+  for (const id of uploadedOnResults(pending, payload)) {
+    db.update("verifyArtifacts", (x) => x.id === id, { state: "uploaded", uploadedAt: now });
   }
 
   const row = db.insert("verifyResults", { id: uuid(), schemaVersion: 1, runId: run.id, payload, createdAt: now });
