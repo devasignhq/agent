@@ -4,7 +4,21 @@
 // backstop. Same pure-selector + sweep shape as security/stale-scans.ts.
 import { db } from "../db.js";
 import type { VerifyArtifact } from "../types.js";
-import { artifactStorage } from "./storage.js";
+import { ARTIFACT_RETENTION_DAYS, artifactStorage } from "./storage.js";
+
+const RETENTION = ARTIFACT_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+
+// Rows stamped under an older, shorter retention; only ever pushes expiresAt later.
+export function selectRetentionExtensions(rows: VerifyArtifact[]): VerifyArtifact[] {
+  return rows.filter((a) => a.state !== "expired" && a.expiresAt < a.createdAt + RETENTION);
+}
+
+export function extendArtifactRetention(): number {
+  const rows = selectRetentionExtensions(db.filter("verifyArtifacts", () => true));
+  for (const a of rows) db.update("verifyArtifacts", (x) => x.id === a.id, { expiresAt: a.createdAt + RETENTION });
+  if (rows.length) console.log(`[verify] retention: extended ${rows.length} artifact(s) to ${ARTIFACT_RETENTION_DAYS} days`);
+  return rows.length;
+}
 
 export function selectExpiredArtifacts(rows: VerifyArtifact[], now: number): VerifyArtifact[] {
   return rows.filter((a) => a.state !== "expired" && a.expiresAt <= now);
@@ -30,6 +44,11 @@ export async function sweepExpiredArtifacts(now = Date.now()): Promise<number> {
 }
 
 export function startArtifactRetention(): void {
+  try {
+    extendArtifactRetention();
+  } catch (err) {
+    console.error("[verify] retention extension failed", err);
+  }
   void sweepExpiredArtifacts().catch((err) => console.error("[verify] retention sweep failed", err));
   setInterval(() => void sweepExpiredArtifacts().catch((err) => console.error("[verify] retention sweep failed", err)), 60 * 60_000);
 }

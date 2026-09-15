@@ -7,7 +7,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node
 import path from "node:path";
 import { db } from "../src/db.js";
 import { config } from "../src/config.js";
-import { artifactKey } from "../src/verify/storage.js";
+import { ARTIFACT_RETENTION_DAYS, artifactKey } from "../src/verify/storage.js";
 import type { VerifyArtifact } from "../src/types.js";
 
 function findFile(dir: string, re: RegExp): string | null {
@@ -95,7 +95,7 @@ export function seedVerifyRun(assetsDir: string, installId: string): { reviewId:
       mkdirSync(path.dirname(dest), { recursive: true });
       copyFileSync(src, dest);
     }
-    const row: VerifyArtifact = { id, schemaVersion: 1, runId, repoId: repo.id, testId, criterionIds, kind, path: `.devasign/artifacts/${id}`, storageKey: key, bytes: src && existsSync(src) ? statSync(src).size : 1, contentType, state: "uploaded", expiresAt: now + 3 * DAY, uploadedAt: now - 61 * 60_000, createdAt: now - 62 * 60_000, posterArtifactId: null, ...over };
+    const row: VerifyArtifact = { id, schemaVersion: 1, runId, repoId: repo.id, testId, criterionIds, kind, path: `.devasign/artifacts/${id}`, storageKey: key, bytes: src && existsSync(src) ? statSync(src).size : 1, contentType, state: "uploaded", expiresAt: now - 62 * 60_000 + ARTIFACT_RETENTION_DAYS * DAY, uploadedAt: now - 61 * 60_000, createdAt: now - 62 * 60_000, posterArtifactId: null, ...over };
     rows.push(row);
     db.insert("verifyArtifacts", row);
     return row;

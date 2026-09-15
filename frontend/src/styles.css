@@ -6325,7 +6325,9 @@ pre.vln-code, .vln-code {
 .acv-rec-chev { color: var(--fg-mute); display: grid; place-items: center; }
 .acv-rec-body { border-top: 1px solid var(--line); padding: 8px; display: flex; flex-direction: column; gap: 8px; }
 .acv-rec-video { width: 100%; max-height: 420px; background: #000; display: block; }
-.acv-rec-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.acv-rec-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.acv-rec-retention { font-size: 10.5px; margin-left: auto; }
+.tst-retention { font-size: 11.5px; margin: -4px 0 10px; }
 .acv-revisions { list-style: none; margin: 0; padding: 0; border: 1px solid var(--line); }
 .acv-revision { padding: 8px 12px; border-bottom: 1px solid var(--line); font-size: 12px; }
 .acv-revision:last-child { border-bottom: 0; }

@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { RunView, VerifyTestRow } from "./api.ts";
-import { EMPTY_FILTERS, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
+import { EMPTY_FILTERS, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, soonestEvidenceExpiry, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
 
 const row = (over: Partial<VerifyTestRow> & { key: string }): VerifyTestRow => ({
   testId: over.key,
@@ -152,6 +152,8 @@ test("testDetail joins criteria, result attempts, recordings, and other evidence
   assert.equal(d.recordings[0].posterUrl, "https://p2");
   assert.equal(d.recordings[0].trace?.getUrl, "https://tr2");
   assert.deepEqual(d.others.map((o) => [o.kind, o.getUrl, o.expired]), [["log", null, true], ["trace", "https://tr2", false]]);
+  assert.equal(soonestEvidenceExpiry(d), NOW + 10, "the expired log is ignored");
+  assert.equal(soonestEvidenceExpiry({ recordings: [], others: [{ artifactId: "x", kind: "log", attempt: null, getUrl: null, expiresAt: NOW - 1, expired: true }] }), null);
   assert.equal(testDetail(view, "t9", NOW), null, "a test not in the plan has no detail");
   assert.equal(testDetail(null, "t1", NOW), null);
 });

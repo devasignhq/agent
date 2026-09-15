@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React from "react";
 import { Icon } from "./icons";
-import { formatDuration, isSignedUrlStale, traceViewerUrl } from "./verify-view";
+import { deletionCountdown, formatDuration, isSignedUrlStale, traceViewerUrl } from "./verify-view";
 
 // A Playwright recording for one criterion: collapsed (poster, test, duration)
 // by default, an inline player with full-screen + trace viewer when opened.
@@ -39,6 +39,7 @@ export const RecordingBlock = ({ rec, testName, durationMs, initiallyOpen, onSta
             <button type="button" className="btn sm ghost" onClick={() => { const el = videoRef.current; if (el && el.requestFullscreen) el.requestFullscreen(); }}>Full screen</button>
             {rec.trace?.getUrl && <a className="btn sm ghost" href={traceViewerUrl(rec.trace.getUrl)} target="_blank" rel="noreferrer">Open trace</a>}
             {rec.getUrl && <a className="btn sm ghost" href={rec.getUrl} target="_blank" rel="noreferrer">Download</a>}
+            <span className="mono mute acv-rec-retention">{deletionCountdown(rec.expiresAt, Date.now())}</span>
           </div>
         </div>
       )}

@@ -43,11 +43,22 @@ export function retentionDays(a: Pick<RunViewArtifact, "expiresAt"> & { createdA
   return Math.max(1, Math.round((a.expiresAt - start) / (24 * 60 * 60 * 1000)));
 }
 
+/** Whole days until a live artifact is deleted: 30 at upload, 29 a day later, 1 on its last day. */
+export function daysUntilDeletion(expiresAt: number, now: number): number {
+  return Math.max(1, Math.ceil((expiresAt - now) / (24 * 60 * 60 * 1000)));
+}
+
+export function deletionCountdown(expiresAt: number, now: number): string {
+  const days = daysUntilDeletion(expiresAt, now);
+  return `deleted in ${days} ${days === 1 ? "day" : "days"}`;
+}
+
 export type Recording = {
   artifactId: string;
   getUrl: string | null;
   posterUrl: string | null;
   urlExpiresAt: number | null;
+  expiresAt: number;
   expired: boolean;
   expiredAfterDays: number;
   bytes: number;
@@ -80,6 +91,7 @@ export function recordingFromVideo(view: RunView, video: RunViewArtifact, siblin
     getUrl: expired ? null : video.getUrl,
     posterUrl: expired ? null : video.posterUrl ?? poster?.getUrl ?? null,
     urlExpiresAt: video.urlExpiresAt,
+    expiresAt: video.expiresAt,
     expired,
     expiredAfterDays: retentionDays(video, view.run.createdAt),
     bytes: video.bytes,

@@ -22,7 +22,9 @@ export type ArtifactStorage = {
 };
 
 const DAY_MS = 24 * 60 * 60 * 1000;
-export const RETENTION_MS: Record<Plan, number> = { free: 1 * DAY_MS, pro: 3 * DAY_MS, max: 3 * DAY_MS };
+export const ARTIFACT_RETENTION_DAYS = 30;
+const RETENTION = ARTIFACT_RETENTION_DAYS * DAY_MS;
+export const RETENTION_MS: Record<Plan, number> = { free: RETENTION, pro: RETENTION, max: RETENTION };
 
 export function retentionExpiresAt(plan: Plan, now: number = Date.now()): number {
   return now + RETENTION_MS[plan];

@@ -4,6 +4,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  daysUntilDeletion,
+  deletionCountdown,
   formatDuration,
   formatFlakeRate,
   isSignedUrlStale,
@@ -20,6 +22,16 @@ const DAY = 24 * 60 * 60 * 1000;
 const NOW = 1_700_000_000_000;
 const art = (over: Partial<RunViewArtifact>): RunViewArtifact =>
   ({ id: "a", kind: "video", testId: "t1", criterionIds: ["1"], bytes: 10, state: "uploaded", expiresAt: NOW + DAY, posterArtifactId: null, path: "v.webm", attempt: 1, getUrl: "https://x/v", posterUrl: "https://x/p", urlExpiresAt: NOW + 300_000, ...over });
+
+test("daysUntilDeletion counts down one whole day at a time, never below 1", () => {
+  assert.equal(daysUntilDeletion(NOW + 30 * DAY, NOW), 30);
+  assert.equal(daysUntilDeletion(NOW + 30 * DAY - 1, NOW), 30);
+  assert.equal(daysUntilDeletion(NOW + 29 * DAY, NOW), 29);
+  assert.equal(daysUntilDeletion(NOW + 60 * 60 * 1000, NOW), 1);
+  assert.equal(daysUntilDeletion(NOW - 1, NOW), 1);
+  assert.equal(deletionCountdown(NOW + 30 * DAY, NOW), "deleted in 30 days");
+  assert.equal(deletionCountdown(NOW + DAY, NOW), "deleted in 1 day");
+});
 
 function view(over: Partial<RunView> = {}): RunView {
   return {
