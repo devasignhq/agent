@@ -72,5 +72,18 @@ money:
     - "backend/scripts/diagnose-escrow.ts"
 verify:
   e2e: auto
+  # How CI boots this app for browser tests: the ephemeral backend (in-memory DB, mock LLM,
+  # no secrets), then the Vite frontend it proxies to. The workflow installs both packages.
+  servers:
+    - name: backend
+      start: npm --prefix backend run dev:ephemeral
+      url: http://localhost:8787
+      ready: /api/health
+  start: npm --prefix frontend run dev -- --port 3001 --strictPort
+  # Must stay localhost:3001 — the ephemeral backend's WEB_ORIGIN, and CORS matches it exactly.
+  url: http://localhost:3001
+  ready: /
+  timeout: 180
   login:
-    strategy: none
+    script: node ./scripts/devasign-login.mjs
+    check: http://localhost:8787/api/me
