@@ -15,6 +15,8 @@ import type { Installation, Repository, VerifyArtifact, VerifyArtifactKind } fro
 import { prNumberFromRef, verifyActionsToken, type ActionsClaims, type OidcResult } from "../verify/oidc.js";
 import { artifactKey, artifactStorage, retentionExpiresAt, UPLOAD_LIMITS } from "../verify/storage.js";
 import { localArtifactPath, localStoreEnabled, verifyLocalSignature } from "../verify/storage-local.js";
+import { normalizeDoctor } from "../verify/doctor-normalize.js";
+import { patchRepoVerify } from "../verify/repo-state.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -166,9 +168,7 @@ export function normalizeDetectedSetup(raw: unknown): DetectedSetup | null {
 function rememberSetup(repo: Repository, setup: ResolveRequest["setup"]): void {
   const detected = normalizeDetectedSetup(setup);
   if (!detected) return;
-  db.update("repositories", (r) => r.id === repo.id, {
-    verify: { onboarding: { state: "none" }, ...(repo.verify || {}), detected },
-  });
+  patchRepoVerify(repo.id, (cur) => ({ ...cur, detected }));
 }
 
 export async function resolveHandler(req: RunnerRequest, res: Response): Promise<void> {
@@ -382,7 +382,7 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
   res.json(out);
 }
 
-function parseResults(body: unknown, runId: string): RunnerResults | null {
+export function parseResults(body: unknown, runId: string): RunnerResults | null {
   const b = (body || {}) as Record<string, any>;
   if (b.runId !== runId || typeof b.sha !== "string" || !Array.isArray(b.results)) return null;
   const results = b.results
@@ -418,7 +418,7 @@ function parseResults(body: unknown, runId: string): RunnerResults | null {
     existingTestsTouchingDiff: Array.isArray(b.existingTestsTouchingDiff) ? b.existingTestsTouchingDiff.map(String).slice(0, 500) : [],
     stdoutArtifactId: typeof b.stdoutArtifactId === "string" ? b.stdoutArtifactId : undefined,
     setup: b.setup && typeof b.setup === "object" ? b.setup : undefined,
-    doctor: b.doctor && typeof b.doctor === "object" ? b.doctor : null,
+    doctor: normalizeDoctor(b.doctor),
     timings: {
       startedAt: Number(b.timings?.startedAt) || 0,
       installFinishedAt: Number(b.timings?.installFinishedAt) || undefined,

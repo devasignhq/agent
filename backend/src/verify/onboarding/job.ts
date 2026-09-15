@@ -12,6 +12,10 @@ import type { Installation, Repository, VerifyRun } from "../../types.js";
 import type { DoctorDiagnosis } from "../contract.js";
 import { inferSetupFromTree, envVarNames } from "../detect.js";
 import { updateRun } from "../runs.js";
+import { mdInline } from "../md.js";
+import { codeFence } from "../../review/render.js";
+import { refreshDefaultYml } from "../default-yml.js";
+import { patchRepoVerify } from "../repo-state.js";
 import {
   ACTION_REF,
   DEVASIGN_YML_PATH,
@@ -22,6 +26,7 @@ import {
   guessVerifyConfig,
   ONBOARDING_BRANCH,
   ONBOARDING_TITLE,
+  patchExtendedWorkflowForDoctor,
   patchWorkflowForDoctor,
   prBody,
   stackHints,
@@ -61,9 +66,10 @@ const defaults: Required<OnboardDeps> = {
 export type OnboardOptions = { trigger: "install" | "manual" | "doctor"; mode?: "separate" | "extend"; workflow?: string };
 export type OnboardResult = { status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string };
 
-function setOnboarding(repo: Repository, patch: Partial<NonNullable<Repository["verify"]>["onboarding"]>, extra: Partial<NonNullable<Repository["verify"]>> = {}): void {
-  const cur = repo.verify ?? { onboarding: { state: "none" as const } };
-  db.update("repositories", (r) => r.id === repo.id, { verify: { ...cur, ...extra, onboarding: { ...cur.onboarding, ...patch } } });
+type VerifyState = NonNullable<Repository["verify"]>;
+
+function setOnboarding(repo: Repository, patch: Partial<VerifyState["onboarding"]>, extra: Partial<VerifyState> | ((cur: VerifyState) => Partial<VerifyState>) = {}): void {
+  patchRepoVerify(repo.id, (cur) => ({ ...cur, ...(typeof extra === "function" ? extra(cur) : extra), onboarding: { ...cur.onboarding, ...patch } }));
 }
 
 const FILES_TO_READ = ["package.json", ".env.example", ".env.test", DEVASIGN_YML_PATH, "requirements.txt", "pyproject.toml", ".python-version", "go.mod", ".nvmrc"];
@@ -150,7 +156,7 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
     setOnboarding(
       repo,
       { state: "pr_open", prNumber: pr.number, prUrl: pr.html_url, mode, workflowPath, workflowVersion: WORKFLOW_VERSION, lastError: null, expectedSecrets: expected, missingSecrets: missing },
-      { detected: repo.verify?.detected ?? setup }
+      (cur) => ({ detected: cur.detected ?? setup })
     );
     if (install.userId) {
       const verb = existingPr ? "updates" : "adds";
@@ -167,18 +173,21 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
 }
 
 /** A merged/closed onboarding PR moves the repo's setup state; nothing is re-opened automatically. */
-export function noteOnboardingPrClosed(repoId: string, prNumber: number, merged: boolean): void {
+export function noteOnboardingPrClosed(repoId: string, prNumber: number, merged: boolean, deps: OnboardDeps = {}): void {
   const repo = db.find("repositories", (r) => r.id === repoId);
   if (!repo || repo.verify?.onboarding?.prNumber !== prNumber) return;
   setOnboarding(repo, { state: merged ? "pr_merged" : "pr_closed" });
+  // Only injected readers pass through: the default one tells a missing file from a failed read.
+  if (merged) void refreshDefaultYml(repo.id, { force: true, deps: { branchSha: deps.branchSha, read: deps.read } });
 }
 
 /** A run that completed without a setup problem marks the repo verified — again after a regenerated setup PR merges. */
 export function noteRunSucceeded(run: VerifyRun): void {
   const repo = db.find("repositories", (r) => r.id === run.repoId);
   const ob = repo?.verify?.onboarding;
-  if (!repo || ob?.state === "verified") return;
-  setOnboarding(repo, { state: "verified", firstSuccessfulRunId: ob?.firstSuccessfulRunId ?? run.id, lastDiagnosis: null });
+  if (!repo) return;
+  if (ob?.state !== "verified") setOnboarding(repo, { state: "verified", firstSuccessfulRunId: ob?.firstSuccessfulRunId ?? run.id, lastDiagnosis: null });
+  else if (ob.lastDiagnosis != null) setOnboarding(repo, { lastDiagnosis: null });
 }
 
 /** Doctor diagnosis → comment on the open onboarding PR (+ a mechanical fix commit when we have one). */
@@ -190,28 +199,32 @@ export async function postDoctorFollowup(run: VerifyRun, doctor: DoctorDiagnosis
   setOnboarding(repo, { lastDiagnosis: doctor });
   const ob = repo.verify?.onboarding;
   if (ob?.state !== "pr_open" || !ob.prNumber) return { commented: false, patched: false };
+  const workflowPath = ob.workflowPath ?? WORKFLOW_PATH;
   let patched = false;
   let patchNote = "";
   try {
-    const current = await d.read(install, repo, WORKFLOW_PATH, ONBOARDING_BRANCH);
-    const next = current ? patchWorkflowForDoctor(current, doctor) : null;
+    const current = await d.read(install, repo, workflowPath, ONBOARDING_BRANCH);
+    // Their own CI file gets a job-scoped edit; the text patch assumes our generated layout.
+    const next = !current ? null : workflowPath === WORKFLOW_PATH ? patchWorkflowForDoctor(current, doctor) : patchExtendedWorkflowForDoctor(current, doctor);
     if (next) {
-      await d.putFile(install, repo, ONBOARDING_BRANCH, WORKFLOW_PATH, next, `Fix DevAsign verification setup: ${doctor.code}`);
+      await d.putFile(install, repo, ONBOARDING_BRANCH, workflowPath, next, `Fix DevAsign verification setup: ${doctor.code}`);
       patched = true;
       patchNote = `\n\nI pushed a commit to this PR that applies the mechanical fix (${doctor.code.replace(/_/g, " ")}).`;
     }
   } catch (err) {
     console.warn("[verify] doctor follow-up commit failed:", err);
   }
+  const patch = doctor.suggestedFix?.patch?.trim() ?? "";
+  const fence = codeFence(patch);
   const lines = [
     `### Setup needs attention`,
     "",
-    `The first verification run on PR #${run.prNumber} could not run its tests: **${doctor.message}** (${doctor.stage}/${doctor.code}).`,
+    `The first verification run on PR #${run.prNumber} could not run its tests: **${mdInline(doctor.message)}** (${doctor.stage}/${doctor.code}).`,
     ...(doctor.missingSecrets?.length ? ["", `Missing secrets: ${doctor.missingSecrets.map((s) => `\`${s}\``).join(", ")}`] : []),
-    ...(doctor.suggestedFix ? ["", doctor.suggestedFix.instructions, ...(doctor.suggestedFix.patch ? ["", "```yaml", doctor.suggestedFix.patch.trim(), "```"] : [])] : []),
+    ...(doctor.suggestedFix ? ["", mdInline(doctor.suggestedFix.instructions, 1000), ...(patch ? ["", `${fence}yaml`, patch, fence] : [])] : []),
     patchNote,
     "",
-    "Criteria on that PR are reported as unverifiable, not failed, until this is fixed.",
+    "Until this is fixed, UI criteria are checked below browser level with a note on each PR, and reported as unverifiable only under `e2e: always`.",
   ];
   const id = await d.postComment(install, repo, ob.prNumber, lines.join("\n"));
   return { commented: id != null, patched };

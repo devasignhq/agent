@@ -1,8 +1,8 @@
 // node --test src/tests-view.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { RunView, VerifyTestRow } from "./api.ts";
-import { EMPTY_FILTERS, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, soonestEvidenceExpiry, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
+import type { BrowserSetupEntry, RunView, VerifyTestRow } from "./api.ts";
+import { EMPTY_FILTERS, browserBanner, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, soonestEvidenceExpiry, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
 
 const row = (over: Partial<VerifyTestRow> & { key: string }): VerifyTestRow => ({
   testId: over.key,
@@ -156,4 +156,59 @@ test("testDetail joins criteria, result attempts, recordings, and other evidence
   assert.equal(soonestEvidenceExpiry({ recordings: [], others: [{ artifactId: "x", kind: "log", attempt: null, getUrl: null, expiresAt: NOW - 1, expired: true }] }), null);
   assert.equal(testDetail(view, "t9", NOW), null, "a test not in the plan has no detail");
   assert.equal(testDetail(null, "t1", NOW), null);
+});
+
+const setupEntry = (over: Partial<BrowserSetupEntry> & { repoId: string }): BrowserSetupEntry => ({
+  repo: `acme/${over.repoId}`,
+  status: "not_configured",
+  missing: ["start", "url"],
+  lastBrowserless: { count: 3, reason: "not_configured", runId: "run1", prNumber: 7, at: 100 },
+  fixUrl: `https://app.devasign.test/workflow?repo=${over.repoId}&setup=browser`,
+  ...over,
+});
+
+test("browserBanner: nothing to flag gives no banner", () => {
+  assert.equal(browserBanner(undefined), null);
+  assert.equal(browserBanner([]), null);
+  assert.equal(
+    browserBanner([
+      setupEntry({ repoId: "fine", status: "unproven", lastBrowserless: null }),
+      setupEntry({ repoId: "fixed", status: "unproven" }),
+      setupEntry({ repoId: "off", status: "disabled" }),
+      setupEntry({ repoId: "quiet", lastBrowserless: null }),
+    ]),
+    null,
+    "configured, disabled, or never checked without a browser"
+  );
+});
+
+test("browserBanner names a single repo and links in-app to its setup panel", () => {
+  const b = browserBanner([setupEntry({ repoId: "r1" }), setupEntry({ repoId: "ok", status: "unproven", lastBrowserless: null })])!;
+  assert.equal(b.text, "UI criteria on acme/r1 were checked without a browser");
+  assert.equal(b.action, "set up browser tests");
+  assert.equal(b.href, "/workflow?repo=r1&setup=browser");
+  assert.deepEqual(b.repos, ["acme/r1"]);
+});
+
+test("browserBanner counts several repos and links to the most recent one", () => {
+  const b = browserBanner([
+    setupEntry({ repoId: "old", lastBrowserless: { count: 1, reason: "not_configured", runId: "a", prNumber: 1, at: 10 } }),
+    setupEntry({ repoId: "new", status: "failing", lastBrowserless: { count: 2, reason: "did_not_start", runId: "b", prNumber: 2, at: 50 } }),
+  ])!;
+  assert.equal(b.text, "UI criteria on 2 repositories were checked without a browser");
+  assert.equal(b.action, "set up browser tests", "mixed reasons use the setup wording");
+  assert.equal(b.href, "/workflow?repo=new&setup=browser");
+  assert.deepEqual(b.repos, ["acme/new", "acme/old"]);
+});
+
+test("browserBanner says the app did not start when every flagged repo is failing", () => {
+  const b = browserBanner([setupEntry({ repoId: "r1", status: "failing", lastBrowserless: { count: 1, reason: "did_not_start", runId: "a", prNumber: 4, at: 1 } })])!;
+  assert.equal(b.text, "UI criteria on acme/r1 were checked without a browser because the app did not start in CI");
+  assert.equal(b.action, "see setup");
+});
+
+test("browserBanner never links outside the setup panel", () => {
+  assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "https://evil.test/logout" })])!.href, "/workflow?repo=r1&setup=browser");
+  assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "" })])!.href, "/workflow?repo=r1&setup=browser");
+  assert.equal(browserBanner([setupEntry({ repoId: "r 2", fixUrl: "/workflow?repo=r%202&setup=browser" })])!.href, "/workflow?repo=r%202&setup=browser");
 });

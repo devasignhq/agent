@@ -10,7 +10,8 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { setArtifactStorageForTests, type ArtifactStorage } from "../verify/storage.js";
-import { artifactsHandler, guard, normalizeDetectedSetup } from "./v1.js";
+import { artifactsHandler, guard, normalizeDetectedSetup, parseResults } from "./v1.js";
+import { DOCTOR_LIMITS, normalizeDoctor } from "../verify/doctor-normalize.js";
 
 function fakeRes() {
   const res: any = { statusCode: 200, body: undefined, headersSent: false };
@@ -137,4 +138,50 @@ test("two artifact files sharing a clientRef are rejected, not fatal", async () 
     db.remove("verifyArtifacts", (a) => a.runId === runId);
     db.remove("verifyRuns", (r) => r.id === runId);
   }
+});
+
+test("a hostile doctor diagnosis keeps only known fields with checked values", () => {
+  const out = normalizeDoctor({
+    stage: "exfiltrate",
+    code: "pwned",
+    message: "x".repeat(5000),
+    missingSecrets: ["API_KEY", "lower_case", "BAD NAME", "A".repeat(101), "$(curl evil)", 7, "STRIPE_KEY"],
+    packages: [
+      { dir: "backend", install: "npm ci --prefix backend" },
+      { dir: "../x", install: "npm ci --prefix ../x" },
+      { dir: "x", install: "npm ci --prefix x; curl evil" },
+      { dir: "..", install: "npm ci --prefix .." },
+      { dir: "frontend", install: "npm ci --prefix backend" },
+      { dir: "web", install: "pnpm install --frozen-lockfile --dir web", extra: "dropped" },
+      "backend",
+    ],
+    logArtifactId: { id: "x" },
+    suggestedFix: { kind: "shell", instructions: "i".repeat(5000), patch: "verify:\n  start: ok\n````\n@org/team [x](https://evil)\n```", run: "rm -rf /" },
+    workflowText: "on: push",
+  })!;
+  assert.deepEqual(Object.keys(out).sort(), ["code", "message", "missingSecrets", "packages", "stage", "suggestedFix"], "unknown fields and a non-string log id are dropped");
+  assert.equal(out.stage, "tests");
+  assert.equal(out.code, "unknown");
+  assert.equal(out.message.length, DOCTOR_LIMITS.message);
+  assert.deepEqual(out.missingSecrets, ["API_KEY", "STRIPE_KEY"]);
+  assert.deepEqual(out.packages, [{ dir: "backend", install: "npm ci --prefix backend" }, { dir: "web", install: "pnpm install --frozen-lockfile --dir web" }]);
+  assert.deepEqual(Object.keys(out.suggestedFix!).sort(), ["instructions", "kind", "patch"]);
+  assert.equal(out.suggestedFix!.kind, "manual");
+  assert.equal(out.suggestedFix!.instructions.length, DOCTOR_LIMITS.instructions);
+  assert.equal(out.suggestedFix!.patch, "verify:\n  start: ok\n~~~\n@org/team [x](https://evil)\n~~~");
+  assert.doesNotMatch(out.suggestedFix!.patch!, /```/, "no backtick fence survives to close the comment's own");
+
+  // A well-formed diagnosis passes through unchanged.
+  const good = { stage: "install", code: "missing_dependencies", message: "m", packages: [{ dir: ".", install: "npm ci --prefix ." }], logArtifactId: "log-1", suggestedFix: { kind: "yml_patch", instructions: "Set start.", patch: "verify:\n  start: npm run dev\n" } };
+  assert.deepEqual(normalizeDoctor(good), good);
+  assert.deepEqual(normalizeDoctor({ message: 42 }), { stage: "tests", code: "unknown", message: "" });
+  for (const bad of [null, undefined, "doctor", 7, ["stage"]]) assert.equal(normalizeDoctor(bad), null);
+});
+
+test("parseResults stores the normalized doctor, not the runner's object", () => {
+  const body = { runId: "r1", sha: "abc1234", results: [], doctor: { stage: "start", code: "app_not_ready", message: "down", secretSauce: "leak", suggestedFix: { kind: "manual", instructions: "fix", patch: "```" } } };
+  const parsed = parseResults(body, "r1")!;
+  assert.deepEqual(parsed.doctor, { stage: "start", code: "app_not_ready", message: "down", suggestedFix: { kind: "manual", instructions: "fix", patch: "~~~" } });
+  assert.equal(parseResults({ ...body, doctor: "not an object" }, "r1")!.doctor, null);
+  assert.equal(parseResults({ ...body, doctor: undefined }, "r1")!.doctor, null);
 });

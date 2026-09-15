@@ -15,6 +15,8 @@ import { formatCardHeader, spliceCardHeader } from "../review/comment.js";
 import { codeFence } from "../review/render.js";
 import type { Criterion, PRReview, Repository, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { RunnerResult } from "./contract.js";
+import { browserlessSummary, type BrowserlessSummary } from "./browserless.js";
+import { mdInline } from "./md.js";
 import { hasRunnerEvidence, updateRun } from "./runs.js";
 
 export const VERIFICATION_START = "<!-- devasign:verification -->";
@@ -68,6 +70,7 @@ export type VerificationView = {
   rows: VerificationRow[];
   counts: { pass: number; fail: number; unverifiable: number; pending: number };
   tests: { generated: number; existing: number; prAuthored: number };
+  browserless?: BrowserlessSummary;
 };
 
 export function runDeepLink(reviewId: string, runId: string | null, criterionId?: string): string {
@@ -180,6 +183,10 @@ export function buildVerificationView(args: {
   }
   const counts = { pass: 0, fail: 0, unverifiable: 0, pending: 0 };
   for (const r of rows) counts[r.verdict] += 1;
+  const browserless =
+    state === "completed" && run?.verdicts.length
+      ? browserlessSummary({ criteria: args.criteria.filter(isVerifiable), verdicts: run.verdicts, plan })
+      : null;
   return {
     state,
     runId,
@@ -194,7 +201,19 @@ export function buildVerificationView(args: {
       existing: plan?.tests.filter((t) => t.origin === "existing").length ?? 0,
       prAuthored: plan?.prAuthoredTests?.length ?? 0,
     },
+    ...(browserless ? { browserless } : {}),
   };
+}
+
+// Runner-reported text (test errors, doctor messages) lands in these reasons.
+const REASON_CAP = 600;
+
+function browserlessNote(b: BrowserlessSummary | null | undefined): string | null {
+  if (!b?.count) return null;
+  const subject = b.count === 1 ? "1 UI criterion was" : `${b.count} UI criteria were`;
+  return b.reason === "did_not_start"
+    ? `${subject} checked without a browser because the app did not start in CI — [see setup](${b.fixUrl})`
+    : `${subject} checked without a browser — [set up browser tests](${b.fixUrl})`;
 }
 
 function stateLine(view: VerificationView): string {
@@ -241,7 +260,7 @@ export function formatVerificationSection(view: VerificationView): string {
   lines.push("");
   for (const r of view.rows) {
     const parts = [`**${r.id}.** ${r.text} — **${verdictWord(r.verdict)}**`];
-    if (r.reason) parts.push(r.reason);
+    if (r.reason) parts.push(mdInline(r.reason, REASON_CAP));
     if (r.fixUrl) parts.push(`[configure app start](${r.fixUrl})`);
     if (r.testName) parts.push(`${r.level ?? "test"}${r.origin === "existing" ? " (existing)" : ""} \`${r.testName}\``);
     if (r.recording) parts.push(r.recording.expired ? `[recording expired](${r.deepLink})` : `[▶ Watch recording](${r.deepLink})`);
@@ -293,13 +312,15 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
     conclusion = "neutral";
     title = view.state === "timed_out" ? "Verification timed out" : "Verification did not complete";
   }
+  const note = browserlessNote(view.browserless);
   const text = [
     stateLine(view),
+    ...(note ? ["", note] : []),
     "",
     ...view.rows.map((r) => {
       const bits = [`${verdictWord(r.verdict)} — ${r.id}. ${r.text}`];
       if (r.testName) bits.push(`test: ${r.testName}`);
-      if (r.reason) bits.push(r.reason);
+      if (r.reason) bits.push(mdInline(r.reason, REASON_CAP));
       if (r.fixUrl) bits.push(`[configure app start](${r.fixUrl})`);
       bits.push(r.recording ? `[watch recording](${r.deepLink})` : `[details](${r.deepLink})`);
       return `- ${bits.join(" · ")}`;
@@ -315,9 +336,14 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
     conclusion,
     output: {
       title,
-      summary: opts.doctor
-        ? `${opts.doctor.message} — criteria are unverifiable, not failed.${opts.doctor.suggestedFix?.instructions ? ` Fix: ${opts.doctor.suggestedFix.instructions}` : ""}`
-        : stateLine(view),
+      summary: [
+        opts.doctor
+          ? `${mdInline(opts.doctor.message)} — criteria are unverifiable, not failed.${opts.doctor.suggestedFix?.instructions ? ` Fix: ${mdInline(opts.doctor.suggestedFix.instructions, 1000)}` : ""}`
+          : stateLine(view),
+        note,
+      ]
+        .filter(Boolean)
+        .join("\n\n"),
       text: text.slice(0, 60_000),
     },
     ...(actions.length ? { actions } : {}),
@@ -520,12 +546,14 @@ export function formatTestsComment(view: VerificationView, repoFullName: string)
         `${view.tests.prAuthored === 1 ? "it was" : "they were"} not used as evidence.`
     );
   }
+  const note = browserlessNote(view.browserless);
+  if (note) lines.push("", note);
 
   lines.push("", VERIFICATION_START);
   for (const r of view.rows) {
     lines.push("", "<details>", `<summary>${r.id} — ${r.text} (${verdictWord(r.verdict)})</summary>`, "");
     lines.push(`**Verdict:** ${verdictWord(r.verdict)}`);
-    if (r.reason) lines.push("", r.reason);
+    if (r.reason) lines.push("", mdInline(r.reason, REASON_CAP));
     if (r.testName) {
       lines.push("", `**Test:** \`${r.testName}\`${r.origin === "existing" ? " (existing)" : ""}${r.level ? ` · ${r.level}` : ""}`);
     }
@@ -535,7 +563,7 @@ export function formatTestsComment(view: VerificationView, repoFullName: string)
         ? `[recording expired](${r.deepLink})`
         : `[▶ Watch recording](${r.deepLink})`
       : `[details](${r.deepLink})`;
-    lines.push("", evidence, "", "</details>");
+    lines.push("", r.fixUrl ? `[fix setup](${r.fixUrl}) · ${evidence}` : evidence, "", "</details>");
   }
   lines.push(VERIFICATION_END);
 

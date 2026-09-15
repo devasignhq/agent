@@ -165,6 +165,7 @@ test("e2e: never in .devasign.yml overrides the workflow; ui criteria become unv
     assert.equal(plan.tests.length, 0);
     assert.match(plan.unverifiable[0].reason, /e2e: never/);
     assert.equal(db.find("repositories", (r) => r.id === s.repo.id)?.verify?.devasignYml?.parsed?.e2e, "never");
+    assert.deepEqual(plan.browser, { policy: "never", allowed: false, bootConfigured: true, reason: "never", fixUrl: plan.browser?.fixUrl });
   } finally {
     s.cleanup();
   }
@@ -179,10 +180,121 @@ test("no boot config: a ui criterion that needs e2e is unverifiable with a fix l
     assert.deepEqual(plan.tests.map((t) => t.criterionIds[0]), ["2"]);
     assert.equal(plan.unverifiable[0].criterionId, "1");
     assert.equal(plan.unverifiable[0].reason, NO_BOOT_REASON);
-    assert.match(String(plan.unverifiable[0].fixUrl), /\/workflow\?repo=/);
+    assert.match(String(plan.unverifiable[0].fixUrl), SETUP_LINK(s.repo.id));
     assert.match(prompts[0], /Browser \(e2e\) tests: not available \(no app start \/ login configured\)/);
     assert.match(prompts[0], /UI criteria remain testable at component level/);
     assert.match(prompts[0], /\[1\]: max level component/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+const SETUP_LINK = (repoId: string) => new RegExp(`/workflow\\?repo=${repoId}&setup=browser$`);
+const ALWAYS_YML = "verify:\n  e2e: always\n";
+
+// --- The browser policy a plan was made under, and strict `e2e: always` ---
+
+test("auto without boot config: the plan and its log record the browser as not allowed, and UI criteria still reach the model", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const { deps: d, prompts } = deps({ responses: [{ tests: [gen("2", "unit")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.browser, { policy: "auto", allowed: false, bootConfigured: false, reason: "no_boot", fixUrl: plan.browser?.fixUrl });
+    assert.match(String(plan.browser?.fixUrl), SETUP_LINK(s.repo.id));
+    assert.match(prompts[0], /\[1\] \(ui\) Criterion 1 holds/);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify" && /^Test plan ready/.test(l.action));
+    assert.deepEqual(log?.meta?.browser, plan.browser);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("e2e: always without boot config: UI criteria never reach the model and are unverifiable with the setup link; code criteria are still planned", async () => {
+  const s = seed([crit("1", "ui"), crit("2")]);
+  const { deps: d, prompts, bodyPrompts } = deps({
+    tree: [...BASE_TREE, ".devasign.yml"],
+    files: { ".devasign.yml": ALWAYS_YML },
+    // Answers about a criterion it was never shown cannot cover it.
+    responses: [{ tests: [gen("2", "unit"), gen("1", "component")], unverifiable: [{ criterionId: "1", reason: "whatever" }] }],
+  });
+  try {
+    const out = await runVerifyPlan(s.run.id, d);
+    assert.equal(out?.status, "awaiting_runner");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(prompts.length, 1);
+    for (const p of [...prompts, ...bodyPrompts]) {
+      assert.doesNotMatch(p, /Criterion 1 holds/);
+      assert.doesNotMatch(p, /\[1\]/);
+    }
+    assert.match(prompts[0], /\[2\] \(code\) Criterion 2 holds/);
+    assert.deepEqual(plan.tests.map((t) => t.criterionIds), [["2"]]);
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: NO_BOOT_REASON, fixUrl: plan.browser?.fixUrl }]);
+    assert.match(String(plan.unverifiable[0].fixUrl), SETUP_LINK(s.repo.id));
+    assert.deepEqual(plan.browser, { policy: "always", allowed: false, bootConfigured: false, reason: "no_boot", fixUrl: plan.browser?.fixUrl });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("e2e: always with only UI criteria and no boot config writes a plan without asking the model", async () => {
+  const s = seed([crit("1", "ui"), crit("2", "ui")]);
+  const { deps: d } = deps({ tree: [...BASE_TREE, ".devasign.yml"], files: { ".devasign.yml": ALWAYS_YML }, responses: [] });
+  let calls = 0;
+  d.llm = async () => {
+    calls += 1;
+    throw new Error("the planner must not be called");
+  };
+  try {
+    const out = await runVerifyPlan(s.run.id, d);
+    assert.equal(calls, 0);
+    assert.equal(out?.status, "awaiting_runner");
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id);
+    assert.ok(plan, "a plan row is written");
+    assert.equal(out?.planId, plan.id);
+    assert.deepEqual(plan.tests, []);
+    assert.deepEqual(plan.commands, []);
+    assert.deepEqual(plan.unverifiable.map((u) => [u.criterionId, u.reason]), [["1", NO_BOOT_REASON], ["2", NO_BOOT_REASON]]);
+    assert.ok(plan.unverifiable.every((u) => SETUP_LINK(s.repo.id).test(String(u.fixUrl))));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("e2e: always with boot config plans UI criteria as before, and the plan records the browser as allowed", async () => {
+  const s = seed([crit("1", "ui")]);
+  const { deps: d, prompts } = deps({
+    tree: [...BASE_TREE, ".devasign.yml"],
+    files: { ".devasign.yml": "verify:\n  e2e: always\n  start: npm run dev\n  url: http://localhost:5173\n" },
+    diff: UI_DIFF,
+    responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.match(prompts[0], /\[1\] \(ui\) Criterion 1 holds/);
+    assert.ok(plan.tests.some((t) => t.level === "e2e" && t.criterionIds.includes("1")));
+    assert.deepEqual(plan.unverifiable, []);
+    assert.deepEqual(plan.browser, { policy: "always", allowed: true, bootConfigured: true, reason: "ok", fixUrl: plan.browser?.fixUrl });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the .devasign.yml snapshot does not clobber a repo.verify field written while the planner was gathering", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d } = deps({ tree: [...BASE_TREE, ".devasign.yml"], files: { ".devasign.yml": BOOT_YML }, responses: [{ tests: [gen("1", "unit")] }] });
+  const lastBrowserless = { count: 2, reason: "did_not_start" as const, runId: "other-run", prNumber: 3, at: 1 };
+  d.fetchDiff = async () => {
+    const cur = db.find("repositories", (r) => r.id === s.repo.id)!;
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "none" }, ...cur.verify, lastBrowserless } });
+    return DIFF;
+  };
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const verify = db.find("repositories", (r) => r.id === s.repo.id)?.verify;
+    assert.deepEqual(verify?.lastBrowserless, lastBrowserless);
+    assert.equal(verify?.devasignYml?.parsed?.start, "npm run dev");
   } finally {
     s.cleanup();
   }
@@ -1164,7 +1276,7 @@ test("a UI criterion the planner still ties to app start after the re-ask keeps 
     const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
     assert.equal(prompts.length, 2);
     assert.equal(plan.unverifiable[0].reason, NO_BOOT_REASON);
-    assert.match(plan.unverifiable[0].fixUrl!, /\/workflow\?repo=/);
+    assert.match(plan.unverifiable[0].fixUrl!, SETUP_LINK(s.repo.id));
   } finally {
     s.cleanup();
   }

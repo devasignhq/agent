@@ -192,6 +192,41 @@ test("a completed verification with no failures is a plain pointer; an unfinishe
   assert.equal(pending, card({ score: 92 }));
 });
 
+test("UI criteria checked without a browser add a set-up link to the Tests line, and nothing without them", () => {
+  const fixUrl = "https://app.test/workflow?repo=r1&setup=browser";
+  const counts = { pass: 3, fail: 0, unverifiable: 1, pending: 0 };
+  const three = card({ verification: verification({ counts, browserless: { count: 3, fixUrl } }) });
+  assert.ok(
+    three.includes(`**Tests:** 3 passed, 1 unverifiable · 3 UI criteria checked without a browser ([set up](${fixUrl})) — see the "Tests by DevAsign" comment.`)
+  );
+  const one = card({ verification: verification({ counts, browserless: { count: 1, fixUrl } }) });
+  assert.ok(one.includes(`· 1 UI criterion checked without a browser ([set up](${fixUrl}))`));
+  assert.doesNotMatch(one, /criteria checked/);
+  const failing = card({ verification: verification({ counts: { ...counts, fail: 1 }, browserless: { count: 2, fixUrl } }) });
+  assert.match(failing, /\*\*1 of 4 verified tests are failing\*\* · 2 UI criteria checked without a browser \(\[set up\]\(/);
+  const allFailing = card({ verification: verification({ counts: { pass: 0, fail: 2, unverifiable: 0, pending: 0 }, browserless: { count: 1, fixUrl } }) });
+  assert.ok(allFailing.includes(`Every verified acceptance-criterion test failed (2 of 2) · 1 UI criterion checked without a browser ([set up](${fixUrl})).`));
+
+  for (const browserless of [undefined, { count: 0, fixUrl }]) {
+    const plain = card({ verification: verification({ counts, browserless }) });
+    assert.doesNotMatch(plain, /without a browser|\[set up\]/);
+    assert.match(plain, /\*\*Tests:\*\* 3 passed, 1 unverifiable — see the "Tests by DevAsign" comment\./);
+  }
+  const pending = card({ verification: verification({ state: "pending", counts, browserless: { count: 3, fixUrl } }) });
+  assert.doesNotMatch(pending, /without a browser/, "only a finished run reports it");
+});
+
+test("a runner-reported failure reason on the card cannot link or mention", () => {
+  const body = card({
+    verification: verification({
+      counts: { pass: 0, fail: 1, unverifiable: 0, pending: 0 },
+      rows: [{ id: "1", text: "Refunds show", verdict: "fail", reason: "expected [x](https://evil) to ping @org/team" }],
+    }),
+  });
+  assert.match(body, /: expected \\\[x\\\]\\\(https:\u200b\/\/evil\\\) to ping @​org\/team/);
+  assert.doesNotMatch(body, /@org\/team/);
+});
+
 test("the head region can be re-rendered in place once verification lands", () => {
   const inputs = { open: [], fixedCount: 0, score: 100, specless: false, criteriaTotal: 2, criteriaMet: 2, summary: "Looks good." };
   const before = card({ ...inputs, unanchored: items({ holistic: { ...EMPTY_HOLISTIC, defects: [finding({ path: undefined })] } }) });

@@ -10,12 +10,14 @@ import { inferSetupFromTree } from "../detect.js";
 import {
   ACTION_REF,
   connectionEnv,
+  DEVASIGN_YML_HEADER,
   expectedSecrets,
   extendWorkflow,
   generateDevasignYml,
   generateWorkflow,
   guessVerifyConfig,
   isKnownInstallCommand,
+  patchExtendedWorkflowForDoctor,
   patchWorkflowForDoctor,
   prBody,
   stackHints,
@@ -192,6 +194,26 @@ test("generateDevasignYml merges into an existing file without touching other bl
   assert.match(fresh, /^# \.devasign\.yml/);
 });
 
+test("the yml header and setup PR body describe what happens without boot config: a PR note, unverifiable only under e2e: always", () => {
+  assert.match(DEVASIGN_YML_HEADER, /checked below browser level with a note on each PR/);
+  assert.match(DEVASIGN_YML_HEADER, /always \(no browser = unverifiable\)/);
+  assert.doesNotMatch(DEVASIGN_YML_HEADER, /reported as unverifiable \(never as failed\)/);
+  assert.ok(DEVASIGN_YML_HEADER.split("\n").every((l) => !l || l.startsWith("# ")), "every header line stays a YAML comment");
+  assert.deepEqual(parse(generateDevasignYml(null, { e2e: "auto" })), { verify: { e2e: "auto" } });
+
+  const none = build(STACKS[4]);
+  const e2e = (body: string) => body.split("### End-to-end tests\n")[1].split("\n\n")[0];
+  const unconfigured = e2e(prBody({ mode: "separate", workflowPath: "x", hints: none.hints, setup: none.setup, verify: none.verify, expected: [], missing: [] }));
+  assert.match(unconfigured, /checked below browser level and each PR carries a note saying so/);
+  assert.match(unconfigured, /With `e2e: always` they are reported as \*\*unverifiable\*\* instead/);
+  assert.doesNotMatch(unconfigured, /UI criteria will be reported as \*\*unverifiable\*\* \(never failed\)/);
+
+  const next = build(STACKS[0]);
+  const configured = e2e(prBody({ mode: "separate", workflowPath: "x", hints: next.hints, setup: next.setup, verify: next.verify, expected: [], missing: [] }));
+  assert.match(configured, /start the app with `npm run dev` and wait for `http:\/\/localhost:3000\/`/);
+  assert.doesNotMatch(configured, /below browser level/, "a repo with boot config gets no fallback caveat");
+});
+
 test("prBody lists expected secrets and flags the missing ones; patchWorkflowForDoctor fixes runtime + browsers only", () => {
   const b = build(STACKS[0]);
   const body = prBody({ mode: "separate", workflowPath: ".github/workflows/devasign-verify.yml", hints: b.hints, setup: b.setup, verify: b.verify, expected: b.secrets, missing: ["STRIPE_KEY"] });
@@ -242,4 +264,49 @@ test("patchWorkflowForDoctor: missing_dependencies inserts the named install ste
   assert.ok(isKnownInstallCommand("pnpm install --frozen-lockfile --dir web", "web"));
   assert.ok(isKnownInstallCommand("npm install --prefix api.v2", "api.v2"));
   assert.ok(!isKnownInstallCommand("npm install --prefix apiXv2", "api.v2"), "the dot is a dot");
+});
+
+test("patchExtendedWorkflowForDoctor edits only the job that runs DevAsign verify in a customer's own workflow", () => {
+  const ci = [
+    "name: CI",
+    "on: [pull_request]",
+    "jobs:",
+    "  lint:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "    - uses: actions/setup-node@v4",
+    "      with:",
+    "        node-version: 18",
+    "    - run: npm ci --prefix backend",
+    "  test:",
+    "    runs-on: ubuntu-latest",
+    "    steps:",
+    "    - uses: actions/checkout@v4",
+    "    - uses: actions/setup-node@v4",
+    "      with:",
+    "        node-version: \"20\"",
+    "    # keep this comment",
+    "    - name: DevAsign verify",
+    `      uses: ${ACTION_REF}`,
+    "",
+  ].join("\n");
+  const runtime = patchExtendedWorkflowForDoctor(ci, { stage: "install", code: "wrong_runtime_version", message: "the repository wants Node >=22 but the runner has v20.1.0" });
+  const r = parse(runtime!);
+  assert.equal(r.jobs.test.steps[1].with["node-version"], "22");
+  assert.equal(r.jobs.lint.steps[0].with["node-version"], 18, "the lint job's Node is untouched");
+  assert.match(runtime!, /# keep this comment/);
+
+  const deps = patchExtendedWorkflowForDoctor(ci, { stage: "install", code: "missing_dependencies", message: "m", packages: [{ dir: "backend", install: "npm ci --prefix backend" }] });
+  const steps = parse(deps!).jobs.test.steps;
+  assert.deepEqual(steps.map((x: any) => x.uses || x.run), ["actions/checkout@v4", "actions/setup-node@v4", "npm ci --prefix backend", ACTION_REF], "another job installing backend does not count");
+  assert.deepEqual(parse(deps!).jobs.lint, parse(ci).jobs.lint);
+
+  const browsers = parse(patchExtendedWorkflowForDoctor(ci, { stage: "browsers", code: "browser_install_failed", message: "no chromium" })!).jobs.test.steps;
+  assert.equal(browsers[browsers.length - 2].run, "npx playwright install --with-deps chromium");
+
+  const matrix = ci.replace('node-version: "20"', "node-version: ${{ matrix.node }}");
+  assert.equal(patchExtendedWorkflowForDoctor(matrix, { stage: "install", code: "wrong_runtime_version", message: "wants Node 22 but has 20" }), null, "a matrix is the customer's to change");
+  assert.equal(patchExtendedWorkflowForDoctor(ci.replace(`uses: ${ACTION_REF}`, "run: echo"), { stage: "browsers", code: "browser_install_failed", message: "x" }), null, "no job runs DevAsign verify");
+  assert.equal(patchExtendedWorkflowForDoctor(ci, { stage: "start", code: "no_start_command", message: "x" }), null, "needs a human");
+  assert.equal(patchExtendedWorkflowForDoctor("jobs: [", { stage: "browsers", code: "browser_install_failed", message: "x" }), null);
 });

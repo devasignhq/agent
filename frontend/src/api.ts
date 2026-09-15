@@ -394,6 +394,8 @@ export type CriterionVerdict = {
   flaky?: boolean;
   retired?: boolean;
   fixUrl?: string;
+  // UI criteria only: whether a browser test decided it, or lower-level tests stood in.
+  browser?: "ran" | "fallback";
 };
 
 export type RunViewArtifact = {
@@ -460,6 +462,34 @@ export type VerifyTestsResponse = {
   counts: VerifyTestCounts;
   repos: Array<{ id: string; name: string }>;
   truncated: boolean;
+  browserSetup?: BrowserSetupEntry[];
+};
+
+// ---- Browser tests setup (backend/src/verify/repo-state.ts browserTestsStatus) ----
+export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "unproven" | "unknown";
+export type LastBrowserless = { count: number; reason: "not_configured" | "did_not_start"; runId: string; prNumber: number; at: number };
+export type BrowserTests = {
+  status: BrowserTestsStatus;
+  missing: Array<"start" | "url">;
+  lastBrowserless: LastBrowserless | null;
+  fixUrl: string;
+  defaultYml: object | null;
+};
+export type BrowserSetupEntry = {
+  repoId: string;
+  repo: string;
+  status: BrowserTestsStatus;
+  missing: Array<"start" | "url">;
+  lastBrowserless: LastBrowserless | null;
+  fixUrl: string;
+};
+export type VerifySetup = {
+  onboarding: NonNullable<Repository["verify"]>["onboarding"];
+  detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null;
+  devasignYml: { start?: string; url?: string; e2e?: string } | null;
+  runnerSeen: boolean;
+  // Absent on backends older than the browser-tests status.
+  browserTests?: BrowserTests;
 };
 
 export type CriteriaRevision = {
@@ -996,7 +1026,7 @@ export const api = {
       body: JSON.stringify({ paths, archived }),
     }),
   verifySetup: (repoId: string) =>
-    request<{ onboarding: NonNullable<Repository["verify"]>["onboarding"]; detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null; devasignYml: { start?: string; url?: string; e2e?: string } | null; runnerSeen: boolean }>(`/api/repositories/${repoId}/verify/setup`),
+    request<VerifySetup>(`/api/repositories/${repoId}/verify/setup`),
   requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string }) =>
     request<{ ok: true; queued: true }>(`/api/repositories/${repoId}/verify/setup-pr`, { method: "POST", body: JSON.stringify(opts) }),
   criteriaRevisions: (reviewId: string) =>

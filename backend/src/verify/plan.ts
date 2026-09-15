@@ -26,7 +26,7 @@ import { planManifestTool, planTestFileTool } from "../review/tools.js";
 import { withMaintainerInstructions } from "../review/decisions.js";
 import { effectiveWorkflow } from "../review/workflow.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format.js";
-import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, VerifyStageUsage } from "../types.js";
+import type { Criterion, Installation, Repository, VerifyPlan, VerifyPlanBrowser, VerifyRun, VerifyStageUsage } from "../types.js";
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, unresolvedRelativeImports, type ImportAllowList } from "./imports.js";
@@ -42,6 +42,7 @@ import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrate
 import { rerenderReport } from "./report.js";
 import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, RUNNER_GONE_MS, updateRun } from "./runs.js";
 import { hasBootConfig, parseDevasignVerify } from "./yml.js";
+import { patchRepoVerify, setupFixUrl } from "./repo-state.js";
 
 export const LEVELS: TestLevel[] = ["unit", "integration", "component", "e2e"];
 const LEVEL_RANK: Record<TestLevel, number> = { unit: 0, integration: 1, component: 2, e2e: 3 };
@@ -555,6 +556,8 @@ export type PlanContext = {
   yml: DevasignVerifyConfig | null;
   ymlFrom: "head" | "base" | null;
   policy: PlanPolicy;
+  // UI criteria kept from the model: `e2e: always` with nothing to boot forbids proving them below the browser.
+  withheld: Criterion[];
   existingTests: string[];
   // Non-test files the PR changes, with their exported symbols when the index knows them.
   changed: Array<{ path: string; exports: string[] }>;
@@ -787,9 +790,8 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const boot = await readVerifyYml(headYml, run.sha, review?.baseSha || repo.defaultBranch, (ref) => readFile(install, repo, ".devasign.yml", ref));
   const yml = boot.yml;
   if (boot.raw != null) {
-    db.update("repositories", (r) => r.id === repo.id, {
-      verify: { onboarding: { state: "none" }, ...(repo.verify || {}), devasignYml: { raw: boot.raw.slice(0, 20_000), parsed: yml, sha: boot.sha } },
-    });
+    const devasignYml = { raw: boot.raw.slice(0, 20_000), parsed: yml, sha: boot.sha };
+    patchRepoVerify(repo.id, (cur) => ({ ...cur, devasignYml }));
   }
   const inferred = inferSetupFromTree(paths, { packageJson, envExample });
   const detected = repo.verify?.detected ?? inferred;
@@ -801,6 +803,8 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const touched = diffPaths(diff);
   const wf = effectiveWorkflow(repo);
   const policy = planPolicy({ criteria, wfE2e: wf.verify?.e2e ?? "auto", yml, setup, touched });
+  const withheld = policy.e2ePolicy === "always" && !policy.bootConfigured ? criteria.filter((c) => (c.kind ?? "code") === "ui") : [];
+  const planned = withheld.length ? criteria.filter((c) => !withheld.includes(c)) : criteria;
   // The tree is the PR head, so it holds the tests the PR itself wrote. Keeping
   // them off both lists is what stops a change being graded by its own tests.
   const existingTests = paths.filter((p) => isTestPath(p) && !policy.prAuthoredTests.has(p));
@@ -813,7 +817,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     .slice(0, 20)
     .map((e) => ({ path: e.path, imports: e.imports }));
   const flakeNotes: string[] = [];
-  for (const c of criteria) {
+  for (const c of planned) {
     for (const row of flakeRowsForCriterion(repo.id, c.text)) {
       if (isRetired(row)) flakeNotes.push(`- [${c.id}]: RETIRED — a ${row.level ?? "generated"} test for this criterion flaked ${row.flakeCount} times; do not generate it again, mark it unverifiable.`);
       else if (isQuarantined(row))
@@ -826,13 +830,14 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     run,
     repo,
     install,
-    criteria,
+    criteria: planned,
     diff,
     treePaths,
     setup,
     yml,
     ymlFrom: boot.from,
     policy,
+    withheld,
     existingTests,
     changed,
     candidates,
@@ -898,7 +903,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
       try {
         const ctx = await gatherContext(run, repo, install, deps);
         const gatherMs = Date.now() - planStartedAt;
-        if (!ctx.criteria.length) {
+        if (!ctx.criteria.length && !ctx.withheld.length) {
           return await settle(updateRun(run.id, { status: "skipped", skipReason: "no_criteria", timings: { ...run.timings, planStartedAt, planFinishedAt: Date.now() } }));
         }
         const wf = effectiveWorkflow(repo);
@@ -917,11 +922,14 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         };
 
         const llmStartedAt = Date.now();
-        const first = await askPlanner<PlanManifest>(llm, system, buildPlannerUserPrompt(ctx), planManifestTool, MANIFEST_BUDGETS, validateManifest, manifestRepair);
+        // Every criterion withheld leaves the model nothing to plan; the plan still records why.
+        const first = ctx.criteria.length
+          ? await askPlanner<PlanManifest>(llm, system, buildPlannerUserPrompt(ctx), planManifestTool, MANIFEST_BUDGETS, validateManifest, manifestRepair)
+          : null;
         const firstLlmMs = Date.now() - llmStartedAt;
-        attempts.manifest = first.attempts;
-        if (!first.value) lose(knownIds, first.lastStopReason);
-        const parsed = first.value ?? {};
+        attempts.manifest = first?.attempts ?? [];
+        if (first && !first.value) lose(knownIds, first.lastStopReason);
+        const parsed = first?.value ?? {};
         let tests = normalizeManifestTests(parsed, knownIds, fallbackRunner, ctx.setup);
         const unverifiable = new Map(normalizeUnverifiable(parsed, knownIds).map((u) => [u.criterionId, u.reason]));
         let { kept, violations } = enforcePlanPolicy(tests, ctx.policy, ctx.treePaths);
@@ -1083,9 +1091,17 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           targetFiles: t.targetFiles,
         }));
         const finalCovered = new Set(finalTests.flatMap((t) => t.criterionIds));
-        const fixUrl = `${config.webOrigin.replace(/\/+$/, "")}/workflow?repo=${repo.id}`;
+        const fixUrl = setupFixUrl(repo.id);
+        const browser: VerifyPlanBrowser = {
+          policy: ctx.policy.e2ePolicy,
+          allowed: ctx.policy.e2eAllowed,
+          bootConfigured: ctx.policy.bootConfigured,
+          reason: ctx.policy.e2ePolicy === "never" ? "never" : ctx.policy.bootConfigured ? "ok" : "no_boot",
+          fixUrl,
+        };
         const planUnverifiable: VerifyPlan["unverifiable"] = [];
-        for (const c of ctx.criteria) {
+        // A withheld criterion is uncovered by construction, so it lands in the noBoot branch.
+        for (const c of [...ctx.criteria, ...ctx.withheld]) {
           if (finalCovered.has(c.id)) continue;
           const isUi = (c.kind ?? "code") === "ui";
           const noBoot = isUi && !ctx.policy.e2eAllowed && ctx.policy.e2ePolicy !== "never";
@@ -1115,6 +1131,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           unverifiable: planUnverifiable,
           prAuthoredTests: [...ctx.policy.prAuthoredTests],
           ...(ctx.yml && ctx.ymlFrom ? { verifyConfig: ctx.yml, verifyConfigFrom: ctx.ymlFrom } : {}),
+          browser,
           createdAt: Date.now(),
         });
         const planFinishedAt = Date.now();
@@ -1144,7 +1161,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             ...(ctx.ymlFrom === "base" ? ["app start read from the base branch's .devasign.yml — this PR's head has no verify block of its own"] : []),
             ...finalTests.map((t) => `${t.level} ${t.origin} ${t.path} → [${t.criterionIds.join(", ")}] (${t.levelReason})`),
             ...planUnverifiable.map((u) => `unverifiable [${u.criterionId}]: ${u.reason}`),
-            ...(first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),
+            ...(!first || first.value ? [] : [lostLine("manifest", first.lastStopReason, first.attempts.length)]),
             ...(attempts.replan && replanLost !== null ? [lostLine("re-plan", replanLost, attempts.replan.length)] : []),
             ...bodyFailed.map((b) => `body failed: ${b}`),
             ...(dropped.length ? [`dropped: ${dropped.join("; ")}`] : []),
@@ -1160,6 +1177,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             unresolvedImports: unresolved,
             apiOnly: ctx.policy.apiOnly,
             e2eAllowed: ctx.policy.e2eAllowed,
+            browser,
             verifyConfigFrom: ctx.ymlFrom,
             prAuthoredTests: [...ctx.policy.prAuthoredTests],
             escalated: escapedIds,

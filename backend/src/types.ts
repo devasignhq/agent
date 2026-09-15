@@ -163,9 +163,17 @@ export type Repository = {
   verify?: RepoVerifyState;
 }
 
+// Why a judged run's UI criteria were decided without a browser: no boot config at all,
+// or boot config whose browser tests could not run.
+export type BrowserlessReason = "not_configured" | "did_not_start";
+
 export type RepoVerifyState = {
   detected?: DetectedSetup | null;
+  // The planner's per-PR snapshot: whichever PR head (or base) was planned last.
   devasignYml?: { raw: string; parsed: DevasignVerifyConfig | null; sha: string } | null;
+  // The default branch's verify block, which is what setup status is judged on.
+  defaultYml?: { sha: string; parsed: DevasignVerifyConfig | null; bootHash: string | null; at: number } | null;
+  lastBrowserless?: { count: number; reason: BrowserlessReason; runId: string; prNumber: number; at: number } | null;
   onboarding: {
     state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
     prNumber?: number;
@@ -1246,6 +1254,9 @@ export type CriterionVerdict = {
   flaky?: boolean;
   retired?: boolean;
   fixUrl?: string;
+  // UI criteria only: "ran" when a browser test decided it, "fallback" when its browser
+  // tests could not run and the tests below them did.
+  browser?: "ran" | "fallback";
 };
 
 export type VerifyStageUsage = Partial<Record<"anthropic" | "gemini", TokenUsage>>;
@@ -1368,7 +1379,17 @@ export type VerifyPlan = {
   // The `verify:` block the plan assumed; "base" when the PR head carries none of its own.
   verifyConfig?: DevasignVerifyConfig;
   verifyConfigFrom?: "head" | "base";
+  // The browser policy the plan was made under; absent on plans older than the field.
+  browser?: VerifyPlanBrowser;
   createdAt: number;
+};
+
+export type VerifyPlanBrowser = {
+  policy: "auto" | "always" | "never";
+  allowed: boolean;
+  bootConfigured: boolean;
+  reason: "ok" | "no_boot" | "never";
+  fixUrl: string;
 };
 
 export type VerifyResults = {
