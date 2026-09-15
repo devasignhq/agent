@@ -4,7 +4,7 @@
 //   node --import tsx/esm --test src/security/issue.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { findingIssueBody } from "./issue.js";
+import { createFindingIssue, findingIssueBody, IssueCreationError } from "./issue.js";
 import type { SecurityFinding } from "../types.js";
 
 const finding = (over: Partial<SecurityFinding> = {}): SecurityFinding => ({
@@ -51,6 +51,30 @@ test("issue body carries severity, location, exploit path, fix and regression te
   assert.match(body, /Blast radius:\*\* funds/);
   // Deep link back to the finding, so the sponsor can get from issue → page.
   assert.match(body, /\/security\/findings\/f1\)/);
+});
+
+test("issue body carries the verifier's cited evidence for a confirmed finding", () => {
+  const body = findingIssueBody(
+    finding({
+      verification: {
+        status: "confirmed",
+        evidence: [{ path: "api/app.ts", line: 40, quote: 'app.use("/v1", router)' }],
+        verifiedAt: 1,
+        model: "m",
+        engine: "verify-v1",
+      },
+    })
+  );
+  assert.match(body, /### Verification/);
+  assert.match(body, /`api\/app\.ts:40` — `app\.use\("\/v1", router\)`/);
+  assert.doesNotMatch(findingIssueBody(finding()), /### Verification/);
+});
+
+test("createFindingIssue refuses a held-back finding before touching GitHub", async () => {
+  await assert.rejects(
+    createFindingIssue({ repo: {} as any, install: {} as any, finding: finding({ state: "unverified" }), actorLogin: "x" }),
+    (e: unknown) => e instanceof IssueCreationError && e.code === "unverified"
+  );
 });
 
 test("issue body omits optional sections cleanly when the finding lacks them", () => {

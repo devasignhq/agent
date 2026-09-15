@@ -62,6 +62,7 @@ const scan = (over: Partial<SecurityScanSummary> = {}): SecurityScanSummary => (
   introduced: 2,
   resolved: 1,
   stillOpen: 4,
+  heldBack: 0,
   ...over,
 });
 
@@ -73,6 +74,8 @@ test("filterFindings: chips select the right states, repo filter scopes", () => 
     finding({ state: "accepted" }),
     finding({ state: "resolved" }),
     finding({ state: "open", repoId: "r2" }),
+    // Held back by the verifier: never in any chip, never counted as open.
+    finding({ state: "unverified", severity: "critical" }),
   ];
   assert.equal(filterFindings(rows, { chip: "new", repoId: "all" }).length, 1);
   // all open = new + open + bounty (+ r2's open), never accepted/resolved

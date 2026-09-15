@@ -279,7 +279,7 @@ for (const [path, flags] of [
     imports: [],
     securityFlags: flags,
     securityScannedSha: `sha-${path.length}`, // already audited at this blob…
-    securityEngine: "audit-v1", // …by THIS engine — a bare sha is a legacy stamp
+    securityEngine: "audit-v2", // …by THIS engine — a bare sha is a legacy stamp
 
     indexedAt: now - HOUR,
     model: "mock",
@@ -320,6 +320,18 @@ seedFinding({
   concern:
     "The route-registration rewrite dropped requireAuth and requireScope from the payouts group while every other group kept them. Any caller who can reach the edge can create a transfer to an arbitrary destination.",
   evidence: 'line 88: app.post("/v1/payouts", createPayout) — no auth middleware in the chain',
+  scannerConfidence: "needs_human",
+  verification: {
+    status: "confirmed",
+    detail: "app.ts mounts the payouts router with no auth middleware; requireAuth is only applied on the /v1/accounts group.",
+    evidence: [
+      { path: "api/app.ts", line: 41, quote: 'app.use("/v1/payouts", payoutsRouter);' },
+      { path: "api/routes/payouts.ts", line: 88, quote: 'app.post("/v1/payouts", createPayout)' },
+    ],
+    verifiedAt: now - 26 * HOUR,
+    model: "mock",
+    engine: "verify-v1",
+  },
   dataflow: { source: "POST /v1/payouts (public edge)", sink: "stripe.transfers.create()", steps: ["idempotency() passes the body through untouched", "createPayout(req.body) reads destination and amount from the caller"] },
   exploitNarrative: [
     "Send POST /v1/payouts from any host — the route has no auth middleware",
@@ -441,6 +453,36 @@ seedFinding({
   exploitNarrative: ["Guess a {userId}/{txId}.pdf key", "GET the object unauthenticated", "Read customer receipts"],
   blastRadius: "customer receipts — read-only",
 });
+// Held back by the verifier: the scanner missed the auth middleware applied
+// where the router is mounted. Hidden from the list, shown only in the ledger.
+seedFinding({
+  path: "api/routes/refunds.ts",
+  line: 31,
+  symbol: "refundHandler",
+  severity: "medium",
+  confidence: "needs_human",
+  scannerConfidence: "needs_human",
+  state: "unverified",
+  stateReason: "refuted — api/app.ts:38 app.use(\"/v1/refunds\", requireAuth, refundsRouter);",
+  title: "Refund route appears to lack an authorization check",
+  concern: "refundHandler reads accountId from the body and issues a refund without an in-file ownership check.",
+  evidence: "line 31: const accountId = req.body.accountId;",
+  exploitNarrative: ["Call POST /v1/refunds as any user", "Pass another tenant's accountId", "A refund is issued against the victim account"],
+  verification: {
+    status: "refuted",
+    reason: "refuted",
+    detail: "requireAuth and requireOwner run where the refunds router is mounted, so the request never reaches refundHandler unauthenticated.",
+    evidence: [],
+    refutingControl: { path: "api/app.ts", line: 38, quote: 'app.use("/v1/refunds", requireAuth, requireOwner, refundsRouter);' },
+    verifiedAt: now - HOUR,
+    model: "mock",
+    engine: "verify-v1",
+  },
+  activity: [
+    { at: now - HOUR, kind: "detected", detail: "Detected by security audit", actor: "audit-agent" },
+    { at: now - HOUR, kind: "verified", detail: "Held back — api/app.ts:38 applies requireAuth to the refunds router", actor: "audit-agent" },
+  ],
+});
 // Scan-run history: a running one streams the terminal; completed ones fill
 // the introduced-vs-resolved chart.
 const seedScan = (over) =>
@@ -457,6 +499,7 @@ const seedScan = (over) =>
     introduced: 0,
     resolved: 0,
     stillOpen: 5,
+    heldBack: 0,
     log: [],
     ...over,
   });
@@ -523,13 +566,16 @@ seedScan({
   introducedBySeverity: { critical: 1, high: 1 },
   resolved: 1,
   stillOpen: 5,
+  heldBack: 1,
+  heldBackByReason: { refuted: 1 },
   log: [
     "$ devasign security-audit ephemeral-tester/demo --trigger merge --merge #487",
     "scope differential · 42 indexed · 12 to scan · 30 cache hits",
-    "✗ CRITICAL api/routes/payouts.ts:88 — Payout route reachable without authentication",
-    "✗ HIGH     api/ledger/export.ts:203 — Ledger export builds SQL by string interpolation",
+    "✓ CRITICAL api/routes/payouts.ts:88 — Payout route reachable without authentication (evidence: api/app.ts:41)",
+    "✓ HIGH     api/ledger/export.ts:203 — Ledger export builds SQL by string interpolation (evidence: api/ledger/export.ts:203)",
+    "◌ refuted — api/app.ts:38 app.use(\"/v1/refunds\", requireAuth, requireOwner, refundsRouter);  api/routes/refunds.ts:31 — Refund route appears to lack an authorization check",
     "✓ 1 finding(s) resolved in infra/s3.tf",
-    "done in 38.0s · 2 new · 1 resolved · 5 open",
+    "done in 38.0s · 2 new · 1 held back · 1 resolved · 5 open",
   ].map((line, i) => ({ at: now - 2 * HOUR + i * 4000, line })),
 });
 console.log("[ephemeral] seeded security findings + scan runs for ephemeral-repo-1");

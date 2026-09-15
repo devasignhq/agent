@@ -466,6 +466,7 @@ function startNightlySecuritySweep() {
         introduced: 0,
         resolved: 0,
         stillOpen: 0,
+        heldBack: 0,
         log: [],
       };
       db.insert("securityScans", run);

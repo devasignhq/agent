@@ -22,6 +22,7 @@ export type AgentFinding = {
   cwe?: string;
   surface: AttackSurface;
   severity: SecuritySeverity;
+  claimedSeverity?: SecuritySeverity; // pre-cap; a confirmed verdict may restore it
   confidence: SecurityConfidence;
   title: string;
   concern: string;
@@ -153,6 +154,7 @@ export function buildFindingRows(raw: unknown, path: string): AgentFinding[] {
       ...(cwe && /^cwe-\d+$/i.test(cwe) ? { cwe: cwe.toUpperCase() } : {}),
       surface: classifySurfaceFor(path, cls),
       severity: capSeverityByConfidence(normalizeSeverity(it.severity), confidence),
+      claimedSeverity: normalizeSeverity(it.severity),
       confidence,
       title,
       concern: concern.slice(0, 2000),

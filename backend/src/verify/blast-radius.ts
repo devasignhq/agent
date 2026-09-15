@@ -1,11 +1,12 @@
 // Implied criteria from the diff's blast radius: when a route, response shape,
 // or exported symbol changes and something in this repo consumes it, the
 // consumer must keep working. Deterministic — diff + repo index, no model.
-import type { Criterion, RepoIndexEntry } from "../types.js";
+import type { Criterion } from "../types.js";
 import { routeLiterals } from "../review/cross-repo/naming.js";
+import { stem, type IndexLike } from "../review/dependents.js";
 import { isFrontendPath, isTestPath } from "./detect.js";
 
-export type IndexLike = Pick<RepoIndexEntry, "path" | "imports" | "exports" | "summary">;
+export type { IndexLike };
 
 const ROUTE_RE =
   /^[+-].*\b(?:router|app|server|api|\w+Router|\w+Routes)\.(get|post|put|patch|delete|use)\s*\(\s*["'`](\/[^"'`\s]*)["'`]/;
@@ -46,10 +47,6 @@ export function changedSurfaces(diff: string): ChangedSurface[] {
     }
   }
   return out;
-}
-
-function stem(p: string): string {
-  return (p.split("/").pop() || p).replace(/\.[^.]+$/, "");
 }
 
 function consumersOfRoute(route: string, entries: IndexLike[], definingPath: string): IndexLike[] {

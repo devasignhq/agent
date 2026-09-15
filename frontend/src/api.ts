@@ -664,7 +664,20 @@ export type SecurityFindingState =
   | "resolved"
   | "accepted"
   | "false_positive"
-  | "snoozed";
+  | "snoozed"
+  | "unverified"; // verifier refuted / could not confirm — hidden, never gates
+
+export type SecurityCitation = { path: string; line?: number; quote: string };
+export type SecurityVerification = {
+  status: "confirmed" | "refuted" | "unverifiable";
+  reason?: "refuted" | "unverifiable" | "evidence_not_in_file" | "no_verdict";
+  detail?: string;
+  evidence: SecurityCitation[];
+  refutingControl?: SecurityCitation;
+  verifiedAt: number;
+  model: string;
+  engine: string;
+};
 
 export type SecurityFindingEvent = {
   at: number;
@@ -686,6 +699,8 @@ export type SecurityFinding = {
   surface: AttackSurface;
   severity: SecuritySeverity;
   confidence: SecurityConfidence;
+  scannerConfidence?: SecurityConfidence;
+  verification?: SecurityVerification;
   title: string;
   concern: string;
   evidence?: string;
@@ -738,6 +753,8 @@ export type SecurityScanSummary = {
   introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
   resolved: number;
   stillOpen: number;
+  heldBack: number; // detections the verifier did not confirm (hidden)
+  heldBackByReason?: Partial<Record<NonNullable<SecurityVerification["reason"]>, number>>;
   // Set when the run completed without scanning anything (no install token,
   // plan-gated, index not built) — lets the chart say why a column is flat.
   skipped?: "no_install" | "plan_locked" | "index_not_built" | "repo_not_found";

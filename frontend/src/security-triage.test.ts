@@ -16,6 +16,8 @@ import {
   requiresNote,
   sortPrecedents,
   suppressedByRulings,
+  heldBackByVerifier,
+  verdictLine,
   teaches,
   validateRuling,
 } from "./security-triage.ts";
@@ -151,6 +153,33 @@ test("suppressedByRulings: a hand-marked false positive is not in the ledger", (
   // watching. A finding the user clicked through isn't a surprise to them.
   const rows = suppressedByRulings([finding({ id: "a", state: "false_positive" })]);
   assert.equal(rows.length, 0);
+});
+
+test("heldBackByVerifier: only unverified rows, newest first", () => {
+  const rows = heldBackByVerifier([
+    finding({ id: "a", state: "unverified", lastSeenAt: 10 }),
+    finding({ id: "b", state: "open" }),
+    finding({ id: "c", state: "unverified", lastSeenAt: 99 }),
+    finding({ id: "d", state: "false_positive" }),
+  ]);
+  assert.deepEqual(rows.map((f) => f.id), ["c", "a"]);
+});
+
+test("verdictLine: one plain-words line per verdict, falling back to stateReason", () => {
+  const base = { verifiedAt: 1, model: "m", engine: "v" };
+  assert.equal(
+    verdictLine(finding({ verification: { ...base, status: "confirmed", evidence: [{ path: "a.ts", line: 3, quote: "q" }] } })),
+    "verified — a.ts:3"
+  );
+  assert.equal(
+    verdictLine(finding({ verification: { ...base, status: "refuted", reason: "refuted", detail: "auth applied", evidence: [], refutingControl: { path: "app.ts", line: 40, quote: "q" } } })),
+    "refuted — control at app.ts:40: auth applied"
+  );
+  assert.equal(
+    verdictLine(finding({ verification: { ...base, status: "unverifiable", reason: "no_verdict", evidence: [] } })),
+    "not verified — the verifier returned no verdict"
+  );
+  assert.equal(verdictLine(finding({ stateReason: "held back — x" })), "held back — x");
 });
 
 test("reconfirmReason: names why a ruling needs another look", () => {

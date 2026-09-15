@@ -9,9 +9,11 @@ import { gh, installationPermissions } from "../github/app.js";
 import type { Installation, Repository, SecurityFinding } from "../types.js";
 import { contradictPrecedent } from "./precedent-store.js";
 
+export type IssueCreationErrorCode = "missing_issues_permission" | "github_error" | "unverified";
+
 export class IssueCreationError extends Error {
-  code: "missing_issues_permission" | "github_error";
-  constructor(code: "missing_issues_permission" | "github_error", message: string) {
+  code: IssueCreationErrorCode;
+  constructor(code: IssueCreationErrorCode, message: string) {
     super(message);
     this.code = code;
   }
@@ -40,6 +42,14 @@ export function findingIssueBody(finding: SecurityFinding): string {
     lines.push("```");
     lines.push(finding.evidence);
     lines.push("```");
+  }
+  if (finding.verification?.status === "confirmed" && finding.verification.evidence.length) {
+    lines.push("");
+    lines.push("### Verification");
+    lines.push("Independently verified against the repository. Cited evidence:");
+    for (const c of finding.verification.evidence) {
+      lines.push(`- \`${c.path}${c.line ? `:${c.line}` : ""}\` — \`${c.quote.replace(/`/g, "'").slice(0, 200)}\``);
+    }
   }
   if (finding.exploitNarrative?.length) {
     lines.push("");
@@ -81,6 +91,9 @@ export async function createFindingIssue(args: {
   finding: SecurityFinding;
   actorLogin: string;
 }): Promise<{ issueNumber: number; issueUrl: string }> {
+  if (args.finding.state === "unverified") {
+    throw new IssueCreationError("unverified", "This finding was held back by the verifier and can't be filed as an issue.");
+  }
   const { repo, install, finding, actorLogin } = args;
   if (finding.issueNumber != null && finding.issueUrl) {
     return { issueNumber: finding.issueNumber, issueUrl: finding.issueUrl };

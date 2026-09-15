@@ -55,6 +55,7 @@ function fixture(plan: string, status: string | null) {
     introduced: 0,
     resolved: 0,
     stillOpen: 0,
+    heldBack: 0,
     log: [],
   } as any);
   return { repo, run };

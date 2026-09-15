@@ -293,7 +293,24 @@ export type SecurityFindingState =
   | "resolved"       // no longer detected (or its fix merged)
   | "accepted"       // accepted risk — suppressed, kept by fingerprint
   | "false_positive" // suppressed, kept by fingerprint so it can't come back
-  | "snoozed";
+  | "snoozed"
+  | "unverified";    // verifier refuted / could not confirm — hidden, never gates
+
+export type SecurityCitation = { path: string; line?: number; quote: string };
+export type SecurityVerificationStatus = "confirmed" | "refuted" | "unverifiable";
+export type SecurityHoldReason = "refuted" | "unverifiable" | "evidence_not_in_file" | "no_verdict";
+// The independent verifier's verdict on a finding. Only "confirmed" — with
+// citations that code checked against the fetched files — may surface a row.
+export type SecurityVerification = {
+  status: SecurityVerificationStatus;
+  reason?: SecurityHoldReason;
+  detail?: string;
+  evidence: SecurityCitation[];
+  refutingControl?: SecurityCitation;
+  verifiedAt: number;
+  model: string;
+  engine: string;
+};
 
 // Why a human suppressed a finding. "False positive" and "accept risk" are one
 // button each in the UI, but a maintainer clicks them for very different
@@ -321,7 +338,8 @@ export type SecurityFindingEvent = {
     | "issue_created"
     | "assigned"
     | "resolved"
-    | "reopened";
+    | "reopened"
+    | "verified";
   detail: string;
   actor?: string; // github login, or "audit-agent" for machine transitions
 };
@@ -339,7 +357,9 @@ export type SecurityFinding = {
   cwe?: string;              // "CWE-89" when the model maps one
   surface: AttackSurface;
   severity: SecuritySeverity;
-  confidence: SecurityConfidence;
+  confidence: SecurityConfidence; // verifier-owned: "confirmed" only when verification.status is
+  scannerConfidence?: SecurityConfidence; // the scanner's self-report, kept for the record
+  verification?: SecurityVerification;
   title: string;             // one line, specific
   concern: string;           // what it is and why it's exploitable
   evidence?: string;         // quoted file:line evidence the model actually read
@@ -451,6 +471,8 @@ export type SecurityScanRun = {
   introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
   resolved: number;          // findings auto-resolved by this run
   stillOpen: number;         // active findings after the run
+  heldBack: number;          // detections the verifier did not confirm (hidden)
+  heldBackByReason?: Partial<Record<SecurityHoldReason, number>>;
   // Why this run completed without scanning anything. Set on the no-op early
   // returns so the dashboard chart can render "skipped" distinctly from a run
   // that scanned and legitimately found no change.

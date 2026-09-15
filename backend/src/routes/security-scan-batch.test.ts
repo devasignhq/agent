@@ -175,6 +175,7 @@ test("a repo already scanning comes back skipped, the rest still queue", () => {
     introduced: 0,
     resolved: 0,
     stillOpen: 0,
+    heldBack: 0,
     log: [],
   } as any);
   const res = fakeRes();

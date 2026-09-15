@@ -5,10 +5,9 @@
 //   node --import tsx/esm --test src/security/reconcile.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { reconcileFile, type ReconcileCtx } from "./reconcile.js";
+import { reconcileFile, type DetectedFinding, type ReconcileCtx } from "./reconcile.js";
 import { fingerprintFinding } from "./fingerprint.js";
-import type { AgentFinding } from "./agent.js";
-import type { SecurityFinding, SecurityFindingState } from "../types.js";
+import type { SecurityFinding, SecurityFindingState, SecurityVerification } from "../types.js";
 
 const ctx = (over: Partial<ReconcileCtx> = {}): ReconcileCtx => ({
   repoId: "r1",
@@ -20,7 +19,25 @@ const ctx = (over: Partial<ReconcileCtx> = {}): ReconcileCtx => ({
   ...over,
 });
 
-const detected = (over: Partial<AgentFinding> = {}): AgentFinding => ({
+const CONFIRMED: SecurityVerification = {
+  status: "confirmed",
+  evidence: [{ path: "api/pay.ts", line: 3, quote: "router.post('/payout', payoutHandler)" }],
+  verifiedAt: 1_999_000,
+  model: "m2",
+  engine: "verify-v1",
+};
+const REFUTED: SecurityVerification = {
+  status: "refuted",
+  reason: "refuted",
+  detail: "requireAuth is applied where the router is mounted",
+  evidence: [],
+  refutingControl: { path: "api/app.ts", line: 40, quote: "app.use('/api', requireAuth, router)" },
+  verifiedAt: 1_999_000,
+  model: "m2",
+  engine: "verify-v1",
+};
+
+const detected = (over: Partial<DetectedFinding> = {}): DetectedFinding => ({
   slug: "payout-missing-auth",
   class: "missing-authz",
   surface: "api",
@@ -29,6 +46,7 @@ const detected = (over: Partial<AgentFinding> = {}): AgentFinding => ({
   title: "Payout route reachable without authentication",
   concern: "no auth middleware in the chain",
   exploitNarrative: ["a", "b", "c"],
+  verification: CONFIRMED,
   ...over,
 });
 
@@ -68,8 +86,67 @@ test("a brand-new fingerprint inserts a state 'new' row with origin attribution"
   assert.equal(row.state, "new");
   assert.equal(row.introducedByPr, 487);
   assert.equal(row.introducedByAuthor, "dmitri");
-  assert.equal(row.activity.length, 1);
+  assert.equal(row.activity.length, 2);
   assert.equal(row.activity[0].kind, "detected");
+  assert.equal(row.activity[1].kind, "verified");
+  assert.equal(row.verification?.status, "confirmed");
+});
+
+test("a new fingerprint the verifier did not confirm is born 'unverified' and counts as held back", () => {
+  const out = reconcileFile({ existing: [], detected: [detected({ verification: REFUTED })], ctx: ctx() });
+  assert.equal(out.insert.length, 1);
+  assert.equal(out.introduced, 0);
+  assert.equal(out.heldBack, 1);
+  const row = out.insert[0];
+  assert.equal(row.state, "unverified");
+  assert.match(row.stateReason ?? "", /refuted — api\/app\.ts:40/);
+  assert.equal(row.verification?.refutingControl?.path, "api/app.ts");
+});
+
+test("an unverified row the verifier later confirms surfaces as 'new'", () => {
+  const existing = stored({ state: "unverified", stateReason: "refuted — x" });
+  const out = reconcileFile({ existing: [existing], detected: [detected()], ctx: ctx() });
+  assert.equal(out.insert.length, 0);
+  assert.equal(out.introduced, 1);
+  const patch = out.update[0].patch;
+  assert.equal(patch.state, "new");
+  assert.equal(patch.stateReason, null);
+  assert.equal(patch.activity?.at(-1)?.kind, "verified");
+});
+
+test("an open row the verifier refutes is demoted to 'unverified' — not resolved", () => {
+  const existing = stored({ state: "open" });
+  const out = reconcileFile({ existing: [existing], detected: [detected({ verification: REFUTED })], ctx: ctx() });
+  assert.equal(out.demoted, 1);
+  assert.equal(out.heldBack, 1);
+  assert.equal(out.resolved, 0);
+  const patch = out.update[0].patch;
+  assert.equal(patch.state, "unverified");
+  assert.match(patch.stateReason ?? "", /^refuted/);
+});
+
+test("a row with an issue or bounty keeps its state on a held-back verdict, with the disagreement logged", () => {
+  for (const over of [{ state: "issue_created" as const, issueNumber: 12 }, { state: "bounty" as const, bountyId: "b1" }]) {
+    const out = reconcileFile({ existing: [stored(over)], detected: [detected({ verification: REFUTED })], ctx: ctx() });
+    assert.equal(out.demoted, 0, over.state);
+    const patch = out.update[0].patch;
+    assert.equal(patch.state, undefined, over.state);
+    assert.equal(patch.activity?.at(-1)?.kind, "verified");
+    assert.match(patch.activity?.at(-1)?.detail ?? "", /^Held back/);
+  }
+});
+
+test("a resolved row is not reopened by a held-back re-detection", () => {
+  const out = reconcileFile({ existing: [stored({ state: "resolved" })], detected: [detected({ verification: REFUTED })], ctx: ctx() });
+  assert.equal(out.update[0].patch.state, undefined);
+  assert.equal(out.heldBack, 0);
+});
+
+test("an unverified row that is no longer detected is removed, not resolved", () => {
+  const out = reconcileFile({ existing: [stored({ state: "unverified" })], detected: [], ctx: ctx() });
+  assert.deepEqual(out.remove, ["f1"]);
+  assert.equal(out.update.length, 0);
+  assert.equal(out.resolved, 0);
 });
 
 test("a re-detection patches the existing row in place and keeps triage state", () => {

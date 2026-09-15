@@ -15,13 +15,15 @@ import type { SecurityAuditJobPayload } from "../queue.js";
 import type {
   Installation,
   RepoIndexEntry,
+  SecurityHoldReason,
   RepoSecurityPolicy,
   Repository,
   SecurityScanRun,
   SecuritySeverity,
   User,
 } from "../types.js";
-import { AUDIT_MODEL, scanFile } from "./agent.js";
+import { AUDIT_MODEL, scanFile, type AgentFinding } from "./agent.js";
+import { applyVerdict, buildEvidenceBundle, holdVerification, mechanicalCheck, verifyFindings, type Verification } from "./verify.js";
 import { classifySurface } from "./fingerprint.js";
 import { isStructurallySensitivePath } from "./static-flags.js";
 import { effectiveSecurityPolicy, isActiveState } from "./policy.js";
@@ -36,7 +38,7 @@ const LOG_CAP = 300;
 // Which engine a `securityScannedSha` stamp came from. Bump this when a change
 // to the audit agent makes prior results stale: every file is then owed exactly
 // one re-scan, after which the cache is warm again.
-export const SECURITY_ENGINE = "audit-v1";
+export const SECURITY_ENGINE = "audit-v2";
 
 // Append one terminal-log line to the run row. Each append is a db.update, so
 // the SSE fan-out (live.ts) streams the log to any open gate view.
@@ -229,6 +231,20 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
       const introducedBySeverity: Partial<Record<SecuritySeverity, number>> = {};
       let resolved = 0;
       let suppressed = 0;
+      let heldBack = 0;
+      const heldBackByReason: Partial<Record<SecurityHoldReason, number>> = {};
+
+      // Bundle files (a mounted router, an auth middleware) recur across scanned
+      // files; fetch each blob once per run.
+      const blobs = new Map<string, Promise<string>>();
+      const getBlob = (e: RepoIndexEntry): Promise<string> => {
+        let p = blobs.get(e.sha);
+        if (!p) {
+          p = fetchBlob(repo, install, e.path, e.sha);
+          blobs.set(e.sha, p);
+        }
+        return p;
+      };
 
       // The maintainers' learned corpus, read ONCE for the whole run: db.filter
       // is a full linear scan with no indexes, so doing this per file would be
@@ -249,7 +265,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
       await runPool(capped, CONCURRENCY, async (entry) => {
         let content: string;
         try {
-          content = await fetchBlob(repo, install, entry.path, entry.sha);
+          content = await getBlob(entry);
         } catch (err) {
           logLine(run.id, `! fetch failed ${entry.path}`);
           return;
@@ -273,6 +289,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
           logLine(run.id, `⟳ ruling needs re-confirming — code changed under it in ${entry.path}`);
         }
 
+        const precedent = renderPrecedentBlock(selectPrecedents(corpus, { repoId: repo.id, path: entry.path }));
         const detected = await scanFile({
           path: entry.path,
           content,
@@ -280,7 +297,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
             `flags: ${entry.securityFlags?.join(", ") || "(none)"} · ` +
             `static: ${entry.staticFlags?.join(", ") || "(none)"} · ${entry.summary}`
           ).slice(0, 500),
-          precedent: renderPrecedentBlock(selectPrecedents(corpus, { repoId: repo.id, path: entry.path })),
+          precedent,
           engines: policy.engines,
         });
         if (detected === null) {
@@ -291,10 +308,33 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         // The secrets engine gates finding-level output (a secret can hide in
         // any file, so it can't be a file-level gate).
         const engineKept = policy.engines.secrets ? detected : detected.filter((d) => d.surface !== "secrets");
+
+        // Verification: evidence must be in the file (code check), then an
+        // independent verifier must confirm against the file + related files.
+        const now0 = Date.now();
+        const valid: AgentFinding[] = [];
+        const verified: ReturnType<typeof applyVerdict>[] = [];
+        for (const d of engineKept) {
+          const m = mechanicalCheck(d, content);
+          if (m.ok) valid.push(m.finding);
+          else verified.push(applyVerdict(d, holdVerification(m.reason, m.detail, now0)));
+        }
+        let verdicts: Verification[] = [];
+        if (valid.length) {
+          const bundle = await buildEvidenceBundle({ entry, allEntries, fetch: getBlob });
+          const got = await verifyFindings({ path: entry.path, content, findings: valid, bundle, precedent });
+          if (got === null) {
+            logLine(run.id, `! verify failed ${entry.path}`);
+            return;
+          }
+          verdicts = got;
+        }
+        valid.forEach((d, i) => verified.push(applyVerdict(d, verdicts[i])));
+
         // Annotate anything a repo-scoped ruling already covers. reconcileFile
         // only honours the annotation when minting a NEW row: a finding that
         // already has a row keeps whatever triage state it earned.
-        const kept: DetectedFinding[] = engineKept.map((d) => {
+        const kept: DetectedFinding[] = verified.map((d) => {
           const p = matchPrecedent(d, corpus, { repoId: repo.id, path: entry.path });
           return p
             ? { ...d, suppressedBy: { precedentId: p.id, action: p.action, note: p.note } }
@@ -315,6 +355,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         const result = reconcileFile({ existing, detected: kept, ctx });
         for (const row of result.insert) db.insert("securityFindings", row);
         for (const u of result.update) db.update("securityFindings", (f) => f.id === u.id, u.patch);
+        for (const id of result.remove) db.remove("securityFindings", (f) => f.id === id);
         for (const id of result.appliedPrecedentIds) {
           const p = corpus.find((r) => r.id === id);
           if (!p) continue;
@@ -332,13 +373,35 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         introduced += result.introduced;
         suppressed += result.appliedPrecedentIds.length;
         resolved += result.resolved;
+        heldBack += result.heldBack;
+        const loc = (row: { path: string; line?: number }) => `${row.path}${row.line ? `:${row.line}` : ""}`;
         for (const row of result.insert) {
           if (row.suppressedByPrecedentId) {
-            logLine(run.id, `· muted by your ruling  ${row.path}${row.line ? `:${row.line}` : ""} — ${row.title}`);
+            logLine(run.id, `· muted by your ruling  ${loc(row)} — ${row.title}`);
+            continue;
+          }
+          if (row.state === "unverified") {
+            const reason = row.verification?.reason ?? "unverifiable";
+            heldBackByReason[reason] = (heldBackByReason[reason] ?? 0) + 1;
+            logLine(run.id, `◌ ${row.stateReason ?? "held back"}  ${loc(row)} — ${row.title}`);
             continue;
           }
           introducedBySeverity[row.severity] = (introducedBySeverity[row.severity] ?? 0) + 1;
-          logLine(run.id, `✗ ${row.severity.toUpperCase().padEnd(8)} ${row.path}${row.line ? `:${row.line}` : ""} — ${row.title}`);
+          const ev = row.verification?.evidence[0];
+          logLine(
+            run.id,
+            `✓ ${row.severity.toUpperCase().padEnd(8)} ${loc(row)} — ${row.title}` +
+              (ev ? ` (evidence: ${ev.path}${ev.line ? `:${ev.line}` : ""})` : "")
+          );
+        }
+        for (const u of result.update) {
+          if (u.patch.state !== "unverified") continue;
+          const reason = u.patch.verification?.reason ?? "unverifiable";
+          heldBackByReason[reason] = (heldBackByReason[reason] ?? 0) + 1;
+          const prior = existing.find((f) => f.id === u.id);
+          if (prior && prior.state !== "unverified") {
+            logLine(run.id, `↓ demoted (${u.patch.stateReason ?? "held back"})  ${loc(prior)} — ${prior.title}`);
+          }
         }
         if (result.resolved > 0) {
           logLine(run.id, `✓ ${result.resolved} finding(s) resolved in ${entry.path}`);
@@ -356,9 +419,13 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
       );
       const now = Date.now();
       for (const f of db.filter("securityFindings", (x) => x.repoId === repo.id)) {
-        if (!isActiveState(f.state)) continue;
+        if (!isActiveState(f.state) && f.state !== "unverified") continue;
         const gone = full ? !livePaths.has(f.path) : removedPaths.has(f.path);
         if (!gone) continue;
+        if (f.state === "unverified") {
+          db.remove("securityFindings", (x) => x.id === f.id);
+          continue;
+        }
         db.update("securityFindings", (x) => x.id === f.id, {
           state: "resolved",
           resolvedAt: now,
@@ -398,7 +465,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
 
       logLine(
         run.id,
-        `done in ${((Date.now() - t0) / 1000).toFixed(1)}s · ${introduced} new · ${resolved} resolved · ${stillOpen} open`
+        `done in ${((Date.now() - t0) / 1000).toFixed(1)}s · ${introduced} new · ${heldBack} held back · ${resolved} resolved · ${stillOpen} open`
       );
       patchRun(run.id, {
         status: "completed",
@@ -409,6 +476,8 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
         introducedBySeverity,
         resolved,
         stillOpen,
+        heldBack,
+        heldBackByReason,
         costUsd,
       });
 
@@ -421,6 +490,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
           files_scanned: filesScanned,
           cache_hits: cacheHits,
           introduced,
+          held_back: heldBack,
           resolved,
           still_open: stillOpen,
           duration_ms: Date.now() - t0,
