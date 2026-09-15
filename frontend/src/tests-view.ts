@@ -123,6 +123,13 @@ function setupPath(fixUrl: string, repoId: string): string {
   return `/workflow?${new URLSearchParams({ repo: repoId, setup: "browser" })}`;
 }
 
+// "failing" covers both an app that never came up and browser tests that ran and could not decide.
+type BrowserlessCause = "not_configured" | "did_not_start" | "browser_errored" | "runner_outdated";
+function bannerCause(e: BrowserSetupEntry): BrowserlessCause {
+  if (e.status !== "failing") return e.status === "runner_outdated" ? "runner_outdated" : "not_configured";
+  return e.lastBrowserless?.reason === "browser_errored" ? "browser_errored" : "did_not_start";
+}
+
 /** Repos whose latest run checked UI criteria without a browser and still need setup, newest first. */
 export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): BrowserBanner | null {
   const hit = (setup ?? [])
@@ -130,13 +137,17 @@ export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): Br
     .sort((a, b) => b.lastBrowserless!.at - a.lastBrowserless!.at);
   if (hit.length === 0) return null;
   const repos = hit.map((e) => e.repo);
-  const didNotStart = hit.every((e) => e.status === "failing");
-  const outdated = hit.every((e) => e.status === "runner_outdated");
+  const causes = new Set(hit.map(bannerCause));
+  // Mixed causes name none of them.
+  const cause = causes.size === 1 ? [...causes][0] : null;
   const where = repos.length === 1 ? repos[0] : `${repos.length} repositories`;
-  const because = didNotStart ? " because the app did not start in CI" : outdated ? " because the runner in CI is too old" : "";
+  const because =
+    cause === "did_not_start" ? " because the app did not start in CI" :
+    cause === "browser_errored" ? " because their browser tests could not run" :
+    cause === "runner_outdated" ? " because the runner in CI is too old" : "";
   return {
     text: `UI criteria on ${where} were checked without a browser${because}`,
-    action: didNotStart ? "see setup" : outdated ? "update the runner" : "set up browser tests",
+    action: cause === "did_not_start" || cause === "browser_errored" ? "see setup" : cause === "runner_outdated" ? "update the runner" : "set up browser tests",
     href: setupPath(hit[0].fixUrl, hit[0].repoId),
     repos,
   };

@@ -467,7 +467,7 @@ export type VerifyTestsResponse = {
 
 // ---- Browser tests setup (backend/src/verify/repo-state.ts browserTestsStatus) ----
 export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "unproven" | "unknown";
-export type LastBrowserless = { count: number; reason: "not_configured" | "did_not_start" | "runner_outdated"; runId: string; prNumber: number; at: number };
+export type LastBrowserless = { count: number; reason: "not_configured" | "did_not_start" | "browser_errored" | "runner_outdated"; runId: string; prNumber: number; at: number };
 export type BrowserTests = {
   status: BrowserTestsStatus;
   missing: Array<"start" | "url">;

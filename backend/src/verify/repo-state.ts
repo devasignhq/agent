@@ -49,13 +49,14 @@ export function browserTestsStatus(v: RepoVerifyState | null | undefined): { sta
     const playwrightConfig = !!v.detected?.frameworks?.some((f) => f.name === "playwright" && !!f.configPath);
     const missing = (["start", "url"] as const).filter((k) => !parsed?.[k]);
     if (missing.length && !playwrightConfig) return { status: "not_configured", missing };
-    if (last?.reason === "did_not_start") return { status: "failing", missing: [] };
+    // Boot failure and browser tests that decided nothing are both a failing setup; only the panel's wording differs.
+    if (last?.reason === "did_not_start" || last?.reason === "browser_errored") return { status: "failing", missing: [] };
     if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
     return { status: "unproven", missing: [] };
   }
   // No default-branch snapshot yet: the last judged run is the only evidence.
   if (last?.reason === "not_configured") return { status: "not_configured", missing: [] };
-  if (last?.reason === "did_not_start") return { status: "failing", missing: [] };
+  if (last?.reason === "did_not_start" || last?.reason === "browser_errored") return { status: "failing", missing: [] };
   if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
   return { status: "unknown", missing: [] };
 }

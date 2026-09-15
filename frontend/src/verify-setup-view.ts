@@ -33,7 +33,9 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
     text = "Not set up — add verify.start and verify.url to .devasign.yml";
     if (missing.length) text += ` (missing: ${missing.map((k) => `verify.${k}`).join(", ")})`;
   } else if (status === "failing") {
-    text = last?.prNumber ? `The app did not start in CI on PR #${last.prNumber}` : "The app did not start in CI";
+    // "failing" covers both an app that never came up and browser tests that ran and could not decide.
+    const onPr = last?.prNumber ? ` on PR #${last.prNumber}` : "";
+    text = last?.reason === "browser_errored" ? `Browser tests could not run${onPr}` : `The app did not start in CI${onPr}`;
   } else if (status === "runner_outdated") {
     text = "The runner in CI is too old for verify.servers or verify.login — update @devasign/verify";
   } else if (status === "unproven") {

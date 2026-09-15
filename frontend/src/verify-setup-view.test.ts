@@ -41,6 +41,16 @@ test("failing, unproven, disabled and unknown each read differently", () => {
   assert.equal(browserTestsRow({ devasignYml: null, browserTests: bt({}) }).text, "Not checked yet");
 });
 
+test("a failing run says which of the two happened, with or without a PR number", () => {
+  const failing = (over: Partial<NonNullable<BrowserTests["lastBrowserless"]>>) =>
+    browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing", lastBrowserless: last(over) }) }).text;
+  assert.equal(failing({ reason: "did_not_start", prNumber: 40 }), "The app did not start in CI on PR #40");
+  assert.equal(failing({ reason: "did_not_start", prNumber: 0 }), "The app did not start in CI");
+  assert.equal(failing({ reason: "browser_errored", prNumber: 40 }), "Browser tests could not run on PR #40");
+  assert.equal(failing({ reason: "browser_errored", prNumber: 0 }), "Browser tests could not run");
+  assert.doesNotMatch(failing({ reason: "browser_errored", prNumber: 40 }), /did not start/, "the boot is not blamed once the browser tests ran");
+});
+
 test("runner_outdated asks for a newer runner and still names the last browser-less run", () => {
   const row = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "runner_outdated", lastBrowserless: last({ reason: "runner_outdated", prNumber: 51 }) }) });
   assert.deepEqual([row.text, row.tone], ["The runner in CI is too old for verify.servers or verify.login — update @devasign/verify", "warn"]);

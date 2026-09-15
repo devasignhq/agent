@@ -163,9 +163,9 @@ export type Repository = {
   verify?: RepoVerifyState;
 }
 
-// Why a judged run's UI criteria were decided without a browser: no boot config at all, boot
-// config whose browser tests could not run, or a runner too old to boot servers or log in.
-export type BrowserlessReason = "not_configured" | "did_not_start" | "runner_outdated";
+// Why a judged run's UI criteria were decided without a browser: no boot config at all, an app
+// that never came up, browser tests that ran and could not decide, or a runner too old to boot.
+export type BrowserlessReason = "not_configured" | "did_not_start" | "browser_errored" | "runner_outdated";
 
 export type RepoVerifyState = {
   detected?: DetectedSetup | null;

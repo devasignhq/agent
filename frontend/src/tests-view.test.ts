@@ -207,6 +207,20 @@ test("browserBanner says the app did not start when every flagged repo is failin
   assert.equal(b.action, "see setup");
 });
 
+test("browserBanner blames the browser tests when every flagged repo errored there, and neither cause when they are mixed", () => {
+  const errored = (repoId: string, at: number) => setupEntry({ repoId, status: "failing", lastBrowserless: { count: 2, reason: "browser_errored", runId: repoId, prNumber: 8, at } });
+  const didNotStart = (repoId: string, at: number) => setupEntry({ repoId, status: "failing", lastBrowserless: { count: 1, reason: "did_not_start", runId: repoId, prNumber: 2, at } });
+  const one = browserBanner([errored("r1", 1)])!;
+  assert.equal(one.text, "UI criteria on acme/r1 were checked without a browser because their browser tests could not run");
+  assert.equal(one.action, "see setup");
+  assert.equal(one.href, "/workflow?repo=r1&setup=browser");
+  const both = browserBanner([errored("r1", 1), errored("r2", 2)])!;
+  assert.equal(both.text, "UI criteria on 2 repositories were checked without a browser because their browser tests could not run");
+  const mixed = browserBanner([errored("r1", 1), didNotStart("r2", 50)])!;
+  assert.equal(mixed.text, "UI criteria on 2 repositories were checked without a browser", "two causes under one status name neither");
+  assert.equal(browserBanner([didNotStart("r1", 1), didNotStart("r2", 2)])!.text, "UI criteria on 2 repositories were checked without a browser because the app did not start in CI");
+});
+
 test("browserBanner flags an outdated runner like a failing app, with its own reason and action", () => {
   const outdated = (repoId: string, at: number, count = 2) => setupEntry({ repoId, status: "runner_outdated", lastBrowserless: { count, reason: "runner_outdated", runId: repoId, prNumber: 5, at } });
   const b = browserBanner([outdated("r1", 1), setupEntry({ repoId: "ok", status: "unproven", lastBrowserless: null })])!;

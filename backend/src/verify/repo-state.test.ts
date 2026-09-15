@@ -21,12 +21,14 @@ test("an outdated runner outranks unproven, but never e2e: never or missing boot
   assert.deepEqual(browserTestsStatus(state({ start: "npm start" }, last("runner_outdated"))), { status: "not_configured", missing: ["url"] });
   assert.equal(browserTestsStatus(state(booted)).status, "unproven");
   assert.equal(browserTestsStatus(state(booted, last("did_not_start"))).status, "failing");
+  assert.equal(browserTestsStatus(state(booted, last("browser_errored"))).status, "failing", "browser tests that decided nothing are failing too");
   assert.equal(browserTestsStatus(state(booted, last("not_configured"))).status, "unproven", "a stale not-configured flag after boot keys merged");
 });
 
 test("without a default-branch snapshot the last run decides, runner_outdated included", () => {
   assert.equal(browserTestsStatus(state(null, last("runner_outdated"), false)).status, "runner_outdated");
   assert.equal(browserTestsStatus(state(null, last("did_not_start"), false)).status, "failing");
+  assert.equal(browserTestsStatus(state(null, last("browser_errored"), false)).status, "failing");
   assert.equal(browserTestsStatus(state(null, null, false)).status, "unknown");
   assert.equal(browserTestsStatus(null).status, "unknown");
 });
