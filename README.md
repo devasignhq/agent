@@ -198,8 +198,8 @@ Deliberate properties:
 - **The runner is a guest in your repo.** It writes only under `.devasign/` and
   cleans up after itself; it never edits `package.json`, lockfiles, or your
   `playwright.config.*`.
-- **Recordings expire.** A retention sweep deletes artifacts on a plan-based
-  schedule and marks the row expired, so the UI says "recording expired"
+- **Recordings expire.** A retention sweep deletes artifacts after 30 days
+  and marks the row expired, so the UI says "recording expired"
   instead of breaking.
 
 Getting set up is one click: DevAsign detects your stack and opens an onboarding

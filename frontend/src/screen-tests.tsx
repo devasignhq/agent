@@ -7,7 +7,7 @@ import { Icon } from "./icons";
 import { api } from "./api";
 import { useLiveTopic } from "./live-context";
 import { RecordingBlock } from "./recording-block";
-import { formatDuration } from "./verify-view";
+import { deletionCountdown, formatDuration } from "./verify-view";
 import {
   EMPTY_FILTERS,
   categoryLabel,
@@ -17,6 +17,7 @@ import {
   markArchived,
   pickEvidence,
   repoOptions,
+  soonestEvidenceExpiry,
   sortRows,
   statusLabel,
   statusTone,
@@ -360,6 +361,7 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted, onArchive, archi
   React.useEffect(() => { void fetchView(); }, [fetchView]);
 
   const d = testDetail(view, row.testId);
+  const evidenceExpiry = d ? soonestEvidenceExpiry(d) : null;
   const current = runId === row.run.id;
   const adoptRow = d?.test.adopted && !row.adopted ? { ...row, adopted: d.test.adopted } : row;
 
@@ -424,6 +426,9 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted, onArchive, archi
 
               <div className="drawer-section">
                 <div className="drawer-label">evidence</div>
+                {evidenceExpiry != null && (
+                  <div className="mono mute tst-retention">Evidence is kept for 30 days — {deletionCountdown(evidenceExpiry, Date.now())}.</div>
+                )}
                 {d.recordings.length === 0 && d.others.length === 0 && <div className="mono mute" style={{ fontSize: 12 }}>No recordings or logs were uploaded for this test.</div>}
                 {d.recordings.map((rec) => (
                   <RecordingBlock key={rec.artifactId} rec={rec} testName={testName(row.path)} durationMs={d.result?.durationMs || 0} initiallyOpen={focusArtifactId ? rec.artifactId === focusArtifactId : rec === d.recordings[d.recordings.length - 1]} onStale={fetchView} />

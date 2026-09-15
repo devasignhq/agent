@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { selectExpiredArtifacts, sweepExpiredArtifacts } from "./retention.js";
+import { extendArtifactRetention, selectExpiredArtifacts, selectRetentionExtensions, sweepExpiredArtifacts } from "./retention.js";
 import { RETENTION_MS, retentionExpiresAt, setArtifactStorageForTests, type ArtifactStorage } from "./storage.js";
 import type { VerifyArtifact } from "../types.js";
 
@@ -12,19 +12,35 @@ const DAY = 24 * 60 * 60 * 1000;
 const row = (over: Partial<VerifyArtifact>): VerifyArtifact =>
   ({ id: uuid(), schemaVersion: 1, runId: "r", repoId: "p", criterionIds: [], kind: "video", path: "v.webm", storageKey: `k/${uuid()}`, bytes: 1, contentType: "video/webm", state: "uploaded", expiresAt: 0, createdAt: 0, ...over });
 
-test("free rows expire after 1 day, pro/max after 3; already-expired rows are not reselected; stranded pending rows expire too", () => {
+test("every plan keeps artifacts 30 days; already-expired rows are not reselected; stranded pending rows expire too", () => {
   const signedAt = 1_700_000_000_000;
   const free = row({ expiresAt: retentionExpiresAt("free", signedAt) });
   const pro = row({ expiresAt: retentionExpiresAt("pro", signedAt) });
   const max = row({ expiresAt: retentionExpiresAt("max", signedAt) });
   const done = row({ expiresAt: signedAt, state: "expired" });
   const stranded = row({ expiresAt: retentionExpiresAt("free", signedAt), state: "pending_upload" });
-  assert.equal(RETENTION_MS.free, DAY);
-  assert.equal(RETENTION_MS.pro, 3 * DAY);
+  for (const plan of ["free", "pro", "max"] as const) assert.equal(RETENTION_MS[plan], 30 * DAY);
   const rows = [free, pro, max, done, stranded];
-  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + DAY - 1).map((a) => a.id), []);
-  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + DAY).map((a) => a.id), [free.id, stranded.id]);
-  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + 3 * DAY).map((a) => a.id), [free.id, pro.id, max.id, stranded.id]);
+  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + 3 * DAY).map((a) => a.id), []);
+  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + 30 * DAY - 1).map((a) => a.id), []);
+  assert.deepEqual(selectExpiredArtifacts(rows, signedAt + 30 * DAY).map((a) => a.id), [free.id, pro.id, max.id, stranded.id]);
+});
+
+test("extension moves live rows stamped under the old retention to createdAt + 30 days, once", () => {
+  const createdAt = Date.now() - 2 * DAY;
+  const live = db.insert("verifyArtifacts", row({ createdAt, expiresAt: createdAt + 3 * DAY }));
+  const gone = db.insert("verifyArtifacts", row({ createdAt, expiresAt: createdAt + DAY, state: "expired" }));
+  const current = db.insert("verifyArtifacts", row({ createdAt, expiresAt: createdAt + 30 * DAY }));
+  try {
+    assert.deepEqual(selectRetentionExtensions([live, gone, current]).map((a) => a.id), [live.id]);
+    assert.ok(extendArtifactRetention() >= 1);
+    assert.equal(db.find("verifyArtifacts", (a) => a.id === live.id)?.expiresAt, createdAt + 30 * DAY);
+    assert.equal(db.find("verifyArtifacts", (a) => a.id === gone.id)?.expiresAt, createdAt + DAY);
+    assert.equal(db.find("verifyArtifacts", (a) => a.id === current.id)?.expiresAt, createdAt + 30 * DAY);
+    assert.equal(extendArtifactRetention(), 0, "a second pass changes nothing");
+  } finally {
+    db.remove("verifyArtifacts", (a) => [live.id, gone.id, current.id].includes(a.id));
+  }
 });
 
 test("sweep deletes the object then marks the row; a failed delete keeps the row for the next sweep; no storage still marks", async () => {

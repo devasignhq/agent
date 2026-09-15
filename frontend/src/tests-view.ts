@@ -115,8 +115,14 @@ export type TestDetail = {
   criteria: Array<{ id: string; text: string; verdict: "pass" | "fail" | "unverifiable" | "pending"; reason: string }>;
   result: { status: ResultStatus; durationMs: number; error: string | null; attempts: Array<{ n: number; status: string; durationMs: number; error: string | null }> } | null;
   recordings: Recording[];
-  others: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; getUrl: string | null; expired: boolean }>;
+  others: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; getUrl: string | null; expiresAt: number; expired: boolean }>;
 };
+
+/** The earliest deletion time among a test's still-live evidence, or null when none is live. */
+export function soonestEvidenceExpiry(detail: Pick<TestDetail, "recordings" | "others">): number | null {
+  const live = [...detail.recordings, ...detail.others].filter((a) => !a.expired).map((a) => a.expiresAt);
+  return live.length ? Math.min(...live) : null;
+}
 
 /** Everything the drawer shows for one test of a fully loaded run view. */
 export function testDetail(view: RunView | null, testId: string, now: number = Date.now()): TestDetail | null {
@@ -146,6 +152,6 @@ export function testDetail(view: RunView | null, testId: string, now: number = D
     others: mine
       .filter((a) => a.kind === "trace" || a.kind === "screenshot" || a.kind === "log")
       .sort((a, b) => (a.attempt ?? 0) - (b.attempt ?? 0))
-      .map((a) => ({ artifactId: a.id, kind: a.kind as TestEvidenceKind, attempt: a.attempt ?? null, getUrl: isExpired(a) ? null : a.getUrl, expired: isExpired(a) })),
+      .map((a) => ({ artifactId: a.id, kind: a.kind as TestEvidenceKind, attempt: a.attempt ?? null, getUrl: isExpired(a) ? null : a.getUrl, expiresAt: a.expiresAt, expired: isExpired(a) })),
   };
 }

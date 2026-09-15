@@ -7,7 +7,7 @@ import { copyFileSync, existsSync, mkdirSync, readdirSync, statSync } from "node
 import path from "node:path";
 import { db } from "../src/db.js";
 import { config } from "../src/config.js";
-import { artifactKey } from "../src/verify/storage.js";
+import { ARTIFACT_RETENTION_DAYS, artifactKey } from "../src/verify/storage.js";
 import type { VerifyArtifact } from "../src/types.js";
 
 function findFile(dir: string, re: RegExp): string | null {
@@ -95,7 +95,7 @@ export function seedVerifyRun(assetsDir: string, installId: string): { reviewId:
       mkdirSync(path.dirname(dest), { recursive: true });
       copyFileSync(src, dest);
     }
-    const row: VerifyArtifact = { id, schemaVersion: 1, runId, repoId: repo.id, testId, criterionIds, kind, path: `.devasign/artifacts/${id}`, storageKey: key, bytes: src && existsSync(src) ? statSync(src).size : 1, contentType, state: "uploaded", expiresAt: now + 3 * DAY, uploadedAt: now - 61 * 60_000, createdAt: now - 62 * 60_000, posterArtifactId: null, ...over };
+    const row: VerifyArtifact = { id, schemaVersion: 1, runId, repoId: repo.id, testId, criterionIds, kind, path: `.devasign/artifacts/${id}`, storageKey: key, bytes: src && existsSync(src) ? statSync(src).size : 1, contentType, state: "uploaded", expiresAt: now - 62 * 60_000 + ARTIFACT_RETENTION_DAYS * DAY, uploadedAt: now - 61 * 60_000, createdAt: now - 62 * 60_000, posterArtifactId: null, ...over };
     rows.push(row);
     db.insert("verifyArtifacts", row);
     return row;
@@ -109,8 +109,9 @@ export function seedVerifyRun(assetsDir: string, installId: string): { reviewId:
   }
   add("a1-log", "log", "t1", ["1"], 1, null, "text/plain");
   add("a1-file", "test_file", "t1", ["1"], 1, null, "text/plain");
-  // Criterion 2: passed, but its recording has EXPIRED (free-tier retention).
-  add("a2-video", "video", "t2", ["2"], 1, null, "video/webm", { state: "expired", expiresAt: now - DAY, expiredAt: now - 60_000, createdAt: now - 2 * DAY });
+  // Criterion 2: passed, but its recording has EXPIRED (uploaded 31 days ago).
+  const a2CreatedAt = now - (ARTIFACT_RETENTION_DAYS + 1) * DAY;
+  add("a2-video", "video", "t2", ["2"], 1, null, "video/webm", { state: "expired", expiresAt: a2CreatedAt + ARTIFACT_RETENTION_DAYS * DAY, expiredAt: now - 60_000, createdAt: a2CreatedAt });
   // Criterion 3: flaky — attempt 1 failed, attempt 2 passed; both recorded.
   add("a3-video-1", "video", "t3", ["3"], 1, video, "video/webm", { posterArtifactId: "a3-poster-1" });
   add("a3-poster-1", "poster", "t3", ["3"], 1, shot, "image/png");
