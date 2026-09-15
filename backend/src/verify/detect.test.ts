@@ -2,7 +2,7 @@
 //   node --import tsx/esm --test src/verify/detect.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { envVarNames, inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
+import { envVarNames, inferSetupFromTree, installCommandFor, nestedPackageDirs, isFrontendPath, isTestPath } from "./detect.js";
 import { hasBootConfig, parseDevasignVerify } from "./yml.js";
 
 test("isTestPath / isFrontendPath heuristics", () => {
@@ -87,4 +87,21 @@ verify:
   assert.equal(parseDevasignVerify("family:\n  name: x\n"), null);
   assert.equal(parseDevasignVerify(": : not yaml ["), null);
   assert.equal(parseDevasignVerify("verify:\n  e2e: sometimes\n")?.e2e, undefined);
+});
+
+test("no root manifest: top-level packages are the install units, with their own lockfiles and a nested Playwright config", () => {
+  assert.deepEqual(nestedPackageDirs(["package.json", "backend/package.json", "frontend/package.json", "tools/x/package.json"]), ["backend", "frontend"]);
+  assert.equal(installCommandFor("backend", ["backend/package-lock.json"]), "npm ci --prefix backend");
+  assert.equal(installCommandFor("web", ["web/pnpm-lock.yaml"]), "pnpm install --frozen-lockfile --dir web");
+  assert.equal(installCommandFor("web", ["web/package.json"]), "npm install --prefix web");
+
+  const paths = ["backend/package.json", "backend/package-lock.json", "backend/src/a.ts", "frontend/package.json", "frontend/playwright.config.ts", "frontend/vitest.config.ts"];
+  const s = inferSetupFromTree(paths);
+  assert.deepEqual(s.packages, ["backend", "frontend"]);
+  assert.equal(s.packageManager, "npm");
+  assert.deepEqual(s.dependencies, [], "a relocated test still resolves bare imports from a root that installs nothing");
+  assert.deepEqual(s.frameworks, [{ name: "playwright", version: undefined, configPath: "frontend/playwright.config.ts" }], "nested vitest is not importable from the root; Playwright is supplied by the runner");
+
+  const rooted = inferSetupFromTree(["package.json", "backend/package.json"], { packageJson: "{}" });
+  assert.equal(rooted.packages, undefined, "a root manifest is the install unit");
 });

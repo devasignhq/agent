@@ -37,6 +37,20 @@ function parsePackageJson(text: string | null | undefined): PackageJson | null {
   }
 }
 
+/** Top-level directories with their own package.json: "backend", "frontend". */
+export function nestedPackageDirs(paths: string[]): string[] {
+  return [...new Set(paths.filter((p) => /^[^/]+\/package\.json$/.test(p)).map((p) => p.split("/")[0]))].sort();
+}
+
+/** The install command for one nested package, keyed off the lockfile it carries. */
+export function installCommandFor(dir: string, paths: string[]): string {
+  const has = (f: string) => paths.includes(`${dir}/${f}`);
+  if (has("pnpm-lock.yaml")) return `pnpm install --frozen-lockfile --dir ${dir}`;
+  if (has("yarn.lock")) return `yarn install --frozen-lockfile --cwd ${dir}`;
+  if (has("bun.lockb") || has("bun.lock")) return `bun install --cwd ${dir}`;
+  return has("package-lock.json") ? `npm ci --prefix ${dir}` : `npm install --prefix ${dir}`;
+}
+
 export function envVarNames(text: string | null | undefined): string[] {
   if (!text) return [];
   const out = new Set<string>();
@@ -66,22 +80,29 @@ export function inferSetupFromTree(
   }
   const languages = [...langCounts.entries()].sort((a, b) => b[1] - a[1]).map(([l]) => l);
 
+  // With no root manifest the top-level packages are the install units.
+  const packages = has("package.json") ? [] : nestedPackageDirs(paths);
+  const inPkg = (f: string) => packages.some((d) => has(`${d}/${f}`));
+
   let packageManager: DetectedSetup["packageManager"] = null;
-  if (has("pnpm-lock.yaml")) packageManager = "pnpm";
-  else if (has("yarn.lock")) packageManager = "yarn";
-  else if (has("bun.lockb") || has("bun.lock")) packageManager = "bun";
-  else if (has("package-lock.json") || has("package.json")) packageManager = "npm";
+  if (has("pnpm-lock.yaml") || inPkg("pnpm-lock.yaml")) packageManager = "pnpm";
+  else if (has("yarn.lock") || inPkg("yarn.lock")) packageManager = "yarn";
+  else if (has("bun.lockb") || has("bun.lock") || inPkg("bun.lockb") || inPkg("bun.lock")) packageManager = "bun";
+  else if (has("package-lock.json") || has("package.json") || packages.length) packageManager = "npm";
   else if (has("poetry.lock")) packageManager = "poetry";
   else if (has("requirements.txt") || has("pyproject.toml")) packageManager = "pip";
   else if (has("go.mod")) packageManager = "go";
 
   const frameworks: DetectedFramework[] = [];
   const cfg = (re: RegExp) => paths.find((p) => re.test(p));
+  // A relocated test cannot import a package-local vitest or jest, so only the root's
+  // count; Playwright is supplied by the runner, so a nested config still names the boot.
+  const cfgAnywhere = (re: RegExp) => cfg(re) ?? paths.find((p) => p.includes("/") && packages.includes(p.split("/")[0]) && re.test(p.slice(p.indexOf("/") + 1)));
   const vitestCfg = cfg(/^vitest\.config\.[cm]?[jt]s$/);
   if (vitestCfg || dep("vitest")) frameworks.push({ name: "vitest", version: dep("vitest"), configPath: vitestCfg });
   const jestCfg = cfg(/^jest\.config\.[cm]?[jt]s$/);
   if (jestCfg || dep("jest")) frameworks.push({ name: "jest", version: dep("jest"), configPath: jestCfg });
-  const pwCfg = cfg(/^playwright\.config\.[cm]?[jt]s$/);
+  const pwCfg = cfgAnywhere(/^playwright\.config\.[cm]?[jt]s$/);
   if (pwCfg || dep("@playwright/test")) frameworks.push({ name: "playwright", version: dep("@playwright/test"), configPath: pwCfg });
   const cyCfg = cfg(/^cypress\.config\.[cm]?[jt]s$/);
   if (cyCfg || dep("cypress")) frameworks.push({ name: "cypress", version: dep("cypress"), configPath: cyCfg });
@@ -116,6 +137,7 @@ export function inferSetupFromTree(
     // Absent means "not collected", which switches the import allow-list off. No root
     // manifest is not that: nothing is installed where a relocated test resolves from.
     ...(pkg ? { dependencies: Object.keys(deps).sort() } : has("package.json") ? {} : { dependencies: [] }),
+    ...(packages.length ? { packages } : {}),
     testCommands,
     envExampleVars: envVars,
     existingWorkflows: paths.filter((p) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p)),

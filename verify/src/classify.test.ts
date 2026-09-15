@@ -263,3 +263,27 @@ test("node --test: the YAML block names the error; a suite's roll-up of its chil
   assert.equal(classifyAttempt("node-test", r(1, tap(TAP_CRASH, TAP_ASSERT))).status, "fail", "one real assertion among crashes is a failure");
   assert.equal(classifyAttempt("node-test", r(1, "TAP version 13\nnot ok 1 - x\n# fail 1")).status, "error", "a bare not ok says only that something failed");
 });
+
+test("node-test: a file that died loading reports the uncaught error the reporter echoed as comments, not 'test failed'", () => {
+  const out = [
+    "TAP version 13",
+    "# node:internal/modules/package_json_reader:316",
+    "#   throw new ERR_MODULE_NOT_FOUND(packageName, fileURLToPath(base), null);",
+    "# Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'dotenv' imported from /r/backend/src/config.ts",
+    "#     at Object.getPackageJSONURL (node:internal/modules/package_json_reader:316:9)",
+    "# Subtest: /r/.devasign/tests/config.test.mts",
+    "not ok 1 - /r/.devasign/tests/config.test.mts",
+    "  ---",
+    "  duration_ms: 120.5",
+    "  location: '/r/.devasign/tests/config.test.mts:1:1'",
+    "  failureType: 'testCodeFailure'",
+    "  error: 'test failed'",
+    "  code: 'ERR_TEST_FAILURE'",
+    "  ...",
+    "1..1",
+    "# fail 1",
+  ].join("\n");
+  const c = classifyAttempt("node-test", r(1, out));
+  assert.equal(c.status, "error");
+  assert.match(c.error ?? "", /^Error \[ERR_MODULE_NOT_FOUND\]: Cannot find package 'dotenv' imported from \/r\/backend\/src\/config\.ts/);
+});

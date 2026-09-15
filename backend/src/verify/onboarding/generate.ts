@@ -3,6 +3,7 @@
 // secret list, the PR body, and mechanical doctor follow-up patches. No I/O.
 import { parseDocument, stringify, isMap, isSeq, YAMLMap, YAMLSeq } from "yaml";
 import type { DetectedSetup, DevasignVerifyConfig, DoctorDiagnosis } from "../contract.js";
+import { installCommandFor, nestedPackageDirs } from "../detect.js";
 
 export const WORKFLOW_PATH = ".github/workflows/devasign-verify.yml";
 export const DEVASIGN_YML_PATH = ".devasign.yml";
@@ -126,8 +127,20 @@ function installSteps(setup: DetectedSetup, hints: StackHints, paths: string[]):
     if (pm === "pnpm") steps.push({ uses: "pnpm/action-setup@v4", with: { version: 9 } });
     if (pm === "bun") steps.push({ uses: "oven-sh/setup-bun@v2" });
     const cache = pm === "pnpm" ? "pnpm" : pm === "yarn" ? "yarn" : pm === "npm" ? "npm" : undefined;
-    const hasLock = paths.some((p) => /^(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/.test(p));
-    steps.push({ uses: "actions/setup-node@v4", with: { "node-version": hints.nodeVersion, ...(cache && hasLock ? { cache } : {}) } });
+    const LOCK = /(?:^|\/)(package-lock\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb?)$/;
+    const hasLock = paths.some((p) => LOCK.test(p) && !p.includes("/"));
+    // No root manifest: every top-level package installs on its own, and the cache
+    // must be keyed on their lockfiles rather than a root one that does not exist.
+    const packages = paths.includes("package.json") ? [] : nestedPackageDirs(paths);
+    const pkgLocks = paths.filter((p) => LOCK.test(p) && packages.includes(p.split("/")[0]));
+    steps.push({
+      uses: "actions/setup-node@v4",
+      with: {
+        "node-version": hints.nodeVersion,
+        ...(cache && hasLock ? { cache } : {}),
+        ...(cache && !hasLock && pkgLocks.length ? { cache, "cache-dependency-path": pkgLocks.join("\n") } : {}),
+      },
+    });
     if (paths.includes("package.json")) {
       const cmd =
         pm === "pnpm" ? (hasLock ? "pnpm install --frozen-lockfile" : "pnpm install")
@@ -136,6 +149,7 @@ function installSteps(setup: DetectedSetup, hints: StackHints, paths: string[]):
         : hasLock ? "npm ci" : "npm install";
       steps.push({ name: "Install dependencies", run: cmd });
     }
+    for (const dir of packages) steps.push({ name: `Install ${dir} dependencies`, run: installCommandFor(dir, paths) });
   } else {
     // The runner itself is a Node CLI (npx); a Python/Go-only repo still needs Node.
     steps.push({ uses: "actions/setup-node@v4", with: { "node-version": "20" } });
@@ -326,6 +340,13 @@ export function patchWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): s
   if (doctor.code === "browser_install_failed") {
     if (/playwright install/.test(text)) return null;
     return text.replace(/(\n\s*- name: DevAsign verify\n)/, "\n      - name: Install Playwright browsers\n        run: npx playwright install --with-deps chromium$1");
+  }
+  if (doctor.code === "missing_dependencies") {
+    const wanted = (doctor.packages ?? []).filter((p) => /^[A-Za-z0-9_.-]+$/.test(p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(text));
+    if (!wanted.length) return null;
+    const steps = wanted.map((p) => `\n      - name: Install ${p.dir} dependencies\n        run: ${p.install}`).join("");
+    const next = text.replace(/(\n\s*- name: DevAsign verify\n)/, `${steps}$1`);
+    return next === text ? null : next;
   }
   return null;
 }

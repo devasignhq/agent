@@ -263,7 +263,7 @@ export function spliceVerificationSection(body: string, section: string): string
   return `${body.replace(/\s+$/, "")}\n\n${section}`;
 }
 
-export function verifyCheckRunPayload(view: VerificationView, headSha: string, opts: { doctor?: { code: string; message: string } | null; adoptRunId?: string | null } = {}) {
+export function verifyCheckRunPayload(view: VerificationView, headSha: string, opts: { doctor?: { code: string; message: string; suggestedFix?: { instructions: string } } | null; adoptRunId?: string | null } = {}) {
   let conclusion: "success" | "failure" | "neutral";
   let title: string;
   if (opts.doctor) {
@@ -313,7 +313,13 @@ export function verifyCheckRunPayload(view: VerificationView, headSha: string, o
     head_sha: headSha,
     status: "completed" as const,
     conclusion,
-    output: { title, summary: opts.doctor ? `${opts.doctor.message} — criteria are unverifiable, not failed.` : stateLine(view), text: text.slice(0, 60_000) },
+    output: {
+      title,
+      summary: opts.doctor
+        ? `${opts.doctor.message} — criteria are unverifiable, not failed.${opts.doctor.suggestedFix?.instructions ? ` Fix: ${opts.doctor.suggestedFix.instructions}` : ""}`
+        : stateLine(view),
+      text: text.slice(0, 60_000),
+    },
     ...(actions.length ? { actions } : {}),
   };
 }

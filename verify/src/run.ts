@@ -5,7 +5,7 @@ import { ApiClient, ApiError } from "./api.js";
 import { resolveArtifactRefs, uploadArtifacts } from "./artifacts.js";
 import { readContext, type RunContext } from "./context.js";
 import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js";
-import { diagnosePlaywrightOutput, preflight } from "./doctor.js";
+import { diagnoseMissingDependencies, diagnosePlaywrightOutput, preflight } from "./doctor.js";
 import { log, setOutput } from "./log.js";
 import type { TokenSource } from "./oidc.js";
 import { onDiskPath, writeModuleTypeShims } from "./module-type.js";
@@ -99,10 +99,12 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
   const others = runnable.filter((t) => t.runner !== "playwright");
 
   results.push(...(await runFileTests({ tests: others, ws, fileOf: (t) => disk.get(t.id) ?? t.path, maxAttempts: (t) => (t.origin === "generated" ? 1 + plan.retries.generated : 1), timeoutMs: opts.testTimeoutMs, artifacts })));
+  doctor = diagnoseMissingDependencies(results, ws.root);
+  if (doctor) log.warn(`setup needs attention: ${doctor.message}`);
 
   if (pw.length) {
     const repoCfg = opts.setup?.frameworks.find((f) => f.name === "playwright")?.configPath ?? null;
-    doctor = preflight({ tests: pw, setup: opts.setup!, yml: opts.yml, repoHasPlaywrightConfig: !!repoCfg, env: process.env, nodeVersion: process.version });
+    doctor = doctor ?? preflight({ tests: pw, setup: opts.setup!, yml: opts.yml, repoHasPlaywrightConfig: !!repoCfg, env: process.env, nodeVersion: process.version });
     if (doctor) {
       log.warn(`setup needs attention: ${doctor.message}`);
       for (const t of pw) results.push({ id: `r-${t.id}`, testId: t.id, criterionIds: t.criterionIds, test: t.path, runner: "playwright", level: t.level, origin: t.origin, status: "error", attempts: [], durationMs: 0, error: doctor.message, artifactIds: [] });

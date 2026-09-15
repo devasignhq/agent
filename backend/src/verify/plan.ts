@@ -29,7 +29,7 @@ import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format
 import type { Criterion, Installation, Repository, VerifyPlan, VerifyRun, VerifyStageUsage } from "../types.js";
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
-import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, type ImportAllowList } from "./imports.js";
+import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, unresolvedRelativeImports, type ImportAllowList } from "./imports.js";
 import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
@@ -54,6 +54,7 @@ export const RETIRED_REASON = "could not produce a stable test (retired after re
 export const PLAN_CUT_OFF_REASON = "the test plan was cut off before this criterion was covered";
 export const PLAN_UNUSABLE_REASON = "the planner did not return a usable test plan";
 export const MISSING_PACKAGE_REASON = "proving this needs a test package this repository does not have";
+export const MISSING_IMPORT_REASON = "the generated test imported a file that does not exist in the repository";
 
 export type PlannerLLM = (args: { system: string; messages: LLMMessage[]; maxTokens: number; tool: StructuredTool }) => Promise<StructuredResult>;
 
@@ -82,6 +83,9 @@ export type PlanPolicy = {
   // Test files this PR adds or changes. They ship inside the change under review,
   // so they carry its blind spots and cannot stand as evidence for it.
   prAuthoredTests: Set<string>;
+  // Non-test files this PR changes. A generated test below e2e must target one of
+  // them: a criterion is about this change, not about whichever module shares a word.
+  touchedSources: Set<string>;
 };
 
 export type RawPlanTest = {
@@ -166,7 +170,16 @@ export function planPolicy(args: {
     if (kind === "ui") maxLevel.set(c.id, e2eAllowed ? "e2e" : "component");
     else maxLevel.set(c.id, apiOnly ? "integration" : "component");
   }
-  return { e2ePolicy, e2eAllowed, bootConfigured, componentCapable: hasRenderStack(args.setup), apiOnly, maxLevel, prAuthoredTests: new Set(args.touched.filter(isTestPath)) };
+  return {
+    e2ePolicy,
+    e2eAllowed,
+    bootConfigured,
+    componentCapable: hasRenderStack(args.setup),
+    apiOnly,
+    maxLevel,
+    prAuthoredTests: new Set(args.touched.filter(isTestPath)),
+    touchedSources: new Set(args.touched.filter((p) => !isTestPath(p))),
+  };
 }
 
 // The planner's paths come from a model reading an attacker-influenced diff, so
@@ -355,7 +368,7 @@ export function normalizeUnverifiable(raw: unknown, knownIds: Set<string>): Arra
     .filter((u) => knownIds.has(u.criterionId));
 }
 
-export type PlanViolation = "missing_existing" | "pr_authored" | "level";
+export type PlanViolation = "missing_existing" | "pr_authored" | "level" | "off_target";
 
 // A component test renders into a DOM shim with no layout engine, so behaviour
 // that only real geometry can settle — canvas, drag, virtualised lists — is
@@ -405,6 +418,16 @@ export function enforcePlanPolicy(
         violations.push({ test: t, reason: "level" });
         continue;
       }
+      // A target the tree does not have is a hallucinated module (a changed file is real by
+      // definition); a test below e2e that targets none of the changed files is testing the
+      // wrong module.
+      const targetFiles = t.targetFiles.map((p) => p.replace(/^\.\//, "")).filter((p) => treePaths.has(p) || policy.touchedSources.has(p));
+      if (t.level !== "e2e" && policy.touchedSources.size && !targetFiles.some((p) => policy.touchedSources.has(p))) {
+        violations.push({ test: t, reason: "off_target" });
+        continue;
+      }
+      kept.push(targetFiles.length === t.targetFiles.length ? t : { ...t, targetFiles });
+      continue;
     }
     kept.push(t);
   }
@@ -468,12 +491,29 @@ function renderSetup(setup: DetectedSetup, yml: DevasignVerifyConfig | null): st
         ? `- Installed packages (the ONLY ones a test may import): ${deps.join(", ")}`
         : "- Installed packages: none — nothing is installed where these tests run, so a test may use only Node builtins and the runner's own assertions.",
     `- Test commands: ${setup.testCommands.join("; ") || "none"}`,
+    setup.packages?.length
+      ? `- Packages (no root package.json): ${setup.packages.map((d) => `${d}/`).join(", ")} — each installs its own dependencies, which its source files resolve from their own directory. A generated test lives under .devasign/tests/ and resolves bare imports from the repository root, so it may import repository source only by relative path.`
+      : "",
     `- Services: ${setup.services.join(", ") || "none"}`,
     setup.monorepo ? `- Monorepo: ${setup.monorepo.tool} (${setup.monorepo.packages.join(", ")})` : "",
     `- .devasign.yml verify: ${yml ? JSON.stringify({ ...yml, login: yml.login ? { strategy: yml.login.strategy } : undefined }) : "none"}`,
   ]
     .filter(Boolean)
     .join("\n");
+}
+
+const MAX_CHANGED_LISTED = 80;
+
+// The only inventory of source paths the planner sees, so it names real modules.
+function renderChanged(ctx: PlanContext): string[] {
+  if (!ctx.changed.length) return [];
+  return [
+    `## Files changed by this PR (${ctx.changed.length})`,
+    "A generated unit, integration or component test must name at least one of these in targetFiles, spelled exactly as listed; " +
+      "a test that targets only other files is dropped. Reach other modules only through these.",
+    ...ctx.changed.slice(0, MAX_CHANGED_LISTED).map((c) => `  - ${c.path}${c.exports.length ? ` (exports: ${c.exports.slice(0, 8).join(", ")})` : ""}`),
+    "",
+  ];
 }
 
 function renderCriteria(criteria: Criterion[]): string {
@@ -516,6 +556,8 @@ export type PlanContext = {
   ymlFrom: "head" | "base" | null;
   policy: PlanPolicy;
   existingTests: string[];
+  // Non-test files the PR changes, with their exported symbols when the index knows them.
+  changed: Array<{ path: string; exports: string[] }>;
   candidates: Array<{ path: string; imports: string[] }>;
   flakeNotes: string[];
   prTitle: string;
@@ -525,7 +567,11 @@ export type ReplanCohorts = { level: string[]; escalate: string[]; fallback?: st
 
 function replanHeader(r: ReplanCohorts): string {
   const lines = ["## Re-plan ONLY these criteria"];
-  if (r.level.length) lines.push(`- [${r.level.join("], [")}]: your previous test was rejected. Plan at or below the max level below.`);
+  if (r.level.length)
+    lines.push(
+      `- [${r.level.join("], [")}]: your previous test was rejected — it was above the max level, or it targeted files this PR did not change. ` +
+        "Plan at or below the max level below, with targetFiles naming a file from the changed list."
+    );
   if (r.escalate.length)
     lines.push(
       `- [${r.escalate.join("], [")}]: you marked these unverifiable, but the Level policy below still allows a rung you did not attempt. ` +
@@ -552,6 +598,7 @@ export function buildPlannerUserPrompt(ctx: PlanContext, opts: { replan?: Replan
     "## Level policy",
     renderPolicy(ctx.policy, target.map((c) => c.id), ctx.setup),
     "",
+    ...renderChanged(ctx),
     "## Repository test setup",
     renderSetup(ctx.setup, ctx.yml),
     "",
@@ -604,7 +651,14 @@ const manifestRepair = (reason: string) => `Your previous answer could not be us
 
 // retryStructured allows exactly one repair pass, so the reason has to carry everything
 // the model needs to rewrite the file — including what it may import instead.
-export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: string[]) => void, path?: string, runner?: TestRunner): (input: unknown) => Validation<{ content: string }> {
+export function makeTestFileValidator(
+  allow: ImportAllowList,
+  onReject?: (bad: string[], missing: string[]) => void,
+  path?: string,
+  runner?: TestRunner,
+  // Where the file's relative imports are anchored and what exists there; absent = unchecked.
+  resolve?: { exists: (p: string) => boolean }
+): (input: unknown) => Validation<{ content: string }> {
   let calls = 0;
   return (input) => {
     const given = input as { content?: unknown; path?: unknown } | null;
@@ -613,15 +667,20 @@ export function makeTestFileValidator(allow: ImportAllowList, onReject?: (bad: s
     const bad = disallowedImports(content, allow);
     const file = path ?? (typeof given?.path === "string" ? given.path : "");
     const unparsable = syntaxError(file, content);
+    // Checked every time: a relative import of nothing is a suite that never loads.
+    const missing = resolve && file ? unresolvedRelativeImports(content, file, resolve.exists) : [];
     // First answer only: a pattern check is a nudge, and a spec that insists may be right.
     // Asked later, it would drop a file whose only repair went to a syntax error.
     const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content), ...moduleSyntaxLint(file, content, runner)] : [];
-    if (!bad.length && !unparsable && !patterns.length) return { ok: true, value: { content } };
+    if (!bad.length && !unparsable && !patterns.length && !missing.length) return { ok: true, value: { content } };
     // Reported every failure, empty included, so a later syntax-only miss is not blamed on a package.
-    onReject?.(bad);
+    onReject?.(bad, missing);
     const available = [...allow.names].sort().join(", ") || "none";
     const problems = [
       unparsable ? `it does not parse — ${unparsable} — and a spec that cannot load fails every other spec run beside it` : "",
+      missing.length
+        ? `it imports ${missing.map((m) => `"${m}"`).join(", ")} relative to ${file}, which do not exist in the repository — a relative import must point at a real repository file from this test's own location (e.g. "../../src/module.ts"), and any helper must be defined inside the test file`
+        : "",
       bad.length
         ? `it imports ${bad.map((b) => `"${b}"`).join(", ")}, which this repository does not have — the runner installs nothing, so the suite would fail to load. ` +
           `Rewrite it using only these packages: ${available}; Node builtins; and the runner's own assertions. ` +
@@ -745,6 +804,8 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   // The tree is the PR head, so it holds the tests the PR itself wrote. Keeping
   // them off both lists is what stops a change being graded by its own tests.
   const existingTests = paths.filter((p) => isTestPath(p) && !policy.prAuthoredTests.has(p));
+  const indexed = new Map(db.filter("repoIndex", (e) => e.repoId === repo.id && policy.touchedSources.has(e.path)).map((e) => [e.path, e.exports]));
+  const changed = [...policy.touchedSources].filter((p) => treePaths.has(p)).map((path) => ({ path, exports: indexed.get(path) ?? [] }));
   const touchedStems = new Set(touched.map((p) => (p.split("/").pop() || p).replace(/\.[^.]+$/, "")));
   const candidates = db
     .filter("repoIndex", (e) => e.repoId === repo.id && isTestPath(e.path) && !policy.prAuthoredTests.has(e.path))
@@ -773,6 +834,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     ymlFrom: boot.from,
     policy,
     existingTests,
+    changed,
     candidates,
     flakeNotes,
     prTitle: review?.prTitle ?? `PR #${run.prNumber}`,
@@ -849,6 +911,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const cutOff = new Set<string>();
         const unusable = new Set<string>();
         const missingPackage = new Set<string>();
+        const missingImport = new Set<string>();
         const lose = (ids: Iterable<string>, stop: string | null) => {
           for (const id of ids) (stop === "max_tokens" ? cutOff : unusable).add(id);
         };
@@ -946,17 +1009,22 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           if (!headReads.has(p)) headReads.set(p, (deps.readFile ?? defaultReadFile)(install, repo, p, run.sha));
           return headReads.get(p)!;
         };
+        // A sibling planned in this batch is as real as a tree path once it is written.
+        const plannedPaths = new Set(survivors.flatMap((s) => [s.path, ...(s.rebaseFrom ? [s.rebaseFrom] : [])]));
         const author = async (t: (typeof survivors)[number]) => {
           // Per test, not per run: the allow-list depends on t.runner and the pool runs
           // three of these at once.
           let rejected: string[] = [];
+          let unresolved: string[] = [];
           const validate = makeTestFileValidator(
             buildImportAllowList(ctx.setup, t.runner),
-            (bad) => {
+            (bad, missing) => {
               rejected = bad;
+              unresolved = missing;
             },
             t.rebaseFrom ?? t.path,
-            t.runner
+            t.runner,
+            { exists: (p) => ctx.treePaths.has(p) || plannedPaths.has(p) }
           );
           try {
             // vitest reads the Vite config when it has none of its own, and a Vite app keeps its
@@ -976,6 +1044,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             }
             bodyFailed.push(`${t.path} (${r.attempts.at(-1)?.reason ?? "no answer"})`);
             if (rejected.length) for (const id of t.criterionIds) missingPackage.add(id);
+            else if (unresolved.length) for (const id of t.criterionIds) missingImport.add(id);
             lose(t.criterionIds, r.lastStopReason);
           } catch (err) {
             bodyFailed.push(`${t.path} (${err instanceof Error ? err.message : String(err)})`.slice(0, 300));
@@ -1027,6 +1096,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             planUnverifiable.push({ criterionId: c.id, reason, ...(reason === NO_BOOT_REASON ? { fixUrl } : {}) });
           } else if (cutOff.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_CUT_OFF_REASON });
           else if (missingPackage.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: MISSING_PACKAGE_REASON });
+          else if (missingImport.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: MISSING_IMPORT_REASON });
           else if (unusable.has(c.id)) planUnverifiable.push({ criterionId: c.id, reason: PLAN_UNUSABLE_REASON });
           else if (noBoot) planUnverifiable.push({ criterionId: c.id, reason: NO_BOOT_REASON, fixUrl });
           else if (isUi && ctx.policy.e2ePolicy === "never")

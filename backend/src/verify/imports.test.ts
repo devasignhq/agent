@@ -3,7 +3,7 @@
 //   node --import tsx/esm --test src/verify/imports.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildImportAllowList, disallowedImports, hasRenderStack, packageRoot } from "./imports.js";
+import { buildImportAllowList, disallowedImports, hasRenderStack, packageRoot, unresolvedRelativeImports } from "./imports.js";
 import type { DetectedSetup, TestRunner } from "./contract.js";
 
 const setup = (over: Partial<DetectedSetup> = {}): DetectedSetup => ({
@@ -90,4 +90,23 @@ test("the framework's own renderer counts: react-dom and happy-dom render compon
   assert.equal(hasRenderStack(setup({ dependencies: ["happy-dom", "react", "react-dom", "vitest"] })), true);
   assert.equal(hasRenderStack(setup({ dependencies: ["jsdom", "preact"] })), true);
   assert.equal(hasRenderStack(setup({ dependencies: ["react", "react-dom"] })), false, "still needs a DOM environment");
+});
+
+test("unresolvedRelativeImports: names relative specifiers that reach no repository file, as written from the test's location", () => {
+  const tree = new Set(["src/handler.ts", "src/util/index.ts", "src/data.json", "tests/fixture.ts"]);
+  const exists = (p: string) => tree.has(p);
+  const content = [
+    'import { handler } from "../src/handler.js";', // .js → .ts is how ESM TypeScript spells it
+    'import util from "../src/util";', // directory index
+    'import data from "../src/data.json";',
+    'import { fx } from "./fixture.ts";',
+    'import type { T } from "./types-only.ts";', // erased before load
+    'import { helper } from "./helper.ts";', // nothing there
+    'const lazy = await import("./lazy.js");',
+    'import { test } from "node:test";',
+  ].join("\n");
+  assert.deepEqual(unresolvedRelativeImports(content, "tests/x.test.ts", exists), ["./helper.ts", "./lazy.js"]);
+  // A sibling the model believes it wrote beside the test, at the root it named.
+  assert.deepEqual(unresolvedRelativeImports('import { a } from "./tests-view.ts";', ".devasign/tests/ledger.test.ts", exists), ["./tests-view.ts"]);
+  assert.deepEqual(unresolvedRelativeImports('import { a } from "../../src/handler.ts";', "tests/x.test.ts", exists), [], "above the root is the rebase step's call, not this one's");
 });

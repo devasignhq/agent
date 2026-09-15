@@ -111,8 +111,18 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
   } catch {
     pkg = null;
   }
-  const deps: Record<string, string> = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
-  const dep = (name: string) => (name in deps ? String(deps[name]).replace(/^[\^~>=<\s]+/, "") : undefined);
+  // With no root manifest the top-level packages are the install units: each
+  // resolves its own dependencies from its own directory.
+  const packages = pkgText == null ? nestedPackageDirs(paths) : [];
+  const nested = packages.map((d) => parseManifest(readText(root, `${d}/package.json`)));
+  const rootDeps: Record<string, string> = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
+  const deps: Record<string, string> = { ...rootDeps };
+  for (const m of nested) Object.assign(deps, m?.dependencies || {}, m?.devDependencies || {});
+  const clean = (v: string) => v.replace(/^[\^~>=<\s]+/, "");
+  const dep = (name: string) => (name in deps ? clean(String(deps[name])) : undefined);
+  // A relocated test cannot import a package-local vitest or jest: those count only at the root.
+  const rootDep = (name: string) => (name in rootDeps ? clean(String(rootDeps[name])) : undefined);
+  const inPkg = (file: string) => packages.some((d) => has(`${d}/${file}`));
   // A generated test resolves against the whole install, so a workspace package's
   // dependencies — and its own name — are as reachable as the root's. With no root
   // manifest nothing hoists here, so the honest answer is an empty list, not silence.
@@ -136,27 +146,29 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
   const languages = [...langCounts.entries()].sort((a, b) => b[1] - a[1]).map(([l]) => l);
 
   let packageManager: DetectedSetup["packageManager"] = null;
-  if (has("pnpm-lock.yaml")) packageManager = "pnpm";
-  else if (has("yarn.lock")) packageManager = "yarn";
-  else if (has("bun.lockb") || has("bun.lock")) packageManager = "bun";
-  else if (has("package-lock.json") || has("package.json")) packageManager = "npm";
+  if (has("pnpm-lock.yaml") || inPkg("pnpm-lock.yaml")) packageManager = "pnpm";
+  else if (has("yarn.lock") || inPkg("yarn.lock")) packageManager = "yarn";
+  else if (has("bun.lockb") || has("bun.lock") || inPkg("bun.lockb") || inPkg("bun.lock")) packageManager = "bun";
+  else if (has("package-lock.json") || has("package.json") || packages.length) packageManager = "npm";
   else if (has("poetry.lock")) packageManager = "poetry";
   else if (has("requirements.txt") || has("pyproject.toml")) packageManager = "pip";
   else if (has("go.mod")) packageManager = "go";
 
   const frameworks: DetectedFramework[] = [];
   const cfg = (re: RegExp) => paths.find((p) => re.test(p));
+  // Playwright is supplied by the runner, so a nested config still names the boot.
+  const cfgAnywhere = (re: RegExp) => cfg(re) ?? paths.find((p) => p.includes("/") && packages.includes(p.split("/")[0]) && re.test(p.slice(p.indexOf("/") + 1)));
   const vitestCfg = cfg(/^vitest\.config\.[cm]?[jt]s$/);
-  if (vitestCfg || dep("vitest")) frameworks.push({ name: "vitest", version: dep("vitest"), configPath: vitestCfg });
+  if (vitestCfg || rootDep("vitest")) frameworks.push({ name: "vitest", version: rootDep("vitest"), configPath: vitestCfg });
   const jestCfg = cfg(/^jest\.config\.[cm]?[jt]s$/);
-  if (jestCfg || dep("jest")) frameworks.push({ name: "jest", version: dep("jest"), configPath: jestCfg });
-  const pwCfg = cfg(/^playwright\.config\.[cm]?[jt]s$/);
+  if (jestCfg || rootDep("jest")) frameworks.push({ name: "jest", version: rootDep("jest"), configPath: jestCfg });
+  const pwCfg = cfgAnywhere(/^playwright\.config\.[cm]?[jt]s$/);
   if (pwCfg || dep("@playwright/test")) frameworks.push({ name: "playwright", version: dep("@playwright/test"), configPath: pwCfg });
   const cyCfg = cfg(/^cypress\.config\.[cm]?[jt]s$/);
-  if (cyCfg || dep("cypress")) frameworks.push({ name: "cypress", version: dep("cypress"), configPath: cyCfg });
+  if (cyCfg || rootDep("cypress")) frameworks.push({ name: "cypress", version: rootDep("cypress"), configPath: cyCfg });
   if (has("pytest.ini") || any(/(^|\/)conftest\.py$/) || any(/(^|\/)test_[^/]+\.py$/)) frameworks.push({ name: "pytest" });
   if (has("go.mod") && any(/_test\.go$/)) frameworks.push({ name: "go-test" });
-  if (/\bnode\b.*\s--test\b/.test(String(pkg?.scripts?.test || ""))) frameworks.push({ name: "node-test" });
+  if ([pkg, ...nested].some((m) => /\bnode\b.*\s--test\b/.test(String(m?.scripts?.test || "")))) frameworks.push({ name: "node-test" });
 
   const testCommands = Object.entries((pkg?.scripts || {}) as Record<string, string>)
     .filter(([k]) => /^(test|e2e|test:[\w-]+)$/.test(k))
@@ -184,6 +196,7 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
     monorepo,
     frameworks,
     dependencies,
+    ...(packages.length ? { packages } : {}),
     testCommands,
     envExampleVars: envVars,
     existingWorkflows: paths.filter((p) => /^\.github\/workflows\/[^/]+\.ya?ml$/.test(p)),
@@ -191,6 +204,40 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
     pythonVersion,
     services,
   };
+}
+
+/** Top-level directories with their own package.json: "backend", "frontend". */
+export function nestedPackageDirs(paths: string[]): string[] {
+  return [...new Set(paths.filter((p) => /^[^/]+\/package\.json$/.test(p)).map((p) => p.split("/")[0]))].sort();
+}
+
+function parseManifest(text: string | null): { scripts?: Record<string, string>; dependencies?: Record<string, string>; devDependencies?: Record<string, string> } | null {
+  try {
+    const j = text ? JSON.parse(text) : null;
+    return j && typeof j === "object" ? j : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The install command for one package directory, keyed off the lockfile it carries. */
+export function installCommandFor(dir: string, hasFile: (rel: string) => boolean): string {
+  const has = (f: string) => hasFile(dir === "." ? f : `${dir}/${f}`);
+  const at = dir === "." ? "" : ` --prefix ${dir}`;
+  if (has("pnpm-lock.yaml")) return `pnpm install --frozen-lockfile${dir === "." ? "" : ` --dir ${dir}`}`;
+  if (has("yarn.lock")) return `yarn install --frozen-lockfile${dir === "." ? "" : ` --cwd ${dir}`}`;
+  if (has("bun.lockb") || has("bun.lock")) return `bun install${dir === "." ? "" : ` --cwd ${dir}`}`;
+  return has("package-lock.json") ? `npm ci${at}` : `npm install${at}`;
+}
+
+/** Nearest directory at or above `file` (repo-relative, posix) with a package.json; "." for the root; null when none. */
+export function packageDirOf(root: string, file: string): string | null {
+  let dir = path.posix.dirname(file);
+  for (;;) {
+    if (existsSync(path.join(root, dir, "package.json"))) return dir;
+    if (dir === ".") return null;
+    dir = path.posix.dirname(dir);
+  }
 }
 
 export function repoHasPlaywright(root: string): boolean {

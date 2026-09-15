@@ -6,7 +6,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runnerAvailable, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_IMPORT_REASON, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runnerAvailable, runVerifyPlan, type PlannerDeps } from "./plan.js";
 import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
@@ -204,7 +204,7 @@ test("the installed package list reaches the planner and the body prompt", async
 
 test("without a render library the component rung closes, and a waved-off ui criterion is not re-asked", async () => {
   const s = seed([crit("1", "ui"), crit("2")]);
-  const responses = [{ tests: [gen("2", "unit")], unverifiable: [{ criterionId: "1", reason: "nothing can render it" }] }];
+  const responses = [{ tests: [gen("2", "unit", { targetFiles: ["src/Canvas.tsx"] })], unverifiable: [{ criterionId: "1", reason: "nothing can render it" }] }];
   const { deps: d, prompts } = deps({ files: { "package.json": PKG({ vitest: "^3" }) }, diff: UI_DIFF, responses });
   try {
     await runVerifyPlan(s.run.id, d);
@@ -401,9 +401,9 @@ test("a criterion covered only by a browser test is re-asked, in the same re-pla
     files: { ".devasign.yml": BOOT_YML },
     diff: UI_DIFF,
     responses: [
-      { tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" }), gen("2", "unit")] },
+      { tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" }), gen("2", "unit", { targetFiles: ["src/Canvas.tsx"] })] },
       // The fallback, plus a repeat of the browser test the criterion already has.
-      { tests: [gen("1", "unit", { path: "pill.logic.test.ts" }), gen("1", "e2e", { path: "e2e/pill-again.spec.ts" })] },
+      { tests: [gen("1", "unit", { path: "pill.logic.test.ts", targetFiles: ["src/Canvas.tsx"] }), gen("1", "e2e", { path: "e2e/pill-again.spec.ts" })] },
     ],
   });
   try {
@@ -767,15 +767,20 @@ const referrer = (over: Record<string, unknown> = {}) => ({
 });
 const planned = (runId: string) => db.find("verifyPlans", (p) => p.runId === runId)!;
 
-test("a sibling dropped by policy is not followed — the referrer falls back to the repo path", async () => {
+// A sibling that policy or retirement dropped is a file nothing writes: the referrer's
+// import of it is rejected at plan time (one repair), never shipped to fail at load.
+test("a sibling dropped by policy is not followed — the referrer is repaired, then dropped with its reason", async () => {
   const s = seed([crit("1")]);
   // The sibling asks for component, which the API-only diff forbids.
-  const { deps: d } = deps({ responses: [{ tests: [referrer(), sibling({ level: "component" })] }] });
+  const { deps: d, bodyPrompts } = deps({ responses: [{ tests: [referrer(), sibling({ level: "component" })] }] });
   try {
     await runVerifyPlan(s.run.id, d);
-    const tests = planned(s.run.id).tests;
-    assert.deepEqual(tests.map((t) => t.path), [".devasign/tests/src/total.test.ts"], "the sibling was dropped");
-    assert.equal(tests[0].content, 'import { make } from "../../../src/factory.js";', "no redirect to a file nothing writes");
+    const plan = planned(s.run.id);
+    assert.deepEqual(plan.tests, [], "the sibling was dropped, and so was the file that imported it");
+    assert.equal(bodyPrompts.length, 2, "one repair pass for the referrer alone");
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: MISSING_IMPORT_REASON }]);
+    const attempts = (db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!.meta as any).attempts.bodies[".devasign/tests/src/total.test.ts"];
+    assert.match(attempts[0].reason, /it imports "\.\/factory\.js" relative to src\/total\.test\.ts, which do not exist/);
   } finally {
     s.cleanup();
   }
@@ -790,9 +795,9 @@ test("a sibling dropped by retirement is not followed either", async () => {
   const { deps: d } = deps({ responses: [{ tests: [referrer(), sibling({ targetFiles: ["src/factory.ts"] })] }] });
   try {
     await runVerifyPlan(s.run.id, d);
-    const tests = planned(s.run.id).tests;
-    assert.deepEqual(tests.map((t) => t.path), [".devasign/tests/src/total.test.ts"]);
-    assert.equal(tests[0].content, 'import { make } from "../../../src/factory.js";');
+    const plan = planned(s.run.id);
+    assert.deepEqual(plan.tests, []);
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: MISSING_IMPORT_REASON }]);
   } finally {
     s.cleanup();
   }
@@ -837,6 +842,7 @@ test("a sibling generated by the re-plan batch is still followed", async () => {
 test("the persisted plan carries rewritten content, and unresolved imports reach the log", async () => {
   const s = seed([crit("1")]);
   const { deps: d } = deps({
+    tree: [...BASE_TREE, "src/total.ts"],
     responses: [{ tests: [referrer({ content: 'import { orderTotal } from "./total.js";\nimport x from "../../../../outside.js";' })] }],
   });
   try {
@@ -1055,6 +1061,7 @@ test("a manifest that sends its lists as JSON text is read as the lists, without
 test("a body cut off twice drops that file alone; its sibling still ships, rebased", async () => {
   const s = seed([crit("1"), crit("2")]);
   const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, "src/one.ts"],
     responses: [{ tests: [gen("1", "unit"), gen("2", "unit", { path: "src/two.test.ts", content: 'import { one } from "./one.js";\n' })] }],
     bodies: { "criterion-1.test.ts": [cut("import"), cut("import")] },
   });
@@ -1202,7 +1209,7 @@ test("a browser test's author is shown the app it drives; a unit test's author, 
   const { deps: d, bodyPrompts } = deps({
     tree: [...BASE_TREE, ...Object.keys(files)],
     files,
-    diff: UI_DIFF,
+    diff: `${UI_DIFF}\n${DIFF}`,
     responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts", targetFiles: ["src/App.tsx"], strategy: "drag two blocks onto the canvas and join them" }), gen("2", "unit", { strategy: "call the handler" })] }],
   });
   try {
@@ -1290,6 +1297,72 @@ test("the head's own verify block wins, and the base branch is never read", asyn
     assert.equal(plan.verifyConfigFrom, "head");
     assert.equal(plan.verifyConfig?.start, "npm start");
     assert.ok(!reads.includes(".devasign.yml@d"));
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a generated test below e2e that targets none of the files the PR changed is off target: dropped and re-planned against the changed list", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, prompts } = deps({
+    responses: [
+      { tests: [gen("1", "unit", { targetFiles: ["frontend/src/app.tsx"] })] }, // exists, but the PR never touched it
+      { tests: [gen("1", "unit", { targetFiles: ["./src/handler.ts", "src/ghost.ts"] })] },
+    ],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.match(prompts[0], /## Files changed by this PR \(1\)\n[^\n]*must name at least one of these in targetFiles/);
+    assert.match(prompts[0], /^  - src\/handler\.ts$/m);
+    assert.equal(prompts.length, 2);
+    assert.match(prompts[1], /targeted files this PR did not change/);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => [t.path, t.targetFiles]), [[`${GENERATED_TEST_PREFIX}/criterion-1.test.ts`, ["src/handler.ts"]]], "kept with its targets normalised and the hallucinated one dropped");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify");
+    assert.match(String(log?.detail), /criterion-1\.test\.ts \(off_target\)/);
+    assert.equal(plan.unverifiable.length, 0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the off-target rule does not apply to browser tests, nor when the PR changed no source file", async () => {
+  const s = seed([crit("1", "ui")]);
+  const { deps: d, prompts } = deps({
+    tree: [...BASE_TREE, "playwright.config.ts"],
+    diff: DIFF.replace(/src\/handler\.ts/g, "src/handler.test.ts"),
+    responses: [{ tests: [gen("1", "unit", { targetFiles: ["frontend/src/app.tsx"] })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(prompts.length, 1, "nothing to re-plan");
+    assert.doesNotMatch(prompts[0], /## Files changed by this PR/);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.deepEqual(plan.tests.map((t) => t.targetFiles), [["frontend/src/app.tsx"]]);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a body importing a relative path that exists nowhere is repaired once, naming the path and the test's own location", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d, bodyPrompts } = deps({
+    responses: [{ tests: [gen("1", "unit")] }],
+    bodies: {
+      "criterion-1.test.ts": [
+        { path: "criterion-1.test.ts", content: 'import { test } from "node:test";\nimport { rows } from "./tests-view.ts";\ntest("x", () => rows());\n' },
+        { path: "criterion-1.test.ts", content: 'import { test } from "node:test";\nimport { handler } from "./src/handler.ts";\ntest("x", () => handler());\n' },
+      ],
+    },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+    const attempts = (db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/criterion-1.test.ts`];
+    assert.match(attempts[0].reason, /it imports "\.\/tests-view\.ts" relative to criterion-1\.test\.ts, which do not exist in the repository/);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.match(String(plan.tests[0].content), /from "\.\.\/\.\.\/src\/handler\.ts"/, "the kept body, re-anchored under .devasign/tests/");
+    assert.equal(plan.unverifiable.length, 0);
   } finally {
     s.cleanup();
   }
