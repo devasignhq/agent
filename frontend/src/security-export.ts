@@ -12,6 +12,7 @@
 import type { SecurityFinding } from "./api.ts";
 import { guardFormula, toCsv } from "./bounty-csv.ts";
 import { displayId, STATE_LABEL } from "./security-findings.ts";
+import { citationLabel } from "./security-triage.ts";
 
 // Resolves a repo's default branch from the overview (the export modules never
 // hold the whole overview, just this closure).
@@ -70,6 +71,20 @@ export function exploitText(f: SecurityFinding): string {
   return (f.exploitNarrative ?? []).map((step, i) => `${i + 1}. ${step}`).join("\n");
 }
 
+// "confirmed" plus one "path:line — quote" line per citation; a held-back
+// verdict exports as its status and reason.
+export function verificationText(f: SecurityFinding): string {
+  const v = f.verification;
+  if (!v) return "";
+  if (v.status === "confirmed") {
+    return ["confirmed", ...v.evidence.map((c) => `${citationLabel(c)} — ${c.quote}`)].join("\n");
+  }
+  if (v.status === "refuted") {
+    return `refuted${v.refutingControl ? ` — ${citationLabel(v.refutingControl)} — ${v.refutingControl.quote}` : ""}`;
+  }
+  return `unverifiable${v.detail ? ` — ${v.detail}` : ""}`;
+}
+
 // Same screen-word rule as the transactions CSV: export the label the page
 // shows, but fall back to the raw wire value rather than "" if a state is
 // added to the backend before this map learns it.
@@ -99,6 +114,7 @@ export const FINDINGS_CSV_HEADERS = [
   // Agent-facing detail — the prose the table has no room for.
   "Concern",
   "Evidence",
+  "Verified Evidence",
   "Dataflow",
   "Exploit Narrative",
   "Blast Radius",
@@ -150,6 +166,7 @@ export const findingsCsvRows = (
     text(findingFileUrl(f, branchOf)),
     text(f.concern),
     text(f.evidence),
+    text(verificationText(f)),
     text(dataflowText(f)),
     text(exploitText(f)),
     text(f.blastRadius),
@@ -196,6 +213,7 @@ export function findingDetailBlocks(f: SecurityFinding): DetailBlock[] {
   const blocks: Array<[string, string | null | undefined]> = [
     ["Concern", f.concern],
     ["Evidence", f.evidence],
+    ["Verification", verificationText(f)],
     ["Dataflow", dataflowText(f)],
     ["Exploit narrative", exploitText(f)],
     ["Blast radius", f.blastRadius],

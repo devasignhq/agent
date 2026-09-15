@@ -69,7 +69,10 @@ import {
   requiresNote,
   sortPrecedents,
   suppressedByRulings,
+  citationLabel,
+  heldBackByVerifier,
   validateRuling,
+  verdictLine,
   type RulingAction,
   type RulingDraft,
 } from "./security-triage.ts";
@@ -399,6 +402,11 @@ export const SecurityPage = ({
               repoFilter={repoFilter}
               onOpen={(id) => navigate(`/security/findings/${id}`)}
               onManage={() => navigate(configPath("rulings"))}
+            />
+            <HeldBackSection
+              findings={overview.findings}
+              repoFilter={repoFilter}
+              onOpen={(id) => navigate(`/security/findings/${id}`)}
             />
           </>
         ))}
@@ -968,6 +976,11 @@ const Dashboard = ({
                 <i /> {latest.introduced} introduced
               </span>
             )}
+            {latest.heldBack > 0 && (
+              <span className="vln-tag plain" title="Detections the verifier could not confirm — hidden, never gating">
+                {latest.heldBack} held back
+              </span>
+            )}
             {gate === "fail" ? (
               <span className="vln-tag new">merge gate blocked</span>
             ) : (
@@ -1438,6 +1451,7 @@ const FindingDetail = ({
   };
 
   const terminal = f.state === "resolved" || f.state === "accepted" || f.state === "false_positive";
+  const held = f.state === "unverified";
 
   return (
     <div className="page vln-page vln-dt">
@@ -1445,6 +1459,11 @@ const FindingDetail = ({
         <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
           <SevPill sev={f.severity} />
           <ConfTag conf={f.confidence} />
+          {f.verification?.status === "confirmed" && (
+            <span className="vln-tag ok" title="An independent verifier confirmed this against the repository with cited evidence">
+              verified
+            </span>
+          )}
           {f.state === "new" && <span className="vln-tag new">new</span>}
           {f.cwe && <span className="vln-tag">{f.cwe}</span>}
           <span className="vln-tag plain">{displayId(f)}</span>
@@ -1542,6 +1561,31 @@ const FindingDetail = ({
                   Evidence <span>{f.path}{f.line ? `:${f.line}` : ""}</span>
                 </div>
                 <pre className="vln-code">{f.evidence}</pre>
+              </div>
+            )}
+            {f.verification && (
+              <div className="vln-block">
+                <div className="vln-h">
+                  Verification <span>{f.verification.status}</span>
+                </div>
+                {f.verification.status === "confirmed" ? (
+                  f.verification.evidence.map((c, i) => (
+                    <div key={i}>
+                      <div className="mono mute" style={{ fontSize: 11 }}>{citationLabel(c)}</div>
+                      <pre className="vln-code">{c.quote}</pre>
+                    </div>
+                  ))
+                ) : (
+                  <>
+                    <div style={{ fontSize: 12 }}>{verdictLine(f)}</div>
+                    {f.verification.refutingControl && (
+                      <>
+                        <div className="mono mute" style={{ fontSize: 11 }}>{citationLabel(f.verification.refutingControl)}</div>
+                        <pre className="vln-code">{f.verification.refutingControl.quote}</pre>
+                      </>
+                    )}
+                  </>
+                )}
               </div>
             )}
             {f.remediation && (
@@ -1642,6 +1686,13 @@ const FindingDetail = ({
           off, and the backend refuses them regardless. */}
       {locked && <LockedNotice />}
 
+      {held ? (
+        <div className="vln-dt-foot">
+          <span className="mono mute" style={{ fontSize: 11 }}>
+            held back — {verdictLine(f)}. No triage until a later scan confirms it.
+          </span>
+        </div>
+      ) : (
       <div className="vln-dt-foot">
         {/* Issue / bounty flow: one-click issue first; bounties ride the issue. */}
         {f.issueUrl ? (
@@ -1699,6 +1750,7 @@ const FindingDetail = ({
           </>
         )}
       </div>
+      )}
 
       {confirm && (
         <RulingModal
@@ -1933,6 +1985,52 @@ const SuppressedSection = ({
           <button className="btn ghost sm" onClick={onManage}>
             Manage rulings
           </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Read-only: what the verifier withheld, and why. There is no promote action —
+// a held-back finding surfaces only when a later scan confirms it.
+const HeldBackSection = ({
+  findings,
+  repoFilter,
+  onOpen,
+}: {
+  findings: SecurityFinding[];
+  repoFilter: string;
+  onOpen: (id: string) => void;
+}) => {
+  const [open, setOpen] = React.useState(false);
+  const scoped = repoFilter === "all" ? findings : findings.filter((f) => f.repoId === repoFilter);
+  const rows = heldBackByVerifier(scoped);
+  if (rows.length === 0) return null;
+
+  return (
+    <div className="vln-suppressed">
+      <button className="vln-suppressed-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name={open ? "chevron-d" : "chevron-r"} size={12} />
+        Held back by verifier ({rows.length})
+        <span className="mono mute" style={{ fontSize: 11, marginLeft: 8 }}>
+          not shown above and never gates — the verifier could not confirm these
+        </span>
+      </button>
+      {open && (
+        <div className="vln-suppressed-list">
+          {rows.map((f) => (
+            <div key={f.id} className="vln-suppressed-row">
+              <button className="vln-suppressed-title" onClick={() => onOpen(f.id)}>
+                <SevPill sev={f.severity} />
+                <span className="mono">{f.path}{f.line ? `:${f.line}` : ""}</span>
+                <span>{f.title}</span>
+              </button>
+              <div className="vln-suppressed-why mono mute">
+                ↳ {verdictLine(f)}
+                {f.verification?.refutingControl && <> · “{f.verification.refutingControl.quote}”</>}
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </div>

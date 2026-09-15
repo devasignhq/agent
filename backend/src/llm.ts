@@ -349,6 +349,31 @@ function mockComplete({ system, messages }: { system?: string; messages: LLMMess
   lastMockPrompt.system = system;
   lastMockPrompt.user = last;
 
+  // Security finding verifier (security/verify.ts). Clean by default; with
+  // SECURITY_VERIFY_SAMPLE=confirmed|refuted|unverifiable, verdict 0 cites the
+  // file's first line so the code-side citation check passes.
+  if (system?.includes("security finding verifier")) {
+    const mode = process.env.SECURITY_VERIFY_SAMPLE;
+    if (mode !== "confirmed" && mode !== "refuted" && mode !== "unverifiable") {
+      return JSON.stringify({ verdicts: [] });
+    }
+    const path = /^Path: (.+)$/m.exec(last)?.[1] ?? "";
+    const firstLine = /<<<BEGIN_UNTRUSTED_FILE_CONTENT[^>]*>>>\n([^\n]*)/.exec(last)?.[1] ?? "";
+    const cite = { path, line: 1, quote: firstLine };
+    return JSON.stringify({
+      verdicts: [
+        {
+          index: 0,
+          status: mode,
+          evidence: mode === "unverifiable" ? [] : [cite],
+          ...(mode === "refuted" ? { refutingControl: cite } : {}),
+          severity: "unchanged",
+          reasoning: `[mock] ${mode}`,
+        },
+      ],
+    });
+  }
+
   // MUST stay ahead of the criteria-synthesis branch below: the judge's user
   // message quotes the drafted list, so it contains the literal phrase
   // "acceptance criteria" and would otherwise be answered with criteria.

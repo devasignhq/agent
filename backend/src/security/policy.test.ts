@@ -95,8 +95,8 @@ test("computeGate: fix_ready still blocks (the default branch is still vulnerabl
   assert.equal(gate.verdict, "fail");
 });
 
-test("computeGate: snoozed, resolved, accepted and false_positive findings never gate", () => {
-  for (const state of ["snoozed", "resolved", "accepted", "false_positive"] as const) {
+test("computeGate: snoozed, resolved, accepted, false_positive and unverified findings never gate", () => {
+  for (const state of ["snoozed", "resolved", "accepted", "false_positive", "unverified"] as const) {
     const gate = computeGate({
       findings: [finding({ state })],
       openReviews: [],

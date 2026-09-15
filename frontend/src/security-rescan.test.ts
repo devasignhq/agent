@@ -42,6 +42,7 @@ function scan(repoId: string, status: SecurityScanSummary["status"]): SecuritySc
     introduced: 0,
     resolved: 0,
     stillOpen: 0,
+    heldBack: 0,
   };
 }
 

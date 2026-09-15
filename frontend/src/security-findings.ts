@@ -32,6 +32,7 @@ export const STATE_LABEL: Record<string, { label: string; tone: "new" | "ok" | "
   accepted: { label: "accepted risk", tone: "plain" },
   false_positive: { label: "false positive", tone: "plain" },
   snoozed: { label: "snoozed", tone: "plain" },
+  unverified: { label: "held back", tone: "plain" },
 };
 
 // States that count as "open work" on the dashboard.

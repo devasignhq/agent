@@ -655,7 +655,8 @@ export type BountySummary = { total: number; active: number; inEscrow: number; p
 export type SecuritySeverity = "critical" | "high" | "medium" | "low";
 export type SecurityConfidence = "confirmed" | "probable" | "needs_human";
 export type AttackSurface = "api" | "frontend" | "infra" | "deps" | "secrets";
-export type SecurityFindingState =
+// The states a maintainer can see and act on.
+export type VisibleFindingState =
   | "new"
   | "open"
   | "issue_created"
@@ -665,6 +666,21 @@ export type SecurityFindingState =
   | "accepted"
   | "false_positive"
   | "snoozed";
+// Held back by the verifier: never listed, filtered or gated — only the ledger shows it.
+export type HiddenFindingState = "unverified";
+export type SecurityFindingState = VisibleFindingState | HiddenFindingState;
+
+export type SecurityCitation = { path: string; line?: number; quote: string };
+export type SecurityVerification = {
+  status: "confirmed" | "refuted" | "unverifiable";
+  reason?: "refuted" | "unverifiable" | "evidence_not_in_file" | "no_verdict";
+  detail?: string;
+  evidence: SecurityCitation[];
+  refutingControl?: SecurityCitation;
+  verifiedAt: number;
+  model: string;
+  engine: string;
+};
 
 export type SecurityFindingEvent = {
   at: number;
@@ -686,6 +702,8 @@ export type SecurityFinding = {
   surface: AttackSurface;
   severity: SecuritySeverity;
   confidence: SecurityConfidence;
+  scannerConfidence?: SecurityConfidence;
+  verification?: SecurityVerification;
   title: string;
   concern: string;
   evidence?: string;
@@ -738,6 +756,8 @@ export type SecurityScanSummary = {
   introducedBySeverity?: Partial<Record<SecuritySeverity, number>>;
   resolved: number;
   stillOpen: number;
+  heldBack: number; // detections the verifier did not confirm (hidden)
+  heldBackByReason?: Partial<Record<NonNullable<SecurityVerification["reason"]>, number>>;
   // Set when the run completed without scanning anything (no install token,
   // plan-gated, index not built) — lets the chart say why a column is flat.
   skipped?: "no_install" | "plan_locked" | "index_not_built" | "repo_not_found";

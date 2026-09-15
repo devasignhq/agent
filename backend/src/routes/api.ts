@@ -818,6 +818,7 @@ function queueRepoScan(
     introduced: 0,
     resolved: 0,
     stillOpen: 0,
+    heldBack: 0,
     log: [],
   };
   db.insert("securityScans", run);
@@ -901,9 +902,8 @@ api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimite
     res.json({ ok: true, ...created });
   } catch (err) {
     if (err instanceof IssueCreationError) {
-      return void res
-        .status(err.code === "missing_issues_permission" ? 403 : 502)
-        .json({ error: err.code, message: err.message });
+      const status = err.code === "missing_issues_permission" ? 403 : err.code === "unverified" ? 409 : 502;
+      return void res.status(status).json({ error: err.code, message: err.message });
     }
     res.status(502).json({ error: "github_error", message: String(err).slice(0, 200) });
   }
@@ -933,6 +933,8 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
   const event = (kind: SecurityFindingEvent["kind"], detail: string): SecurityFindingEvent[] =>
     [...(finding.activity ?? []), { at: now, kind, detail, actor: ctx.user.githubLogin }].slice(-50);
 
+  // Held-back rows are not findings yet: no triage until the verifier confirms.
+  if (finding.state === "unverified") return void res.status(409).json({ error: "unverified" });
   const TERMINAL = new Set(["resolved", "accepted", "false_positive"]);
   let patch: Partial<SecurityFinding> | null = null;
 

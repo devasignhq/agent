@@ -18,6 +18,7 @@ import {
   findingsCsv,
   findingsCsvRows,
   originLabel,
+  verificationText,
 } from "./security-export.ts";
 
 const DAY = 86_400_000;
@@ -98,7 +99,7 @@ test("findingsCsv: multi-line concern stays one quoted cell, one row", () => {
 
 test("findingsCsvRows: absent optionals export as empty cells, never 'undefined'", () => {
   const [, row] = findingsCsvRows([finding()], branchOf);
-  for (const col of ["CWE", "Line", "Symbol", "Evidence", "Dataflow", "Exploit Narrative", "Bounty", "Issue URL"]) {
+  for (const col of ["CWE", "Line", "Symbol", "Evidence", "Verified Evidence", "Dataflow", "Exploit Narrative", "Bounty", "Issue URL"]) {
     assert.equal(row[FINDINGS_CSV_HEADERS.indexOf(col)], "", col);
   }
   assert.ok(!row.includes("undefined"));
@@ -154,12 +155,14 @@ test("findingDetailBlocks: full finding yields all blocks in order, sparse omits
     remediation: "r",
     regressionTest: "rt",
     stateReason: "sr",
+    verification: { status: "confirmed", evidence: [{ path: "api/app.ts", line: 4, quote: "use(auth)" }], verifiedAt: 1, model: "m", engine: "v" },
   });
   assert.deepEqual(
     findingDetailBlocks(full).map((b) => b.label),
     [
       "Concern",
       "Evidence",
+      "Verification",
       "Dataflow",
       "Exploit narrative",
       "Blast radius",
@@ -170,6 +173,21 @@ test("findingDetailBlocks: full finding yields all blocks in order, sparse omits
     ]
   );
   assert.deepEqual(findingDetailBlocks(finding()).map((b) => b.label), ["Concern"]);
+  assert.equal(findingDetailBlocks(full)[2].text, "confirmed\napi/app.ts:4 — use(auth)");
+});
+
+test("verificationText: citations for a confirmation, status and reason otherwise", () => {
+  const base = { verifiedAt: 1, model: "m", engine: "v" };
+  assert.equal(
+    verificationText(finding({ verification: { ...base, status: "refuted", reason: "refuted", evidence: [], refutingControl: { path: "app.ts", line: 40, quote: "use(auth)" } } })),
+    "refuted — app.ts:40 — use(auth)"
+  );
+  assert.equal(
+    verificationText(finding({ verification: { ...base, status: "unverifiable", reason: "unverifiable", detail: "needs the WAF config", evidence: [] } })),
+    "unverifiable — needs the WAF config"
+  );
+  const [, row] = findingsCsvRows([finding({ verification: { ...base, status: "confirmed", evidence: [{ path: "a.ts", quote: "x" }] } })], branchOf);
+  assert.equal(row[FINDINGS_CSV_HEADERS.indexOf("Verified Evidence")], "confirmed\na.ts — x");
 });
 
 test("findingMetaLine / findingLocationLine", () => {

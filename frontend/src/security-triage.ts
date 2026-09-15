@@ -8,7 +8,7 @@
 // corpus doesn't make the agent sharper — it trains it to go quiet, and on a
 // security tool that failure is silent. Splitting the reasons at the click is
 // what lets us learn from the corrections and ignore the rest.
-import type { SecurityRulingCode, SecurityPrecedent, SecurityFinding } from "./api.ts";
+import type { SecurityCitation, SecurityRulingCode, SecurityPrecedent, SecurityFinding } from "./api.ts";
 
 export type RulingAction = "false_positive" | "accept";
 
@@ -161,6 +161,40 @@ export function isSuppressedByRuling(f: SecurityFinding): boolean {
 // the whole reason auto-suppression is safe to ship.
 export function suppressedByRulings(findings: SecurityFinding[]): SecurityFinding[] {
   return findings.filter(isSuppressedByRuling).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+}
+
+// --- the verifier ledger ---------------------------------------------------
+
+export function isHeldBack(f: SecurityFinding): boolean {
+  return f.state === "unverified";
+}
+
+// Findings the verifier would not confirm, newest first. Hidden everywhere
+// else, so this ledger is the only place a maintainer can see what was withheld.
+export function heldBackByVerifier(findings: SecurityFinding[]): SecurityFinding[] {
+  return findings.filter(isHeldBack).sort((a, b) => b.lastSeenAt - a.lastSeenAt);
+}
+
+export function citationLabel(c: SecurityCitation): string {
+  return `${c.path}${c.line ? `:${c.line}` : ""}`;
+}
+
+export function verdictLine(f: SecurityFinding): string {
+  const v = f.verification;
+  if (!v) return f.stateReason || "held back";
+  if (v.status === "confirmed") {
+    return `verified — ${v.evidence[0] ? citationLabel(v.evidence[0]) : "cited evidence"}`;
+  }
+  if (v.status === "refuted") {
+    return `refuted — control at ${v.refutingControl ? citationLabel(v.refutingControl) : "an unknown location"}${v.detail ? `: ${v.detail}` : ""}`;
+  }
+  const why =
+    v.reason === "evidence_not_in_file"
+      ? "the quoted evidence is not in the file"
+      : v.reason === "no_verdict"
+      ? "the verifier returned no verdict"
+      : v.detail || "could not be verified from the code";
+  return `not verified — ${why}`;
 }
 
 export function precedentById(

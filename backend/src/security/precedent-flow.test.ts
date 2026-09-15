@@ -26,6 +26,7 @@ const detection = (over: Partial<DetectedFinding> = {}): DetectedFinding => ({
   evidence: "line 42: const accountId = req.body.accountId;",
   symbol: "payoutHandler",
   exploitNarrative: ["a", "b", "c"],
+  verification: { status: "confirmed", evidence: [{ path: "api/routes/payouts.ts", line: 2, quote: "const accountId = req.body.accountId;" }], verifiedAt: 1, model: "m", engine: "verify-v1" },
   ...over,
 });
 
