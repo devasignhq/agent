@@ -66,3 +66,25 @@ test("?setup=browser opens the panel only for the named repo, and closing strips
   assert.equal(withoutBrowserSetup(params).toString(), "repo=r1");
   assert.equal(params.get("setup"), "browser", "the input is not mutated");
 });
+
+const boot = { start: "npm --prefix frontend run dev -- --port 3001", url: "http://localhost:3001", servers: [{ name: "backend" }] };
+
+test("a configured repo shows the command and url CI boots, with its servers", () => {
+  const row = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "unproven", defaultYml: boot }) });
+  assert.deepEqual(row.boot, { start: boot.start, url: boot.url, servers: ["backend"] });
+  const failing = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing", defaultYml: boot }) });
+  assert.deepEqual(failing.boot?.servers, ["backend"], "a boot that failed in CI is the one worth showing");
+  const noServers = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "unproven", defaultYml: { start: boot.start, url: boot.url } }) });
+  assert.deepEqual(noServers.boot?.servers, []);
+});
+
+test("nothing to boot, nothing to show", () => {
+  const cases: Array<[string, BrowserTests]> = [
+    ["not set up", bt({ status: "not_configured", missing: ["start", "url"], defaultYml: { e2e: "auto" } })],
+    ["off", bt({ status: "disabled", defaultYml: { e2e: "never", ...boot } })],
+    ["no snapshot yet", bt({ status: "unknown" })],
+    ["half a block", bt({ status: "unproven", defaultYml: { start: boot.start } })],
+  ];
+  for (const [name, browserTests] of cases) assert.equal(browserTestsRow({ devasignYml: null, browserTests }).boot, null, name);
+  assert.equal(browserTestsRow({ devasignYml: { start: boot.start, url: boot.url }, browserTests: undefined }).boot, null, "an old backend sends no block to show");
+});

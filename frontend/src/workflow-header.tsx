@@ -145,6 +145,12 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
         <dt>Browser tests</dt>
         <dd>
           <span className={browser.tone === "warn" ? "t-warn" : browser.tone === "mute" ? "mute" : undefined}>{browser.text}</span>
+          {browser.boot && (
+            <div className="mute">
+              <span className="mono">{browser.boot.start}</span> → <span className="mono">{browser.boot.url}</span>
+              {browser.boot.servers.length > 0 && ` · with ${browser.boot.servers.join(", ")}`}
+            </div>
+          )}
           {browser.last && <div className="mute">{browser.last}</div>}
           <div><a className="wf-verify-link" href={VERIFY_YML_REFERENCE} target="_blank" rel="noreferrer">verify block reference <Icon name="external" size={10} /></a></div>
         </dd>

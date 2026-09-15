@@ -13,6 +13,8 @@ export type BrowserTestsRow = {
   tone: "ok" | "warn" | "mute";
   text: string;
   last: string | null;
+  // What CI will actually run, once the default branch says how to boot the app.
+  boot: { start: string; url: string; servers: string[] } | null;
 };
 
 // Old backends send no browserTests; the planner's yml snapshot is the best guess then.
@@ -47,7 +49,12 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
     tone = "mute";
   }
   const showLast = status !== "disabled" && !!last && last.count > 0;
-  return { status, tone, text, last: showLast ? `PR #${last.prNumber}: ${uiCriteriaCount(last.count)} checked without a browser` : null };
+  const yml = bt?.defaultYml ?? null;
+  const boot =
+    status !== "not_configured" && status !== "disabled" && yml?.start && yml?.url
+      ? { start: yml.start, url: yml.url, servers: (yml.servers ?? []).map((s) => s.name).filter(Boolean) }
+      : null;
+  return { status, tone, text, last: showLast ? `PR #${last.prNumber}: ${uiCriteriaCount(last.count)} checked without a browser` : null, boot };
 }
 
 /** A fix link names its repo; the panel opens only for that repo (or when none is named). */
