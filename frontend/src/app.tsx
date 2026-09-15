@@ -970,13 +970,17 @@ const TweaksUI = ({ t, setTweak }) => (
 );
 
 const STATSIG_ANON_ID = "a-user";
+// A browser driven by automation (DevAsign's CI browser tests, Playwright) sends no analytics and records no replays.
+const AUTOMATED = typeof navigator !== "undefined" && navigator.webdriver === true;
 
 const App = () => {
   const auth = useAuth();
   const { client } = useClientAsyncInit(
     "client-cBOBwEpbz8xXWVxibGwwth6hoDZFc4TfLNpQlA3BFMw",
     { userID: STATSIG_ANON_ID },
-    { plugins: [new StatsigAutoCapturePlugin(), new StatsigSessionReplayPlugin()] }
+    AUTOMATED
+      ? { plugins: [], loggingEnabled: "disabled" }
+      : { plugins: [new StatsigAutoCapturePlugin(), new StatsigSessionReplayPlugin()] }
   );
 
   // Keep the Statsig identity in sync with the session. useClientAsyncInit
