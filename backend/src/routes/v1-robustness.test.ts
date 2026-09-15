@@ -145,12 +145,13 @@ test("a hostile doctor diagnosis keeps only known fields with checked values", (
     stage: "exfiltrate",
     code: "pwned",
     message: "x".repeat(5000),
-    missingSecrets: ["API_KEY", "lower_case", "BAD NAME", "A".repeat(101), "$(curl evil)", 7, "STRIPE_KEY"],
+    missingSecrets: ["API_KEY", "BAD NAME", "A".repeat(101), "$(curl evil)", "`x`", 7, "STRIPE_KEY"],
     packages: [
       { dir: "backend", install: "npm ci --prefix backend" },
       { dir: "../x", install: "npm ci --prefix ../x" },
       { dir: "x", install: "npm ci --prefix x; curl evil" },
       { dir: "..", install: "npm ci --prefix .." },
+      { dir: ".", install: "npm ci; curl evil" },
       { dir: "frontend", install: "npm ci --prefix backend" },
       { dir: "web", install: "pnpm install --frozen-lockfile --dir web", extra: "dropped" },
       "backend",
@@ -171,17 +172,43 @@ test("a hostile doctor diagnosis keeps only known fields with checked values", (
   assert.equal(out.suggestedFix!.patch, "verify:\n  start: ok\n~~~\n@org/team [x](https://evil)\n~~~");
   assert.doesNotMatch(out.suggestedFix!.patch!, /```/, "no backtick fence survives to close the comment's own");
 
-  // A well-formed diagnosis passes through unchanged.
-  const good = { stage: "install", code: "missing_dependencies", message: "m", packages: [{ dir: ".", install: "npm ci --prefix ." }], logArtifactId: "log-1", suggestedFix: { kind: "yml_patch", instructions: "Set start.", patch: "verify:\n  start: npm run dev\n" } };
-  assert.deepEqual(normalizeDoctor(good), good);
   assert.deepEqual(normalizeDoctor({ message: 42 }), { stage: "tests", code: "unknown", message: "" });
   for (const bad of [null, undefined, "doctor", 7, ["stage"]]) assert.equal(normalizeDoctor(bad), null);
 });
 
+// Shaped exactly as verify/src/doctor.ts (preflight, diagnoseMissingDependencies, diagnosePlaywrightOutput)
+// and run.ts (logArtifactId) emit them; every field judge, report and onboarding read must survive.
+test("every diagnosis the CLI writes passes through the normalizer unchanged", () => {
+  const names = Array.from({ length: 12 }, (_, i) => `SERVICE_${i}_API_TOKEN_SECRET`);
+  const cli = [
+    { stage: "install", code: "wrong_runtime_version", message: "the repository wants Node >=22 but the runner has 20.20.2", suggestedFix: { kind: "workflow_patch", instructions: "Add a setup-node step with node-version: 22 before the DevAsign verify step." } },
+    { stage: "services", code: "missing_secret", message: `${names.length + 1} environment variable(s) named in .devasign.yml are not set in this job: ${[...names, "database_url"].join(", ")}`, missingSecrets: [...names, "database_url"], suggestedFix: { kind: "workflow_patch", instructions: "Map each as env: NAME: ${{ secrets.NAME }} on the verify step, and add the secret in the repository settings." } },
+    { stage: "start", code: "no_start_command", message: "end-to-end tests were planned but nothing tells the runner how to start the app: no playwright.config webServer and no `verify.start`/`verify.url` in .devasign.yml", suggestedFix: { kind: "yml_patch", patch: "verify:\n  start: npm run dev\n  url: http://localhost:3000\n", instructions: "Add verify.start and verify.url to .devasign.yml (the command that serves the app and the URL it listens on)." } },
+    {
+      stage: "install",
+      code: "missing_dependencies",
+      message:
+        "dependencies are not installed on this runner for the repository root (dotenv, uuid, zod, yaml); backend/ (@anthropic-ai/sdk, @opentelemetry/instrumentation-express, jsonwebtoken, @stellar/stellar-sdk); contributor/ (@tanstack/react-query, react-dom, react-router-dom, @vitejs/plugin-react); frontend/ (@statsig/react-bindings, react-dom, @xyflow/react, @vercel/analytics)",
+      packages: [
+        { dir: ".", install: "npm ci" },
+        { dir: "backend", install: "npm ci --prefix backend" },
+        { dir: "contributor", install: "pnpm install --frozen-lockfile --dir contributor" },
+        { dir: "frontend", install: "bun install --cwd frontend" },
+      ],
+      suggestedFix: { kind: "workflow_patch", instructions: "Add an install step before the DevAsign verify step: `npm ci`, `npm ci --prefix backend`, `pnpm install --frozen-lockfile --dir contributor`, `bun install --cwd frontend`." },
+    },
+    { stage: "browsers", code: "browser_install_failed", message: "Playwright's Chromium is not installed on this runner", logArtifactId: "0b7f3f2e-5d2a-4c1e-9a55-2f1d3c9e8b71", suggestedFix: { kind: "manual", instructions: "The runner installs Chromium automatically; if that failed, add `npx playwright install --with-deps chromium` to the workflow." } },
+    { stage: "start", code: "app_not_ready", message: "the app did not become reachable at verify.url before the timeout", logArtifactId: "5c1a9d0e-7b3f-4f8e-a2d4-9e6b1c0f3a58", suggestedFix: { kind: "yml_patch", instructions: "Check verify.start and verify.url in .devasign.yml; make sure the start command serves that URL and needed env vars/services are provided." } },
+  ];
+  assert.ok(cli[1].message.length > 300 && cli[3].message.length > 300, "the long CLI messages exceed the old 300-character cap");
+  for (const d of cli) assert.deepEqual(normalizeDoctor(d), d, `${d.code} is stored as the CLI sent it`);
+});
+
 test("parseResults stores the normalized doctor, not the runner's object", () => {
-  const body = { runId: "r1", sha: "abc1234", results: [], doctor: { stage: "start", code: "app_not_ready", message: "down", secretSauce: "leak", suggestedFix: { kind: "manual", instructions: "fix", patch: "```" } } };
+  const body = { runId: "r1", sha: "abc1234", results: [], doctor: { stage: "start", code: "app_not_ready", message: "down", logArtifactId: "art-1", secretSauce: "leak", suggestedFix: { kind: "manual", instructions: "fix", patch: "```" } } };
   const parsed = parseResults(body, "r1")!;
-  assert.deepEqual(parsed.doctor, { stage: "start", code: "app_not_ready", message: "down", suggestedFix: { kind: "manual", instructions: "fix", patch: "~~~" } });
+  // logArtifactId must survive: resultsHandler marks that log uploaded and the judge cites it as evidence.
+  assert.deepEqual(parsed.doctor, { stage: "start", code: "app_not_ready", message: "down", logArtifactId: "art-1", suggestedFix: { kind: "manual", instructions: "fix", patch: "~~~" } });
   assert.equal(parseResults({ ...body, doctor: "not an object" }, "r1")!.doctor, null);
   assert.equal(parseResults({ ...body, doctor: undefined }, "r1")!.doctor, null);
 });

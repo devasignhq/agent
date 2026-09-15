@@ -16,9 +16,16 @@ const CODES: Record<DoctorCode, true> = {
   unknown: true,
 };
 const FIX_KINDS = new Set(["yml_patch", "workflow_patch", "manual"]);
-const SECRET_NAME = /^[A-Z][A-Z0-9_]{0,99}$/;
+// An environment variable name: .devasign.yml may name lower-case ones too.
+const SECRET_NAME = /^[A-Za-z_][A-Za-z0-9_]{0,99}$/;
+// The CLI's installCommandFor for the repository root carries no directory flag.
+const ROOT_INSTALLS = new Set(["npm ci", "npm install", "pnpm install --frozen-lockfile", "yarn install --frozen-lockfile", "bun install"]);
 
-export const DOCTOR_LIMITS = { message: 300, instructions: 1000, patch: 4000, secrets: 50, packages: 50 };
+// Well above anything the CLI writes (its messages list package and variable names); renderers clip further.
+export const DOCTOR_LIMITS = { message: 2000, instructions: 2000, patch: 4000, secrets: 50, packages: 50 };
+
+const knownPackage = (dir: string, install: string): boolean =>
+  dir === "." ? ROOT_INSTALLS.has(install) : PLAIN_DIR.test(dir) && dir !== ".." && isKnownInstallCommand(install, dir);
 
 const text = (v: unknown, cap: number): string => (typeof v === "string" ? v.slice(0, cap) : "");
 const record = (v: unknown): Record<string, unknown> | null => (v && typeof v === "object" && !Array.isArray(v) ? (v as Record<string, unknown>) : null);
@@ -38,7 +45,7 @@ export function normalizeDoctor(raw: unknown): DoctorDiagnosis | null {
     out.packages = o.packages
       .map(record)
       .filter((p): p is Record<string, unknown> => !!p && typeof p.dir === "string" && typeof p.install === "string")
-      .filter((p) => PLAIN_DIR.test(p.dir as string) && p.dir !== ".." && isKnownInstallCommand(p.install as string, p.dir as string))
+      .filter((p) => knownPackage(p.dir as string, p.install as string))
       .slice(0, DOCTOR_LIMITS.packages)
       .map((p) => ({ dir: p.dir as string, install: p.install as string }));
   }
