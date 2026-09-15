@@ -11,6 +11,8 @@ process.env.DATABASE_URL = "";
 process.env.ANTHROPIC_API_KEY = "";
 process.env.GEMINI_API_KEY = "";
 process.env.STATSIG_SECRET_KEY = "";
+// Always the dev session secret, whatever backend/.env holds: scripts/devasign-login.mjs mints with it.
+process.env.SESSION_SECRET = "";
 // ||= so a second, parallel instance can point at its own frontend port.
 process.env.WEB_ORIGIN ||= "http://localhost:3001";
 process.env.PORT ||= "8787"; // ||= so a caller can run a second instance elsewhere
