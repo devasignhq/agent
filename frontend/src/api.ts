@@ -655,7 +655,8 @@ export type BountySummary = { total: number; active: number; inEscrow: number; p
 export type SecuritySeverity = "critical" | "high" | "medium" | "low";
 export type SecurityConfidence = "confirmed" | "probable" | "needs_human";
 export type AttackSurface = "api" | "frontend" | "infra" | "deps" | "secrets";
-export type SecurityFindingState =
+// The states a maintainer can see and act on.
+export type VisibleFindingState =
   | "new"
   | "open"
   | "issue_created"
@@ -664,8 +665,10 @@ export type SecurityFindingState =
   | "resolved"
   | "accepted"
   | "false_positive"
-  | "snoozed"
-  | "unverified"; // verifier refuted / could not confirm — hidden, never gates
+  | "snoozed";
+// Held back by the verifier: never listed, filtered or gated — only the ledger shows it.
+export type HiddenFindingState = "unverified";
+export type SecurityFindingState = VisibleFindingState | HiddenFindingState;
 
 export type SecurityCitation = { path: string; line?: number; quote: string };
 export type SecurityVerification = {
