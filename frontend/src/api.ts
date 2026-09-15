@@ -449,11 +449,12 @@ export type VerifyTestRow = {
   durationMs: number;
   evidence: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; expired: boolean }>;
   adopted: TestAdoption | null;
+  archived: { at: number } | null;
   repo: { id: string; name: string };
   review: { id: string; prNumber: number; prTitle: string };
   run: { id: string; sha: string; status: VerifyRunStatus; createdAt: number; checkRunUrl: string | null };
 };
-export type VerifyTestCounts = { ran: number; e2e: number; unit: number; passed: number; failed: number };
+export type VerifyTestCounts = { ran: number; e2e: number; unit: number; passed: number; failed: number; archived: number };
 export type VerifyTestsResponse = {
   rows: VerifyTestRow[];
   counts: VerifyTestCounts;
@@ -988,6 +989,11 @@ export const api = {
     request<{ status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string }>(`/api/reviews/${reviewId}/verify/adopt`, {
       method: "POST",
       body: JSON.stringify({ runId, testIds }),
+    }),
+  archiveTests: (reviewId: string, paths: string[], archived: boolean) =>
+    request<{ ok: true; archivedTests: Array<{ path: string; at: number }> }>(`/api/reviews/${reviewId}/verify/archive`, {
+      method: "POST",
+      body: JSON.stringify({ paths, archived }),
     }),
   verifySetup: (repoId: string) =>
     request<{ onboarding: NonNullable<Repository["verify"]>["onboarding"]; detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null; devasignYml: { start?: string; url?: string; e2e?: string } | null; runnerSeen: boolean }>(`/api/repositories/${repoId}/verify/setup`),

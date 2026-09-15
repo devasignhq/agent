@@ -4,7 +4,7 @@ import { db, onRowChange } from "../db.js";
 import { installMembers } from "../github/installations.js";
 import { hasClients, notifyAudience } from "../notifications-stream.js";
 import { changedBeyond } from "../bounties/live.js";
-import type { VerifyArtifact, VerifyRun } from "../types.js";
+import type { PRReview, VerifyArtifact, VerifyRun } from "../types.js";
 
 // updatedAt is stamped on every updateRun; a reaper touch that changes nothing
 // else must not wake every open tab.
@@ -38,6 +38,12 @@ export function verifyRowMatters(collection: string, row: unknown, prev: unknown
     if (p && p.state === a.state) return null;
     if (!p && a.state === "pending_upload") return null;
     return a.repoId;
+  }
+  if (collection === "prReviews") {
+    const r = row as PRReview;
+    const p = prev as PRReview | null;
+    if (!p || JSON.stringify(p.archivedTests ?? []) === JSON.stringify(r.archivedTests ?? [])) return null;
+    return r.repoId;
   }
   return null;
 }

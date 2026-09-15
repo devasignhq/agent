@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { RunView, VerifyTestRow } from "./api.ts";
-import { EMPTY_FILTERS, filterRows, markAdopted, pickEvidence, repoOptions, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
+import { EMPTY_FILTERS, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
 
 const row = (over: Partial<VerifyTestRow> & { key: string }): VerifyTestRow => ({
   testId: over.key,
@@ -17,6 +17,7 @@ const row = (over: Partial<VerifyTestRow> & { key: string }): VerifyTestRow => (
   durationMs: 10,
   evidence: [],
   adopted: null,
+  archived: null,
   repo: { id: "r1", name: "acme/shop" },
   review: { id: "rev1", prNumber: 7, prTitle: "Refunds" },
   run: { id: "run1", sha: "abc", status: "completed", createdAt: 100, checkRunUrl: null },
@@ -36,6 +37,7 @@ test("status tone and label", () => {
   assert.equal(statusTone("skipped"), "nit");
   assert.equal(statusTone("not_run"), "mute");
   assert.equal(statusLabel("fail"), "FAIL");
+  assert.equal(statusLabel("error"), "FAIL");
   assert.equal(statusLabel("not_run"), "not run");
   assert.equal(statusLabel("pass"), "pass");
 });
@@ -55,6 +57,31 @@ test("filters narrow by repo, category, status, origin, review, and search", () 
   assert.deepEqual(keys({ q: "CHECKOUT" }), ["a"]);
   assert.deepEqual(keys({ q: "#9" }), ["b"]);
   assert.deepEqual(keys({ q: "acme/api" }), ["b"]);
+});
+
+test("the Failed filter includes errored tests; archived rows show only under the Archived view", () => {
+  const rows = [
+    row({ key: "p" }),
+    row({ key: "e", status: "error" }),
+    row({ key: "x", status: "fail", archived: { at: 1 } }),
+  ];
+  const keys = (f: Partial<typeof EMPTY_FILTERS>) => filterRows(rows, { ...EMPTY_FILTERS, ...f }).map((r) => r.key);
+  assert.deepEqual(keys({}), ["p", "e"]);
+  assert.deepEqual(keys({ status: "fail" }), ["e"]);
+  assert.deepEqual(keys({ archived: true }), ["x"]);
+  assert.deepEqual(keys({ archived: true, status: "fail" }), ["x"]);
+});
+
+test("markArchived toggles matching paths of one review; countRows sets archived rows apart", () => {
+  const rows = [
+    row({ key: "a", path: "a.ts" }),
+    row({ key: "b", path: "b.ts", status: "error" }),
+    row({ key: "c", path: "a.ts", review: { id: "rev2", prNumber: 9, prTitle: "Tax" } }),
+  ];
+  const archived = markArchived(rows, "rev1", ["a.ts"], true, 5);
+  assert.deepEqual(archived.map((r) => r.archived), [{ at: 5 }, null, null]);
+  assert.deepEqual(countRows(archived), { ran: 2, e2e: 2, unit: 0, passed: 1, failed: 1, archived: 1 });
+  assert.equal(markArchived(archived, "rev1", ["a.ts"], false)[0].archived, null);
 });
 
 test("sort: newest run first, then failures, then path", () => {

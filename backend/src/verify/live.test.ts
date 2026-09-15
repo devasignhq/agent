@@ -21,3 +21,9 @@ test("artifacts: only state transitions signal; a signing insert is silent; othe
   assert.equal(verifyRowMatters("verifyArtifacts", art({ state: "uploaded", bytes: 5 }), art({ state: "uploaded" })), null);
   assert.equal(verifyRowMatters("prReviews", { repoId: "x" }, null), null);
 });
+
+test("prReviews: only an archivedTests change signals", () => {
+  const rev = (over: Record<string, unknown> = {}) => ({ id: "v", repoId: "repo-1", status: "passed", ...over });
+  assert.equal(verifyRowMatters("prReviews", rev({ status: "failed" }), rev()), null);
+  assert.equal(verifyRowMatters("prReviews", rev({ archivedTests: [{ path: "a", at: 1, by: "u" }] }), rev()), "repo-1");
+});
