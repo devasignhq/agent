@@ -1,6 +1,9 @@
 // Setup diagnosis. A first run on an unconfigured repo must explain itself,
 // never fail the pipeline, and never pretend a broken setup is a broken PR.
-import type { DetectedSetup, DevasignVerifyConfig, DoctorDiagnosis, PlanTest } from "./types.js";
+import { existsSync, realpathSync } from "node:fs";
+import path from "node:path";
+import { installCommandFor, packageDirOf } from "./detect.js";
+import type { DetectedSetup, DevasignVerifyConfig, DoctorDiagnosis, PlanTest, RunnerResult } from "./types.js";
 
 function satisfies(actual: string, range: string): boolean {
   const cur = /v?(\d+)\.(\d+)/.exec(actual);
@@ -50,6 +53,62 @@ export function preflight(args: {
     };
   }
   return null;
+}
+
+// Node ESM: "Cannot find package 'dotenv' imported from /abs/backend/src/config.ts";
+// jest/CJS: "Cannot find module 'uuid' from 'src/x.ts'". Relative and absolute
+// specifiers are a missing file, not a missing install, and are left alone.
+const MISSING_PACKAGE = /Cannot find (?:package|module) '((?:@[^'/]+\/)?[^'./][^']*)'(?: imported)? from '?([^'\s]+)'?/;
+
+/**
+ * Tests that died loading a bare package point at a package directory whose
+ * dependencies were never installed on this runner — a workflow gap, not a
+ * failed criterion. Absolute importer paths are read relative to `root`.
+ */
+export function diagnoseMissingDependencies(results: RunnerResult[], root: string): DoctorDiagnosis | null {
+  const byDir = new Map<string, Set<string>>();
+  // Node prints real paths; the workspace root may be reached through a symlink (macOS tmp).
+  const real = (p: string) => {
+    try {
+      return realpathSync(p);
+    } catch {
+      return p;
+    }
+  };
+  const inside = (abs: string): string | null => {
+    for (const base of [root, real(root)]) {
+      for (const p of [abs, real(abs)]) {
+        const rel = path.relative(base, p);
+        if (rel && !rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
+      }
+    }
+    return null;
+  };
+  for (const r of results) {
+    for (const text of [r.error, ...r.attempts.map((a) => a.error)]) {
+      const m = text ? MISSING_PACKAGE.exec(text) : null;
+      if (!m) continue;
+      const importer = path.isAbsolute(m[2]) ? inside(m[2]) : m[2];
+      if (!importer || importer.startsWith("..")) continue;
+      const dir = packageDirOf(root, importer.replace(/\\/g, "/"));
+      if (!dir || existsSync(path.join(root, dir, "node_modules"))) continue;
+      byDir.set(dir, (byDir.get(dir) ?? new Set()).add(m[1].split("/").slice(0, m[1].startsWith("@") ? 2 : 1).join("/")));
+    }
+  }
+  if (!byDir.size) return null;
+  const hasFile = (rel: string) => existsSync(path.join(root, rel));
+  const packages = [...byDir.keys()].sort().map((dir) => ({ dir, install: installCommandFor(dir, hasFile) }));
+  const where = packages.map((p) => `${p.dir === "." ? "the repository root" : `${p.dir}/`} (${[...byDir.get(p.dir)!].slice(0, 4).join(", ")})`).join("; ");
+  return {
+    stage: "install",
+    code: "missing_dependencies",
+    message: `dependencies are not installed on this runner for ${where}`,
+    packages,
+    suggestedFix: {
+      kind: "workflow_patch",
+      instructions: `Add an install step before the DevAsign verify step: ${packages.map((p) => `\`${p.install}\``).join(", ")}.`,
+    },
+  };
 }
 
 /** Turn a Playwright boot failure (from its output) into a diagnosis, or null. */

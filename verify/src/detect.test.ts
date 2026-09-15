@@ -50,3 +50,20 @@ test("manifestNames tolerates malformed or absent manifests", () => {
   assert.deepEqual(manifestNames("{ not json"), []);
   assert.deepEqual(manifestNames(JSON.stringify({ dependencies: { a: "1" }, devDependencies: { b: "2" } })), ["a", "b"]);
 });
+
+test("no root manifest: top-level packages are the install units; node-test is seen through them, vitest is not", async () => {
+  const root = repo({
+    "backend/package.json": { scripts: { test: "node --import tsx/esm --test 'src/**/*.test.ts'" }, devDependencies: { vitest: "^3.0.0" } },
+    "backend/package-lock.json": "{}",
+    "backend/src/a.ts": "export const a = 1;",
+    "frontend/package.json": { scripts: { test: "node --test" } },
+    "frontend/src/app.tsx": "export const App = () => null;",
+  });
+  const s = await detectSetup(root, { probeRuntimes: false });
+  assert.deepEqual(s.packages, ["backend", "frontend"]);
+  assert.equal(s.packageManager, "npm");
+  assert.deepEqual(s.frameworks.map((f) => f.name), ["node-test"], "a package-local vitest cannot be imported from .devasign/tests");
+  assert.deepEqual(s.dependencies, []);
+  const rooted = await detectSetup(repo({ "package.json": { name: "x" }, "backend/package.json": { name: "b" } }), { probeRuntimes: false });
+  assert.equal(rooted.packages, undefined);
+});

@@ -4,6 +4,7 @@ import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import { aggregateAttempts, classifyAttempt } from "../classify.js";
+import { packageDirOf } from "../detect.js";
 import { runCommand } from "../exec.js";
 import { log } from "../log.js";
 import type { LocalArtifact, PlanTest, RunnerAttempt, RunnerResult, TestRunner } from "../types.js";
@@ -15,17 +16,22 @@ export function tsxLoader(): string {
   return require.resolve("tsx/esm");
 }
 
-function bin(root: string, name: string): string | null {
-  const p = path.join(root, "node_modules", ".bin", name);
-  return existsSync(p) ? p : null;
+function bin(roots: string | string[], name: string): string | null {
+  for (const root of Array.isArray(roots) ? roots : [roots]) {
+    const p = path.join(root, "node_modules", ".bin", name);
+    if (existsSync(p)) return p;
+  }
+  return null;
 }
 
-export function commandForFile(runner: TestRunner, file: string, root: string): { cmd: string; args: string[] } {
+// `roots`: where a framework binary may live — the package the test exercises
+// first, then the repo root.
+export function commandForFile(runner: TestRunner, file: string, roots: string | string[]): { cmd: string; args: string[] } {
   switch (runner) {
     case "vitest":
-      return { cmd: bin(root, "vitest") ?? "npx", args: [...(bin(root, "vitest") ? [] : ["--no-install", "vitest"]), "run", "--reporter=default", file] };
+      return { cmd: bin(roots, "vitest") ?? "npx", args: [...(bin(roots, "vitest") ? [] : ["--no-install", "vitest"]), "run", "--reporter=default", file] };
     case "jest":
-      return { cmd: bin(root, "jest") ?? "npx", args: [...(bin(root, "jest") ? [] : ["--no-install", "jest"]), "--runTestsByPath", file] };
+      return { cmd: bin(roots, "jest") ?? "npx", args: [...(bin(roots, "jest") ? [] : ["--no-install", "jest"]), "--runTestsByPath", file] };
     case "pytest":
       return { cmd: "python3", args: ["-m", "pytest", "-q", "-p", "no:cacheprovider", file] };
     case "go":
@@ -52,8 +58,12 @@ export async function runFileTests(args: {
     const attemptRefs: string[][] = [];
     const file = args.fileOf?.(t) ?? t.path;
     log.group(`${t.origin} ${t.level} ${t.path}${file !== t.path ? ` → ${file}` : ""} (${t.runner})`);
+    // A framework binary lives with the package the test exercises, not at a root
+    // that may carry no manifest at all.
+    const pkgDir = t.targetFiles?.[0] ? packageDirOf(args.ws.root, t.targetFiles[0]) : null;
+    const binRoots = pkgDir && pkgDir !== "." ? [path.join(args.ws.root, pkgDir), args.ws.root] : args.ws.root;
     for (let n = 1; n <= max; n++) {
-      const { cmd, args: argv } = commandForFile(t.runner, file, args.ws.root);
+      const { cmd, args: argv } = commandForFile(t.runner, file, binRoots);
       const logFile = path.join(args.ws.artifactsDir, "logs", `${t.id}-${n}.log`);
       const r = await runCommand({ cmd, args: argv, cwd: args.ws.root, timeoutMs: args.timeoutMs, logFile, onLine: (l) => console.log(`  ${l}`) });
       const c = classifyAttempt(t.runner, r);

@@ -1,8 +1,11 @@
 // node --import tsx/esm --test src/doctor.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { diagnosePlaywrightOutput, preflight } from "./doctor.js";
-import type { PlanTest } from "./types.js";
+import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { diagnoseMissingDependencies, diagnosePlaywrightOutput, preflight } from "./doctor.js";
+import type { PlanTest, RunnerResult } from "./types.js";
 
 const pw = { runner: "playwright" } as PlanTest;
 const setup = { languages: [], frameworks: [], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] as never[] };
@@ -27,4 +30,30 @@ test("Playwright output maps to browser/boot diagnoses", () => {
   assert.equal(diagnosePlaywrightOutput("Error: Process from config.webServer was not able to start. Exit code: 1")?.code, "app_not_ready");
   assert.equal(diagnosePlaywrightOutput("page.goto: net::ERR_CONNECTION_REFUSED")?.code, "app_not_ready");
   assert.equal(diagnosePlaywrightOutput("1 failed"), null);
+});
+
+function errored(error: string): RunnerResult {
+  return { id: "r-1", testId: "1", criterionIds: ["1"], test: ".devasign/tests/a.test.ts", runner: "node-test", level: "unit", origin: "generated", status: "error", attempts: [{ n: 1, status: "error", durationMs: 1, error, artifactIds: [] }], durationMs: 1, error, artifactIds: [] };
+}
+
+test("a test that died loading a bare package from a package whose node_modules is absent is a missing_dependencies diagnosis", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-doc-"));
+  for (const rel of ["backend/package.json", "backend/package-lock.json", "frontend/package.json"]) {
+    mkdirSync(path.dirname(path.join(root, rel)), { recursive: true });
+    writeFileSync(path.join(root, rel), "{}");
+  }
+  const node = errored(`Error [ERR_MODULE_NOT_FOUND]: Cannot find package 'dotenv' imported from ${path.join(root, "backend/src/config.ts")}`);
+  const jest = errored("Cannot find module '@anthropic-ai/sdk/core' from 'frontend/src/api.ts'");
+  const d = diagnoseMissingDependencies([node, jest], root)!;
+  assert.equal(d.code, "missing_dependencies");
+  assert.equal(d.stage, "install");
+  assert.deepEqual(d.packages, [{ dir: "backend", install: "npm ci --prefix backend" }, { dir: "frontend", install: "npm install --prefix frontend" }]);
+  assert.match(d.message, /backend\/ \(dotenv\); frontend\/ \(@anthropic-ai\/sdk\)/);
+  assert.match(d.suggestedFix!.instructions, /`npm ci --prefix backend`, `npm install --prefix frontend`/);
+
+  // A relative import of nothing is a wrong test, not a missing install; an installed package dir is fine.
+  assert.equal(diagnoseMissingDependencies([errored(`Cannot find module '${path.join(root, ".devasign/tests/tests-view.ts")}' imported from ${path.join(root, ".devasign/tests/a.test.ts")}`)], root), null);
+  mkdirSync(path.join(root, "backend/node_modules"));
+  assert.equal(diagnoseMissingDependencies([node], root), null);
+  assert.equal(diagnoseMissingDependencies([errored("AssertionError: 1 !== 2")], root), null);
 });

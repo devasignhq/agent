@@ -153,6 +153,7 @@ export function normalizeDetectedSetup(raw: unknown): DetectedSetup | null {
     // Spread, not filled in like the rest: absent must stay absent, because it is what
     // tells the planner not to enforce an import allow-list it cannot trust.
     ...(Array.isArray(o.dependencies) ? { dependencies: strings(o.dependencies, 300).filter((n) => n.length <= 214 && PACKAGE_NAME.test(n)) } : {}),
+    ...(Array.isArray(o.packages) ? { packages: strings(o.packages, 50).filter((d) => /^[A-Za-z0-9_.-]+$/.test(d) && d !== "." && d !== "..") } : {}),
     testCommands: strings(o.testCommands, 20),
     envExampleVars: strings(o.envExampleVars, 100),
     existingWorkflows: strings(o.existingWorkflows, 50),

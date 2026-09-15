@@ -5,6 +5,7 @@
 // Fails open on purpose: without a dependency list we allow everything, because a
 // dropped legitimate test costs more than the bug this guards against.
 import { builtinModules } from "node:module";
+import { posix } from "node:path";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import type { DetectedSetup, TestRunner } from "./contract.js";
 
@@ -52,6 +53,27 @@ export function hasRenderStack(setup: DetectedSetup): boolean {
   const has = (n: string) => setup.dependencies!.includes(n);
   const domCapable = setup.frameworks.some((f) => f.name === "vitest" || f.name === "jest");
   return domCapable && RENDER_LIBS.some(has) && DOM_ENVS.some(has);
+}
+
+const RESOLVE_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".jsx", ".json"];
+
+/** Relative specifiers that resolve to nothing in the repository, as written, from `fromPath`. */
+export function unresolvedRelativeImports(content: string, fromPath: string, exists: (p: string) => boolean): string[] {
+  const spans = codeSpans(content);
+  const dir = posix.dirname(fromPath.replace(/^\.\//, ""));
+  const missing = new Set<string>();
+  for (const m of content.matchAll(BARE_IMPORT)) {
+    const [, lead, , spec] = m;
+    if (!isRewritableSpecifier(spans, m.index, lead, spec)) continue;
+    if (/\b(?:import|export)\s+type\b/.test(lead)) continue;
+    if (!spec.startsWith("./") && !spec.startsWith("../")) continue;
+    const target = posix.normalize(posix.join(dir, spec));
+    if (target.startsWith("..")) continue; // reported by the rebase step as above_root
+    const stem = target.replace(/\.[cm]?[jt]sx?$/, "");
+    const candidates = [target, ...RESOLVE_EXTS.map((e) => stem + e), ...RESOLVE_EXTS.map((e) => `${target}/index${e}`)];
+    if (!candidates.some(exists)) missing.add(spec);
+  }
+  return [...missing];
 }
 
 /** Package roots the content imports that the repo cannot resolve. Empty when not enforcing. */

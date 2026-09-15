@@ -56,6 +56,9 @@ export type DetectedSetup = {
   // Declared package names (dependencies + devDependencies). Absent on rows stored
   // before this field existed, so read it as `?? []`.
   dependencies?: string[];
+  // Top-level directories that carry their own package.json when the root has none
+  // ("backend", "frontend"). Each installs and resolves its own dependencies.
+  packages?: string[];
   testCommands: string[];
   envExampleVars: string[];
   existingWorkflows: string[];
@@ -71,6 +74,7 @@ export type DoctorCode =
   | "missing_secret"
   | "wrong_runtime_version"
   | "install_failed"
+  | "missing_dependencies"
   | "app_not_ready"
   | "browser_install_failed"
   | "unknown";
@@ -81,6 +85,9 @@ export type DoctorDiagnosis = {
   message: string;
   missingSecrets?: string[];
   logArtifactId?: string;
+  // missing_dependencies: the package directories whose node_modules were absent,
+  // each with the install command the workflow needs before the verify step.
+  packages?: Array<{ dir: string; install: string }>;
   suggestedFix?: { kind: "yml_patch" | "workflow_patch" | "manual"; patch?: string; instructions: string };
 };
 

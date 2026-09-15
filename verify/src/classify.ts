@@ -79,9 +79,14 @@ function jestFailures(lines: string[]): Failure[] {
 const TAP_NOT_OK = /^\s*not ok \d+ - /;
 const TAP_END = /^\s*(?:\.\.\.$|#|(?:not )?ok \d+ )/;
 const TAP_FRAME = /\(?((?:file:\/\/)?[^()\s]+:\d+:\d+)\)?$/;
+// The message line of an echoed error, not the source line that threw it.
+const CRASH_MESSAGE = /\b\w*Error(?: \[[A-Z_]+\])?: |Cannot find (?:package|module) /;
 
 function tapFailures(lines: string[]): Failure[] {
   const out: Failure[] = [];
+  // A file that dies loading gets a bare `error: 'test failed'`; the cause is the
+  // uncaught error the reporter echoes as "# …" comment lines above it.
+  const crash = lines.find((l) => /^\s*# /.test(l) && INFRA.test(l) && CRASH_MESSAGE.test(l))?.replace(/^\s*# /, "").trim();
   for (let i = 0; i < lines.length; i++) {
     if (!TAP_NOT_OK.test(lines[i])) continue;
     const block: string[] = [];
@@ -90,7 +95,8 @@ function tapFailures(lines: string[]): Failure[] {
     // A suite's own entry only rolls up the children reported above it.
     if (/failureType: 'subtestsFailed'/.test(yaml)) continue;
     const name = /^\s*name: '([^']+)'/m.exec(yaml)?.[1];
-    const error = tapError(block);
+    const yamlError = tapError(block);
+    const error = yamlError === "test failed" && crash ? crash : yamlError;
     const stack = block.findIndex((l) => /^\s*stack: /.test(l));
     out.push({
       message: name && !error.startsWith(name) ? `${name}: ${error}` : error,
