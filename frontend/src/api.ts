@@ -473,7 +473,8 @@ export type BrowserTests = {
   missing: Array<"start" | "url">;
   lastBrowserless: LastBrowserless | null;
   fixUrl: string;
-  defaultYml: object | null;
+  // The default branch's verify block: how CI boots the app for browser tests.
+  defaultYml: { e2e?: string; start?: string; url?: string; servers?: Array<{ name: string }> } | null;
 };
 export type BrowserSetupEntry = {
   repoId: string;
