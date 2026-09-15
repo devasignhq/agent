@@ -19,12 +19,14 @@ import { artifactStorage } from "./storage.js";
 import { notifyForReview } from "../notifications.js";
 import { afterFeedbackRunSettled } from "./feedback.js";
 import { noteRunSucceeded, postDoctorFollowup } from "./onboarding/job.js";
-import { browserlessSummary } from "./browserless.js";
+import { browserlessSummary, type E2eWithheld } from "./browserless.js";
 import { patchRepoVerify } from "./repo-state.js";
 import { v4 as uuid } from "uuid";
 
 export const FLAKY_REASON = "flaky test — quarantined";
 export const NO_BROWSER_REASON = "the app did not start for browser tests";
+export const RUNNER_OUTDATED_REASON = "the runner in CI is too old to boot verify.servers or run verify.login — update @devasign/verify";
+export const BOOT_PAUSED_REASON = "DevAsign has paused browser tests that boot verify.servers or verify.login";
 
 const EVIDENCE_KIND_ORDER: VerifyArtifact["kind"][] = ["log", "screenshot", "test_file", "video", "trace", "poster"];
 
@@ -58,10 +60,16 @@ export function computeVerdicts(args: {
   plan: VerifyPlan | null;
   doctor: DoctorDiagnosis | null;
   artifacts: VerifyArtifact[];
+  withheld?: E2eWithheld | null;
 }): CriterionVerdict[] {
   const out: CriterionVerdict[] = [];
   const planned = new Map((args.plan?.unverifiable ?? []).map((u) => [u.criterionId, u]));
   const strict = args.plan?.browser?.policy === "always" ? args.plan.browser : null;
+  // The runner never received the plan's browser tests, so no e2e result says which criteria they covered.
+  const withheldE2e = new Set(args.withheld ? (args.plan?.tests ?? []).filter((t) => t.runner === "playwright").flatMap((t) => t.criterionIds) : []);
+  const withheldReason = args.withheld === "runner_outdated" ? RUNNER_OUTDATED_REASON : args.withheld === "managed_boot_off" ? BOOT_PAUSED_REASON : NO_BROWSER_REASON;
+  // A pause is DevAsign's own switch; the repo's setup has nothing to fix.
+  const withheldFixUrl = args.withheld === "managed_boot_off" ? undefined : args.plan?.browser?.fixUrl;
   for (const c of args.criteria) {
     if (!isVerifiable(c)) continue;
     const all = args.results.filter((r) => r.criterionIds.includes(c.id));
@@ -70,12 +78,14 @@ export function computeVerdicts(args: {
     // the browser saw.
     const browserRan = all.some((r) => r.level === "e2e" && r.status !== "error" && r.status !== "skipped");
     const covering = browserRan ? all.filter((r) => r.level === "e2e") : all;
-    const stamp = c.kind !== "ui" ? null : browserRan ? "ran" : all.some((r) => r.level === "e2e") ? "fallback" : null;
+    const held = c.kind === "ui" && !browserRan && withheldE2e.has(c.id);
+    const stamp = c.kind !== "ui" ? null : browserRan ? "ran" : held || all.some((r) => r.level === "e2e") ? "fallback" : null;
     // A fallback stamps only a pass or fail the lower tests decided. `e2e: always` refuses every
     // verdict its browser tests could not decide, whichever way the tests below them went.
     const decided = (v: CriterionVerdict): CriterionVerdict => {
       if (stamp === "fallback" && strict) {
-        return { criterionId: v.criterionId, verdict: "unverifiable", reason: NO_BROWSER_REASON, evidenceRefs: v.evidenceRefs, fixUrl: strict.fixUrl, ...(v.verdict !== "unverifiable" ? { browser: stamp } : {}) };
+        const fixUrl = held ? withheldFixUrl : strict.fixUrl;
+        return { criterionId: v.criterionId, verdict: "unverifiable", reason: held ? withheldReason : NO_BROWSER_REASON, evidenceRefs: v.evidenceRefs, ...(fixUrl ? { fixUrl } : {}), ...(v.verdict !== "unverifiable" ? { browser: stamp } : {}) };
       }
       if (!stamp || (stamp === "fallback" && v.verdict === "unverifiable")) return v;
       return { ...v, browser: stamp };
@@ -84,6 +94,10 @@ export function computeVerdicts(args: {
     // subset); criteria whose own tests ran keep their real pass/fail.
     if (args.doctor && (!covering.length || covering.every((r) => r.status === "error" || r.status === "skipped"))) {
       out.push(decided({ criterionId: c.id, verdict: "unverifiable", reason: `setup needs attention: ${args.doctor.message}`.slice(0, 300), evidenceRefs: args.doctor.logArtifactId ? [{ artifactId: args.doctor.logArtifactId }] : [] }));
+      continue;
+    }
+    if (!covering.length && held) {
+      out.push({ criterionId: c.id, verdict: "unverifiable", reason: withheldReason, evidenceRefs: [], ...(withheldFixUrl ? { fixUrl: withheldFixUrl } : {}) });
       continue;
     }
     if (!covering.length) {
@@ -152,8 +166,9 @@ export function mergeModelVerdicts(code: CriterionVerdict[], model: ModelVerdict
     if (v.verdict !== "unverifiable" && m.verdict === "unverifiable") {
       return { ...v, verdict: "unverifiable", reason, evidenceRefs };
     }
-    // Flaky and strict-browser reasons are fixed wording the model may not rewrite.
-    return { ...v, reason: v.verdict === "unverifiable" && (v.flaky || v.reason === NO_BROWSER_REASON) ? v.reason : reason, evidenceRefs };
+    // Flaky and browser-refusal reasons are fixed wording the model may not rewrite.
+    const fixed = v.flaky || v.reason === NO_BROWSER_REASON || v.reason === RUNNER_OUTDATED_REASON || v.reason === BOOT_PAUSED_REASON;
+    return { ...v, reason: v.verdict === "unverifiable" && fixed ? v.reason : reason, evidenceRefs };
   });
 }
 
@@ -161,17 +176,22 @@ export function mergeModelVerdicts(code: CriterionVerdict[], model: ModelVerdict
 function noteBrowserless(run: VerifyRun, criteria: Criterion[], verdicts: CriterionVerdict[], results: RunnerResult[], doctor: DoctorDiagnosis | null, plan: VerifyPlan | null, at: number): void {
   const browser = plan?.browser;
   if (!browser) return;
-  const s = browserlessSummary({ criteria, verdicts, plan });
+  const withheld = run.runnerMeta?.e2eWithheld ?? null;
+  // A paused run says nothing about the repo's setup, so whatever the last real run found stands.
+  if (withheld === "managed_boot_off") return;
+  const s = browserlessSummary({ criteria, verdicts, plan, withheld });
   const cur = db.find("repositories", (r) => r.id === run.repoId)?.verify?.lastBrowserless ?? null;
-  let next: RepoVerifyState["lastBrowserless"] = s ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at } : null;
+  let next: RepoVerifyState["lastBrowserless"] = s && s.reason !== "paused" ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at } : null;
   if (!s) {
     const ui = new Set(criteria.filter((c) => c.kind === "ui").map((c) => c.id));
     const e2e = results.filter((r) => r.level === "e2e");
-    // No test below decided these criteria, but the app still did not start: keep a did_not_start flag, or record one.
-    const noBrowserRan = e2e.some((r) => r.criterionIds.some((id) => ui.has(id))) && e2e.every((r) => r.status === "error" || r.status === "skipped");
+    const heldUi = !!withheld && (plan?.tests ?? []).some((t) => t.runner === "playwright" && t.criterionIds.some((id) => ui.has(id)));
+    // No test below decided these criteria, but no browser could run: keep the flag for that cause, or record one.
+    const noBrowserRan = (heldUi || e2e.some((r) => r.criterionIds.some((id) => ui.has(id)))) && e2e.every((r) => r.status === "error" || r.status === "skipped");
     if (browser.policy !== "never" && noBrowserRan) {
-      if (cur?.reason === "did_not_start") return;
-      next = { count: 0, reason: "did_not_start", runId: run.id, prNumber: run.prNumber, at };
+      const reason = heldUi && withheld === "runner_outdated" ? "runner_outdated" : "did_not_start";
+      if (cur?.reason === reason) return;
+      next = { count: 0, reason, runId: run.id, prNumber: run.prNumber, at };
     } else {
       if (browser.policy !== "never" && (doctor || !verdicts.some((v) => ui.has(v.criterionId)))) return;
       if (cur == null) return;
@@ -248,7 +268,7 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
   const { criteria } = criteriaForRun(run);
   const doctor = results.payload.doctor ?? null;
 
-  const all = computeVerdicts({ criteria, results: results.payload.results, plan, doctor, artifacts });
+  const all = computeVerdicts({ criteria, results: results.payload.results, plan, doctor, artifacts, withheld: run.runnerMeta?.e2eWithheld });
   // A feedback re-run planned only the affected criteria; everything else keeps
   // the previous run's verdict (never shown to the model) rather than reading
   // as "no test ran".

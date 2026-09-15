@@ -1414,6 +1414,149 @@ test("the head's own verify block wins, and the base branch is never read", asyn
   }
 });
 
+// --- Boot keys from base, servers and a login script ---
+
+const SIGNED_IN = /Browser tests start signed in \(the runner applies a saved session\); never sign in inside a test\./;
+const MANAGED_BASE_YML = [
+  "verify:",
+  "  e2e: auto",
+  "  start: npm run dev -w frontend",
+  "  url: http://localhost:5173",
+  "  servers:",
+  "    - name: backend",
+  "      start: npm run dev -w backend",
+  "      url: http://localhost:4000",
+  "  login:",
+  "    script: node scripts/devasign-login.mjs",
+  "    check: /api/me",
+  "",
+].join("\n");
+
+function branchYml(d: PlannerDeps, headSha: string, head: string | null, base: string | null, reads: string[]) {
+  d.readFile = async (_i, _r, path, sha) => {
+    reads.push(`${path}@${sha}`);
+    if (path !== ".devasign.yml") return null;
+    return sha === headSha ? head : sha === "d" ? base : null;
+  };
+}
+
+test("a head block without start keeps its own keys and takes the whole boot group from base", async () => {
+  const s = seed([crit("1", "ui")]);
+  const reads: string[] = [];
+  const { deps: d, prompts } = deps({ tree: [...BASE_TREE, ".devasign.yml"], diff: UI_DIFF, responses: [{ tests: [gen("1", "e2e", { path: "e2e/pill.spec.ts" })] }] });
+  branchYml(d, s.run.sha, "verify:\n  e2e: always\n  install: npm install\n  url: http://localhost:9999\n  env: [API_TOKEN]\n", MANAGED_BASE_YML, reads);
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.ok(reads.includes(".devasign.yml@d"));
+    assert.equal(plan.verifyConfigFrom, "base_boot");
+    assert.deepEqual(plan.verifyConfig, {
+      e2e: "always",
+      env: ["API_TOKEN"],
+      start: "npm run dev -w frontend",
+      url: "http://localhost:5173",
+      servers: [{ name: "backend", start: "npm run dev -w backend", url: "http://localhost:4000" }],
+      login: { script: "node scripts/devasign-login.mjs", check: "/api/me" },
+    });
+    assert.equal(plan.browser?.policy, "always");
+    assert.equal(plan.browser?.allowed, true);
+    assert.deepEqual(plan.unverifiable, []);
+    assert.match(prompts[0], /Browser \(e2e\) tests: available/);
+    assert.match(prompts[0], SIGNED_IN);
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify" && l.action.startsWith("Test plan ready"));
+    assert.match(String(log?.detail), /boot keys read from the base branch's \.devasign\.yml — this PR's head block has no start/);
+    assert.equal((log?.meta as { verifyConfigFrom?: string }).verifyConfigFrom, "base_boot");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a head block with its own start is used whole: base's servers and login script never reach the plan", async () => {
+  const s = seed([crit("1", "ui")]);
+  const reads: string[] = [];
+  const { deps: d, prompts } = deps({ tree: [...BASE_TREE, ".devasign.yml"], diff: UI_DIFF, responses: [{ tests: [gen("1", "e2e")] }] });
+  branchYml(d, s.run.sha, "verify:\n  start: npm start\n  url: http://localhost:3000\n", MANAGED_BASE_YML, reads);
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.equal(plan.verifyConfigFrom, "head");
+    assert.deepEqual(plan.verifyConfig, { start: "npm start", url: "http://localhost:3000" });
+    assert.ok(!reads.includes(".devasign.yml@d"));
+    assert.doesNotMatch(prompts[0], /servers: |login script/);
+    assert.doesNotMatch(prompts[0], SIGNED_IN);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a head block without start keeps it all when base has no start either", async () => {
+  const s = seed([crit("1", "ui")]);
+  const reads: string[] = [];
+  const { deps: d } = deps({ tree: [...BASE_TREE, ".devasign.yml"], diff: UI_DIFF, responses: [{ tests: [gen("1", "component")] }] });
+  branchYml(d, s.run.sha, "verify:\n  e2e: auto\n  install: npm ci\n", "verify:\n  url: http://localhost:5173\n  login:\n    script: node login.mjs\n", reads);
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+    assert.ok(reads.includes(".devasign.yml@d"));
+    assert.equal(plan.verifyConfigFrom, "head");
+    assert.deepEqual(plan.verifyConfig, { e2e: "auto", install: "npm ci" });
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the prompt names servers and says a login script exists, never its command or form credentials", async () => {
+  const s = seed([crit("1", "ui")]);
+  const yml = [
+    "verify:",
+    "  start: npm run dev",
+    "  url: http://localhost:5173",
+    "  servers:",
+    "    - name: backend",
+    "      start: node api/server-secret-cmd.js",
+    "      url: http://localhost:4000",
+    "    - name: worker",
+    "      start: node worker.js --queue",
+    "      url: http://localhost:4001",
+    "  login:",
+    "    script: E2E_PASS=hunter2 node scripts/devasign-login.mjs",
+    "    strategy: form",
+    "    form:",
+    "      url: /login",
+    "      user: admin@example.com",
+    "      pass: formpass-s3cret",
+    "",
+  ].join("\n");
+  const { deps: d, prompts } = deps({ tree: [...BASE_TREE, ".devasign.yml"], files: { ".devasign.yml": yml }, diff: UI_DIFF, responses: [{ tests: [gen("1", "e2e")] }] });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.match(prompts[0], /\.devasign\.yml verify: \{[^\n]*"start":"npm run dev"[^\n]*"login":\{"strategy":"form"\}\}; servers: backend, worker; login script: yes$/m);
+    assert.match(prompts[0], SIGNED_IN);
+    for (const leaked of ["hunter2", "devasign-login", "server-secret-cmd", "worker.js", "admin@example.com", "formpass-s3cret", "localhost:4000"]) {
+      assert.ok(!prompts[0].includes(leaked), `prompt leaks ${leaked}`);
+    }
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("the signed-in line needs both a login script and a browser the plan may use", async () => {
+  for (const [yml, expected] of [
+    ["verify:\n  start: npm run dev\n  url: http://localhost:5173\n  login:\n    check: /api/me\n    strategy: cookie\n", false],
+    ["verify:\n  e2e: never\n  start: npm run dev\n  url: http://localhost:5173\n  login:\n    script: node login.mjs\n", false],
+    ["verify:\n  start: npm run dev\n  url: http://localhost:5173\n  login:\n    script: node login.mjs\n", true],
+  ] as const) {
+    const s = seed([crit("1", "ui")]);
+    const { deps: d, prompts } = deps({ tree: [...BASE_TREE, ".devasign.yml"], files: { ".devasign.yml": yml }, diff: UI_DIFF, responses: [{ tests: [gen("1", "component")] }] });
+    try {
+      await runVerifyPlan(s.run.id, d);
+      assert.equal(SIGNED_IN.test(prompts[0]), expected, yml);
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
 test("a generated test below e2e that targets none of the files the PR changed is off target: dropped and re-planned against the changed list", async () => {
   const s = seed([crit("1")]);
   const { deps: d, prompts } = deps({

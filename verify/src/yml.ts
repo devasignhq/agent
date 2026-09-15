@@ -1,42 +1,25 @@
-// The `verify:` block of .devasign.yml. Everything else in the file is ignored
-// here (cross-repo/topology.ts reads `family:` with its own minimal scanner).
-// verify/src/yml.ts mirrors normalizeVerifyBlock; keep the two in step.
-import { parse } from "yaml";
-import type { DevasignVerifyConfig } from "./contract.js";
+// The `verify:` block of .devasign.yml, normalized the same way the backend's
+// normalizeVerifyBlock does (backend/src/verify/yml.ts); keep the two in step.
+import type { DevasignVerifyConfig } from "./types.js";
 
 const SERVICES = new Set(["postgres", "mysql", "redis"]);
 const LOGIN = new Set(["none", "storage_state", "form", "cookie"]);
 const SERVER_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
-// Step names the runner's boot already uses for its own logs and diagnoses.
+// Step names the boot already uses for its own logs and diagnoses.
 export const RESERVED_SERVER_NAMES: ReadonlySet<string> = new Set(["app", "install", "build", "seed", "login"]);
 export const MAX_SERVERS = 4;
-// A command cut short runs a different command, so an over-long one is dropped whole instead.
-export const MAX_COMMAND = 4000;
 export const BOOT_TIMEOUT = { min: 10, max: 900, default: 180 };
 
-// The keys that say how the app boots; a head block without `start` borrows all of them from base.
+// The keys that say how the app boots; they travel as one group when a plan's block fills in the checkout's.
 export const BOOT_KEYS = ["install", "build", "seed", "start", "url", "ready", "timeout", "servers", "login"] as const;
 
 const str = (v: unknown, cap = 500): string | undefined =>
   typeof v === "string" && v.trim() ? v.trim().slice(0, cap) : undefined;
 
-const command = (v: unknown): string | undefined => {
-  const s = str(v, Infinity);
-  return s && s.length <= MAX_COMMAND ? s : undefined;
-};
+// The checkout's commands run exactly as merged, never cut short (the backend drops over-long ones).
+const command = (v: unknown): string | undefined => str(v, Infinity);
 
-export function parseDevasignVerify(raw: string | null | undefined): DevasignVerifyConfig | null {
-  if (!raw || !raw.trim()) return null;
-  let doc: unknown;
-  try {
-    doc = parse(raw);
-  } catch {
-    return null;
-  }
-  return normalizeVerifyBlock((doc as { verify?: unknown } | null)?.verify);
-}
-
-export function normalizeVerifyBlock(v: unknown): DevasignVerifyConfig | null {
+export function normalizeVerify(v: unknown): DevasignVerifyConfig | null {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   const o = v as Record<string, unknown>;
   const out: DevasignVerifyConfig = {};
@@ -97,12 +80,19 @@ export function normalizeVerifyBlock(v: unknown): DevasignVerifyConfig | null {
   return out;
 }
 
-/** Boot config the runner can start the app from — a precondition for planning any E2E test. */
-export function hasBootConfig(cfg: DevasignVerifyConfig | null | undefined): boolean {
-  return Boolean(cfg?.start && cfg?.url);
+// A checkout block without `start` keeps its other keys but boots the way the plan's block
+// does, the same rule the backend planned by (readVerifyYml).
+export function mergeBootConfig(checkout: DevasignVerifyConfig | null, planCfg: DevasignVerifyConfig | null | undefined): DevasignVerifyConfig | null {
+  if (!checkout) return planCfg ?? null;
+  if (checkout.start || !planCfg?.start) return checkout;
+  const boot: ReadonlySet<string> = new Set(BOOT_KEYS);
+  return {
+    ...Object.fromEntries(Object.entries(checkout).filter(([k]) => !boot.has(k))),
+    ...Object.fromEntries(Object.entries(planCfg).filter(([k]) => boot.has(k))),
+  } as DevasignVerifyConfig;
 }
 
-/** Servers or a login script need the runner's own boot manager (CLI 1.6+), not Playwright's webServer. */
+/** Servers or a login script need the runner's own boot manager rather than Playwright's webServer. */
 export function needsManagedBoot(cfg: DevasignVerifyConfig | null | undefined): boolean {
   return Boolean(cfg?.servers?.length || cfg?.login?.script);
 }

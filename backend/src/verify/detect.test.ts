@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { envVarNames, inferSetupFromTree, installCommandFor, nestedPackageDirs, isFrontendPath, isTestPath } from "./detect.js";
-import { hasBootConfig, parseDevasignVerify } from "./yml.js";
+import { BOOT_TIMEOUT, hasBootConfig, MAX_COMMAND, MAX_SERVERS, needsManagedBoot, normalizeVerifyBlock, parseDevasignVerify, RESERVED_SERVER_NAMES } from "./yml.js";
 
 test("isTestPath / isFrontendPath heuristics", () => {
   for (const p of ["src/a.test.ts", "src/__tests__/b.tsx", "tests/c.py", "pkg/d_test.go", "e2e/login.spec.ts", "conftest.py"]) assert.ok(isTestPath(p), p);
@@ -87,6 +87,70 @@ verify:
   assert.equal(parseDevasignVerify("family:\n  name: x\n"), null);
   assert.equal(parseDevasignVerify(": : not yaml ["), null);
   assert.equal(parseDevasignVerify("verify:\n  e2e: sometimes\n")?.e2e, undefined);
+});
+
+// Mirrored in verify/src/yml.test.ts; the two normalizers must agree case for case.
+test("normalizeVerifyBlock bounds timeout, keeps valid distinct servers up to the cap, and reads a login script without a strategy", () => {
+  const cfg = normalizeVerifyBlock({
+    start: "npm run dev",
+    url: "http://localhost:5173",
+    timeout: 5000,
+    servers: [
+      { name: "api", start: "npm start", url: "http://localhost:8787", ready: "/health" },
+      { name: "API", start: "a", url: "http://localhost:1" },
+      { name: "-api", start: "a", url: "http://localhost:1" },
+      { name: "api", start: "dup", url: "http://localhost:2" },
+      { name: "worker", start: "npm run worker" },
+      "redis",
+      { name: "w1", start: "b", url: "http://localhost:3" },
+      { name: "w2", start: "c", url: "http://localhost:4" },
+      { name: "w3", start: "d", url: "http://localhost:5" },
+      { name: "w4", start: "e", url: "http://localhost:6" },
+    ],
+    login: { script: "node scripts/devasign-login.mjs", check: "/api/me", strategy: "magic" },
+  });
+  assert.equal(cfg?.timeout, BOOT_TIMEOUT.max);
+  assert.deepEqual(cfg?.servers?.map((s) => s.name), ["api", "w1", "w2", "w3"]);
+  assert.equal(cfg?.servers?.length, MAX_SERVERS);
+  assert.deepEqual(cfg?.servers?.[0], { name: "api", start: "npm start", url: "http://localhost:8787", ready: "/health" });
+  assert.deepEqual(cfg?.login, { script: "node scripts/devasign-login.mjs", check: "/api/me" });
+  assert.equal(needsManagedBoot(cfg), true);
+
+  assert.equal(normalizeVerifyBlock({ timeout: 1 })?.timeout, BOOT_TIMEOUT.min);
+  assert.equal(normalizeVerifyBlock({ timeout: 12.5 })?.timeout, undefined);
+  assert.equal(normalizeVerifyBlock({ timeout: "60" })?.timeout, undefined);
+  assert.deepEqual(normalizeVerifyBlock({ login: { strategy: "none" } })?.login, { strategy: "none" });
+  assert.deepEqual(normalizeVerifyBlock({ login: {}, servers: [{ name: "Bad!", start: "x", url: "y" }] }), {});
+  assert.equal(normalizeVerifyBlock(["verify"]), null);
+  assert.equal(needsManagedBoot(normalizeVerifyBlock({ login: { check: "/api/me", strategy: "cookie" } })), false, "a check alone boots nothing");
+  assert.equal(needsManagedBoot({ start: "npm start", url: "http://localhost:3000" }), false);
+  assert.equal(needsManagedBoot(normalizeVerifyBlock({ login: { script: "node login.mjs" } })), true);
+});
+
+test("normalizeVerifyBlock never cuts a command short and refuses server names the runner's own boot steps use", () => {
+  const long = `npm ci --prefix frontend && ${"npm ci --prefix packages/some-workspace && ".repeat(12)}npm run build --workspace contrib`;
+  assert.ok(long.length > 540);
+  const tooLong = `echo ${"x".repeat(MAX_COMMAND)}`;
+  const cfg = normalizeVerifyBlock({
+    install: long,
+    build: tooLong,
+    start: long,
+    url: "http://localhost:5173",
+    servers: [
+      ...[...RESERVED_SERVER_NAMES].map((name) => ({ name, start: "node api.mjs", url: "http://localhost:8787" })),
+      { name: "a".repeat(33), start: "node x.mjs", url: "http://localhost:1" },
+      { name: "worker", start: tooLong, url: "http://localhost:2" },
+      { name: "api", start: long, url: "http://localhost:8787" },
+    ],
+    login: { script: long, check: tooLong },
+  });
+  assert.equal(cfg?.install, long);
+  assert.equal(cfg?.start, long);
+  assert.equal(cfg?.login?.script, long);
+  assert.equal("build" in cfg!, false, "an over-long command is dropped whole");
+  assert.equal(cfg?.login?.check, undefined);
+  assert.deepEqual(cfg?.servers, [{ name: "api", start: long, url: "http://localhost:8787" }], "a reserved or over-long name is dropped, never cut to fit");
+  assert.deepEqual([...RESERVED_SERVER_NAMES].sort(), ["app", "build", "install", "login", "seed"]);
 });
 
 test("no root manifest: top-level packages are the install units, with their own lockfiles and a nested Playwright config", () => {

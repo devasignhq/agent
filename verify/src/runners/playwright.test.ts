@@ -4,7 +4,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, writeFileSync, mkdirSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { fileStatus, generatePlaywrightConfig, hasChromium, mapReport, ourPlaywrightDir, playwrightBrowsersRoot, testOutcome, webServerFromYml, type PwReport } from "./playwright.js";
+import { consoleLine, fileStatus, generatePlaywrightConfig, hasChromium, mapReport, ourPlaywrightDir, playwrightBrowsersRoot, testOutcome, webServerFromYml, type PwReport } from "./playwright.js";
+import { redact } from "../boot.js";
 import { Workspace } from "../workspace.js";
 import type { LocalArtifact, PlanTest } from "../types.js";
 
@@ -31,6 +32,56 @@ test("the generated config extends the customer's and forces recording even when
   const noBase = generatePlaywrightConfig({ root, baseConfigRel: null, testDir: root, outputDir: root, reportFile: "r", retries: 0, webServer: null });
   assert.match(noBase, /const __base: any = \{\};/);
   assert.doesNotMatch(noBase, /webServer/);
+});
+
+test("a booted app: generated tests take our baseURL and session over the customer's, and no webServer starts", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-pw-booted-"));
+  writeFileSync(
+    path.join(root, "playwright.config.ts"),
+    `export default { use: { baseURL: "http://theirs", storageState: "their-state.json", locale: "fr-FR", video: "off" }, projects: [{ name: "chromium", use: { baseURL: "http://project", storageState: "project-state.json" } }], webServer: { command: "exit 7", url: "http://theirs" } };\n`
+  );
+  const ws = new Workspace(root);
+  ws.linkPackage("@playwright/test", ourPlaywrightDir());
+  const common = { root, baseConfigRel: "playwright.config.ts", testDir: path.join(root, ".devasign/tests/e2e"), outputDir: path.join(root, ".devasign/artifacts/pw"), reportFile: path.join(root, "r.json"), retries: 0 };
+  const statePath = path.join(root, ".devasign/auth/state.json");
+
+  const src = generatePlaywrightConfig({ ...common, booted: { baseUrl: "http://127.0.0.1:4173", storageState: statePath } });
+  assert.doesNotMatch(src, /b\.webServer/);
+  const cfg = (await import(ws.write(".devasign/playwright.config.ts", src))).default;
+  assert.equal(cfg.webServer, undefined, "yml start/servers win over the customer's webServer");
+  assert.equal(cfg.use.baseURL, "http://127.0.0.1:4173");
+  assert.equal(cfg.use.storageState, statePath);
+  assert.equal(cfg.use.locale, "fr-FR", "settings we do not own are kept");
+  assert.equal(cfg.use.video, "on");
+  assert.equal(cfg.projects[0].use.baseURL, "http://127.0.0.1:4173", "the kept project cannot shadow the booted app");
+  assert.equal(cfg.projects[0].use.storageState, statePath);
+
+  const existing = generatePlaywrightConfig({ ...common, testDir: root, booted: { baseUrl: "http://127.0.0.1:4173", storageState: statePath, existing: true } });
+  assert.ok(!existing.includes(statePath), "the repo's own tests never get the saved session");
+  const ecfg = (await import(ws.write(".devasign/playwright.existing.config.ts", existing))).default;
+  assert.equal(ecfg.webServer, undefined);
+  assert.equal(ecfg.use.baseURL, "http://theirs", "the customer's use wins for their own tests");
+  assert.equal(ecfg.use.storageState, "their-state.json");
+  assert.equal(ecfg.projects[0].use.storageState, "project-state.json");
+  assert.equal(ecfg.use.video, "on");
+
+  const bare = generatePlaywrightConfig({ ...common, baseConfigRel: null, testDir: root, booted: { baseUrl: "http://127.0.0.1:4173", existing: true } });
+  const bcfg = (await import(ws.write(".devasign/playwright.bare.config.ts", bare))).default;
+  assert.equal(bcfg.use.baseURL, "http://127.0.0.1:4173");
+  assert.equal("storageState" in bcfg.use, false);
+});
+
+test("the legacy webServer pipes the app's output into the Playwright log", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-pw-legacy-"));
+  const ws = new Workspace(root);
+  ws.linkPackage("@playwright/test", ourPlaywrightDir());
+  const src = generatePlaywrightConfig({ root, baseConfigRel: null, testDir: root, outputDir: root, reportFile: "r", retries: 0, webServer: webServerFromYml({ start: "node s.mjs", url: "http://localhost:4173" }) });
+  const cfg = (await import(ws.write(".devasign/playwright.config.ts", src))).default;
+  assert.equal(cfg.webServer.command, "node s.mjs");
+  assert.equal(cfg.webServer.stdout, "pipe");
+  assert.equal(cfg.webServer.stderr, "pipe");
+  assert.equal(cfg.use.baseURL, "http://localhost:4173");
+  assert.equal("storageState" in cfg.use, false);
 });
 
 test("webServerFromYml chains install/build/seed/start and uses the ready path", () => {
@@ -182,4 +233,33 @@ test("hasChromium recognises an installed browser and ignores anything else", ()
 
 test("hasChromium treats a missing cache dir as empty, not an error", () => {
   assert.equal(hasChromium("/nope", () => { throw new Error("ENOENT"); }), false);
+});
+
+test("mapReport scrubs each message whole before cutting it to size, so no part of a secret survives the cut", () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-pw-scrub-"));
+  const ws = new Workspace(root);
+  const session = "sess-0123456789abcdefghijklmnopqrstuvwxyz";
+  const state = { cookies: [{ name: "sid", value: session, domain: "localhost", path: "/" }], origins: [] };
+  const scrub = (text: string) => redact(text, { env: {}, state });
+  // The 500-character cut lands inside the session value.
+  const message = `${"x".repeat(480)} received: ${session} trailing text`;
+  const t: PlanTest = { id: "t1", path: ".devasign/tests/e2e/a.spec.ts", content: "", criterionIds: ["1"], level: "e2e", levelReason: "", origin: "generated", runner: "playwright", testSignature: "s", strategyVersion: 1, targetFiles: [] };
+  const report: PwReport = { suites: [{ file: "a.spec.ts", specs: [{ title: "a", file: "a.spec.ts", tests: [{ results: [{ status: "failed", retry: 0, error: { message } }] }] }] }] };
+  const [res] = mapReport(report, [t], ws, [], "", scrub);
+  assert.equal(res.attempts[0].error!.length, 500);
+  assert.ok(!res.attempts[0].error!.includes(session.slice(0, 8)), res.attempts[0].error);
+  assert.ok(!res.error!.includes(session.slice(0, 8)));
+  const [unscrubbed] = mapReport(report, [t], ws, [], "");
+  assert.ok(unscrubbed.attempts[0].error!.includes(session.slice(0, 8)), "the cut alone keeps a prefix of the value");
+
+  const [noResult] = mapReport({ suites: [] }, [t], ws, [], `Error: ${"y".repeat(490)} Cookie: sid=${session}`, scrub);
+  assert.ok(!noResult.error!.includes(session.slice(0, 8)), noResult.error);
+});
+
+test("a legacy webServer's stdout stays out of the job log; its stderr, and everything else, is still shown", () => {
+  assert.equal(consoleLine("[WebServer] created admin / password Xy7", "out", true), null);
+  assert.equal(consoleLine("\u001b[2m[WebServer] \u001b[22mseeded", "out", true), null);
+  assert.equal(consoleLine("[WebServer] Error: EADDRINUSE", "err", true), "[WebServer] Error: EADDRINUSE");
+  assert.equal(consoleLine("  ✓  1 a.spec.ts:3:1 › a (1.2s)", "out", true), "  ✓  1 a.spec.ts:3:1 › a (1.2s)");
+  assert.equal(consoleLine("[WebServer] theirs", "out", false), "[WebServer] theirs", "without our webServer nothing is filtered");
 });

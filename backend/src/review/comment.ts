@@ -392,7 +392,7 @@ const REASON_CLIP = 200;
 
 function browserlessSuffix(b: CardVerification["browserless"]): string {
   if (!b?.count) return "";
-  return ` · ${b.count} UI ${b.count === 1 ? "criterion" : "criteria"} checked without a browser ([set up](${b.fixUrl}))`;
+  return ` · ${b.count} UI ${b.count === 1 ? "criterion" : "criteria"} checked without a browser${b.fixUrl ? ` ([set up](${b.fixUrl}))` : ""}`;
 }
 
 function verificationLines(v: CardVerification, allFailing: boolean): string[] {

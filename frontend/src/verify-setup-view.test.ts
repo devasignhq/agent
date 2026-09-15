@@ -41,6 +41,14 @@ test("failing, unproven, disabled and unknown each read differently", () => {
   assert.equal(browserTestsRow({ devasignYml: null, browserTests: bt({}) }).text, "Not checked yet");
 });
 
+test("runner_outdated asks for a newer runner and still names the last browser-less run", () => {
+  const row = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "runner_outdated", lastBrowserless: last({ reason: "runner_outdated", prNumber: 51 }) }) });
+  assert.deepEqual([row.text, row.tone], ["The runner in CI is too old for verify.servers or verify.login — update @devasign/verify", "warn"]);
+  assert.equal(row.last, "PR #51: 3 UI criteria checked without a browser");
+  assert.equal(browserTestsRow({ devasignYml: null, browserTests: bt({ status: "runner_outdated", lastBrowserless: last({ reason: "runner_outdated", count: 0 }) }) }).last, null, "nothing was checked below the browser either");
+  assert.doesNotMatch(browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing", lastBrowserless: last({ reason: "did_not_start" }) }) }).text, /too old/);
+});
+
 test("an old backend without browserTests falls back to the yml snapshot", () => {
   assert.equal(browserTestsRow({ devasignYml: { start: "npm start" } }).text, "Not set up — add verify.start and verify.url to .devasign.yml (missing: verify.url)");
   assert.equal(browserTestsRow({ devasignYml: { start: "npm start", url: "http://localhost:3000" } }).text, "Configured");

@@ -214,6 +214,8 @@ test("UI criteria checked without a browser add a set-up link to the Tests line,
   }
   const pending = card({ verification: verification({ state: "pending", counts, browserless: { count: 3, fixUrl } }) });
   assert.doesNotMatch(pending, /without a browser/, "only a finished run reports it");
+  const paused = card({ verification: verification({ counts, browserless: { count: 2, fixUrl: "" } }) });
+  assert.ok(paused.includes(`**Tests:** 3 passed, 1 unverifiable · 2 UI criteria checked without a browser — see the "Tests by DevAsign" comment.`), "no link when there is nothing to set up");
 });
 
 test("a runner-reported failure reason on the card cannot link or mention", () => {

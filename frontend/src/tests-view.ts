@@ -126,15 +126,17 @@ function setupPath(fixUrl: string, repoId: string): string {
 /** Repos whose latest run checked UI criteria without a browser and still need setup, newest first. */
 export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): BrowserBanner | null {
   const hit = (setup ?? [])
-    .filter((e) => (e.status === "not_configured" || e.status === "failing") && (e.lastBrowserless?.count ?? 0) > 0)
+    .filter((e) => (e.status === "not_configured" || e.status === "failing" || e.status === "runner_outdated") && (e.lastBrowserless?.count ?? 0) > 0)
     .sort((a, b) => b.lastBrowserless!.at - a.lastBrowserless!.at);
   if (hit.length === 0) return null;
   const repos = hit.map((e) => e.repo);
   const didNotStart = hit.every((e) => e.status === "failing");
+  const outdated = hit.every((e) => e.status === "runner_outdated");
   const where = repos.length === 1 ? repos[0] : `${repos.length} repositories`;
+  const because = didNotStart ? " because the app did not start in CI" : outdated ? " because the runner in CI is too old" : "";
   return {
-    text: `UI criteria on ${where} were checked without a browser${didNotStart ? " because the app did not start in CI" : ""}`,
-    action: didNotStart ? "see setup" : "set up browser tests",
+    text: `UI criteria on ${where} were checked without a browser${because}`,
+    action: didNotStart ? "see setup" : outdated ? "update the runner" : "set up browser tests",
     href: setupPath(hit[0].fixUrl, hit[0].repoId),
     repos,
   };

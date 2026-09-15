@@ -3,9 +3,10 @@
 import type { DoctorCode, DoctorDiagnosis, DoctorStage } from "./contract.js";
 import { isKnownInstallCommand, PLAIN_DIR } from "./onboarding/generate.js";
 
-const STAGES: Record<DoctorStage, true> = { checkout: true, install: true, build: true, services: true, start: true, browsers: true, tests: true };
+const STAGES: Record<DoctorStage, true> = { checkout: true, install: true, build: true, services: true, start: true, login: true, browsers: true, tests: true };
 const CODES: Record<DoctorCode, true> = {
   no_start_command: true,
+  login_failed: true,
   missing_service: true,
   missing_secret: true,
   wrong_runtime_version: true,

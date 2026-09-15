@@ -207,6 +207,20 @@ test("browserBanner says the app did not start when every flagged repo is failin
   assert.equal(b.action, "see setup");
 });
 
+test("browserBanner flags an outdated runner like a failing app, with its own reason and action", () => {
+  const outdated = (repoId: string, at: number, count = 2) => setupEntry({ repoId, status: "runner_outdated", lastBrowserless: { count, reason: "runner_outdated", runId: repoId, prNumber: 5, at } });
+  const b = browserBanner([outdated("r1", 1), setupEntry({ repoId: "ok", status: "unproven", lastBrowserless: null })])!;
+  assert.equal(b.text, "UI criteria on acme/r1 were checked without a browser because the runner in CI is too old");
+  assert.equal(b.action, "update the runner");
+  assert.equal(b.href, "/workflow?repo=r1&setup=browser");
+  assert.equal(browserBanner([outdated("r1", 1, 0)]), null, "no UI criterion was checked below the browser");
+
+  const both = browserBanner([outdated("r1", 1), outdated("r2", 2)])!;
+  assert.equal(both.text, "UI criteria on 2 repositories were checked without a browser because the runner in CI is too old");
+  const mixed = browserBanner([outdated("r1", 1), setupEntry({ repoId: "r2", status: "failing", lastBrowserless: { count: 1, reason: "did_not_start", runId: "b", prNumber: 2, at: 50 } })])!;
+  assert.deepEqual([mixed.text, mixed.action], ["UI criteria on 2 repositories were checked without a browser", "set up browser tests"]);
+});
+
 test("browserBanner never links outside the setup panel", () => {
   assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "https://evil.test/logout" })])!.href, "/workflow?repo=r1&setup=browser");
   assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "" })])!.href, "/workflow?repo=r1&setup=browser");
