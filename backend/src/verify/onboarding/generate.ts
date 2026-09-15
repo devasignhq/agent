@@ -328,6 +328,15 @@ export function prBody(args: {
   return lines.join("\n");
 }
 
+const PLAIN_DIR = /^[A-Za-z0-9_.-]+$/;
+
+/** Exactly the shapes installCommandFor produces, for this directory and no other. */
+export function isKnownInstallCommand(install: string, dir: string): boolean {
+  if (!PLAIN_DIR.test(dir)) return false;
+  const d = dir.replace(/[.]/g, "\\.");
+  return new RegExp(`^(?:npm (?:ci|install) --prefix ${d}|pnpm install --frozen-lockfile --dir ${d}|yarn install --frozen-lockfile --cwd ${d}|bun install --cwd ${d})$`).test(install);
+}
+
 /** Mechanical fixes to our workflow after a doctor diagnosis; null when the fix needs a human. */
 export function patchWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): string | null {
   if (doctor.code === "wrong_runtime_version") {
@@ -342,7 +351,11 @@ export function patchWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): s
     return text.replace(/(\n\s*- name: DevAsign verify\n)/, "\n      - name: Install Playwright browsers\n        run: npx playwright install --with-deps chromium$1");
   }
   if (doctor.code === "missing_dependencies") {
-    const wanted = (doctor.packages ?? []).filter((p) => /^[A-Za-z0-9_.-]+$/.test(p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(text));
+    // The diagnosis arrives from the runner, and this text becomes a `run:` step: only a
+    // plain directory name and one of the install forms installCommandFor emits get in.
+    const wanted = (doctor.packages ?? []).filter(
+      (p) => PLAIN_DIR.test(p.dir) && isKnownInstallCommand(p.install, p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(text)
+    );
     if (!wanted.length) return null;
     const steps = wanted.map((p) => `\n      - name: Install ${p.dir} dependencies\n        run: ${p.install}`).join("");
     const next = text.replace(/(\n\s*- name: DevAsign verify\n)/, `${steps}$1`);
