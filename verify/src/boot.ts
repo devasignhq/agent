@@ -14,6 +14,9 @@ export type StorageState = {
 export type BootStep = { name: string; kind: "setup" | "server"; cmd: string; url?: string; readyUrl?: string; timeoutMs: number };
 export type BootSpec = { steps: BootStep[]; baseUrl: string; login: { script: string; check?: string; timeoutMs: number } | null };
 export type BootHandle = { stop(): Promise<void>; logFiles: string[] };
+// What each step did, for the boot probe's report; a step the boot never reached has no entry.
+export type BootStepResult = { name: string; kind: "setup" | "server"; ok: boolean; readyMs?: number; exitCode?: number | null };
+export type BootCheck = { status: number | null; cors?: "ok" | "missing" | "mismatch" };
 
 const LOGIN_TIMEOUT_MS = 120_000;
 const STOP_GRACE_MS = 5_000;
@@ -196,16 +199,23 @@ export async function startApp(
   spec: BootSpec,
   ws: { root: string; artifactsDir: string },
   deps: { fetchImpl?: typeof fetch; pollMs?: number } = {}
-): Promise<{ ok: true; handle: BootHandle } | { ok: false; handle: BootHandle; diagnosis: DoctorDiagnosis; failedStep: string }> {
+): Promise<
+  | { ok: true; handle: BootHandle; steps: BootStepResult[] }
+  | { ok: false; handle: BootHandle; diagnosis: DoctorDiagnosis; failedStep: string; steps: BootStepResult[] }
+> {
   const fetchImpl = deps.fetchImpl ?? fetch;
   const pollMs = deps.pollMs ?? 500;
   const procs: Proc[] = [];
   const logFiles: string[] = [];
   const handle = makeHandle(procs, logFiles);
   const env = childEnv();
+  const steps: BootStepResult[] = [];
+  const done = (step: BootStep, ok: boolean, extra: Omit<BootStepResult, "name" | "kind" | "ok"> = {}) => {
+    steps.push({ name: step.name, kind: step.kind, ok, ...extra });
+  };
   const fail = async (step: BootStep, diagnosis: DoctorDiagnosis) => {
     await handle.stop();
-    return { ok: false as const, handle, diagnosis, failedStep: step.name };
+    return { ok: false as const, handle, diagnosis, failedStep: step.name, steps };
   };
   for (const step of spec.steps) {
     const logFile = path.resolve(ws.artifactsDir, "logs", `boot-${step.name}.log`);
@@ -219,6 +229,7 @@ export async function startApp(
       } catch {
         // the diagnosis still says what happened
       }
+      done(step, false);
       return fail(step, { stage: "start", code: "app_not_ready", message: `something else was already answering at the ${step.name} server's url` });
     }
     let p: Proc;
@@ -226,21 +237,28 @@ export async function startApp(
       p = launch(step.name, step.cmd, ws.root, logFile, env);
     } catch {
       const d: Pick<DoctorDiagnosis, "stage" | "code"> = step.kind === "setup" ? (SETUP_DIAG[step.name] ?? { stage: "start", code: "unknown" }) : { stage: "start", code: "app_not_ready" };
+      done(step, false);
       return fail(step, { ...d, message: `the ${step.name} command could not be started` });
     }
     procs.push(p);
     logFiles.push(logFile);
+    const launchedAt = Date.now();
     if (step.kind === "setup") {
       const res = await runToExit(p, step.timeoutMs);
       if (res.timedOut || res.code !== 0) {
         const d = SETUP_DIAG[step.name] ?? { stage: "start", code: "unknown" };
         const message = res.timedOut ? `the ${step.name} command did not finish within ${secs}s` : `the ${step.name} command failed`;
+        done(step, false, { exitCode: res.code });
         return fail(step, { ...d, message });
       }
+      done(step, true, { exitCode: res.code });
       continue;
     }
     const target = step.readyUrl || step.url || "";
-    if (!URL.canParse(target)) return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server's ready URL is not a valid URL` });
+    if (!URL.canParse(target)) {
+      done(step, false);
+      return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server's ready URL is not a valid URL` });
+    }
     const deadline = Date.now() + step.timeoutMs;
     let up = false;
     while (Date.now() < deadline) {
@@ -254,12 +272,19 @@ export async function startApp(
       } catch {
         // not listening yet
       }
-      if (p.exited) return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server exited before it was ready` });
+      if (p.exited) {
+        done(step, false, { exitCode: p.child.exitCode });
+        return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server exited before it was ready` });
+      }
       await Promise.race([sleep(Math.min(pollMs, Math.max(0, deadline - Date.now()))), p.exit]);
     }
-    if (!up) return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server did not answer at its ready URL within ${secs}s` });
+    if (!up) {
+      done(step, false);
+      return fail(step, { stage: "start", code: "app_not_ready", message: `the ${step.name} server did not answer at its ready URL within ${secs}s` });
+    }
+    done(step, true, { readyMs: Date.now() - launchedAt });
   }
-  return { ok: true, handle };
+  return { ok: true, handle, steps };
 }
 
 async function answers(fetchImpl: typeof fetch, url: string): Promise<boolean> {
@@ -389,7 +414,7 @@ export async function checkSession(args: {
   state: StorageState;
   fetchImpl?: typeof fetch;
   windowMs?: number;
-}): Promise<{ ok: true; status: number } | { ok: false; status: number | null; cors?: "missing" | "mismatch"; diagnosis: DoctorDiagnosis }> {
+}): Promise<{ ok: true; status: number; cors?: "ok" } | { ok: false; status: number | null; cors?: "missing" | "mismatch"; diagnosis: DoctorDiagnosis }> {
   const fetchImpl = args.fetchImpl ?? fetch;
   let checkUrl: URL;
   let origin: string;
@@ -413,7 +438,7 @@ export async function checkSession(args: {
         if (!crossOrigin) return { ok: true, status };
         const allowOrigin = res.headers.get("access-control-allow-origin");
         const allowCredentials = res.headers.get("access-control-allow-credentials");
-        if (allowOrigin === origin && allowCredentials === "true") return { ok: true, status };
+        if (allowOrigin === origin && allowCredentials === "true") return { ok: true, status, cors: "ok" };
         const cors = allowOrigin && allowOrigin !== origin ? "mismatch" : "missing";
         return { ok: false, status, cors, diagnosis: loginFailed("the session check's CORS headers do not allow the app's origin").diagnosis };
       }
@@ -480,7 +505,15 @@ export function redact(text: string, opts: RedactOptions): string {
   const swaps = new Map<string, string>();
   const secret = (v: unknown) => {
     if (typeof v !== "string" || v.length < MIN_SECRET) return;
-    for (const form of [v, encodeURIComponent(v), JSON.stringify(v).slice(1, -1)]) swaps.set(form, REDACTED);
+    // A lone surrogate in a session value makes encodeURIComponent throw; this scrub runs
+    // inside a stream handler, where a throw is an uncaught exception that ends the run.
+    let encoded: string | null = null;
+    try {
+      encoded = encodeURIComponent(v);
+    } catch {
+      // not URL-encodable; the literal form still gets swapped
+    }
+    for (const form of [v, ...(encoded === null ? [] : [encoded]), JSON.stringify(v).slice(1, -1)]) swaps.set(form, REDACTED);
   };
   for (const name of opts.envNames || []) secret(env[name]);
   for (const [name, value] of Object.entries(env)) if (SECRET_NAME.test(name)) secret(value);
@@ -538,12 +571,12 @@ export async function bootManaged(
   ws: { root: string; dir: string; artifactsDir: string },
   deps: { fetchImpl?: typeof fetch; pollMs?: number } = {}
 ): Promise<
-  | { ok: true; handle: BootHandle; baseUrl: string; storageStatePath: string | null; state: StorageState | null; sessionChecked: boolean }
-  | { ok: false; handle: BootHandle | null; diagnosis: DoctorDiagnosis }
+  | { ok: true; handle: BootHandle; baseUrl: string; storageStatePath: string | null; state: StorageState | null; sessionChecked: boolean; steps: BootStepResult[]; check: BootCheck | null }
+  | { ok: false; handle: BootHandle | null; diagnosis: DoctorDiagnosis; steps: BootStepResult[]; failedStep: string | null; check: BootCheck | null }
 > {
   const spec = bootSpec(yml);
   if (!spec) {
-    return { ok: false, handle: null, diagnosis: { stage: "start", code: "no_start_command", message: "verify.start and verify.url are required to boot the app" } };
+    return { ok: false, handle: null, diagnosis: { stage: "start", code: "no_start_command", message: "verify.start and verify.url are required to boot the app" }, steps: [], failedStep: null, check: null };
   }
   const redactLogs = (handle: BootHandle, state: StorageState | null) => {
     for (const f of handle.logFiles) redactFile(f, { envNames: yml.env, state });
@@ -552,24 +585,25 @@ export async function bootManaged(
   if (!started.ok) {
     await started.handle.stop();
     redactLogs(started.handle, null);
-    return { ok: false, handle: started.handle, diagnosis: started.diagnosis };
+    return { ok: false, handle: started.handle, diagnosis: started.diagnosis, steps: started.steps, failedStep: started.failedStep, check: null };
   }
-  const { handle } = started;
-  const failed = async (diagnosis: DoctorDiagnosis, state: StorageState | null) => {
+  const { handle, steps } = started;
+  const failed = async (diagnosis: DoctorDiagnosis, state: StorageState | null, check: BootCheck | null) => {
     await handle.stop();
     cleanupAuth(ws);
     redactLogs(handle, state);
-    return { ok: false as const, handle, diagnosis };
+    return { ok: false as const, handle, diagnosis, steps, failedStep: "login", check };
   };
-  if (!spec.login) return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: null, state: null, sessionChecked: false };
+  if (!spec.login) return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: null, state: null, sessionChecked: false, steps, check: null };
   handle.logFiles.push(path.resolve(ws.artifactsDir, "logs", "boot-login.log"));
   const login = await runLogin(spec, ws);
-  if (!login.ok) return failed(login.diagnosis, login.state);
+  if (!login.ok) return failed(login.diagnosis, login.state, null);
   if (!spec.login.check) {
     log.info("session not checked (no verify.login.check)");
-    return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: login.storageStatePath, state: login.state, sessionChecked: false };
+    return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: login.storageStatePath, state: login.state, sessionChecked: false, steps, check: null };
   }
   const check = await checkSession({ baseUrl: spec.baseUrl, check: spec.login.check, state: login.state, fetchImpl: deps.fetchImpl });
-  if (!check.ok) return failed(check.diagnosis, login.state);
-  return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: login.storageStatePath, state: login.state, sessionChecked: true };
+  const outcome: BootCheck = { status: check.status, ...(check.cors ? { cors: check.cors } : {}) };
+  if (!check.ok) return failed(check.diagnosis, login.state, outcome);
+  return { ok: true, handle, baseUrl: spec.baseUrl, storageStatePath: login.storageStatePath, state: login.state, sessionChecked: true, steps, check: outcome };
 }

@@ -286,7 +286,31 @@ export async function postPRComment(
 
 // Edit an existing PR/issue comment in place (the "review in progress" → verdict
 // update). PATCHes /issues/comments/{id} — note this endpoint is keyed by comment
-// id, not PR number. Best-effort: returns whether it succeeded, never throws.
+// id, not PR number. "gone" is a comment that no longer exists; "failed" is anything
+// else (a 502, a rate limit), which a caller must not read as "it was deleted".
+export type CommentUpdate = "updated" | "gone" | "failed";
+
+export async function updatePRCommentResult(
+  installationId: number,
+  owner: string,
+  name: string,
+  commentId: number,
+  body: string
+): Promise<CommentUpdate> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/issues/comments/${commentId}`, {
+      method: "PATCH",
+      body: JSON.stringify({ body }),
+      headers: { "Content-Type": "application/json" },
+    });
+    return "updated";
+  } catch (err) {
+    console.warn(`[github] failed to update PR comment ${owner}/${name}#${commentId}:`, err);
+    return err instanceof GitHubApiError && (err.status === 404 || err.status === 410) ? "gone" : "failed";
+  }
+}
+
+/** Best-effort variant for callers that only need "did it stick": never throws. */
 export async function updatePRComment(
   installationId: number,
   owner: string,
@@ -294,17 +318,7 @@ export async function updatePRComment(
   commentId: number,
   body: string
 ): Promise<boolean> {
-  try {
-    await gh(installationId, `/repos/${owner}/${name}/issues/comments/${commentId}`, {
-      method: "PATCH",
-      body: JSON.stringify({ body }),
-      headers: { "Content-Type": "application/json" },
-    });
-    return true;
-  } catch (err) {
-    console.warn(`[github] failed to update PR comment ${owner}/${name}#${commentId}:`, err);
-    return false;
-  }
+  return (await updatePRCommentResult(installationId, owner, name, commentId, body)) === "updated";
 }
 
 // Current body of a PR/issue comment, or null when it cannot be read.
@@ -517,6 +531,17 @@ export async function branchTipSha(installationId: number, owner: string, name: 
   } catch (err) {
     if (isMissingFileError(err)) return null;
     throw err;
+  }
+}
+
+/** The commit a pull request currently points at, or null when it cannot be read. */
+export async function pullRequestHeadSha(installationId: number, owner: string, name: string, prNumber: number): Promise<string | null> {
+  try {
+    const pr = await gh<{ head?: { sha?: string } }>(installationId, `/repos/${owner}/${name}/pulls/${prNumber}`);
+    return typeof pr?.head?.sha === "string" ? pr.head.sha : null;
+  } catch (err) {
+    console.warn(`[github] could not read the head of ${owner}/${name}#${prNumber}:`, err);
+    return null;
   }
 }
 

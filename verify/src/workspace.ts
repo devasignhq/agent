@@ -21,7 +21,7 @@ export class Workspace {
     this.testsDir = path.join(this.dir, "tests");
     this.preexistingDir = existsSync(this.dir);
     // A previous interrupted or --keep run must not leak state into this one.
-    for (const sub of ["tests", "artifacts", "node_modules", "auth", "playwright.config.ts", "playwright.existing.config.ts"]) {
+    for (const sub of ["tests", "artifacts", "node_modules", "auth", "playwright.config.ts", "playwright.existing.config.ts", "playwright.boot.config.ts"]) {
       rmSync(path.join(this.dir, sub), { recursive: true, force: true });
     }
   }

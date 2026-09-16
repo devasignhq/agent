@@ -1,5 +1,7 @@
 // Domain types mirror the Firestore sketch in devasign.md §3.
 import type {
+  BootReport,
+  BootStage,
   DetectedSetup,
   DevasignVerifyConfig,
   DoctorDiagnosis,
@@ -173,7 +175,29 @@ export type RepoVerifyState = {
   devasignYml?: { raw: string; parsed: DevasignVerifyConfig | null; sha: string } | null;
   // The default branch's verify block, which is what setup status is judged on.
   defaultYml?: { sha: string; parsed: DevasignVerifyConfig | null; bootHash: string | null; at: number } | null;
-  lastBrowserless?: { count: number; reason: BrowserlessReason; runId: string; prNumber: number; at: number } | null;
+  // `bootHash`: the default branch's boot fingerprint when this was recorded, so a later probe
+  // of the very same config is not mistaken for evidence that the failure was fixed.
+  lastBrowserless?: { count: number; reason: BrowserlessReason; runId: string; prNumber: number; at: number; bootHash?: string | null } | null;
+  // What the setup PR's own CI run found when it booted the proposed config.
+  boot?: {
+    ok: boolean;
+    configHash: string;
+    // The sha the App read the hashed yml at (the setup PR's head), which must be the
+    // commit the runner booted — `sha` — for the hash to stand for anything.
+    configSha?: string | null;
+    prNumber: number;
+    sha: string;
+    at: number;
+    // The probe's offeredAt, so a replayed older report cannot outrank a newer one.
+    offeredAt?: number;
+    stage?: BootStage;
+    failedServer?: string;
+    // null when the yml has no login script, so there was nothing to sign in as.
+    signedIn: boolean | null;
+    probeId: string;
+    logArtifactId?: string;
+    screenshotArtifactId?: string;
+  } | null;
   onboarding: {
     state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
     prNumber?: number;
@@ -200,6 +224,11 @@ export type RepoVerifyState = {
     firstSuccessfulRunId?: string | null;
     expectedSecrets?: string[];
     missingSecrets?: string[] | null; // null = the App could not read secret names
+    // A runner reached the setup PR that could have booted it, but its CLI is too old.
+    probeUnavailable?: { cliVersion: string; at: number } | null;
+    // The boot check's comment, scoped to the PR it lives on: GitHub edits a comment by id
+    // alone, so a regenerated setup PR must never rewrite the old PR's comment.
+    bootComment?: { prNumber: number; commentId: number } | null;
     lastError?: string | null;
   };
 };
@@ -1438,6 +1467,29 @@ export type VerifyArtifact = {
   uploadedAt?: number | null;
   expiredAt?: number | null;
   createdAt: number;
+  // "probe": `runId` holds a BootProbe id, not a VerifyRun id. Absent on rows
+  // written before boot probes existed, which are all run artifacts.
+  owner?: "run" | "probe";
+};
+
+// One offer to boot the setup PR's proposed config in that PR's own CI, and what
+// came back. `report` arrives from the customer's runner: normalized, never trusted.
+export type BootProbe = {
+  id: string;
+  schemaVersion: 1;
+  repoId: string;
+  // prNumber, actionsRunId and attempt all come from the signed OIDC claims and together
+  // key the row: one probe per CI job attempt, whatever the runner puts in the body.
+  prNumber: number;
+  actionsRunId?: string;
+  sha: string;
+  attempt: number;
+  status: "offered" | "reported" | "expired";
+  offeredAt: number;
+  reportedAt?: number;
+  uploadedBytes: number;
+  uploadedCount: number;
+  report?: BootReport;
 };
 
 export type TestFlakeHistory = {
@@ -1487,5 +1539,6 @@ export type DB = {
   verifyPlans: VerifyPlan[];
   verifyResults: VerifyResults[];
   verifyArtifacts: VerifyArtifact[];
+  bootProbes: BootProbe[];
   testFlakeHistory: TestFlakeHistory[];
 };

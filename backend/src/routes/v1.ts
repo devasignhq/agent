@@ -11,11 +11,13 @@ import { installationsForUser, userInInstall } from "../github/installations.js"
 import { effectiveWorkflow } from "../review/workflow.js";
 import { enqueueVerifyJudge } from "../queue.js";
 import { runnerLimiter } from "../rate-limit.js";
-import type { Installation, Repository, VerifyArtifact, VerifyArtifactKind } from "../types.js";
+import type { BootProbe, Installation, Repository, VerifyArtifact, VerifyArtifactKind } from "../types.js";
 import { prNumberFromRef, verifyActionsToken, type ActionsClaims, type OidcResult } from "../verify/oidc.js";
 import { artifactKey, artifactStorage, retentionExpiresAt, UPLOAD_LIMITS } from "../verify/storage.js";
 import { localArtifactPath, localStoreEnabled, verifyLocalSignature } from "../verify/storage-local.js";
 import { normalizeDoctor } from "../verify/doctor-normalize.js";
+import { normalizeBootReport, settleBootProbe } from "../verify/boot-probe.js";
+import { PROBE_EXPIRE_MS } from "../verify/reaper.js";
 import { patchRepoVerify } from "../verify/repo-state.js";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -37,6 +39,9 @@ import type {
   ApiError,
   ArtifactSignFile,
   ArtifactSignResponse,
+  BootProbeOffer,
+  BootReport,
+  BootReportResponse,
   DetectedSetup,
   ResolveRequest,
   ResolveResponse,
@@ -179,6 +184,59 @@ function rememberSetup(repo: Repository, setup: ResolveRequest["setup"]): void {
   patchRepoVerify(repo.id, (cur) => ({ ...cur, detected }));
 }
 
+// A probe uploads one boot log and one screenshot, not a run's videos and traces.
+export const PROBE_UPLOAD_LIMITS = { maxFileBytes: 20 * 1024 * 1024, maxTotalBytes: 40 * 1024 * 1024, maxFiles: 10 } as const;
+// Even keyed off signed claims, a repo that re-runs its setup job forever must not
+// accumulate probe rows (and upload quota) without bound.
+export const MAX_PROBES_PER_PR = 20;
+
+/** Offer the setup PR's own CI run a boot of the config that PR proposes — or record why we can't. */
+export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): BootProbeOffer | null {
+  const ob = runner.repo.verify?.onboarding;
+  if (!ob?.prNumber || ob.prNumber !== body.pr || !ob.setupPrOpen) return null;
+  // The claims are signed; body.event is whatever the runner typed, so it decides nothing.
+  if (runner.claims.event_name !== "pull_request") return null;
+  const prNumber = prNumberFromRef(runner.claims.ref);
+  if (prNumber !== ob.prNumber) return null;
+
+  const now = Date.now();
+  if (!body.capabilities?.includes("boot_probe")) {
+    patchRepoVerify(runner.repo.id, (cur) => ({
+      ...cur,
+      onboarding: { ...cur.onboarding, probeUnavailable: { cliVersion: body.cliVersion ?? "", at: now } },
+    }));
+    return null;
+  }
+
+  const attempt = Number(runner.claims.run_attempt) || 1;
+  const actionsRunId = String(runner.claims.run_id);
+  const uploadLimits = { ...PROBE_UPLOAD_LIMITS };
+  // One row per CI job attempt. Every part of the key is signed — body.sha is the runner's
+  // to choose, so keying on it would let one job mint a probe (and a fresh quota) per fake sha.
+  const existing = db.find(
+    "bootProbes",
+    (p) => p.repoId === runner.repo.id && p.prNumber === prNumber && p.actionsRunId === actionsRunId && p.attempt === attempt
+  );
+  if (existing) return { probeId: existing.id, uploadLimits };
+  if (db.filter("bootProbes", (p) => p.repoId === runner.repo.id && p.prNumber === prNumber).length >= MAX_PROBES_PER_PR) return null;
+
+  const probe = db.insert("bootProbes", {
+    id: uuid(),
+    schemaVersion: 1,
+    repoId: runner.repo.id,
+    prNumber,
+    actionsRunId,
+    sha: body.sha,
+    attempt,
+    status: "offered",
+    offeredAt: now,
+    uploadedBytes: 0,
+    uploadedCount: 0,
+  });
+  patchRepoVerify(runner.repo.id, (cur) => ({ ...cur, onboarding: { ...cur.onboarding, probeUnavailable: null } }));
+  return { probeId: probe.id, uploadLimits };
+}
+
 export async function resolveHandler(req: RunnerRequest, res: Response): Promise<void> {
   const runner = req.runner!;
   const body = parseResolveBody(req.body);
@@ -190,9 +248,11 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
   rememberSetup(runner.repo, body.setup);
 
   // DevAsign never reviews its own onboarding PR, so no plan will ever exist for it.
+  // Instead that run is where the proposed boot config gets tried (offerBootProbe).
   const onboardingPr = runner.repo.verify?.onboarding?.prNumber;
   if (onboardingPr != null && onboardingPr === body.pr) {
-    const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "onboarding_pr" };
+    const probe = offerBootProbe(runner, body);
+    const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "onboarding_pr", ...(probe ? { probe } : {}) };
     return void res.json(out);
   }
 
@@ -302,25 +362,38 @@ function parseSignFiles(body: unknown): ArtifactSignFile[] | null {
   });
 }
 
-export async function artifactsHandler(req: RunnerRequest, res: Response): Promise<void> {
-  const run = runForRunner(req, res);
-  if (!run) return;
-  if (run.status !== "running" && run.status !== "awaiting_runner") return fail(res, 409, "run_not_accepting_artifacts");
-  const files = parseSignFiles(req.body);
-  if (!files) return fail(res, 400, "invalid_body", { detail: "files[] is required" });
+// Where signed artifacts hang: a verify run, or a boot probe (whose id then sits
+// in VerifyArtifact.runId). The caps are the caller's, because a probe accumulates
+// its own on the probe row — one request must not be able to beat them by splitting.
+type SignContext = {
+  ownerId: string;
+  repoId: string;
+  owner: "run" | "probe";
+  plan: Plan;
+  limits: { maxFileBytes: number; maxTotalBytes: number; maxFiles: number };
+  usedBytes: number;
+  usedCount: number;
+  existing: VerifyArtifact[]; // already signed for this owner — posters link back into them
+};
 
+export async function signArtifactFiles(
+  files: ArtifactSignFile[],
+  ctx: SignContext,
+  // Called synchronously — before the first signPut await and again after any rollback —
+  // with the usage this owner has now. Two requests in flight must not each see the old total.
+  claim?: (totals: { totalBytes: number; count: number }) => void
+): Promise<{ body: ArtifactSignResponse; totalBytes: number; count: number; storageReady: boolean }> {
   const storage = artifactStorage();
   const out: ArtifactSignResponse = { ok: true, uploads: [], rejected: [] };
   if (!storage) {
     out.rejected = files.map((f) => ({ clientRef: f.clientRef, reason: "storage_unconfigured" }));
-    return void res.json(out);
+    return { body: out, totalBytes: ctx.usedBytes, count: ctx.usedCount, storageReady: false };
   }
 
-  const existing = db.filter("verifyArtifacts", (a) => a.runId === run.id);
-  let totalBytes = existing.reduce((s, a) => s + a.bytes, 0);
-  let count = existing.length;
+  let totalBytes = ctx.usedBytes;
+  let count = ctx.usedCount;
   const now = Date.now();
-  const expiresAt = retentionExpiresAt(req.runner!.plan, now);
+  const expiresAt = retentionExpiresAt(ctx.plan, now);
   const idByRef = new Map<string, string>();
   const refById = new Map<string, string>();
   const rows: VerifyArtifact[] = [];
@@ -334,11 +407,11 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
       out.rejected.push({ clientRef: f.clientRef, reason: "unsupported_kind" });
       continue;
     }
-    if (f.bytes > UPLOAD_LIMITS.maxFileBytes) {
+    if (f.bytes > ctx.limits.maxFileBytes) {
       out.rejected.push({ clientRef: f.clientRef, reason: "too_large" });
       continue;
     }
-    if (count + 1 > UPLOAD_LIMITS.maxFiles || totalBytes + f.bytes > UPLOAD_LIMITS.maxTotalBytes) {
+    if (count + 1 > ctx.limits.maxFiles || totalBytes + f.bytes > ctx.limits.maxTotalBytes) {
       out.rejected.push({ clientRef: f.clientRef, reason: "quota" });
       continue;
     }
@@ -352,13 +425,14 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
     rows.push({
       id,
       schemaVersion: 1,
-      runId: run.id,
-      repoId: run.repoId,
+      runId: ctx.ownerId,
+      repoId: ctx.repoId,
+      owner: ctx.owner,
       testId: f.testId,
       criterionIds: f.criterionIds ?? [],
       kind: f.kind,
       path: f.path,
-      storageKey: artifactKey(run.repoId, run.id, id, f.kind, f.contentType),
+      storageKey: artifactKey(ctx.repoId, ctx.ownerId, id, f.kind, f.contentType),
       bytes: f.bytes,
       contentType: f.contentType,
       posterArtifactId: null,
@@ -376,22 +450,156 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
   for (const f of files) {
     if (f.kind !== "poster" || !f.posterFor) continue;
     const posterId = idByRef.get(f.clientRef);
-    const videoId = idByRef.get(f.posterFor) ?? existing.find((a) => a.path === f.posterFor)?.id;
+    const videoId = idByRef.get(f.posterFor) ?? ctx.existing.find((a) => a.path === f.posterFor)?.id;
     if (!posterId || !videoId) continue;
     const video = rows.find((r) => r.id === videoId);
     if (video) video.posterArtifactId = posterId;
     else db.update("verifyArtifacts", (a) => a.id === videoId, { posterArtifactId: posterId });
   }
 
+  // The quota is taken here, with no await in between, so a concurrent request for the same
+  // owner reads these rows and counters — never the snapshot this one started from.
+  for (const row of rows) db.insert("verifyArtifacts", row);
+  claim?.({ totalBytes, count });
+
   const urlExpiresAt = now + config.artifacts.putUrlTtlSeconds * 1000;
-  for (const row of rows) {
-    const { url, headers } = await storage.signPut(row.storageKey, row.contentType, config.artifacts.putUrlTtlSeconds);
-    db.insert("verifyArtifacts", row);
-    out.uploads.push({ clientRef: refById.get(row.id)!, artifactId: row.id, putUrl: url, headers, urlExpiresAt, retentionExpiresAt: expiresAt });
+  const signedIds = new Set<string>();
+  const rollback = (unsigned: VerifyArtifact[]) => {
+    for (const row of unsigned) db.remove("verifyArtifacts", (a) => a.id === row.id);
+    const left = db.filter("verifyArtifacts", (a) => a.runId === ctx.ownerId);
+    claim?.({ totalBytes: left.reduce((s, a) => s + a.bytes, 0), count: left.length });
+  };
+  try {
+    for (const row of rows) {
+      const { url, headers } = await storage.signPut(row.storageKey, row.contentType, config.artifacts.putUrlTtlSeconds);
+      signedIds.add(row.id);
+      out.uploads.push({ clientRef: refById.get(row.id)!, artifactId: row.id, putUrl: url, headers, urlExpiresAt, retentionExpiresAt: expiresAt });
+    }
+  } catch (err) {
+    rollback(rows.filter((r) => !signedIds.has(r.id)));
+    throw err;
   }
-  updateRun(run.id, { artifactBytes: totalBytes });
-  res.json(out);
+  return { body: out, totalBytes, count, storageReady: true };
 }
+
+export async function artifactsHandler(req: RunnerRequest, res: Response): Promise<void> {
+  const run = runForRunner(req, res);
+  if (!run) return;
+  if (run.status !== "running" && run.status !== "awaiting_runner") return fail(res, 409, "run_not_accepting_artifacts");
+  const files = parseSignFiles(req.body);
+  if (!files) return fail(res, 400, "invalid_body", { detail: "files[] is required" });
+
+  const existing = db.filter("verifyArtifacts", (a) => a.runId === run.id);
+  const signed = await signArtifactFiles(files, {
+    ownerId: run.id,
+    repoId: run.repoId,
+    owner: "run",
+    plan: req.runner!.plan,
+    limits: UPLOAD_LIMITS,
+    usedBytes: existing.reduce((s, a) => s + a.bytes, 0),
+    usedCount: existing.length,
+    existing,
+  });
+  if (signed.storageReady) updateRun(run.id, { artifactBytes: signed.totalBytes });
+  res.json(signed.body);
+}
+
+/** The one guard both probe endpoints go through: this runner's repo, this PR, this sha, still offered, still young. */
+export function probeForRunner(req: RunnerRequest, res: Response, sha?: string): BootProbe | null {
+  const runner = req.runner!;
+  const probe = db.find("bootProbes", (p) => p.id === String(req.params.probeId));
+  // A probe on another repo is not this runner's business, and must not be confirmed to exist.
+  if (!probe || probe.repoId !== runner.repo.id) {
+    fail(res, 404, "probe_not_found");
+    return null;
+  }
+  if (prNumberFromRef(runner.claims.ref) !== probe.prNumber) {
+    fail(res, 403, "pr_mismatch");
+    return null;
+  }
+  if (sha !== undefined && sha.toLowerCase() !== probe.sha.toLowerCase()) {
+    fail(res, 409, "sha_mismatch");
+    return null;
+  }
+  if (probe.status !== "offered") {
+    fail(res, 409, "probe_not_offered");
+    return null;
+  }
+  if (Date.now() - probe.offeredAt > PROBE_EXPIRE_MS) {
+    fail(res, 409, "probe_expired");
+    return null;
+  }
+  return probe;
+}
+
+const bodySha = (body: unknown): string | undefined => {
+  const v = (body as { sha?: unknown })?.sha;
+  return typeof v === "string" ? v : undefined;
+};
+
+export async function probeArtifactsHandler(req: RunnerRequest, res: Response): Promise<void> {
+  const probe = probeForRunner(req, res, bodySha(req.body));
+  if (!probe) return;
+  const files = parseSignFiles(req.body);
+  if (!files) return fail(res, 400, "invalid_body", { detail: "files[] is required" });
+
+  // Read the ledger off the rows, not the counters, and take what this request claims before
+  // any await: two concurrent requests must share one cap, not get one each.
+  const already = db.filter("verifyArtifacts", (a) => a.runId === probe.id);
+  const signed = await signArtifactFiles(
+    files,
+    {
+      ownerId: probe.id,
+      repoId: probe.repoId,
+      owner: "probe",
+      plan: req.runner!.plan,
+      limits: PROBE_UPLOAD_LIMITS,
+      usedBytes: Math.max(probe.uploadedBytes, already.reduce((s, a) => s + a.bytes, 0)),
+      usedCount: Math.max(probe.uploadedCount, already.length),
+      existing: already,
+    },
+    ({ totalBytes, count }) => {
+      db.update("bootProbes", (p) => p.id === probe.id, { uploadedBytes: totalBytes, uploadedCount: count });
+    }
+  );
+  res.json(signed.body);
+}
+
+/** Pending probe artifacts the report vouches for; anything else stays unconfirmed and expires unread. */
+export function uploadedOnBootReport(pending: VerifyArtifact[], report: BootReport): string[] {
+  const referenced = new Set(
+    [report.logArtifactId, report.screenshotArtifactId, report.diagnosis?.logArtifactId].filter((id): id is string => !!id)
+  );
+  return pending.filter((a) => referenced.has(a.id)).map((a) => a.id);
+}
+
+export function makeProbeResultHandler(deps: { settle?: (probeId: string) => Promise<void> } = {}) {
+  const settle = deps.settle ?? settleBootProbe;
+  return async function probeResultHandler(req: RunnerRequest, res: Response): Promise<void> {
+    const probe = probeForRunner(req, res, bodySha(req.body));
+    if (!probe) return;
+    const report = normalizeBootReport(req.body);
+    if (!report) return fail(res, 400, "invalid_body", { detail: "a boot report is required" });
+
+    const now = Date.now();
+    // Flip before anything async: a second POST of the same probe must lose the race, not double-report.
+    const claimed = db.update("bootProbes", (p) => p.id === probe.id && p.status === "offered", {
+      status: "reported",
+      reportedAt: now,
+      report,
+    });
+    if (!claimed) return fail(res, 409, "probe_not_offered");
+    const pending = db.filter("verifyArtifacts", (a) => a.runId === probe.id && a.state === "pending_upload");
+    for (const id of uploadedOnBootReport(pending, report)) {
+      db.update("verifyArtifacts", (x) => x.id === id, { state: "uploaded", uploadedAt: now });
+    }
+    void settle(probe.id).catch((err) => console.warn("[verify] boot probe settle failed:", err));
+    const out: BootReportResponse = { ok: true };
+    res.json(out);
+  };
+}
+
+export const probeResultHandler = makeProbeResultHandler();
 
 export function parseResults(body: unknown, runId: string): RunnerResults | null {
   const b = (body || {}) as Record<string, any>;
@@ -573,6 +781,8 @@ v1.use(express.json({ limit: "8mb" }));
 v1.post("/runs/resolve", guard(runnerAuth), guard(resolveHandler));
 v1.post("/runs/:runId/artifacts", guard(runnerAuth), guard(artifactsHandler));
 v1.post("/runs/:runId/results", guard(runnerAuth), guard(resultsHandler));
+v1.post("/probes/:probeId/artifacts", guard(runnerAuth), guard(probeArtifactsHandler));
+v1.post("/probes/:probeId/result", guard(runnerAuth), guard(probeResultHandler));
 v1.get("/runs/:runId", guard(readAuth), guard(getRunHandler));
 v1.get("/health", (_req, res) => {
   res.json({ ok: true, apiVersion: 1, verifyEnabled: effectiveWorkflow({ workflow: undefined }).stages.verify });

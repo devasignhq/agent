@@ -4,7 +4,7 @@
 import { db } from "../db.js";
 import { config } from "../config.js";
 import { enqueueVerifyJudge } from "../queue.js";
-import type { VerifyRun } from "../types.js";
+import type { BootProbe, VerifyRun } from "../types.js";
 
 // Planning and judgment are single LLM jobs; 15 quiet minutes is dead, not slow.
 export const JOB_STALE_MS = 15 * 60_000;
@@ -74,7 +74,26 @@ export function sweepStaleVerifyRuns(
   return stale.length;
 }
 
+// How long an offered boot probe stays usable. Also the age guard on both probe
+// endpoints, so an id a CI log leaked cannot be redeemed days later.
+export const PROBE_EXPIRE_MS = 2 * 60 * 60_000;
+
+export function selectExpiredBootProbes(probes: BootProbe[], now: number): string[] {
+  return probes.filter((p) => p.status === "offered" && now - p.offeredAt > PROBE_EXPIRE_MS).map((p) => p.id);
+}
+
+export function sweepExpiredBootProbes(now: number = Date.now()): number {
+  const ids = selectExpiredBootProbes(db.filter("bootProbes", () => true), now);
+  for (const id of ids) db.update("bootProbes", (p) => p.id === id, { status: "expired" });
+  if (ids.length > 0) console.log(`[verify] expired ${ids.length} unreported boot probe(s)`);
+  return ids.length;
+}
+
 export function startVerifyReaper(onSettled?: (run: VerifyRun) => void): void {
   sweepStaleVerifyRuns({ boot: true }, onSettled);
-  setInterval(() => sweepStaleVerifyRuns({ boot: false }, onSettled), 5 * 60_000);
+  sweepExpiredBootProbes();
+  setInterval(() => {
+    sweepStaleVerifyRuns({ boot: false }, onSettled);
+    sweepExpiredBootProbes();
+  }, 5 * 60_000);
 }

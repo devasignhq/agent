@@ -54,6 +54,31 @@ test("a normal command still resolves with its exit code and output", async () =
   assert.ok(missing.spawnError, "a spawn failure is reported, not thrown");
 });
 
+test("a line handler that throws cannot take the run down with it", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-exec-throw-"));
+  // onLine runs inside a stream "data" handler, where a throw is an uncaught exception —
+  // it escapes every try/catch on the call path and ends the process.
+  const seen: string[] = [];
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    const res = await runCommand({
+      cmd: process.execPath,
+      args: ["-e", 'console.log("first"); console.log("second"); process.stdout.write("tail")'],
+      cwd: root,
+      timeoutMs: 10_000,
+      onLine: (l) => {
+        seen.push(l);
+        throw new Error("a scrub blew up");
+      },
+    });
+    assert.equal(res.code, 0);
+    assert.deepEqual(seen, ["first", "second", "tail"], "every line is still offered");
+  } finally {
+    console.warn = warn;
+  }
+});
+
 test("onLine gets whole lines tagged with their stream, even when a line arrives split across pipe chunks", async () => {
   const root = mkdtempSync(path.join(os.tmpdir(), "dv-exec-lines-"));
   // The pauses force separate chunks: the header, then its value, then a final line with no newline.

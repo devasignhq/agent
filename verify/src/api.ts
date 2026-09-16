@@ -1,6 +1,12 @@
 // Typed client for the /v1 runner API.
 import type { TokenSource } from "./oidc.js";
-import { CLI_VERSION, type ArtifactSignFile, type ArtifactSignResponse, type ResolveRequest, type ResolveResponse, type RunView, type RunnerResults } from "./types.js";
+import { CLI_VERSION, type ArtifactSignFile, type ArtifactSignResponse, type BootReport, type ResolveRequest, type ResolveResponse, type RunView, type RunnerResults } from "./types.js";
+
+/** Where signed uploads go: a run's endpoint, or a boot probe's (which also checks the sha). */
+export type ArtifactTarget = { path: string; sha?: string };
+
+export const runArtifacts = (runId: string): ArtifactTarget => ({ path: `/v1/runs/${runId}/artifacts` });
+export const probeArtifacts = (probeId: string, sha: string): ArtifactTarget => ({ path: `/v1/probes/${probeId}/artifacts`, sha });
 
 export class ApiError extends Error {
   constructor(public status: number, public body: unknown, message?: string) {
@@ -61,8 +67,12 @@ export class ApiClient {
     return this.request<ResolveResponse>("POST", "/v1/runs/resolve", body).then((r) => r.body);
   }
 
-  signArtifacts(runId: string, files: ArtifactSignFile[]): Promise<ArtifactSignResponse> {
-    return this.request<ArtifactSignResponse>("POST", `/v1/runs/${runId}/artifacts`, { files }).then((r) => r.body);
+  signArtifacts(target: ArtifactTarget, files: ArtifactSignFile[]): Promise<ArtifactSignResponse> {
+    return this.request<ArtifactSignResponse>("POST", target.path, { files, ...(target.sha ? { sha: target.sha } : {}) }).then((r) => r.body);
+  }
+
+  bootReport(probeId: string, report: BootReport): Promise<{ ok: true }> {
+    return this.request<{ ok: true }>("POST", `/v1/probes/${probeId}/result`, report).then((r) => r.body);
   }
 
   results(runId: string, payload: RunnerResults): Promise<{ ok: true; runId: string; status: string }> {

@@ -25,7 +25,16 @@ function legacyStatus(yml: VerifySetup["devasignYml"]): { status: BrowserTestsSt
   return { status: missing.length ? "not_configured" : "unproven", missing };
 }
 
-export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devasignYml">): BrowserTestsRow {
+/** What a probe that failed says went wrong. Two stages mean the app was up, so they do not blame the boot. */
+export function bootFailureText(boot: NonNullable<VerifySetup["boot"]>): string {
+  const where = boot.stage === "servers" && boot.failedServer ? `the ${boot.failedServer} server` : null;
+  if (boot.stage === "login") return "The app came up in CI, but DevAsign could not sign in";
+  if (boot.stage === "page") return "The app came up in CI, but its page did not load";
+  if (boot.stage === "browsers") return "DevAsign could not install its browser in CI — the app itself came up";
+  return where ? `The app did not start in CI — ${where} never came up` : "The app did not start in CI";
+}
+
+export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devasignYml" | "boot">): BrowserTestsRow {
   const bt = setup.browserTests;
   const { status, missing } = bt ? { status: bt.status, missing: bt.missing ?? [] } : legacyStatus(setup.devasignYml);
   const last = bt?.lastBrowserless ?? null;
@@ -41,6 +50,14 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
     text = last?.reason === "did_not_start" ? `The app did not start in CI${onPr}` : `Browser tests could not run${onPr}`;
   } else if (status === "runner_outdated") {
     text = "The runner in CI is too old for verify.servers or verify.login — update @devasign/verify";
+  } else if (status === "proven") {
+    // The setup PR's own CI booted this config; say where it came up, not just that it is configured.
+    const url = bt?.defaultYml?.url;
+    text = url ? `Working — the app came up at ${url} in CI` : "Working — the app came up in CI";
+    tone = "ok";
+  } else if (status === "boot_failed") {
+    // The setup PR's own CI booted this exact config and it did not come up: never a green row.
+    text = setup.boot ? bootFailureText(setup.boot) : "The app did not start in CI";
   } else if (status === "unproven") {
     text = "Configured";
     tone = "ok";

@@ -1,9 +1,10 @@
 // The run: token → resolve → write tests → run → upload → results → summary.
 import { appendFileSync, existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { ApiClient, ApiError } from "./api.js";
+import { ApiClient, ApiError, runArtifacts } from "./api.js";
 import { resolveArtifactRefs, uploadArtifacts } from "./artifacts.js";
 import { bootManaged, cleanupAuth, redact, redactFile, type StorageState } from "./boot.js";
+import { runBootProbe } from "./boot-probe.js";
 import { readContext, type RunContext } from "./context.js";
 import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js";
 import { diagnoseMissingDependencies, diagnosePlaywrightOutput, preflight } from "./doctor.js";
@@ -60,7 +61,7 @@ export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: Runner
       setup: polls === 0 ? setup : undefined,
       actions: { runId: ctx.runId, jobUrl: ctx.jobUrl, runnerOs: ctx.runnerOs },
       cliVersion: CLI_VERSION,
-      capabilities: ["managed_boot"],
+      capabilities: ["managed_boot", "boot_probe"],
       // Tells the server this job is leaving, so a plan landing later re-dispatches CI
       // instead of stranding the run until it times out.
       ...(finalPoll ? { giveUp: true } : {}),
@@ -239,6 +240,8 @@ export async function run(opts: RunOptions): Promise<number> {
       return 0;
     }
     if (resolved.status === "empty") {
+      // The App's own setup PR: nothing to judge, but the boot config it proposes is worth trying.
+      if (resolved.probe) return runBootProbe({ api, probe: resolved.probe, ws, yml, setup, sha: ctx.sha, keep: opts.keep, testTimeoutMs: opts.testTimeoutMs, fetchImpl });
       log.info(`nothing to verify: ${resolved.reason}`);
       return 0;
     }
@@ -262,7 +265,7 @@ export async function run(opts: RunOptions): Promise<number> {
     const { results, artifacts, doctor, doctorLogRef } = await executePlan(plan, ws, { yml: bootYml, testTimeoutMs: opts.testTimeoutMs, setup });
     let finalResults = results;
     if (api && ctx) {
-      const ids = await uploadArtifacts(api, runId, artifacts, plan.uploadLimits, fetchImpl);
+      const ids = await uploadArtifacts(api, runArtifacts(runId), artifacts, plan.uploadLimits, fetchImpl);
       finalResults = resolveArtifactRefs(results, ids);
       if (doctor && doctor.logArtifactId === undefined) {
         const logId = doctorLogRef ? ids.get(doctorLogRef) : [...ids.entries()].find(([ref]) => ref.startsWith("log:pw:"))?.[1];

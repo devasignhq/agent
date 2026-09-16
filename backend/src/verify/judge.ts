@@ -193,8 +193,11 @@ function noteBrowserless(args: {
   // A paused run says nothing about the repo's setup, so whatever the last real run found stands.
   if (withheld === "managed_boot_off") return;
   const s = browserlessSummary({ criteria, verdicts, plan, withheld, doctor, inherited });
-  const cur = db.find("repositories", (r) => r.id === run.repoId)?.verify?.lastBrowserless ?? null;
-  let next: RepoVerifyState["lastBrowserless"] = s && s.reason !== "paused" ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at } : null;
+  const verify = db.find("repositories", (r) => r.id === run.repoId)?.verify;
+  const cur = verify?.lastBrowserless ?? null;
+  // Which config was in force: a later probe of this same fingerprint is a re-run, not a fix.
+  const bootHash = verify?.defaultYml?.bootHash ?? null;
+  let next: RepoVerifyState["lastBrowserless"] = s && s.reason !== "paused" ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at, bootHash } : null;
   if (!s) {
     const ui = new Set(criteria.filter((c) => c.kind === "ui").map((c) => c.id));
     const e2e = results.filter((r) => r.level === "e2e");
@@ -204,7 +207,7 @@ function noteBrowserless(args: {
     if (browser.policy !== "never" && noBrowserRan) {
       const reason = heldUi && withheld === "runner_outdated" ? "runner_outdated" : appNeverStarted(doctor) ? "did_not_start" : "browser_errored";
       if (cur?.reason === reason) return;
-      next = { count: 0, reason, runId: run.id, prNumber: run.prNumber, at };
+      next = { count: 0, reason, runId: run.id, prNumber: run.prNumber, at, bootHash };
     } else {
       // A criterion this run only carried over proves nothing about its browser either way.
       if (browser.policy !== "never" && (doctor || !verdicts.some((v) => ui.has(v.criterionId) && !inherited.has(v.criterionId)))) return;
