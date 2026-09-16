@@ -98,18 +98,18 @@ test("the test author is told to write ES-module syntax for the runners that loa
   assert.match(testFileSystemPrompt(), /node:test, the bundled runner or vitest, write ES-module syntax only[\s\S]*never `require\(\)`/);
 });
 
-// devasignhq/agent#249: the PR body's own "appNeverStarted() is the single predicate … so the
-// note, the verdict reason and the repo flag can never disagree" became a criterion verbatim,
-// and the verifier read its undefined "agree" as string equality across five surfaces.
-test("criteria synthesis refuses a mechanism the PR described about itself, and an undefined 'agree'", () => {
-  for (const prompt of [criteriaSynthesisSystemPrompt(true), criteriaSynthesisSystemPrompt(false), criteriaSynthesisSystemPrompt(false, "bounty")]) {
-    assert.match(prompt, /is the author narrating their own refactor, not a requirement anyone asked for/);
-    assert.match(prompt, /The PR's own description never counts as that prescription/);
-    assert.match(prompt, /states exactly what must be equal between them/);
-    assert.match(prompt, /driven by a single shared predicate so they always agree/, "the anti-pattern list carries the shape itself");
-    assert.match(prompt, /the PR's own description prescribes nothing/);
-    assert.match(prompt, /no broad criterion restates what narrower ones already pin/);
-  }
+// devasignhq/agent#249: a fixture that asserted the right constant against a case it never
+// built failed a correct PR, and the judge could not see the fixture to say so.
+test("the test author builds the case its criterion names, and the judge reads that fixture before accepting a red", () => {
+  const author = testFileSystemPrompt();
+  assert.match(author, /find in that source the guard that selects it[\s\S]*inputs that satisfy it/);
+  assert.match(author, /assert the marker that path sets before asserting the outcome/);
+  assert.match(author, /an expectation copied out of an existing test needs that test's fixture with it/);
+  assert.match(author, /Assert nothing the criterion does not name/);
+  const judge = verificationJudgmentSystemPrompt();
+  assert.match(judge, /read the fixture before you accept that failure/);
+  assert.match(judge, /Downgrade it to "unverifiable" when the fixture does not build the case the criterion names/);
+  assert.match(judge, /stays a fail/, "a real red must survive the new licence to downgrade");
 });
 
 test("emoji ban is stated in every stage prompt", () => {

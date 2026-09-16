@@ -233,6 +233,29 @@ async function defaultFetchBytes(url: string, maxBytes: number): Promise<Buffer 
 const MAX_IMAGES = 6;
 const MAX_IMAGE_BYTES = 3 * 1024 * 1024;
 const MAX_LOG_BYTES = 20 * 1024;
+const MAX_TEST_FILES = 4;
+const MAX_TEST_FILE_BYTES = 16 * 1024;
+const MAX_TEST_FILE_LINES = 300;
+// A long file is cut in the middle, not at the end: its fixtures open it and its assertions close it.
+const TEST_FILE_HEAD_LINES = 280;
+const TEST_FILE_TAIL_LINES = MAX_TEST_FILE_LINES - TEST_FILE_HEAD_LINES;
+
+// A test asserting a case its own fixture never built reads as a real red in every other
+// piece of evidence; only its source says otherwise, so the judge is shown that source.
+export function failingGeneratedTestFiles(args: {
+  code: CriterionVerdict[];
+  artifacts: VerifyArtifact[];
+  plan: Pick<VerifyPlan, "tests"> | null;
+  max?: number;
+}): VerifyArtifact[] {
+  const failed = new Set(
+    args.code.filter((v) => v.verdict === "fail").flatMap((v) => v.evidenceRefs.map((r) => r.artifactId).filter((id): id is string => !!id))
+  );
+  const generated = new Set((args.plan?.tests ?? []).filter((t) => t.origin === "generated").map((t) => t.id));
+  return args.artifacts
+    .filter((a) => a.kind === "test_file" && failed.has(a.id) && !!a.testId && generated.has(a.testId))
+    .slice(0, args.max ?? MAX_TEST_FILES);
+}
 
 export function buildJudgeUserPrompt(args: {
   criteria: Criterion[];
@@ -241,6 +264,8 @@ export function buildJudgeUserPrompt(args: {
   artifacts: VerifyArtifact[];
   logs: Map<string, string>;
   doctor: DoctorDiagnosis | null;
+  // Generated test sources by testId, for the tests whose failure decides a criterion.
+  testFiles?: Map<string, string>;
 }): string {
   const byId = new Map(args.artifacts.map((a) => [a.id, a]));
   const lines: string[] = ["# Verification evidence", ""];
@@ -262,6 +287,17 @@ export function buildJudgeUserPrompt(args: {
         lines.push(`    artifact ${art.id}: ${art.kind} ${art.path}`);
         const log = args.logs.get(art.id);
         if (log) lines.push("    ```", ...log.split("\n").slice(0, 60).map((l) => "    " + l.slice(0, 300)), "    ```");
+      }
+      const source = args.testFiles?.get(r.testId);
+      if (source) {
+        const body = source.split("\n");
+        const cut = body.length - MAX_TEST_FILE_LINES;
+        const shown =
+          cut > 0
+            ? [...body.slice(0, TEST_FILE_HEAD_LINES), `… ${cut} more line(s)`, ...body.slice(-TEST_FILE_TAIL_LINES)]
+            : body;
+        lines.push("    this test's own source — DevAsign generated it; read its fixture before accepting its failure:");
+        lines.push("    ```", ...shown.map((l) => "    " + l.slice(0, 300)), "    ```");
       }
     }
   }
@@ -323,10 +359,12 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
         const storage = artifactStorage();
         const fetchBytes = deps.fetchBytes ?? defaultFetchBytes;
         const logs = new Map<string, string>();
+        const testFiles = new Map<string, string>();
         const images: Array<{ mediaType: string; base64: string }> = [];
         if (storage && code.length) {
           const wanted = new Set(code.flatMap((v) => v.evidenceRefs.map((r) => r.artifactId).filter((id): id is string => !!id)));
           const uiIds = new Set(criteria.filter((c) => c.kind === "ui").map((c) => c.id));
+          const sources = new Set(failingGeneratedTestFiles({ code, artifacts, plan }).map((a) => a.id));
           for (const a of artifacts) {
             if (!wanted.has(a.id)) continue;
             if (a.kind === "log") {
@@ -335,12 +373,15 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
             } else if (a.kind === "screenshot" && images.length < MAX_IMAGES && a.criterionIds.some((id) => uiIds.has(id))) {
               const buf = await fetchBytes(await storage.signGet(a.storageKey, config.artifacts.getUrlTtlSeconds), MAX_IMAGE_BYTES);
               if (buf && buf.length <= MAX_IMAGE_BYTES) images.push({ mediaType: a.contentType.startsWith("image/") ? a.contentType : "image/png", base64: buf.toString("base64") });
+            } else if (a.kind === "test_file" && sources.has(a.id) && a.testId) {
+              const buf = await fetchBytes(await storage.signGet(a.storageKey, config.artifacts.getUrlTtlSeconds), MAX_TEST_FILE_BYTES);
+              if (buf) testFiles.set(a.testId, buf.toString("utf8"));
             }
           }
         }
         const wf = effectiveWorkflow(repo);
         const system = withMaintainerInstructions(verificationJudgmentSystemPrompt(), wf.prompts?.verify);
-        const user = buildJudgeUserPrompt({ criteria, code, results: results.payload.results, artifacts, logs, doctor });
+        const user = buildJudgeUserPrompt({ criteria, code, results: results.payload.results, artifacts, logs, doctor, testFiles });
         const text = deps.llm
           ? await deps.llm({ system, user, images })
           : (await completeWithMeta({ system, cacheSystem: true, maxTokens: 4_000, messages: [{ role: "user", content: user }], images })).text;
