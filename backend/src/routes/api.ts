@@ -1448,6 +1448,10 @@ const RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
 // the button for the whole probe window.
 export const RECHECK_PICKUP_MS = 15 * 60_000;
 
+// The cap counts probe rows, but a click reaches GitHub before it has one: two at once
+// would each spend a branch-tip read. One in flight per repo is enough.
+const bootCheckInFlight = new Set<string>();
+
 /** Why the panel's boot-check button is live, or is not. */
 export function bootCheckAvailability(repo: Repository, now = Date.now()): { available: boolean; reason?: string } {
   const ob = repo.verify?.onboarding;
@@ -1485,51 +1489,59 @@ export function makeBootCheckHandler(deps: BootCheckDeps = {}) {
     const install = db.find("installations", (i) => i.id === repo.installationId);
     if (!install) return void res.json({ ok: true, dispatched: false, reason: "no_installation" });
 
-    // The App resolves the commit, so the probe is pinned to it before any runner is told about it.
-    const branchTip = deps.branchTip ?? ((i, r, branch) => branchTipSha(i.installationId, r.owner, r.name, branch));
-    const sha = await branchTip(install, repo, repo.defaultBranch).catch((err) => {
-      console.warn(`[verify] boot check could not read ${repo.owner}/${repo.name}@${repo.defaultBranch}:`, err instanceof Error ? err.message : err);
-      return null;
-    });
-    if (!sha) return void res.json({ ok: true, dispatched: false, reason: "head_unreadable" });
-
-    // Re-read after the round trip to GitHub, and mint before the next await: two clicks
-    // must not each get a re-check.
-    const now = Date.now();
-    const current = db.find("repositories", (r) => r.id === repo.id) ?? repo;
-    const still = bootCheckAvailability(current, now);
-    if (!still.available) return void res.json({ ok: true, dispatched: false, reason: still.reason });
-    const probe = db.insert("bootProbes", {
-      id: uuid(),
-      schemaVersion: 1,
-      repoId: repo.id,
-      kind: "recheck",
-      // Only this dispatch's client_payload carries it, so echoing it back is what tells
-      // the run GitHub started for us apart from every other dispatch run in the repo.
-      nonce: randomBytes(24).toString("base64url"),
-      prNumber: current.verify!.onboarding.prNumber!,
-      sha,
-      attempt: 1,
-      status: "offered",
-      offeredAt: now,
-      uploadedBytes: 0,
-      uploadedCount: 0,
-    });
-    const dispatch = deps.dispatch ?? ((i, r, payload) => repositoryDispatch(i.installationId, r.owner, r.name, DISPATCH_EVENT, payload));
-    const record = (bootCheck: RepoVerifyState["onboarding"]["bootCheck"]) =>
-      patchRepoVerify(repo.id, (cur) => ({ ...cur, onboarding: { ...cur.onboarding, bootCheck } }));
+    if (bootCheckInFlight.has(repo.id)) return void res.json({ ok: true, dispatched: false, reason: "cooldown" });
+    bootCheckInFlight.add(repo.id);
     try {
-      await dispatch(install, repo, { pr: probe.prNumber, sha, probe: { id: probe.id, nonce: probe.nonce } });
-    } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.warn(`[verify] boot-check repository_dispatch failed for ${repo.owner}/${repo.name}:`, msg);
-      // Nothing will ever report this row, and leaving it offered would block the next attempt.
-      db.update("bootProbes", (p) => p.id === probe.id, { status: "expired" });
-      record({ at: now, probeId: probe.id, dispatched: false, error: `${msg.slice(0, 300)} — the workflow needs a repository_dispatch trigger and the App needs contents:write` });
-      return void res.json({ ok: true, dispatched: false, reason: "dispatch_failed" });
+      // The App resolves the commit, so the probe is pinned to it before any runner is told about it.
+      const branchTip = deps.branchTip ?? ((i, r, branch) => branchTipSha(i.installationId, r.owner, r.name, branch));
+      const sha = await branchTip(install, repo, repo.defaultBranch).catch((err) => {
+        console.warn(`[verify] boot check could not read ${repo.owner}/${repo.name}@${repo.defaultBranch}:`, err instanceof Error ? err.message : err);
+        return null;
+      });
+      if (!sha) return void res.json({ ok: true, dispatched: false, reason: "head_unreadable" });
+
+      // Re-read after the round trip to GitHub, and mint before the next await: two clicks
+      // must not each get a re-check.
+      const now = Date.now();
+      const current = db.find("repositories", (r) => r.id === repo.id) ?? repo;
+      const still = bootCheckAvailability(current, now);
+      if (!still.available) return void res.json({ ok: true, dispatched: false, reason: still.reason });
+      const probe = db.insert("bootProbes", {
+        id: uuid(),
+        schemaVersion: 1,
+        repoId: repo.id,
+        kind: "recheck",
+        // Only this dispatch's client_payload carries it, so echoing it back is what tells
+        // the run GitHub started for us apart from every other dispatch run in the repo.
+        nonce: randomBytes(24).toString("base64url"),
+        prNumber: current.verify!.onboarding.prNumber!,
+        sha,
+        attempt: 1,
+        status: "offered",
+        offeredAt: now,
+        uploadedBytes: 0,
+        uploadedCount: 0,
+      });
+      const dispatch = deps.dispatch ?? ((i, r, payload) => repositoryDispatch(i.installationId, r.owner, r.name, DISPATCH_EVENT, payload));
+      const record = (bootCheck: RepoVerifyState["onboarding"]["bootCheck"]) =>
+        // The row can change while the dispatch is in flight; a bootCheck on a repo whose
+        // onboarding was reset would name a probe that no longer stands for anything.
+        patchRepoVerify(repo.id, (cur) => (cur.onboarding?.prNumber ? { ...cur, onboarding: { ...cur.onboarding, bootCheck } } : cur));
+      try {
+        await dispatch(install, repo, { pr: probe.prNumber, sha, probe: { id: probe.id, nonce: probe.nonce } });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[verify] boot-check repository_dispatch failed for ${repo.owner}/${repo.name}:`, msg);
+        // Nothing will ever report this row, and leaving it offered would block the next attempt.
+        db.update("bootProbes", (p) => p.id === probe.id, { status: "expired" });
+        record({ at: now, probeId: probe.id, dispatched: false, error: `${msg.slice(0, 300)} — the workflow needs a repository_dispatch trigger and the App needs contents:write` });
+        return void res.json({ ok: true, dispatched: false, reason: "dispatch_failed" });
+      }
+      record({ at: now, probeId: probe.id, dispatched: true });
+      res.json({ ok: true, dispatched: true });
+    } finally {
+      bootCheckInFlight.delete(repo.id);
     }
-    record({ at: now, probeId: probe.id, dispatched: true });
-    res.json({ ok: true, dispatched: true });
   };
 }
 export const bootCheckHandler = makeBootCheckHandler();

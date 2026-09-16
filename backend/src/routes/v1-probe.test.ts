@@ -811,3 +811,39 @@ test("a runner too old to echo the App's token says so, instead of leaving the p
   await resolve(other, { capabilities: ["boot_probe"], sha: "f".repeat(40) }, { event_name: "repository_dispatch", ref: "refs/heads/main" });
   assert.equal(repoVerify(other).onboarding.bootCheck!.error, undefined, "a different commit's run is not evidence about the runner");
 });
+
+test("two clicks at once spend one branch-tip read between them, not one each", async () => {
+  const t = seedTenant();
+  let tips = 0;
+  const handler = makeBootCheckHandler({
+    branchTip: async () => { tips += 1; await new Promise((r) => setTimeout(r, 10)); return SHA; },
+    dispatch: async () => {},
+  });
+  const call = () => { const res = fakeRes(); return handler(ownerReq(t.userId, t.repo.id), res).then(() => res); };
+  const [a, b] = await Promise.all([call(), call()]);
+
+  assert.equal(tips, 1, "the GitHub read is behind the throttle, not in front of it");
+  const outcomes = [a.body, b.body].sort((x: any, y: any) => Number(y.dispatched) - Number(x.dispatched));
+  assert.deepEqual(outcomes[0], { ok: true, dispatched: true });
+  assert.equal(outcomes[1].dispatched, false, "the second click is refused");
+  assert.equal(outcomes[1].reason, "cooldown");
+  assert.equal(db.filter("bootProbes", (p) => p.repoId === t.repo.id && p.kind === "recheck").length, 1, "and only one probe exists");
+});
+
+test("a re-check whose repo was reset mid-dispatch does not leave a bootCheck naming its probe", async () => {
+  const t = seedTenant();
+  const handler = makeBootCheckHandler({
+    branchTip: async () => SHA,
+    // The reset lands while GitHub is being asked, i.e. before the result is recorded.
+    dispatch: async () => {
+      const v = db.find("repositories", (r) => r.id === t.repo.id)!.verify!;
+      db.update("repositories", (r) => r.id === t.repo.id, { verify: { ...v, onboarding: { state: "none" } } });
+    },
+  });
+  const res = fakeRes();
+  await handler(ownerReq(t.userId, t.repo.id), res);
+  assert.equal(res.body.dispatched, true, "GitHub did take the dispatch");
+  const ob = db.find("repositories", (r) => r.id === t.repo.id)!.verify!.onboarding;
+  assert.equal(ob.prNumber, undefined, "the reset stands");
+  assert.equal(ob.bootCheck, undefined, "and no bootCheck was written onto it");
+});
