@@ -17,7 +17,20 @@ function seed(over: { userId?: string } = {}) {
   db.insert("users", { id: userId, githubId: 1, githubLogin: "owner", email: "o@x", plan: "pro", createdAt: 0 } as any);
   db.insert("installations", { id: installId, userId, accountId: 1, accountLogin: "acme", installationId: 9, repoIds: [] } as any);
   const repo = db.insert("repositories", { id: uuid(), installationId: installId, owner: "acme", name: "shop", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true } as any);
-  const calls = { branches: [] as string[], files: {} as Record<string, string>, prs: [] as any[], comments: [] as string[], openPr: null as { number: number; html_url: string } | null };
+  const calls = {
+    branches: [] as string[],
+    files: {} as Record<string, string>,
+    puts: [] as string[],
+    reads: [] as string[],
+    prs: [] as any[],
+    bodies: [] as string[],
+    updated: [] as number[],
+    caughtUp: [] as number[],
+    comments: [] as string[],
+    openPr: null as { number: number; html_url: string; body?: string } | null,
+    branchTip: null as string | null,
+  };
+  let clock = 0;
   const tree = ["package.json", "package-lock.json", "src/app.ts", "src/app.test.ts", ".env.example", ".github/workflows/ci.yml"];
   const contents: Record<string, string> = {
     "package.json": JSON.stringify({ scripts: { dev: "vite", test: "vitest run" }, dependencies: { vite: "5" }, devDependencies: { vitest: "2" } }),
@@ -27,14 +40,20 @@ function seed(over: { userId?: string } = {}) {
   const deps: OnboardDeps = {
     branchSha: async () => "headsha",
     tree: async () => tree.map((path) => ({ path, type: "blob", sha: "s", size: 1 })),
-    read: async (_i, _r, path) => calls.files[path] ?? contents[path] ?? null,
+    read: async (_i, _r, path, ref) => { calls.reads.push(`${path}@${ref}`); return calls.files[path] ?? contents[path] ?? null; },
+    branchTip: async () => calls.branchTip,
     ensureBranch: async (_i, _r, branch) => { calls.branches.push(branch); },
-    putFile: async (_i, _r, _b, path, content) => { calls.files[path] = content; },
+    putFile: async (_i, _r, _b, path, content) => { calls.puts.push(path); calls.files[path] = content; },
     createPr: async (_i, _r, args) => { calls.prs.push(args); return { number: 40 + calls.prs.length, html_url: `https://github.com/acme/shop/pull/${40 + calls.prs.length}` }; },
     findPr: async () => calls.openPr,
+    updatePr: async (_i, _r, n, patch) => { calls.updated.push(n); calls.bodies.push(patch.body); },
+    updateBranch: async (_i, _r, n) => { calls.caughtUp.push(n); return true; },
+    behindBy: async () => 0,
     secretNames: async () => ["API_KEY"],
     postComment: async (_i, _r, _n, body) => { calls.comments.push(body); return 1; },
     prHeadRef: async () => "feature/refunds",
+    sleep: async (ms) => { clock += ms; },
+    now: () => clock,
   };
   const cleanup = () => {
     db.remove("notifications", (n) => n.userId === userId);
@@ -42,8 +61,12 @@ function seed(over: { userId?: string } = {}) {
     db.remove("installations", (i) => i.id === installId);
     db.remove("users", (u) => u.id === userId);
   };
-  return { repo, installId, userId, deps, calls, cleanup };
+  return { repo, installId, userId, deps, calls, contents, cleanup };
 }
+
+const settle = () => new Promise((r) => setImmediate(r));
+const repoRow = (id: string) => db.find("repositories", (r) => r.id === id)!;
+const diagnosis = { stage: "start" as const, code: "app_not_ready" as const, message: "the app did not become reachable" };
 
 test("install → onboarding PR with the workflow + .devasign.yml, expected/missing secrets recorded, notification sent", async () => {
   const s = seed();
@@ -68,7 +91,11 @@ test("install → onboarding PR with the workflow + .devasign.yml, expected/miss
     assert.equal(repo.verify?.onboarding.prNumber, 41);
     assert.deepEqual(repo.verify?.onboarding.expectedSecrets, ["API_KEY"]);
     assert.deepEqual(repo.verify?.onboarding.missingSecrets, []);
-    assert.ok(repo.verify?.detected?.frameworks.some((f) => f.name === "vitest"));
+    assert.equal(repo.verify?.onboarding.setupPrOpen, true);
+    // Onboarding is still the only writer of `detected`, and the Stack row, the playwright
+    // escape hatch in browserTestsStatus and hasRunnerEvidence all read it.
+    assert.ok(repo.verify?.detected?.existingWorkflows, "the tree inference is still recorded");
+    assert.equal(repo.verify?.onboarding.candidates?.sha, "headsha", "and what the tree said the app boots like is cached alongside it");
     const n = db.find("notifications", (x) => x.userId === s.userId);
     assert.match(n!.title, /Enable DevAsign verification on acme\/shop/);
     // A second install event does not open another PR; a manual regenerate does.
@@ -188,6 +215,59 @@ test("a regenerated setup PR that merges parks the repo on pr_merged, and the ne
   }
 });
 
+test("a green run on the setup PR itself does not mark the repo verified — nothing has landed yet", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    const ob = () => repoRow(s.repo.id).verify!.onboarding;
+    assert.equal(ob().prNumber, 41);
+    // The workflow only exists on the setup branch, so the first run IS the setup PR's.
+    const review = db.insert("prReviews", { id: uuid(), repoId: s.repo.id, prNumber: 41, prTitle: "Enable DevAsign verification", headSha: "abc", baseSha: "d", status: "reviewing", verdict: null, criteria: [], taskId: null, additions: 0, deletions: 0, changedFiles: 0, createdAt: 0, updatedAt: 0 } as any);
+    snapshotCriteriaRevision(review.id, [], null);
+    const run = createVerifyRun({ review, repo: s.repo, status: "completed", triggeredBy: { kind: "pr_event" } });
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { ...repoRow(s.repo.id).verify!, onboarding: { ...ob(), lastDiagnosis: diagnosis } } });
+
+    noteRunSucceeded(run);
+    assert.equal(ob().state, "pr_open", "it proves the workflow runs, not that it reached the default branch");
+    assert.equal(ob().firstSuccessfulRunId, undefined);
+    assert.equal(ob().lastDiagnosis, null, "the setup problem it was diagnosed with is gone, though");
+
+    // The bug this guards: "verified" then froze, because closing unmerged keeps that state.
+    noteOnboardingPrClosed(s.repo.id, 41, false, s.deps);
+    assert.equal(ob().state, "pr_closed");
+    assert.notEqual((await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps)).reason, "already verified");
+    db.remove("verifyRuns", (r) => r.id === run.id);
+    db.remove("criteriaRevisions", (c) => c.reviewId === review.id);
+    db.remove("prReviews", (r) => r.id === review.id);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("more workflow files than we can read is not proof the action is absent", async () => {
+  const s = seed();
+  try {
+    const many = Array.from({ length: 11 }, (_, i) => `.github/workflows/a${String(i).padStart(2, "0")}.yml`);
+    const last = many[many.length - 1];
+    const tree = [...many, "package.json"].map((path) => ({ path, type: "blob" as const, sha: "s", size: 1 }));
+    s.calls.files[last] = `name: nightly\non:\n  pull_request:\njobs:\n  x:\n    steps:\n      - uses: ${ACTION_REF}\n`;
+    const deps = { ...s.deps, tree: async () => tree };
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "verified", firstSuccessfulRunId: "run-1" } } });
+
+    await runVerifyOnboard(s.repo.id, { trigger: "manual" }, deps);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.state, "verified", "a file we never read cannot demote a repo that is verified");
+
+    // Once we know where our step lives, that file is read before any other.
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "verified", firstSuccessfulRunId: "run-1", workflowPath: last } } });
+    s.calls.puts.length = 0;
+    await runVerifyOnboard(s.repo.id, { trigger: "manual" }, deps);
+    assert.ok(s.calls.reads.some((r) => r.startsWith(`${last}@`)), "the workflow that already runs us is never the one left unread");
+    assert.ok(!s.calls.puts.includes(WORKFLOW_PATH), "a second workflow beside it would verify every pull request twice");
+  } finally {
+    s.cleanup();
+  }
+});
+
 test("adopt: generated tests land under tests/devasign/ on a branch off the PR head, PR targets the PR's branch", async () => {
   const s = seed();
   try {
@@ -233,24 +313,211 @@ test("a manual regenerate reaches a repo that already merged its setup PR — th
     const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, onboarded);
     assert.equal(out.status, "opened", "regenerate must not be a silent no-op");
     assert.ok(s.calls.files[WORKFLOW_PATH], "the workflow is rewritten at the current generator version");
-    const ob = db.find("repositories", (r) => r.id === s.repo.id)?.verify?.onboarding;
-    assert.equal(ob?.state, "pr_open");
-    assert.equal(ob?.workflowPath, WORKFLOW_PATH, "where our step lives is now persisted");
-    assert.equal(ob?.workflowVersion, WORKFLOW_VERSION, "so a stale copy is detectable later");
+    const ob = repoRow(s.repo.id).verify!.onboarding;
+    assert.equal(ob.state, "pr_merged", "a follow-up PR does not un-merge the workflow that is already live");
+    assert.equal(ob.setupPrOpen, true);
+    assert.equal(ob.workflowPath, WORKFLOW_PATH, "where our step lives is now persisted");
+    assert.equal(ob.workflowVersion, WORKFLOW_VERSION, "so a stale copy is detectable later");
+
+    noteOnboardingPrClosed(s.repo.id, out.prNumber!, false, onboarded);
+    const closed = repoRow(s.repo.id).verify!.onboarding;
+    assert.equal(closed.state, "pr_merged", "closing that PR unmerged leaves the repo set up");
+    assert.equal(closed.setupPrOpen, false);
+
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { onboarding: { state: "verified", firstSuccessfulRunId: "run-1" } } });
+    await runVerifyOnboard(s.repo.id, { trigger: "manual" }, onboarded);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.state, "verified", "a verified repo is never demoted by opening a setup PR");
   } finally {
     s.cleanup();
   }
 });
 
-test("regenerating while the setup PR is open reuses it instead of 422-ing on a duplicate head", async () => {
+test("an open setup PR is updated in place: caught up with the base, read at the branch, and never reset", async () => {
   const s = seed();
   try {
-    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41" };
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "the body of the first version" };
+    // What the maintainer fixed on the setup branch after we opened the PR.
+    s.calls.files[DEVASIGN_YML_PATH] = "family: shop\nverify:\n  e2e: auto\n  start: npm run dev -- --port 4000\n  url: http://localhost:4000\n  ready: /\n";
     const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps);
     assert.equal(out.status, "opened");
     assert.equal(out.prNumber, 41, "the existing PR is reused");
     assert.equal(s.calls.prs.length, 0, "no second PR is attempted for the same branch");
-    assert.deepEqual(s.calls.branches, [ONBOARDING_BRANCH], "the branch is still force-updated with the new commits");
+    assert.deepEqual(s.calls.branches, [], "the branch is never reset out from under the maintainer");
+    assert.deepEqual(s.calls.caughtUp, [41], "it is brought up to date with the base before anything is read");
+    assert.ok(s.calls.reads.includes(`${DEVASIGN_YML_PATH}@${ONBOARDING_BRANCH}`), "the yml is read at the branch, not at the default head");
+    assert.ok(s.calls.reads.includes(`${WORKFLOW_PATH}@${ONBOARDING_BRANCH}`));
+    const yml = parse(s.calls.files[DEVASIGN_YML_PATH]);
+    assert.equal(yml.verify.url, "http://localhost:4000", "the port they fixed survives the regenerate");
+    assert.equal(yml.family, "shop", "and so does the rest of their file");
+    assert.deepEqual(s.calls.updated, [41], "the body stops describing the first version forever");
+    assert.match(s.calls.bodies[0], /What this PR adds/);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.setupPrOpen, true);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a setup branch GitHub has not finished catching up is left untouched", async () => {
+  const s = seed();
+  try {
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "" };
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, { ...s.deps, behindBy: async () => 3 });
+    assert.equal(out.status, "failed");
+    assert.deepEqual(s.calls.puts, [], "writing against a stale branch would revert the base it is behind");
+    assert.deepEqual(s.calls.updated, []);
+    assert.match(repoRow(s.repo.id).verify!.onboarding.lastError!, /still behind main/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a branch read that fails is not an empty file: nothing is written and the error is recorded", async () => {
+  const s = seed();
+  try {
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "" };
+    const theirs = "family: shop\nverify:\n  e2e: auto\n  start: npm run dev -- --port 4000\n  url: http://localhost:4000\n";
+    s.calls.files[DEVASIGN_YML_PATH] = theirs;
+    // A 403 secondary-rate-limit or a 500 reads exactly like "the file is not there" to a
+    // reader that swallows — and then the generated defaults overwrite what they fixed.
+    const flaky: OnboardDeps = {
+      ...s.deps,
+      read: async (i, r, path, ref) => {
+        if (ref === ONBOARDING_BRANCH) throw new Error("GitHub 403: You have exceeded a secondary rate limit");
+        return s.deps.read!(i, r, path, ref);
+      },
+    };
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, flaky);
+    assert.equal(out.status, "failed");
+    assert.deepEqual(s.calls.puts, [], "a read we could not make is never a reason to rewrite the branch");
+    assert.equal(s.calls.files[DEVASIGN_YML_PATH], theirs, "their port fix and their family key survive");
+    assert.match(repoRow(s.repo.id).verify!.onboarding.lastError!, /secondary rate limit/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a compare that does not say how far behind the branch is counts as not caught up", async () => {
+  const s = seed();
+  try {
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "" };
+    // 0 is the value that means "safe to write"; an unrecognised payload must not become one.
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, { ...s.deps, behindBy: async () => null });
+    assert.equal(out.status, "failed");
+    assert.deepEqual(s.calls.puts, []);
+    assert.match(repoRow(s.repo.id).verify!.onboarding.lastError!, /still behind main/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a setup branch whose PR was closed unmerged is never force-pushed over", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    noteOnboardingPrClosed(s.repo.id, 41, false, s.deps);
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.state, "pr_closed");
+
+    // They closed the PR meaning to fix it up, and kept working on the branch.
+    const theirs = "verify:\n  e2e: auto\n  start: npm run dev -- --port 4000\n  url: http://localhost:4000\n  ready: /\n";
+    const onBranch: Record<string, string> = { ...s.calls.files, [DEVASIGN_YML_PATH]: theirs };
+    const withBranch: OnboardDeps = {
+      ...s.deps,
+      branchTip: async () => "their-commit",
+      read: async (_i, _r, path, ref) => {
+        s.calls.reads.push(`${path}@${ref}`);
+        return ref === ONBOARDING_BRANCH ? onBranch[path] ?? null : s.contents[path] ?? null;
+      },
+    };
+    s.calls.branches.length = 0;
+    s.calls.puts.length = 0;
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "install" }, withBranch);
+    assert.deepEqual(s.calls.branches, [], "their commits are on that branch — resetting it destroys them");
+    assert.ok(!s.calls.puts.includes(DEVASIGN_YML_PATH), "and their boot config is read at the branch, not replaced with ours");
+    assert.equal(out.status, "skipped");
+
+    // Behind the base with no PR, there is no update-branch to run: writing would
+    // propose reverting whatever moved on since.
+    const behind = await runVerifyOnboard(s.repo.id, { trigger: "manual" }, { ...withBranch, behindBy: async () => 4 });
+    assert.equal(behind.status, "failed");
+    assert.match(behind.reason!, /has unmerged commits and is behind main/);
+    assert.deepEqual(s.calls.branches, []);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a workflow path that is not in the tree is refused, not silently redirected at another file", async () => {
+  const s = seed();
+  try {
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual", mode: "extend", workflow: ".github/workflows/typo.yml" }, s.deps);
+    assert.equal(out.status, "failed");
+    assert.match(out.reason!, /typo\.yml is not a workflow in main/);
+    assert.deepEqual(s.calls.puts, [], "editing whatever sorts first could be deploy.yml");
+    assert.match(repoRow(s.repo.id).verify!.onboarding.lastError!, /not a workflow/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("regenerating an open setup PR commits only what actually differs", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "install" }, s.deps);
+    assert.deepEqual(s.calls.branches, [ONBOARDING_BRANCH], "with no PR open yet, resetting the branch is safe");
+    assert.deepEqual(s.calls.puts.sort(), [DEVASIGN_YML_PATH, WORKFLOW_PATH]);
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: s.calls.prs[0].body };
+    s.calls.puts.length = 0;
+
+    assert.equal((await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps)).status, "opened");
+    assert.deepEqual(s.calls.puts, [], "the branch already says exactly this");
+    assert.deepEqual(s.calls.updated, [], "and so does the body");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("extend mode: an open setup PR whose branch already runs the action gets no second workflow", async () => {
+  const s = seed();
+  try {
+    const extend = { trigger: "manual" as const, mode: "extend" as const, workflow: ".github/workflows/ci.yml" };
+    await runVerifyOnboard(s.repo.id, extend, s.deps);
+    assert.ok(s.calls.files[".github/workflows/ci.yml"].includes(ACTION_REF));
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "" };
+    s.calls.puts.length = 0;
+
+    assert.equal((await runVerifyOnboard(s.repo.id, extend, s.deps)).status, "opened");
+    assert.ok(!s.calls.puts.includes(WORKFLOW_PATH), "a separate workflow beside their job would verify every PR twice");
+    assert.ok(!s.calls.puts.includes(".github/workflows/ci.yml"), "and their job is not given a second verify step");
+    assert.equal(repoRow(s.repo.id).verify!.onboarding.workflowPath, ".github/workflows/ci.yml");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a separate-mode regenerate adds no workflow when the repo's own CI already runs the action", async () => {
+  const s = seed();
+  try {
+    s.calls.files[".github/workflows/ci.yml"] = `name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: ${ACTION_REF}\n`;
+    assert.equal((await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps)).status, "opened");
+    assert.ok(!s.calls.puts.includes(WORKFLOW_PATH), "their CI already runs us");
+    const ob = repoRow(s.repo.id).verify!.onboarding;
+    assert.equal(ob.mode, "extend");
+    assert.equal(ob.workflowPath, ".github/workflows/ci.yml", "which is where the doctor follow-up must patch");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a .devasign.yml that does not parse is left alone and recorded as the setup's last error", async () => {
+  const s = seed();
+  try {
+    s.calls.openPr = { number: 41, html_url: "https://github.com/acme/shop/pull/41", body: "" };
+    const broken = "verify:\n  start: 'unterminated\n";
+    s.calls.files[DEVASIGN_YML_PATH] = broken;
+    assert.equal((await runVerifyOnboard(s.repo.id, { trigger: "manual" }, s.deps)).status, "opened");
+    assert.equal(s.calls.files[DEVASIGN_YML_PATH], broken, "overwriting it would throw away whatever they were editing");
+    assert.ok(!s.calls.puts.includes(DEVASIGN_YML_PATH));
+    assert.match(repoRow(s.repo.id).verify!.onboarding.lastError!, /left unchanged/);
   } finally {
     s.cleanup();
   }
@@ -260,10 +527,6 @@ test("the generated workflow carries a version marker so a stale copy can be spo
   const wf = generateWorkflow({ languages: ["ts"], frameworks: [], testCommands: [], services: [], envExampleVars: [], packageManager: "npm" } as any, { node: true, nodeVersion: "20" } as any, [], ["package.json"]);
   assert.match(wf, new RegExp(`# devasign-workflow: v${WORKFLOW_VERSION}`));
 });
-
-const settle = () => new Promise((r) => setImmediate(r));
-const repoRow = (id: string) => db.find("repositories", (r) => r.id === id)!;
-const diagnosis = { stage: "start" as const, code: "app_not_ready" as const, message: "the app did not become reachable" };
 
 test("a clean run clears a stale diagnosis on an already-verified repo without re-stamping it", () => {
   const s = seed();

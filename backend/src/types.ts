@@ -178,6 +178,19 @@ export type RepoVerifyState = {
     state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
     prNumber?: number;
     prUrl?: string;
+    // Whether that PR is still open. `state` cannot carry it: a repo whose workflow is
+    // already on the default branch stays verified/pr_merged while a setup PR is open.
+    setupPrOpen?: boolean;
+    // What the tree said the app boots like, at the default head it was inferred from
+    // (the shape of boot-inference's BootCandidates). The setup panel offers these.
+    candidates?: {
+      sha: string;
+      webApp: { dir: string; framework: "vite" | "next"; port: number } | null;
+      servers: Array<{ dir: string; name: string; script: string; port: number }>;
+      loginScript: string | null;
+      ambiguousWebApps: string[];
+      eligibleDirs: string[];
+    } | null;
     mode?: "separate" | "extend";
     // Where our step actually lives (extend mode puts it in the customer's own file),
     // and which generator wrote it — together these make a stale copy detectable.

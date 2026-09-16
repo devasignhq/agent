@@ -10,8 +10,11 @@ import {
   enqueueBountyCriteria,
   enqueueMaintainerFeedback,
   enqueueReview,
+  enqueueVerifyOnboard,
+  mergeOnboardPayload,
   queueSnapshot,
 } from "./queue.js";
+import { onboardOptions } from "./verify/jobs.js";
 
 test("enqueueReview dedupes a review that is already pending", () => {
   const first = enqueueReview("review-1");
@@ -54,6 +57,42 @@ test("different bounties still enqueue independently", () => {
   const before = queueSnapshot().reviews;
   enqueueBountyCriteria("bounty-2");
   assert.equal(queueSnapshot().reviews, before + 1);
+});
+
+// ── onboarding ───────────────────────────────────────────────────────────────
+// One job per repo, but the second ask is real work: a maintainer clicking
+// "Update setup PR" seconds after the install webhook must not be dropped.
+test("a manual regenerate merges into the install job already waiting for that repo", () => {
+  const first = enqueueVerifyOnboard({ repoId: "repo-1", trigger: "install" });
+  const second = enqueueVerifyOnboard({ repoId: "repo-1", trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml" });
+  assert.equal(second.id, first.id, "still one job per repo");
+  assert.equal(queueSnapshot().verify, 1);
+  assert.deepEqual(second.payload, { repoId: "repo-1", trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml" });
+});
+
+test("mergeOnboardPayload keeps the stronger trigger, the latest choices and every answer", () => {
+  assert.deepEqual(
+    mergeOnboardPayload(
+      { repoId: "r", trigger: "manual", mode: "separate", workflow: ".github/workflows/ci.yml", answers: { url: "http://localhost:3001", e2e: "auto" } },
+      { repoId: "r", trigger: "install", answers: { e2e: "always" } }
+    ),
+    { repoId: "r", trigger: "manual", mode: "separate", workflow: ".github/workflows/ci.yml", answers: { url: "http://localhost:3001", e2e: "always" } },
+    "an install trigger neither downgrades a queued manual run nor forgets what it was told"
+  );
+  assert.deepEqual(
+    mergeOnboardPayload({ repoId: "r", trigger: "install" }, { repoId: "r", trigger: "manual", mode: "extend" }),
+    { repoId: "r", trigger: "manual", mode: "extend" }
+  );
+  assert.equal(mergeOnboardPayload({ repoId: "r", trigger: "install" }, { repoId: "r", trigger: "doctor" }).trigger, "doctor", "the later trigger wins when neither is manual");
+  assert.deepEqual(mergeOnboardPayload({ repoId: "r", trigger: "install" }, { repoId: "r", trigger: "install" }), { repoId: "r", trigger: "install" }, "nothing is invented");
+});
+
+test("everything the queue kept reaches the onboarding run: the worker's dispatch drops no field", () => {
+  // The merge above works to preserve `answers` across triggers; a dispatch that names
+  // the fields it forwards drops whatever is added later, and nothing type-checks it.
+  const payload = { repoId: "r", trigger: "manual" as const, mode: "extend" as const, workflow: ".github/workflows/ci.yml", answers: { url: "http://localhost:3001" } };
+  assert.deepEqual(onboardOptions(payload), { trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml", answers: { url: "http://localhost:3001" } });
+  assert.deepEqual(onboardOptions({ repoId: "r", trigger: "install" }), { trigger: "install" });
 });
 
 test("criteria jobs drain in the reviews bucket, never behind an index build", () => {
