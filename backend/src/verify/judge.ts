@@ -236,6 +236,9 @@ const MAX_LOG_BYTES = 20 * 1024;
 const MAX_TEST_FILES = 4;
 const MAX_TEST_FILE_BYTES = 16 * 1024;
 const MAX_TEST_FILE_LINES = 300;
+// A long file is cut in the middle, not at the end: its fixtures open it and its assertions close it.
+const TEST_FILE_HEAD_LINES = 280;
+const TEST_FILE_TAIL_LINES = MAX_TEST_FILE_LINES - TEST_FILE_HEAD_LINES;
 
 // A test asserting a case its own fixture never built reads as a real red in every other
 // piece of evidence; only its source says otherwise, so the judge is shown that source.
@@ -288,10 +291,13 @@ export function buildJudgeUserPrompt(args: {
       const source = args.testFiles?.get(r.testId);
       if (source) {
         const body = source.split("\n");
+        const cut = body.length - MAX_TEST_FILE_LINES;
+        const shown =
+          cut > 0
+            ? [...body.slice(0, TEST_FILE_HEAD_LINES), `… ${cut} more line(s)`, ...body.slice(-TEST_FILE_TAIL_LINES)]
+            : body;
         lines.push("    this test's own source — DevAsign generated it; read its fixture before accepting its failure:");
-        lines.push("    ```", ...body.slice(0, MAX_TEST_FILE_LINES).map((l) => "    " + l.slice(0, 300)));
-        if (body.length > MAX_TEST_FILE_LINES) lines.push(`    … ${body.length - MAX_TEST_FILE_LINES} more line(s)`);
-        lines.push("    ```");
+        lines.push("    ```", ...shown.map((l) => "    " + l.slice(0, 300)), "    ```");
       }
     }
   }

@@ -467,6 +467,9 @@ test("the judge reads the source of a generated test whose failure fails a crite
   assert.match(prompt, /this test's own source — DevAsign generated it/);
   assert.match(prompt, /\/\/ \[1\] the criterion/);
   assert.match(prompt, /… 21 more line\(s\)/, "a long file is cut, and says so");
+  assert.match(prompt, /line 278/, "the head is kept");
+  assert.doesNotMatch(prompt, /line 279\b/, "the cut falls in the middle");
+  assert.match(prompt, /line 319/, "and the tail, where a test file's assertions are");
   assert.equal(prompt.split("this test's own source").length - 1, 1, "only the test whose source was fetched carries one");
 });
 
