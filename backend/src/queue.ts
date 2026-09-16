@@ -345,6 +345,8 @@ export function mergeOnboardPayload(
   const answers = waiting.answers || next.answers ? { ...waiting.answers, ...next.answers } : undefined;
   return {
     repoId: waiting.repoId,
+    // Only manual is load-bearing: runVerifyOnboard branches on `!== "manual"` and nothing else,
+    // so a queued doctor giving way to a later install changes the log line, not the run.
     trigger: waiting.trigger === "manual" || next.trigger === "manual" ? "manual" : next.trigger,
     ...(next.mode ?? waiting.mode ? { mode: next.mode ?? waiting.mode } : {}),
     ...(next.workflow ?? waiting.workflow ? { workflow: next.workflow ?? waiting.workflow } : {}),
