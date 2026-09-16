@@ -172,8 +172,37 @@ export type ResolveEmptyReason =
 export type ResolveResponse =
   | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number; giveUpAfterMs?: number }
   | { ok: true; status: "ready"; runId: string; plan: RunnerPlan }
-  | { ok: true; status: "empty"; runId: string | null; reason: ResolveEmptyReason }
+  // `probe`: this is the App's own setup PR and the backend wants its proposed boot
+  // config tried. Nothing is planned or judged — the runner boots and reports back.
+  | { ok: true; status: "empty"; runId: string | null; reason: ResolveEmptyReason; probe?: BootProbeOffer }
   | { ok: true; status: "setup"; runId: string; onboardingPr?: number };
+
+export type BootProbeOffer = { probeId: string; uploadLimits: RunnerPlan["uploadLimits"] };
+
+// ---- The boot probe: POST /v1/probes/{probeId}/{artifacts,result} -----------
+// Untrusted: anyone who can open a PR can influence what the probe reports, so
+// the backend normalizes it against a whitelist and composes the PR comment from
+// the repo's own .devasign.yml plus fixed per-code text — never from these strings.
+
+// "browsers" is DevAsign's own Chromium install failing after the app came up — not the repo's fault.
+export type BootStage = "config" | "install" | "servers" | "start" | "login" | "browsers" | "page" | "done";
+
+export type BootReport = {
+  sha: string;
+  ok: boolean;
+  stage: BootStage; // where it stopped; "done" when it came up
+  failedServer?: string;
+  durationMs: number;
+  cliVersion: string;
+  servers: Array<{ name: string; ok: boolean; readyMs?: number; exitCode?: number | null }>;
+  login?: { ran: boolean; checked: boolean; ok: boolean; checkStatus?: number; cors?: "ok" | "missing" | "mismatch" };
+  page?: { status: number | null };
+  diagnosis?: DoctorDiagnosis | null;
+  logArtifactId?: string;
+  screenshotArtifactId?: string;
+};
+
+export type BootReportResponse = { ok: true };
 
 // ---- POST /v1/runs/{runId}/artifacts ----------------------------------------
 
@@ -189,7 +218,8 @@ export type ArtifactSignFile = {
   posterFor?: string; // clientRef of the video this poster belongs to
 };
 
-export type ArtifactSignRequest = { files: ArtifactSignFile[] };
+// `sha` is checked when present on the probe path (/v1/probes/{id}/artifacts).
+export type ArtifactSignRequest = { files: ArtifactSignFile[]; sha?: string };
 
 export type ArtifactRejectReason = "too_large" | "quota" | "unsupported_kind" | "storage_unconfigured" | "invalid";
 

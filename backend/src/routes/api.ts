@@ -54,6 +54,7 @@ import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
 import { refreshDefaultYml, type DefaultYmlDeps } from "../verify/default-yml.js";
 import { browserTestsStatus, setupFixUrl } from "../verify/repo-state.js";
+import { signBootArtifacts } from "../verify/boot-probe.js";
 import { enqueueVerifyOnboard } from "../queue.js";
 
 export const api = Router();
@@ -1402,11 +1403,15 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
     ]);
     clearTimeout(timer);
     const v = db.find("repositories", (r) => r.id === ctx.repo.id)?.verify ?? ctx.repo.verify;
+    const boot = v?.boot ?? null;
     res.json({
       onboarding: v?.onboarding ?? { state: "none" },
       detected: v?.detected ?? null,
       devasignYml: v?.devasignYml?.parsed ?? null,
       runnerSeen: !!v?.detected || !!v?.onboarding?.firstSuccessfulRunId,
+      // What the setup PR's own CI made of the proposed boot config, with short-lived evidence links.
+      boot: boot ? { ...boot, ...(await signBootArtifacts(ctx.repo.id, boot)) } : null,
+      probeUnavailable: v?.onboarding?.probeUnavailable ?? null,
       browserTests: {
         ...browserTestsStatus(v),
         lastBrowserless: v?.lastBrowserless ?? null,

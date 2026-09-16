@@ -5,13 +5,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer, type IncomingMessage } from "node:http";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import net from "node:net";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { run } from "../src/run.js";
 import { staticTokenSource } from "../src/oidc.js";
+import { CLI_VERSION } from "../src/types.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fixture = path.join(here, "..", "fixtures", "no-framework-app");
@@ -127,41 +129,57 @@ test("run: an empty plan uploads empty results and exits 0", async () => {
 });
 
 type Upload = { body: Buffer; contentType: string };
-type FakeApi = { url: string; resolves: any[]; signed: any[]; uploads: Map<string, Upload>; results: () => any; close: () => void };
+type FakeApi = { url: string; resolves: any[]; signed: any[]; signBodies: any[]; uploads: Map<string, Upload>; results: () => any; close: () => void };
 
-async function fakeApi(runId: string, ready: unknown): Promise<FakeApi> {
+// `probe`: the resolve answers with a boot-probe offer instead of a plan, and the
+// artifact and result endpoints move to /v1/probes/<id>/… as the setup PR's run uses them.
+async function fakeApi(id: string, ready: any, opts: { probe?: boolean } = {}): Promise<FakeApi> {
   const resolves: any[] = [];
   const signed: any[] = [];
+  const signBodies: any[] = [];
   const uploads = new Map<string, Upload>();
   let results: any = null;
   let port = 0;
+  const base = opts.probe ? `/v1/probes/${id}` : `/v1/runs/${id}`;
+  const resultPath = opts.probe ? `${base}/result` : `${base}/results`;
   const server = createServer(async (req, res) => {
     const url = new URL(req.url || "/", "http://x");
     const json = (code: number, b: unknown) => { res.writeHead(code, { "Content-Type": "application/json" }); res.end(JSON.stringify(b)); };
     if (url.pathname === "/v1/runs/resolve") {
       resolves.push(JSON.parse((await body(req)).toString()));
-      return json(200, { ok: true, status: "ready", runId, plan: ready });
+      return json(200, opts.probe
+        ? { ok: true, status: "empty", runId: null, reason: "onboarding_pr", probe: { probeId: id, uploadLimits: ready.uploadLimits } }
+        : { ok: true, status: "ready", runId: id, plan: ready });
     }
-    if (url.pathname === `/v1/runs/${runId}/artifacts`) {
+    if (url.pathname === `${base}/artifacts`) {
       const b = JSON.parse((await body(req)).toString());
-      const base = signed.length;
+      const at = signed.length;
+      signBodies.push(b);
       signed.push(...b.files);
-      return json(200, { ok: true, rejected: [], uploads: b.files.map((f: any, i: number) => ({ clientRef: f.clientRef, artifactId: `art-${base + i}`, putUrl: `http://127.0.0.1:${port}/put/${encodeURIComponent(f.clientRef)}`, headers: { "Content-Type": f.contentType }, urlExpiresAt: 0, retentionExpiresAt: 0 })) });
+      return json(200, { ok: true, rejected: [], uploads: b.files.map((f: any, i: number) => ({ clientRef: f.clientRef, artifactId: `art-${at + i}`, putUrl: `http://127.0.0.1:${port}/put/${encodeURIComponent(f.clientRef)}`, headers: { "Content-Type": f.contentType }, urlExpiresAt: 0, retentionExpiresAt: 0 })) });
     }
     if (url.pathname.startsWith("/put/") && req.method === "PUT") {
       uploads.set(decodeURIComponent(url.pathname.slice(5)), { body: await body(req), contentType: String(req.headers["content-type"]) });
       res.writeHead(200);
       return res.end();
     }
-    if (url.pathname === `/v1/runs/${runId}/results`) {
+    if (url.pathname === resultPath) {
       results = JSON.parse((await body(req)).toString());
-      return json(200, { ok: true, runId, status: "judging" });
+      return json(200, opts.probe ? { ok: true } : { ok: true, runId: id, status: "judging" });
     }
     json(404, { ok: false, error: "not_found" });
   });
   await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
   port = (server.address() as any).port;
-  return { url: `http://127.0.0.1:${port}`, resolves, signed, uploads, results: () => results, close: () => server.close() };
+  return { url: `http://127.0.0.1:${port}`, resolves, signed, signBodies, uploads, results: () => results, close: () => server.close() };
+}
+
+async function freePort(): Promise<number> {
+  const srv = net.createServer();
+  await new Promise<void>((r) => srv.listen(0, "127.0.0.1", r));
+  const port = (srv.address() as net.AddressInfo).port;
+  await new Promise<void>((r) => srv.close(() => r()));
+  return port;
 }
 
 const listening = (port: number) =>
@@ -261,7 +279,7 @@ test("managed boot: api + web + login script → the generated test runs signed 
   try {
     const code = await run({ apiUrl: api.url, token: staticTokenSource("t"), failOn: "never", resolveTimeoutMs: 10_000, testTimeoutMs: 120_000, keep: false, cwd: twoServer, pr: 9, sha: "def5678" });
     assert.equal(code, 0);
-    assert.ok(api.resolves.length > 0 && api.resolves.every((b) => JSON.stringify(b.capabilities) === '["managed_boot"]'), "every resolve advertises managed_boot");
+    assert.ok(api.resolves.length > 0 && api.resolves.every((b) => JSON.stringify(b.capabilities) === '["managed_boot","boot_probe"]'), "every resolve advertises managed_boot");
     const results = api.results();
     assert.ok(results, "results were posted");
     assert.equal(results.doctor, null);
@@ -334,13 +352,92 @@ test("legacy boot: a start/url-only yml still boots through Playwright's webServ
     const results = api.results();
     assert.equal(results.doctor, null);
     assert.deepEqual(results.results.map((r: any) => [r.testId, r.status]), [["t2", "pass"]]);
-    assert.ok(api.resolves.every((b) => JSON.stringify(b.capabilities) === '["managed_boot"]'));
+    assert.ok(api.resolves.every((b) => JSON.stringify(b.capabilities) === '["managed_boot","boot_probe"]'));
     assert.equal(api.signed.some((f: any) => f.clientRef.startsWith("log:boot:")), false, "no managed boot ran");
     assert.match(uploadedText(api, "log:pw:playwright.config.ts"), /\[WebServer\] fixture app on http:\/\/localhost:4173/, "Playwright started the app and piped its stdout");
     assert.equal(existsSync(path.join(fixture, ".devasign")), false);
     assert.equal(await eventuallyClosed(4173), true, "Playwright stopped its webServer");
   } finally {
     console.log = consoleLog;
+    api.close();
+  }
+});
+
+test("boot probe: the setup PR's own run boots the proposed config, uploads a log and a screenshot, and reports it came up", async () => {
+  await assertPortsFree(4180, 4181);
+  const api = await fakeApi("probe-1", plan, { probe: true });
+  const session = await fixtureSession();
+  rmSync(path.join(twoServer, ".devasign"), { recursive: true, force: true });
+  try {
+    const code = await run({ apiUrl: api.url, token: staticTokenSource("t"), failOn: "never", resolveTimeoutMs: 10_000, testTimeoutMs: 120_000, keep: false, cwd: twoServer, pr: 11, sha: "aa11bb22" });
+    assert.equal(code, 0);
+    assert.ok(api.resolves.every((b) => (b.capabilities || []).includes("boot_probe")), "the offer only reaches a runner that announced it can probe");
+    const report = api.results();
+    assert.ok(report, "the boot report was posted");
+    assert.equal(report.ok, true, JSON.stringify(report));
+    assert.equal(report.stage, "done");
+    assert.equal(report.sha, "aa11bb22");
+    assert.equal(report.cliVersion, CLI_VERSION);
+    assert.ok(report.durationMs > 0);
+    assert.deepEqual(report.servers.map((s: any) => [s.name, s.ok]), [["api", true], ["app", true]], "every server and then the app");
+    assert.ok(report.servers.every((s: any) => typeof s.readyMs === "number"), JSON.stringify(report.servers));
+    assert.deepEqual(report.login, { ran: true, checked: true, ok: true, checkStatus: 200, cors: "ok" });
+    assert.deepEqual(report.page, { status: 200 });
+    assert.equal(report.diagnosis, null);
+
+    const refs = api.signed.map((f: any) => f.clientRef);
+    for (const ref of ["log:boot:api", "log:boot:app", "log:boot:login", "log:pw:playwright.boot.config.ts", "screenshot:boot"]) assert.ok(refs.includes(ref), `${ref} in ${refs.join(", ")}`);
+    assert.equal(api.signed.some((f: any) => f.kind === "video" || f.kind === "trace"), false, "a recording of a signed-in page is not evidence anyone asked for");
+    assert.ok(api.signBodies.length > 0 && api.signBodies.every((b) => b.sha === "aa11bb22"), "the probe's uploads are signed against the sha they describe");
+    assert.equal(report.logArtifactId, `art-${refs.indexOf("log:pw:playwright.boot.config.ts")}`);
+    assert.equal(report.screenshotArtifactId, `art-${refs.indexOf("screenshot:boot")}`);
+    assert.equal(api.uploads.get("screenshot:boot")!.body.subarray(1, 4).toString("ascii"), "PNG", "the screenshot is a real image");
+    await assertNoSession(api, session, { traces: false });
+
+    assert.equal(existsSync(path.join(twoServer, ".devasign")), false, "the workspace, boot config and session file included, is cleaned up");
+    assert.equal(await listening(4180), false, "the api server was stopped");
+    assert.equal(await listening(4181), false, "the web server was stopped");
+  } finally {
+    api.close();
+  }
+});
+
+test("boot probe: a server that exits before it is ready reports ok:false at servers/<name>, with that server's log", async () => {
+  const api = await fakeApi("probe-2", plan, { probe: true });
+  const dir = mkdtempSync(path.join(tmpdir(), "dv-probe-"));
+  const [apiPort, appPort] = [await freePort(), await freePort()];
+  writeFileSync(path.join(dir, "index.html"), "<main>x</main>\n");
+  writeFileSync(path.join(dir, ".devasign.yml"), [
+    "verify:",
+    "  e2e: auto",
+    "  timeout: 10",
+    "  servers:",
+    "    - name: api",
+    '      start: echo "the api is not going to make it"; exit 3',
+    `      url: http://127.0.0.1:${apiPort}`,
+    "  start: exit 0",
+    `  url: http://127.0.0.1:${appPort}`,
+    "",
+  ].join("\n"));
+  try {
+    const code = await run({ apiUrl: api.url, token: staticTokenSource("t"), failOn: "never", resolveTimeoutMs: 10_000, testTimeoutMs: 60_000, keep: false, cwd: dir, pr: 12, sha: "cc33dd44" });
+    assert.equal(code, 0, "a boot config that does not work is news for the setup PR, not a red check");
+    const report = api.results();
+    assert.equal(report.ok, false);
+    assert.equal(report.stage, "servers");
+    assert.equal(report.failedServer, "api");
+    assert.deepEqual(report.servers, [{ name: "api", ok: false, exitCode: 3 }], "the app step was never reached");
+    assert.equal(report.login, undefined);
+    assert.equal(report.page, undefined);
+    assert.equal(report.diagnosis.code, "app_not_ready");
+    assert.equal(report.diagnosis.message, "the api server exited before it was ready");
+    assert.deepEqual(api.signed.map((f: any) => f.clientRef), ["log:boot:api"]);
+    assert.equal(report.logArtifactId, "art-0");
+    assert.equal(report.diagnosis.logArtifactId, "art-0");
+    assert.match(uploadedText(api, "log:boot:api"), /the api is not going to make it/);
+    assert.equal(existsSync(path.join(dir, ".devasign")), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
     api.close();
   }
 });

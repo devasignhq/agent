@@ -1,7 +1,7 @@
 // node --test src/verify-setup-view.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { BrowserTests, LastBrowserless } from "./api.ts";
+import type { BrowserTests, LastBrowserless, VerifySetup } from "./api.ts";
 import { browserTestsRow, opensBrowserSetup, uiCriteriaCount, withoutBrowserSetup } from "./verify-setup-view.ts";
 
 const bt = (over: Partial<BrowserTests>): BrowserTests => ({
@@ -88,6 +88,32 @@ test("a configured repo shows the command and url CI boots, with its servers", (
   assert.deepEqual(failing.boot?.servers, ["backend"], "a boot that failed in CI is the one worth showing");
   const noServers = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "unproven", defaultYml: { start: boot.start, url: boot.url } }) });
   assert.deepEqual(noServers.boot?.servers, []);
+});
+
+test("proven says the app came up in CI, and where", () => {
+  const row = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "proven", defaultYml: boot }) });
+  assert.deepEqual([row.text, row.tone], ["Working — the app came up at http://localhost:3001 in CI", "ok"]);
+  assert.deepEqual(row.boot, { start: boot.start, url: boot.url, servers: ["backend"] }, "the proven boot is still worth showing");
+  const noUrl = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "proven" }) });
+  assert.deepEqual([noUrl.text, noUrl.tone], ["Working — the app came up in CI", "ok"]);
+  const stillNoting = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "proven", defaultYml: boot, lastBrowserless: last({ count: 2, prNumber: 8 }) }) });
+  assert.equal(stillNoting.last, "PR #8: 2 UI criteria checked without a browser", "an older browser-less run is still reported");
+});
+
+test("a probe that could not boot the app is never a green row", () => {
+  const probe = (over: Partial<NonNullable<VerifySetup["boot"]>>): NonNullable<VerifySetup["boot"]> => ({
+    ok: false, prNumber: 7, sha: "abc", at: 2, signedIn: null, logUrl: null, screenshotUrl: null, urlExpiresAt: null, ...over,
+  });
+  const failed = bt({ status: "boot_failed", defaultYml: boot });
+  const page = browserTestsRow({ devasignYml: null, browserTests: failed, boot: probe({ stage: "page" }) });
+  assert.deepEqual([page.text, page.tone], ["The app came up in CI, but its page did not load", "warn"]);
+  const servers = browserTestsRow({ devasignYml: null, browserTests: failed, boot: probe({ stage: "servers", failedServer: "backend" }) });
+  assert.deepEqual([servers.text, servers.tone], ["The app did not start in CI — the backend server never came up", "warn"]);
+  const login = browserTestsRow({ devasignYml: null, browserTests: failed, boot: probe({ stage: "login" }) });
+  assert.equal(login.text, "The app came up in CI, but DevAsign could not sign in");
+  const noDetail = browserTestsRow({ devasignYml: null, browserTests: failed });
+  assert.deepEqual([noDetail.text, noDetail.tone], ["The app did not start in CI", "warn"]);
+  assert.deepEqual(page.boot, { start: boot.start, url: boot.url, servers: ["backend"] }, "the boot that failed is worth showing");
 });
 
 test("nothing to boot, nothing to show", () => {

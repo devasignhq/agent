@@ -96,6 +96,7 @@ export async function purgeAccount(
 
   // ── Erase local state, child rows first ─────────────────────────────────────
   db.remove("verifyArtifacts", (a) => repoIds.has(a.repoId));
+  db.remove("bootProbes", (p) => repoIds.has(p.repoId));
   db.remove("verifyResults", (r) => verifyRunIds.has(r.runId));
   db.remove("verifyPlans", (p) => repoIds.has(p.repoId));
   db.remove("verifyRuns", (r) => repoIds.has(r.repoId));

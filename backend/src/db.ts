@@ -47,6 +47,7 @@ const empty: DB = {
   verifyPlans: [],
   verifyResults: [],
   verifyArtifacts: [],
+  bootProbes: [],
   testFlakeHistory: [],
 };
 
@@ -78,6 +79,7 @@ const TABLES: Record<keyof DB, string> = {
   verifyPlans: "verify_plans",
   verifyResults: "verify_results",
   verifyArtifacts: "verify_artifacts",
+  bootProbes: "boot_probes",
   testFlakeHistory: "test_flake_history",
 };
 

@@ -3,7 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import { tmpdir } from "node:os";
 import path from "node:path";
@@ -144,7 +144,7 @@ test("a managed boot whose server exits is an app_not_ready diagnosis: browser t
     const code = await run({ apiUrl: "http://fake", token: staticTokenSource("t"), resolveTimeoutMs: 5_000, testTimeoutMs: 30_000, keep: false, cwd: dir, pr: 7, sha: "abc1234", fetchImpl });
     assert.equal(code, 0);
     assert.ok(resolves.length > 0);
-    for (const r of resolves) assert.deepEqual(r.capabilities, ["managed_boot"], "every resolve says this runner can boot servers and sign in");
+    for (const r of resolves) assert.deepEqual(r.capabilities, ["managed_boot", "boot_probe"], "every resolve says this runner can boot servers, sign in and run a boot probe");
     const results = posted as RunnerResults | null;
     assert.ok(results, "results were posted");
     assert.equal(results.doctor?.code, "app_not_ready");
@@ -314,6 +314,51 @@ test("when Playwright throws after a managed boot, the servers still stop, the s
   } finally {
     killLeftovers(dir);
     restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("a boot probe the backend refuses is still exit 0, and a preflight failure never downloads a browser", async () => {
+  const dir = mkdtempSync(path.join(tmpdir(), "dv-probe-api-"));
+  const browsers = mkdtempSync(path.join(tmpdir(), "dv-probe-browsers-"));
+  const saved = process.env.PLAYWRIGHT_BROWSERS_PATH;
+  process.env.PLAYWRIGHT_BROWSERS_PATH = browsers;
+  // No .devasign.yml at all: the probe stops at preflight, before any browser or boot.
+  writeFileSync(path.join(dir, "index.html"), "<main></main>\n");
+  const posted: any[] = [];
+  let mode: "refused" | "unreachable" = "refused";
+  const fetchImpl = (async (input: string | URL | Request, init?: RequestInit) => {
+    const url = new URL(String(input));
+    if (url.pathname === "/v1/runs/resolve") {
+      return new Response(JSON.stringify({ ok: true, status: "empty", runId: null, reason: "onboarding_pr", probe: { probeId: "p1", uploadLimits: { maxFileBytes: 1e6, maxTotalBytes: 1e6, maxFiles: 10 } } }), { status: 200, headers: { "Content-Type": "application/json" } });
+    }
+    if (url.pathname === "/v1/probes/p1/result") {
+      posted.push(JSON.parse(String(init?.body)));
+      if (mode === "unreachable") throw new Error("socket hang up");
+      return new Response(JSON.stringify({ ok: false, error: "probe_expired" }), { status: 409, headers: { "Content-Type": "application/json" } });
+    }
+    throw new Error(`the probe called ${url.pathname}, which it has no business calling`);
+  }) as typeof fetch;
+  const probe = () => run({ apiUrl: "http://fake", token: staticTokenSource("t"), resolveTimeoutMs: 5_000, testTimeoutMs: 30_000, keep: false, cwd: dir, pr: 13, sha: "ee55ff66", fetchImpl });
+  try {
+    assert.equal(await probe(), 0);
+    assert.equal(posted.length, 1);
+    assert.equal(posted[0].ok, false);
+    assert.equal(posted[0].stage, "config");
+    assert.equal(posted[0].sha, "ee55ff66");
+    assert.deepEqual(posted[0].servers, []);
+    assert.equal(posted[0].diagnosis.code, "no_start_command");
+    assert.equal(posted[0].logArtifactId, undefined, "nothing ran, so there is nothing to link");
+    assert.deepEqual(readdirSync(browsers), [], "a config-stage probe never downloads Chromium");
+    assert.equal(existsSync(path.join(dir, ".devasign")), false);
+
+    mode = "unreachable";
+    assert.equal(await probe(), 0, "an API that cannot be reached is not the customer's pipeline's problem either");
+    assert.equal(posted.length, 4, "the client retried the transport failure twice, then let it go");
+  } finally {
+    if (saved === undefined) delete process.env.PLAYWRIGHT_BROWSERS_PATH;
+    else process.env.PLAYWRIGHT_BROWSERS_PATH = saved;
+    rmSync(browsers, { recursive: true, force: true });
     rmSync(dir, { recursive: true, force: true });
   }
 });

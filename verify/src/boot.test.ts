@@ -269,7 +269,7 @@ test("checkSession sends the cookie and Origin, retries until 2xx, and enforces 
     // The app on localhost, the API on 127.0.0.1: a different origin.
     const app = `http://localhost:${srv.port}`;
     const cross = await checkSession({ baseUrl: app, check: `${sameOrigin}/cors-ok`, state: s });
-    assert.deepEqual(cross, { ok: true, status: 200 });
+    assert.deepEqual(cross, { ok: true, status: 200, cors: "ok" }, "a credentialed cross-origin check records that CORS allowed it");
     assert.equal(seen.at(-1)!.origin, app);
 
     const wrong = await checkSession({ baseUrl: app, check: `${sameOrigin}/cors-wrong`, state: s });
@@ -308,6 +308,17 @@ test("redact removes secret env values, cookie headers and storage-state values,
   assert.match(out, /Set-Cookie: \[redacted\]/);
   assert.match(out, /sent sid=\[redacted\] and t=\[redacted\]/);
   assert.equal(redact("no custom-value here", { env, state: null }), "no custom-value here", "an unnamed, unsecret-looking var is left alone");
+});
+
+test("a session value that cannot be URL-encoded is still redacted, and never throws", () => {
+  // This scrub runs inside a stream handler: a throw there is an uncaught exception that
+  // ends the probe and turns the customer's setup PR red. page.context().storageState()
+  // hands back whatever the app kept, lone surrogates included.
+  const lone = "abcdef\ud800ghijkl";
+  const s = state([{ name: "sid", value: lone }], [{ origin: "http://x", localStorage: [{ name: "draft", value: lone }] }]);
+  const out = redact(`bare ${lone} here`, { envNames: [], env: {}, state: s });
+  assert.ok(!out.includes(lone), "the value is still swapped out");
+  assert.doesNotThrow(() => redact("nothing to match", { env: { TOKEN: lone }, state: s }));
 });
 
 test("redactFile scrubs a server log that printed a secret, and ignores a missing file", { timeout: 30_000 }, async () => {

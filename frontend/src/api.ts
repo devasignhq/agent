@@ -466,8 +466,8 @@ export type VerifyTestsResponse = {
 };
 
 // ---- Browser tests setup (backend/src/verify/repo-state.ts browserTestsStatus) ----
-export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "unproven" | "unknown";
-export type LastBrowserless = { count: number; reason: "not_configured" | "did_not_start" | "browser_errored" | "runner_outdated"; runId: string; prNumber: number; at: number };
+export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "proven" | "unproven" | "boot_failed" | "unknown";
+export type LastBrowserless = { count: number; reason: "not_configured" | "did_not_start" | "browser_errored" | "runner_outdated"; runId: string; prNumber: number; at: number; bootHash?: string | null };
 export type BrowserTests = {
   status: BrowserTestsStatus;
   missing: Array<"start" | "url">;
@@ -484,6 +484,21 @@ export type BrowserSetupEntry = {
   lastBrowserless: LastBrowserless | null;
   fixUrl: string;
 };
+// What the setup PR's own CI run made of the proposed boot config. The evidence links are
+// signed for 300s, so they are only good for the panel that just loaded them.
+export type VerifyBoot = {
+  ok: boolean;
+  prNumber: number;
+  sha: string;
+  at: number;
+  stage?: "config" | "install" | "servers" | "start" | "login" | "browsers" | "page" | "done";
+  failedServer?: string;
+  // null when the yml has no login script, so there was nothing to sign in as.
+  signedIn: boolean | null;
+  logUrl: string | null;
+  screenshotUrl: string | null;
+  urlExpiresAt: number | null;
+};
 export type VerifySetup = {
   onboarding: NonNullable<Repository["verify"]>["onboarding"];
   detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null;
@@ -491,6 +506,9 @@ export type VerifySetup = {
   runnerSeen: boolean;
   // Absent on backends older than the browser-tests status.
   browserTests?: BrowserTests;
+  // Absent on backends older than the boot probe; null until a probe reports.
+  boot?: VerifyBoot | null;
+  probeUnavailable?: { cliVersion: string; at: number } | null;
 };
 
 export type CriteriaRevision = {

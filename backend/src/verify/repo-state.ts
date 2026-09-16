@@ -38,10 +38,35 @@ export function bootHash(cfg: DevasignVerifyConfig | null | undefined): string |
   return createHash("sha256").update(stableJson(picked)).digest("hex").slice(0, 16);
 }
 
-export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "unproven" | "unknown";
+export type BrowserTestsStatus = "disabled" | "not_configured" | "failing" | "runner_outdated" | "proven" | "unproven" | "boot_failed" | "unknown";
+
+/** Whether the probe's own verdict is about the config the default branch runs today. */
+function bootIsCurrent(v: RepoVerifyState): boolean {
+  const boot = v.boot;
+  if (!boot?.configHash || boot.configHash !== v.defaultYml?.bootHash) return false;
+  // The hash was read at the setup PR's head; the probe must have booted that same commit.
+  return !!boot.configSha && boot.configSha.toLowerCase() === boot.sha.toLowerCase();
+}
+
+/** A boot probe proves the setup only while the yml it booted is still the one on the default branch. */
+function bootProven(v: RepoVerifyState, parsed: DevasignVerifyConfig | null): boolean {
+  const boot = v.boot;
+  if (!boot?.ok || !bootIsCurrent(v)) return false;
+  // A boot that came up with a login script already ran that script; only a session check
+  // that actually answered wrong (signedIn === false) contradicts it.
+  return !parsed?.login?.script || boot.signedIn !== false;
+}
 
 export function browserTestsStatus(v: RepoVerifyState | null | undefined): { status: BrowserTestsStatus; missing: Array<"start" | "url"> } {
   const last = v?.lastBrowserless ?? null;
+  // Boot failure and browser tests that decided nothing are both a failing setup; only the panel's wording differs.
+  const failure = !last
+    ? null
+    : last.reason === "did_not_start" || last.reason === "browser_errored"
+      ? { status: "failing" as const, at: last.at }
+      : last.reason === "runner_outdated"
+        ? { status: "runner_outdated" as const, at: last.at }
+        : null;
   if (v?.defaultYml) {
     const parsed = v.defaultYml.parsed;
     if (parsed?.e2e === "never") return { status: "disabled", missing: [] };
@@ -49,14 +74,18 @@ export function browserTestsStatus(v: RepoVerifyState | null | undefined): { sta
     const playwrightConfig = !!v.detected?.frameworks?.some((f) => f.name === "playwright" && !!f.configPath);
     const missing = (["start", "url"] as const).filter((k) => !parsed?.[k]);
     if (missing.length && !playwrightConfig) return { status: "not_configured", missing };
-    // Boot failure and browser tests that decided nothing are both a failing setup; only the panel's wording differs.
-    if (last?.reason === "did_not_start" || last?.reason === "browser_errored") return { status: "failing", missing: [] };
-    if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
+    // A run that failed after the probe outranks it: the probe only ever proved one commit.
+    // So does an older one the probe cannot have fixed, because it booted that very config.
+    const sameConfigAsFailure = !!last?.bootHash && !!v.boot?.configHash && last.bootHash === v.boot.configHash;
+    if (failure && (!v.boot || failure.at >= v.boot.at || sameConfigAsFailure)) return { status: failure.status, missing: [] };
+    if (bootProven(v, parsed)) return { status: "proven", missing: [] };
+    if (failure) return { status: failure.status, missing: [] };
+    // The probe ran this exact config and it did not come up: that is not "configured".
+    if (v.boot && v.boot.ok === false && bootIsCurrent(v)) return { status: "boot_failed", missing: [] };
     return { status: "unproven", missing: [] };
   }
   // No default-branch snapshot yet: the last judged run is the only evidence.
   if (last?.reason === "not_configured") return { status: "not_configured", missing: [] };
-  if (last?.reason === "did_not_start" || last?.reason === "browser_errored") return { status: "failing", missing: [] };
-  if (last?.reason === "runner_outdated") return { status: "runner_outdated", missing: [] };
+  if (failure) return { status: failure.status, missing: [] };
   return { status: "unknown", missing: [] };
 }

@@ -160,8 +160,34 @@ export type FailOn = "never" | "verdict" | "unverifiable";
 export type ResolveResponse =
   | { ok: true; status: "pending"; runId: string | null; retryAfterMs: number; giveUpAfterMs?: number }
   | { ok: true; status: "ready"; runId: string; plan: RunnerPlan }
-  | { ok: true; status: "empty"; runId: string | null; reason: string }
+  // `probe`: this is the App's own setup PR and the backend wants its proposed boot
+  // config tried. Nothing is planned or judged — the runner boots and reports back.
+  | { ok: true; status: "empty"; runId: string | null; reason: string; probe?: BootProbeOffer }
   | { ok: true; status: "setup"; runId: string; onboardingPr?: number };
+
+export type BootProbeOffer = { probeId: string; uploadLimits: RunnerPlan["uploadLimits"] };
+
+// ---- The boot probe: POST /v1/probes/{probeId}/{artifacts,result} -----------
+// Untrusted on arrival: the backend normalizes every field against a whitelist and
+// composes its PR comment from the repo's own .devasign.yml plus fixed per-code text.
+
+// "browsers" is DevAsign's own Chromium install failing after the app came up — not the repo's fault.
+export type BootStage = "config" | "install" | "servers" | "start" | "login" | "browsers" | "page" | "done";
+
+export type BootReport = {
+  sha: string;
+  ok: boolean;
+  stage: BootStage; // where it stopped; "done" when it came up
+  failedServer?: string;
+  durationMs: number;
+  cliVersion: string;
+  servers: Array<{ name: string; ok: boolean; readyMs?: number; exitCode?: number | null }>;
+  login?: { ran: boolean; checked: boolean; ok: boolean; checkStatus?: number; cors?: "ok" | "missing" | "mismatch" };
+  page?: { status: number | null };
+  diagnosis?: DoctorDiagnosis | null;
+  logArtifactId?: string;
+  screenshotArtifactId?: string;
+};
 
 export type ArtifactKind = "video" | "trace" | "screenshot" | "log" | "test_file" | "poster";
 

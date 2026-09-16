@@ -66,6 +66,15 @@ export async function runCommand(opts: {
     }, opts.timeoutMs);
     // A pipe chunk can end mid-line; onLine only ever sees whole lines, so a scrub can match them.
     const partial = { out: "", err: "" };
+    // These run inside a stream "data" handler: a throw there is an uncaught exception that
+    // takes the whole process down, so no scrub or printer can ever kill the run.
+    const emit = (line: string, which: "out" | "err") => {
+      try {
+        opts.onLine?.(line, which);
+      } catch (err) {
+        console.warn(`[verify] a log line handler failed: ${err instanceof Error ? err.message : String(err)}`);
+      }
+    };
     const take = (chunk: Buffer, which: "out" | "err") => {
       const s = chunk.toString("utf8");
       if (which === "out") stdout = (stdout + s).slice(-MAX_CAPTURE);
@@ -78,7 +87,7 @@ export async function runCommand(opts: {
           lines.push(partial[which]);
           partial[which] = "";
         }
-        for (const line of lines) if (line) opts.onLine(line, which);
+        for (const line of lines) if (line) emit(line, which);
       }
       armDrain();
     };
@@ -89,7 +98,7 @@ export async function runCommand(opts: {
       settled = true;
       clearTimeout(timer);
       clearTimeout(drain);
-      for (const which of ["out", "err"] as const) if (partial[which]) opts.onLine?.(partial[which], which);
+      for (const which of ["out", "err"] as const) if (partial[which]) emit(partial[which], which);
       const full: ExecResult = { ...result, stdout, stderr, output, durationMs: Date.now() - started };
       if (opts.logFile) {
         try {

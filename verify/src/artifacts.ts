@@ -1,7 +1,7 @@
 // Sign, upload, and map clientRef → artifactId. Files go straight to the
 // bucket via the signed PUT URL; the API never sees the bytes.
 import { readFileSync, statSync } from "node:fs";
-import type { ApiClient } from "./api.js";
+import type { ApiClient, ArtifactTarget } from "./api.js";
 import { log } from "./log.js";
 import type { ArtifactSignFile, LocalArtifact, RunnerPlan, RunnerResult } from "./types.js";
 
@@ -39,14 +39,14 @@ export function planUploads(artifacts: LocalArtifact[], limits: RunnerPlan["uplo
   return { files, skipped };
 }
 
-export async function uploadArtifacts(api: ApiClient, runId: string, artifacts: LocalArtifact[], limits: RunnerPlan["uploadLimits"], fetchImpl: typeof fetch = fetch): Promise<Map<string, string>> {
+export async function uploadArtifacts(api: ApiClient, target: ArtifactTarget, artifacts: LocalArtifact[], limits: RunnerPlan["uploadLimits"], fetchImpl: typeof fetch = fetch): Promise<Map<string, string>> {
   const ids = new Map<string, string>();
   const { files, skipped } = planUploads(artifacts, limits);
   for (const s of skipped) log.warn(`artifact ${s.clientRef} not uploaded: ${s.reason}`);
   const byRef = new Map(artifacts.map((a) => [a.clientRef, a]));
   for (let i = 0; i < files.length; i += BATCH) {
     const batch = files.slice(i, i + BATCH);
-    const signed = await api.signArtifacts(runId, batch);
+    const signed = await api.signArtifacts(target, batch);
     for (const r of signed.rejected || []) log.warn(`artifact ${r.clientRef} rejected by the API: ${r.reason}`);
     for (const u of signed.uploads || []) {
       const local = byRef.get(u.clientRef);

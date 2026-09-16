@@ -86,6 +86,7 @@ function seedAccount(): Seed {
   db.insert("notifications", { id: uuid(), userId, kind: "system", title: "t", meta: "", createdAt: Date.now(), readAt: null } as any);
   db.insert("authAudit", { id: uuid(), userId, at: Date.now(), event: "signin" } as any);
   db.insert("linearProjectUpdates", { id: uuid(), projectId: "p", projectName: "P", body: "", userId, createdAt: Date.now(), updatedAt: Date.now() } as any);
+  db.insert("bootProbes", { id: uuid(), schemaVersion: 1, repoId: repo1, prNumber: 7, sha: "a".repeat(40), attempt: 1, status: "offered", offeredAt: Date.now(), uploadedBytes: 0, uploadedCount: 0 } as any);
 
   return {
     userId,
@@ -109,7 +110,8 @@ function footprint(a: Seed): number {
     db.filter("integrations", (i) => i.userId === a.userId).length +
     db.filter("notifications", (n) => n.userId === a.userId).length +
     db.filter("linearProjectUpdates", (u) => u.userId === a.userId).length +
-    db.filter("authAudit", (au) => au.userId === a.userId).length
+    db.filter("authAudit", (au) => au.userId === a.userId).length +
+    db.filter("bootProbes", (p) => a.repoIds.has(p.repoId)).length
   );
 }
 

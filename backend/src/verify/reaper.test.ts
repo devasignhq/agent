@@ -2,8 +2,8 @@
 //   node --import tsx/esm --test src/verify/reaper.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { JOB_STALE_MS, JUDGE_ABANDON_MS, selectStaleVerifyRuns, type StaleAction } from "./reaper.js";
-import type { VerifyRun } from "../types.js";
+import { JOB_STALE_MS, JUDGE_ABANDON_MS, PROBE_EXPIRE_MS, selectExpiredBootProbes, selectStaleVerifyRuns, type StaleAction } from "./reaper.js";
+import type { BootProbe, VerifyRun } from "../types.js";
 
 const NOW = 1_700_000_000_000;
 function run(status: VerifyRun["status"], updatedAgoMs: number, resultsId?: string): VerifyRun {
@@ -36,6 +36,20 @@ test("while running, a job is only lost after JOB_STALE_MS of silence", () => {
   const runs = [run("planning", JOB_STALE_MS - 1), run("judging", JOB_STALE_MS + 1), run("awaiting_runner", 59 * 60_000)];
   const out = selectStaleVerifyRuns(runs, NOW, { boot: false, runTimeoutMs: 60 * 60_000 });
   assert.deepEqual(out.map((s) => s.id), [`judging-${JOB_STALE_MS + 1}`]);
+});
+
+// An offered probe is a live upload grant, so it must not outlive its window: a
+// runner that never came back leaves the row open until the reaper closes it.
+test("only offered boot probes past the window expire", () => {
+  const probe = (status: BootProbe["status"], offeredAgoMs: number): BootProbe =>
+    ({ id: `${status}-${offeredAgoMs}`, status, offeredAt: NOW - offeredAgoMs }) as BootProbe;
+  const probes = [
+    probe("offered", PROBE_EXPIRE_MS + 1),
+    probe("offered", PROBE_EXPIRE_MS - 1),
+    probe("reported", PROBE_EXPIRE_MS * 10),
+    probe("expired", PROBE_EXPIRE_MS * 10),
+  ];
+  assert.deepEqual(selectExpiredBootProbes(probes, NOW), [`offered-${PROBE_EXPIRE_MS + 1}`]);
 });
 
 // A judge job can sit behind the serial queue for longer than JOB_STALE_MS. The
