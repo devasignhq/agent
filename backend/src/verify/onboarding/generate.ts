@@ -2,8 +2,9 @@
 // block of .devasign.yml, the extend-an-existing-workflow edit, the expected
 // secret list, the PR body, and mechanical doctor follow-up patches. No I/O.
 import { parseDocument, stringify, isMap, isSeq, YAMLMap, YAMLSeq } from "yaml";
+import { inferBootCandidates } from "../boot-inference.js";
 import type { DetectedSetup, DevasignVerifyConfig, DoctorDiagnosis } from "../contract.js";
-import { installCommandFor, nestedPackageDirs } from "../detect.js";
+import { installCommandFor, isPlainDir, nestedPackageDirs, PLAIN_DIR } from "../detect.js";
 
 export const WORKFLOW_PATH = ".github/workflows/devasign-verify.yml";
 export const DEVASIGN_YML_PATH = ".devasign.yml";
@@ -47,13 +48,16 @@ export function stackHints(setup: DetectedSetup, paths: string[], pkg: PackageJs
   const py = setup.languages.includes("python") || has("pyproject.toml") || has("requirements.txt");
   const reqs = (files["requirements.txt"] || "") + (files["pyproject.toml"] || "");
   const pyVer = (files[".python-version"] || "").trim() || majorMinorPython(files["pyproject.toml"]) || "3.12";
+  // No root manifest: the frameworks live in nested packages, so the same
+  // inference that proposes the boot config names them.
+  const nested = pkg || has("package.json") ? null : inferBootCandidates({ paths, files, mode: "separate", workflowTexts: [] });
   return {
     node: !!pkg || setup.languages.includes("typescript") || setup.languages.includes("javascript"),
     python: py,
     go: has("go.mod"),
-    nextjs: dep(pkg, "next"),
-    vite: dep(pkg, "vite"),
-    express: dep(pkg, "express") || dep(pkg, "fastify") || dep(pkg, "koa"),
+    nextjs: dep(pkg, "next") || nested?.webApp?.framework === "next",
+    vite: dep(pkg, "vite") || nested?.webApp?.framework === "vite",
+    express: dep(pkg, "express") || dep(pkg, "fastify") || dep(pkg, "koa") || !!nested?.servers.length,
     fastapi: /fastapi/i.test(reqs),
     django: /django/i.test(reqs),
     flask: /flask/i.test(reqs),
@@ -149,7 +153,12 @@ function installSteps(setup: DetectedSetup, hints: StackHints, paths: string[]):
         : hasLock ? "npm ci" : "npm install";
       steps.push({ name: "Install dependencies", run: cmd });
     }
-    for (const dir of packages) steps.push({ name: `Install ${dir} dependencies`, run: installCommandFor(dir, paths) });
+    // The directory name becomes a `run:` command, so only one the validator can
+    // re-derive gets in — a package we cannot name safely is left uninstalled.
+    for (const dir of packages) {
+      const run = installCommandFor(dir, paths);
+      if (isKnownInstallCommand(run, dir)) steps.push({ name: `Install ${dir} dependencies`, run });
+    }
   } else {
     // The runner itself is a Node CLI (npx); a Python/Go-only repo still needs Node.
     steps.push({ uses: "actions/setup-node@v4", with: { "node-version": "20" } });
@@ -202,21 +211,26 @@ export function generateWorkflow(setup: DetectedSetup, hints: StackHints, secret
   return WORKFLOW_HEADER + stringify(doc, { lineWidth: 0 });
 }
 
-/** Best-effort boot config per stack; omitted when unknown so e2e is honestly unverifiable. */
-export function guessVerifyConfig(setup: DetectedSetup, hints: StackHints, pkg: PackageJsonLike, secrets: string[]): DevasignVerifyConfig {
+/** Best-effort boot config per stack, omitted when unknown; inferred `boot` keys win over the root-only guesses. */
+export function guessVerifyConfig(setup: DetectedSetup, hints: StackHints, pkg: PackageJsonLike, secrets: string[], boot?: Partial<DevasignVerifyConfig>): DevasignVerifyConfig {
   const scripts = pkg?.scripts || {};
   const pmRun = setup.packageManager === "pnpm" ? "pnpm" : setup.packageManager === "yarn" ? "yarn" : setup.packageManager === "bun" ? "bun run" : "npm run";
   const cfg: DevasignVerifyConfig = { e2e: "auto" };
-  if (hints.nextjs) Object.assign(cfg, { build: scripts.build ? `${pmRun} build` : undefined, start: scripts.dev ? `${pmRun} dev` : `${pmRun} start`, url: "http://localhost:3000", ready: "/" });
-  else if (hints.vite) Object.assign(cfg, { start: scripts.dev ? `${pmRun} dev -- --port 5173` : undefined, url: "http://localhost:5173", ready: "/" });
+  // The JS branches read root scripts, so they only speak for a root manifest;
+  // a nested app is inferred instead and arrives in `boot`.
+  if (pkg && hints.nextjs) Object.assign(cfg, { build: scripts.build ? `${pmRun} build` : undefined, start: scripts.dev ? `${pmRun} dev` : `${pmRun} start`, url: "http://localhost:3000", ready: "/" });
+  else if (pkg && hints.vite) Object.assign(cfg, { start: scripts.dev ? `${pmRun} dev -- --port 5173` : undefined, url: "http://localhost:5173", ready: "/" });
   else if (hints.fastapi) Object.assign(cfg, { start: "uvicorn app.main:app --port 8000", url: "http://localhost:8000", ready: "/docs" });
   else if (hints.django) Object.assign(cfg, { start: "python manage.py runserver 0.0.0.0:8000", url: "http://localhost:8000", ready: "/" });
   else if (hints.flask) Object.assign(cfg, { start: "flask run --port 5000", url: "http://localhost:5000", ready: "/" });
-  else if (hints.express && scripts.start) Object.assign(cfg, { start: `${pmRun.replace(" run", "")} start`, url: "http://localhost:3000", ready: "/" });
+  else if (pkg && hints.express && scripts.start) Object.assign(cfg, { start: `${pmRun.replace(" run", "")} start`, url: "http://localhost:3000", ready: "/" });
   if (setup.services.length) cfg.services = setup.services.map((name) => ({ name }));
   if (hints.prisma) cfg.seed = "npx prisma db seed || true";
   cfg.login = { strategy: "none" };
   if (secrets.length) cfg.env = secrets;
+  // An inferred start replaces the whole root-only boot guess, not half of it.
+  if (boot?.start) for (const k of ["build", "start", "url", "ready"] as const) delete cfg[k];
+  for (const [k, v] of Object.entries(boot ?? {})) if (v !== undefined) (cfg as Record<string, unknown>)[k] = v;
   for (const k of Object.keys(cfg) as Array<keyof DevasignVerifyConfig>) if (cfg[k] === undefined) delete cfg[k];
   return cfg;
 }
@@ -227,20 +241,68 @@ export const DEVASIGN_YML_HEADER =
   "# they are set, UI criteria are checked below browser level with a note on each PR.\n" +
   "# e2e: auto | always (no browser = unverifiable) | never (no browser tests, no note).\n";
 
-/** Merge the `verify:` block into an existing .devasign.yml (comments kept) or create one. */
-export function generateDevasignYml(existing: string | null, verify: DevasignVerifyConfig): string {
-  if (existing && existing.trim()) {
-    const doc = parseDocument(existing);
-    if (!doc.errors.length && (isMap(doc.contents) || doc.contents == null)) {
-      if (doc.get("verify")) return existing; // already configured: leave the customer's block alone
-      doc.set("verify", verify);
-      return doc.toString({ lineWidth: 0 });
+export type YmlMergeResult = { text: string } | { error: string };
+
+// What inference may add to a `verify:` block. Never `env` or `services`.
+const BOOT_KEYS = ["install", "build", "seed", "start", "url", "ready", "timeout", "servers", "login"] as const;
+// These describe one boot between them. Our start beside their url points the browser at a
+// port nothing serves, and our servers beside their start boots a service they never asked
+// for — so the group is all-or-nothing: if they set any of it, inference adds none of it.
+const BOOT_GROUP: ReadonlySet<string> = new Set(["start", "url", "ready", "servers", "login"]);
+
+/** Add the boot keys an existing `verify:` block lacks — never overwriting one the maintainer set, keeping
+ *  comments — or create the file. `answers` overwrite their own keys; an unparseable file is left alone. */
+export function mergeDevasignYml(existing: string | null, inferred: DevasignVerifyConfig, answers: Partial<DevasignVerifyConfig> = {}): YmlMergeResult {
+  const created = (): DevasignVerifyConfig => {
+    const cfg: DevasignVerifyConfig = { ...inferred, ...answers };
+    if (cfg.e2e === "never") for (const k of BOOT_KEYS) delete cfg[k];
+    return cfg;
+  };
+  if (!existing || !existing.trim()) return { text: DEVASIGN_YML_HEADER + stringify({ verify: created() }, { lineWidth: 0 }) };
+  const doc = parseDocument(existing);
+  if (doc.errors.length) return { error: "the existing .devasign.yml did not parse" };
+  if (doc.contents != null && !isMap(doc.contents)) return { error: "the existing .devasign.yml is not a map" };
+  const block = doc.get("verify");
+  if (block == null) {
+    doc.set("verify", doc.createNode(created()));
+    return { text: doc.toString({ lineWidth: 0 }) };
+  }
+  if (!isMap(block)) return { error: "the verify block in the existing .devasign.yml is not a map" };
+
+  const before = block.toJSON() as Record<string, unknown>;
+  let changed = false;
+  const put = (key: string, value: unknown) => {
+    block.set(key, doc.createNode(value));
+    changed = true;
+  };
+  const e2e = answers.e2e ?? (typeof before.e2e === "string" ? before.e2e : inferred.e2e);
+  const login = block.get("login");
+  const theirBoot = ["start", "url", "servers"].some((k) => block.has(k)) || (isMap(login) && !!login.get("script"));
+  if (e2e !== "never") {
+    for (const key of BOOT_KEYS) {
+      const value = inferred[key];
+      if (key === "login" || value === undefined || block.has(key)) continue;
+      if (theirBoot && BOOT_GROUP.has(key)) continue;
+      put(key, value);
+    }
+    const script = theirBoot ? undefined : inferred.login?.script;
+    if (script && login == null) put("login", { script });
+    else if (script && isMap(login) && !login.get("script") && (!login.items.length || login.get("strategy") === "none")) {
+      login.delete("strategy");
+      login.set("script", script);
+      changed = true;
     }
   }
-  return DEVASIGN_YML_HEADER + stringify({ verify }, { lineWidth: 0 });
+  for (const [key, value] of Object.entries(answers)) {
+    if (value === undefined || JSON.stringify(before[key]) === JSON.stringify(value)) continue;
+    put(key, value);
+  }
+  return { text: changed ? doc.toString({ lineWidth: 0 }) : existing };
 }
 
-export type ExtendResult = { text: string; job: string } | { error: string };
+export type ExtendResult = { text: string; job: string; dispatch: boolean } | { error: string };
+
+const DISPATCH_REF = "${{ github.event.client_payload.sha || github.sha }}";
 
 /** Insert the verify step after the chosen job's last step and grant id-token: write. */
 export function extendWorkflow(existing: string, opts: { job?: string } = {}): ExtendResult {
@@ -276,12 +338,44 @@ export function extendWorkflow(existing: string, opts: { job?: string } = {}): E
   } else if (typeof topPerms !== "string") {
     job.set("permissions", doc.createNode({ contents: "read", "id-token": "write" }));
   }
-  // Let comment-triggered re-runs reach this workflow too.
+  // Let comment-triggered re-runs reach this workflow — but a dispatch runs EVERY job in
+  // the file, so a workflow that also deploys or releases never gets the trigger.
   const on = doc.get("on") ?? doc.get(true);
-  if (isMap(on)) {
-    if (!on.has("repository_dispatch")) on.set("repository_dispatch", doc.createNode({ types: ["devasign-verify"] }));
+  const dispatched = isMap(on) && jobs.items.length === 1 && !on.has("repository_dispatch");
+  if (dispatched) {
+    (on as YAMLMap).set("repository_dispatch", doc.createNode({ types: ["devasign-verify"] }));
+    // Their checkout has no ref, so a dispatched run would verify the default branch.
+    // `|| github.sha` keeps every other event checking out exactly what it did before.
+    const checkout = (steps as YAMLSeq).items.find((s) => isMap(s) && String(s.get("uses") ?? "").startsWith("actions/checkout"));
+    if (isMap(checkout)) {
+      const withMap = checkout.get("with");
+      if (withMap == null) checkout.set("with", doc.createNode({ ref: DISPATCH_REF }));
+      else if (isMap(withMap) && !withMap.has("ref")) withMap.set("ref", DISPATCH_REF);
+    }
   }
-  return { text: doc.toString({ lineWidth: 0 }), job: pick };
+  return { text: doc.toString({ lineWidth: 0 }), job: pick, dispatch: dispatched };
+}
+
+// Only what the proposed yml actually says: no promise that the app boots (Phase 4 proves it).
+function browserTestLines(verify: DevasignVerifyConfig): string[] {
+  if (verify.e2e === "never") return ["`e2e: never` is set, so DevAsign plans no browser tests and PRs say nothing about them."];
+  const lines: string[] = [];
+  if (verify.start && verify.url) {
+    lines.push(`The runner will start the app with \`${verify.start}\` and wait for \`${verify.url}${verify.ready ?? ""}\`. If that is wrong, fix \`verify.start\` / \`verify.url\` in \`.devasign.yml\`.`);
+    for (const s of verify.servers ?? []) lines.push(`- \`${s.name}\` starts first: \`${s.start}\`, ready at \`${s.url}${s.ready ?? ""}\``);
+    lines.push(
+      verify.login?.script
+        ? `- Signed in by \`${verify.login.script}\`, which writes the saved session the browser tests start from.`
+        : "- No login script, so browser tests run signed out. Set `verify.login.script` if the pages under test need a session."
+    );
+  } else {
+    lines.push(
+      "No start command could be inferred. Set `verify.start` (the command that serves the app) and `verify.url` (where it answers) in `.devasign.yml`, plus `verify.servers` for any API that page needs and `verify.login.script` if it needs a session.",
+      "Until they are set, UI criteria are checked below browser level and each PR carries a note saying so. With `e2e: always` they are reported as **unverifiable** instead."
+    );
+  }
+  lines.push("UI criteria on PRs show a note until browser tests run.");
+  return lines;
 }
 
 export function prBody(args: {
@@ -293,6 +387,8 @@ export function prBody(args: {
   expected: string[];
   missing: string[] | null; // null when the secrets API was not readable
   extendedJob?: string;
+  // Whether the workflow answers DevAsign's re-run dispatch, or only its own triggers.
+  dispatch?: boolean;
 }): string {
   const stack = [
     args.hints.nextjs ? "Next.js" : args.hints.vite ? "Vite" : args.hints.express ? "Node service" : args.hints.node ? "Node" : null,
@@ -307,7 +403,9 @@ export function prBody(args: {
     "",
     "### What this PR adds",
     args.mode === "extend"
-      ? `- A **DevAsign verify** step appended to the \`${args.extendedJob}\` job in \`${args.workflowPath}\`, reusing that job's environment and services (with \`id-token: write\` so the runner can authenticate).`
+      ? `- A **DevAsign verify** step appended to the \`${args.extendedJob}\` job in \`${args.workflowPath}\`, reusing that job's environment and services (with \`id-token: write\` so the runner can authenticate).${
+          args.dispatch === false ? " This workflow has other jobs, so it is left on its own triggers: re-running verification means pushing to the pull request." : ""
+        }`
       : `- \`${args.workflowPath}\` — a workflow that runs on every pull request${stack.length ? ` (detected: ${stack.join(", ")})` : ""}.`,
     "- `.devasign.yml` — how the runner boots the app for end-to-end tests and which secrets the tests need. Correct it once; DevAsign reads it on every run.",
     "",
@@ -318,22 +416,27 @@ export function prBody(args: {
     ...(args.missing && args.missing.length ? ["", `Add the missing ${args.missing.length === 1 ? "secret" : "secrets"} under Settings → Secrets and variables → Actions before merging, or remove the lines you don't need. Values never leave your CI; DevAsign only sees names.`] : []),
     ...(args.missing === null && args.expected.length ? ["", "DevAsign could not read this repository's secret names (the App lacks `secrets: read`), so it cannot tell which are missing."] : []),
     "",
-    "### End-to-end tests",
-    args.verify.start && args.verify.url
-      ? `The runner will start the app with \`${args.verify.start}\` and wait for \`${args.verify.url}${args.verify.ready ?? ""}\`. If that is wrong, fix \`verify.start\` / \`verify.url\` in \`.devasign.yml\`.`
-      : "No start command could be inferred. Until `verify.start` and `verify.url` are set in `.devasign.yml`, UI criteria are checked below browser level and each PR carries a note saying so. With `e2e: always` they are reported as **unverifiable** instead.",
+    "### Browser tests",
+    ...browserTestLines(args.verify),
     "",
     "Merging this PR enables verification. Until then, DevAsign posts each PR's criteria with a neutral \"Setup pending\" check.",
   ];
   return lines.join("\n");
 }
 
-export const PLAIN_DIR = /^[A-Za-z0-9_.-]+$/;
+export { PLAIN_DIR };
+
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&");
+
+/** Whether `text` already installs `dir` — matched the way boot-inference matches it. */
+const installsDir = (text: string, dir: string) =>
+  new RegExp(`(?:--prefix|--dir|--cwd|working-directory:)\\s*\\.?/?${escapeRe(dir)}(?![\\w./-])`).test(text);
 
 /** Exactly the shapes installCommandFor produces, for this directory and no other. */
 export function isKnownInstallCommand(install: string, dir: string): boolean {
-  if (!PLAIN_DIR.test(dir)) return false;
-  const d = dir.replace(/[.]/g, "\\.");
+  // The same gate startCommandFor applies: "..", "." and a leading dash are arguments, not directories.
+  if (!isPlainDir(dir)) return false;
+  const d = escapeRe(dir);
   return new RegExp(`^(?:npm (?:ci|install) --prefix ${d}|pnpm install --frozen-lockfile --dir ${d}|yarn install --frozen-lockfile --cwd ${d}|bun install --cwd ${d})$`).test(install);
 }
 
@@ -353,9 +456,7 @@ export function patchWorkflowForDoctor(text: string, doctor: DoctorDiagnosis): s
   if (doctor.code === "missing_dependencies") {
     // The diagnosis arrives from the runner, and this text becomes a `run:` step: only a
     // plain directory name and one of the install forms installCommandFor emits get in.
-    const wanted = (doctor.packages ?? []).filter(
-      (p) => PLAIN_DIR.test(p.dir) && isKnownInstallCommand(p.install, p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(text)
-    );
+    const wanted = (doctor.packages ?? []).filter((p) => isKnownInstallCommand(p.install, p.dir) && !installsDir(text, p.dir));
     if (!wanted.length) return null;
     const steps = wanted.map((p) => `\n      - name: Install ${p.dir} dependencies\n        run: ${p.install}`).join("");
     const next = text.replace(/(\n\s*- name: DevAsign verify\n)/, `${steps}$1`);
@@ -387,9 +488,7 @@ export function patchExtendedWorkflowForDoctor(text: string, doctor: DoctorDiagn
     if (/playwright install/.test(jobText)) return null;
     insert([{ name: "Install Playwright browsers", run: "npx playwright install --with-deps chromium" }]);
   } else if (doctor.code === "missing_dependencies") {
-    const wanted = (doctor.packages ?? []).filter(
-      (p) => PLAIN_DIR.test(p.dir) && isKnownInstallCommand(p.install, p.dir) && !new RegExp(`(--prefix|--dir|--cwd|working-directory:)\\s*${p.dir}\\b`).test(jobText)
-    );
+    const wanted = (doctor.packages ?? []).filter((p) => isKnownInstallCommand(p.install, p.dir) && !installsDir(jobText, p.dir));
     if (!wanted.length) return null;
     insert(wanted.map((p) => ({ name: `Install ${p.dir} dependencies`, run: p.install })));
   } else {

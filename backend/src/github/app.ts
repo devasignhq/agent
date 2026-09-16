@@ -493,6 +493,33 @@ export async function readFileAtRef(installationId: number, owner: string, name:
   }
 }
 
+/** Whether a failed read means the file is absent. A 403 rate limit or a 500 does not. */
+export function isMissingFileError(err: unknown): boolean {
+  if (err instanceof GitHubApiError) return err.status === 404;
+  return /^gh text 404 /.test(err instanceof Error ? err.message : String(err));
+}
+
+/** readFileAtRef that only maps "the file is not there" to null: a 403 or 500 is not an empty file. */
+export async function readFileAtRefStrict(installationId: number, owner: string, name: string, path: string, ref: string): Promise<string | null> {
+  const encoded = path.split("/").map(encodeURIComponent).join("/");
+  try {
+    return await ghText(installationId, `/repos/${owner}/${name}/contents/${encoded}?ref=${encodeURIComponent(ref)}`, { Accept: "application/vnd.github.raw" });
+  } catch (err) {
+    if (isMissingFileError(err)) return null;
+    throw err;
+  }
+}
+
+/** The tip of `branch`, or null when the branch does not exist. Other failures throw. */
+export async function branchTipSha(installationId: number, owner: string, name: string, branch: string): Promise<string | null> {
+  try {
+    return await getBranchSha(installationId, owner, name, branch);
+  } catch (err) {
+    if (isMissingFileError(err)) return null;
+    throw err;
+  }
+}
+
 export async function createPullRequest(
   installationId: number,
   owner: string,
@@ -507,22 +534,72 @@ export async function createPullRequest(
   return { number: pr.number, html_url: pr.html_url };
 }
 
-/** The open PR for `head` (branch name, no owner prefix), or null. */
-export async function findOpenPullRequest(
+/**
+ * The open PR for `head` (branch name, no owner prefix), or null. Only a 404 reads as
+ * "no PR": a caller that resets the setup branch on null must not do that because a
+ * transient 500 hid the maintainer's open PR.
+ */
+export async function findOpenPullRequestStrict(
   installationId: number,
   owner: string,
   name: string,
   head: string
-): Promise<{ number: number; html_url: string } | null> {
+): Promise<{ number: number; html_url: string; body: string } | null> {
+  let prs: Array<{ number: number; html_url: string; body?: string | null }>;
   try {
-    const prs = await gh<Array<{ number: number; html_url: string }>>(
-      installationId,
-      `/repos/${owner}/${name}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&per_page=1`
-    );
-    return prs?.[0] ? { number: prs[0].number, html_url: prs[0].html_url } : null;
-  } catch {
-    return null;
+    prs = await gh(installationId, `/repos/${owner}/${name}/pulls?state=open&head=${encodeURIComponent(`${owner}:${head}`)}&per_page=1`);
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 404) return null;
+    throw err;
   }
+  const pr = prs?.[0];
+  return pr ? { number: pr.number, html_url: pr.html_url, body: pr.body ?? "" } : null;
+}
+
+/** Edit an open PR in place, so the setup PR's body keeps describing what the branch proposes. */
+export async function updatePullRequest(
+  installationId: number,
+  owner: string,
+  name: string,
+  prNumber: number,
+  patch: { title?: string; body?: string }
+): Promise<void> {
+  await gh(installationId, `/repos/${owner}/${name}/pulls/${prNumber}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+}
+
+/** Merge the base branch into a PR's head. False when GitHub answers 422: already up to date. */
+export async function updatePullRequestBranch(installationId: number, owner: string, name: string, prNumber: number): Promise<boolean> {
+  try {
+    await gh(installationId, `/repos/${owner}/${name}/pulls/${prNumber}/update-branch`, {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({}),
+    });
+    return true;
+  } catch (err) {
+    if (err instanceof GitHubApiError && err.status === 422) return false;
+    throw err;
+  }
+}
+
+// Slashes stay literal: the compare path is `{base}...{head}`, and a branch named
+// devasign/enable-verification must not arrive as devasign%2Fenable-verification.
+const refSegment = (ref: string) => encodeURIComponent(ref).replace(/%2F/g, "/");
+
+/** A compare response's behind_by, or null when it did not state one. 0 is what callers
+ *  read as "caught up, safe to write", so an unrecognised body must never become one. */
+export function behindByFrom(cmp: unknown): number | null {
+  const n = (cmp as { behind_by?: unknown } | null | undefined)?.behind_by;
+  return Number.isInteger(n) ? (n as number) : null;
+}
+
+/** How many commits `head` is behind `base` — 0 once an update-branch merge has landed. */
+export async function compareBehindBy(installationId: number, owner: string, name: string, base: string, head: string): Promise<number | null> {
+  return behindByFrom(await gh<{ behind_by?: number }>(installationId, `/repos/${owner}/${name}/compare/${refSegment(base)}...${refSegment(head)}`));
 }
 
 /** Names of the repo's Actions secrets, or null when the App cannot read them (needs secrets:read). */

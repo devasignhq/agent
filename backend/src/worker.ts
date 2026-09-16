@@ -9,6 +9,7 @@ import { runSecurityAudit } from "./security/audit.js";
 import { runCrossRepoTopologyJob } from "./review/cross-repo/job.js";
 import { enqueueVerifyFeedbackIfEligible } from "./verify/feedback.js";
 import {
+  onboardOptions,
   runVerifyFeedbackJob,
   runVerifyJudgeJob,
   runVerifyOnboardJob,
@@ -81,7 +82,7 @@ async function runJob(job: Job): Promise<void> {
       return;
     case "verify_onboard":
       console.log(`[worker] verify_onboard ${job.payload.repoId} (${job.payload.trigger})`);
-      await runVerifyOnboardJob(job.payload.repoId, { trigger: job.payload.trigger, mode: job.payload.mode, workflow: job.payload.workflow });
+      await runVerifyOnboardJob(job.payload.repoId, onboardOptions(job.payload));
       return;
   }
 }

@@ -37,18 +37,38 @@ function parsePackageJson(text: string | null | undefined): PackageJson | null {
   }
 }
 
+// Git allows any byte but "/" and NUL in a path component, and these names reach
+// `run:` steps and start commands, so the charset gate lives at the one place every
+// consumer gets its directory list from.
+export const PLAIN_DIR = /^[A-Za-z0-9_.-]+$/;
+
+export const isPlainDir = (dir: string) => PLAIN_DIR.test(dir) && dir !== "." && dir !== ".." && !dir.startsWith("-");
+
+export type BootPm = "npm" | "pnpm" | "yarn" | "bun";
+
 /** Top-level directories with their own package.json: "backend", "frontend". */
 export function nestedPackageDirs(paths: string[]): string[] {
-  return [...new Set(paths.filter((p) => /^[^/]+\/package\.json$/.test(p)).map((p) => p.split("/")[0]))].sort();
+  return [...new Set(paths.filter((p) => /^[^/]+\/package\.json$/.test(p)).map((p) => p.split("/")[0]))].filter(isPlainDir).sort();
 }
 
-/** The install command for one nested package, keyed off the lockfile it carries. */
+/** The package manager of one directory, from its own lockfile, else the repository root's. */
+export function pmFor(dir: string, paths: string[]): BootPm {
+  for (const base of [`${dir}/`, ""]) {
+    if (paths.includes(`${base}pnpm-lock.yaml`)) return "pnpm";
+    if (paths.includes(`${base}yarn.lock`)) return "yarn";
+    if (paths.includes(`${base}bun.lockb`) || paths.includes(`${base}bun.lock`)) return "bun";
+    if (paths.includes(`${base}package-lock.json`)) return "npm";
+  }
+  return "npm";
+}
+
+/** The install command for one nested package. Same package manager the start command uses. */
 export function installCommandFor(dir: string, paths: string[]): string {
-  const has = (f: string) => paths.includes(`${dir}/${f}`);
-  if (has("pnpm-lock.yaml")) return `pnpm install --frozen-lockfile --dir ${dir}`;
-  if (has("yarn.lock")) return `yarn install --frozen-lockfile --cwd ${dir}`;
-  if (has("bun.lockb") || has("bun.lock")) return `bun install --cwd ${dir}`;
-  return has("package-lock.json") ? `npm ci --prefix ${dir}` : `npm install --prefix ${dir}`;
+  const pm = pmFor(dir, paths);
+  if (pm === "pnpm") return `pnpm install --frozen-lockfile --dir ${dir}`;
+  if (pm === "yarn") return `yarn install --frozen-lockfile --cwd ${dir}`;
+  if (pm === "bun") return `bun install --cwd ${dir}`;
+  return paths.includes(`${dir}/package-lock.json`) ? `npm ci --prefix ${dir}` : `npm install --prefix ${dir}`;
 }
 
 export function envVarNames(text: string | null | undefined): string[] {

