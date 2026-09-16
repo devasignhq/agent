@@ -569,7 +569,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       install &&
       shouldReviewNewCommits({ startedNewCommit, lastReviewedSha, headSha: review.headSha, priorCriteriaCount })
     ) {
-      const delta = await fetchIncrementalDelta(install.installationId, repo, lastReviewedSha!, review.headSha);
+      const delta = await fetchIncrementalDelta(install.installationId, repo, review.prNumber, lastReviewedSha!, review.headSha);
       if (delta) deltaCommits = delta.commits;
       if (delta && delta.commits.length) {
         commitIntent = await reviewNewCommits({
@@ -4931,6 +4931,12 @@ export function shouldReviewNewCommits(args: {
   );
 }
 
+/** Whether every commit in the delta belongs to the PR. An empty delta carries nothing foreign. */
+export function deltaIsOwnWork(deltaShas: string[], prShas: Iterable<string>): boolean {
+  const own = new Set([...prShas].map((s) => s.toLowerCase()));
+  return deltaShas.every((s) => own.has(s.toLowerCase()));
+}
+
 // Fetch the incremental delta between the last reviewed sha and the new head:
 // the new commits (messages = author intent) and a diff of ONLY those commits.
 // One compare call carries both `commits[]` and `files[].patch`. Best-effort:
@@ -4939,6 +4945,7 @@ export function shouldReviewNewCommits(args: {
 async function fetchIncrementalDelta(
   installationId: number,
   repo: { owner: string; name: string },
+  prNumber: number,
   base: string,
   head: string
 ): Promise<{ commits: Array<{ sha: string; message: string }>; diff: string } | null> {
@@ -4961,6 +4968,17 @@ async function fetchIncrementalDelta(
       sha: c.sha,
       message: c.commit?.message || "",
     }));
+    // Merging the base branch into the PR branch leaves head "ahead", so the compare above
+    // also walks in every commit the base gained: another PR's merged work would read as this
+    // author's intent and mint criteria this PR's diff can never satisfy. GitHub's own PR
+    // commit list is the authority on what belongs here.
+    if (commits.length) {
+      const own = await gh<Array<{ sha: string }>>(
+        installationId,
+        `/repos/${repo.owner}/${repo.name}/pulls/${prNumber}/commits?per_page=100`
+      );
+      if (!deltaIsOwnWork(commits.map((c) => c.sha), (own ?? []).map((c) => c.sha))) return null;
+    }
     // Reassemble a unified-diff view from per-file patches, capped like the
     // holistic pass. GitHub omits `patch` for very large/binary files; list those
     // by name so the model still sees they changed.

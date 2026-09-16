@@ -4,7 +4,7 @@
 //   node --import tsx/esm --test src/review/new-commit-review.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { shouldReviewNewCommits, normalizeCommitIntent } from "./pipeline.js";
+import { shouldReviewNewCommits, normalizeCommitIntent, deltaIsOwnWork } from "./pipeline.js";
 
 // ── shouldReviewNewCommits ──────────────────────────────────────────────────
 const base = {
@@ -30,6 +30,23 @@ test("shouldReviewNewCommits: false on a same-sha rerun (head equals base, or no
 
 test("shouldReviewNewCommits: false when the PR has no prior criteria", () => {
   assert.equal(shouldReviewNewCommits({ ...base, priorCriteriaCount: 0 }), false);
+});
+
+// ── deltaIsOwnWork ──────────────────────────────────────────────────────────
+// devasignhq/agent#252: resolving a conflict by merging main into the branch left the head
+// "ahead", so the compare walked in the three commits main had gained and the intent review
+// minted six criteria from another PR's merged work — permanent on the row, and unsatisfiable
+// because that code lives in the base branch and never appears in this PR's diff.
+test("deltaIsOwnWork: true when every delta commit belongs to the PR", () => {
+  assert.equal(deltaIsOwnWork(["aaa", "bbb"], ["aaa", "bbb", "ccc"]), true);
+  assert.equal(deltaIsOwnWork(["AAA"], ["aaa"]), true, "shas compare case-insensitively");
+  assert.equal(deltaIsOwnWork([], []), true, "an empty delta carries nothing foreign");
+});
+
+test("deltaIsOwnWork: false when the delta carries a commit the PR does not own", () => {
+  // The #252 shape: one own commit (the merge) plus the base branch's commits.
+  assert.equal(deltaIsOwnWork(["07bd5d2", "e0b0288", "cc6e548", "71bf6ad"], ["7821fbd", "71bf6ad"]), false);
+  assert.equal(deltaIsOwnWork(["aaa"], []), false, "an unknown PR commit list is not a licence to proceed");
 });
 
 // ── normalizeCommitIntent ───────────────────────────────────────────────────
