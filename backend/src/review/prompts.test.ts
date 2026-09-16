@@ -112,6 +112,20 @@ test("the test author builds the case its criterion names, and the judge reads t
   assert.match(judge, /stays a fail/, "a real red must survive the new licence to downgrade");
 });
 
+// devasignhq/agent#249: the PR body's own "appNeverStarted() is the single predicate … so the
+// note, the verdict reason and the repo flag can never disagree" became a criterion verbatim,
+// and the verifier read its undefined "agree" as string equality across five surfaces.
+test("criteria synthesis refuses a mechanism the PR described about itself, and an undefined 'agree'", () => {
+  for (const prompt of [criteriaSynthesisSystemPrompt(true), criteriaSynthesisSystemPrompt(false), criteriaSynthesisSystemPrompt(false, "bounty")]) {
+    assert.match(prompt, /is the author narrating their own refactor, not a requirement anyone asked for/);
+    assert.match(prompt, /The PR's own description never counts as that prescription/);
+    assert.match(prompt, /states exactly what must be equal between them/);
+    assert.match(prompt, /driven by a single shared predicate so they always agree/, "the anti-pattern list carries the shape itself");
+    assert.match(prompt, /the PR's own description prescribes nothing/);
+    assert.match(prompt, /no broad criterion restates what narrower ones already pin/);
+  }
+});
+
 test("emoji ban is stated in every stage prompt", () => {
   for (const [prompt] of CASES) {
     assert.match(prompt, /Never use emoji/);
