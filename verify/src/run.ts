@@ -62,6 +62,7 @@ export async function resolvePlan(api: ApiClient, ctx: RunContext, setup: Runner
       actions: { runId: ctx.runId, jobUrl: ctx.jobUrl, runnerOs: ctx.runnerOs },
       cliVersion: CLI_VERSION,
       capabilities: ["managed_boot", "boot_probe"],
+      ...(ctx.probe ? { probe: ctx.probe } : {}),
       // Tells the server this job is leaving, so a plan landing later re-dispatches CI
       // instead of stranding the run until it times out.
       ...(finalPoll ? { giveUp: true } : {}),

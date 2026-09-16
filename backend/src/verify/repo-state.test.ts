@@ -88,6 +88,17 @@ test("a re-run of the same config is not evidence that an older failure was fixe
   assert.equal(browserTestsStatus(probed(booted, {}, { ...sameConfig, reason: "not_configured" })).status, "proven", "a stale not-configured flag is still not a failure");
 });
 
+test("a deliberate re-check of the current config can clear a failure the setup PR's own CI left", () => {
+  // judge.ts stamps the failure with the default branch's bootHash and a re-check boots that
+  // same yml, so on an unchanged repo they ALWAYS match and the failure would never clear.
+  const failure = { count: 1, reason: "did_not_start" as const, runId: "r", prNumber: 12, at: 1_000, bootHash: bootHash(booted) };
+  const recheck = { kind: "recheck" as const, prNumber: 0, at: 9_000 };
+  assert.equal(browserTestsStatus(probed(booted, recheck, failure)).status, "proven", "the maintainer booted the current config and it came up");
+  assert.equal(browserTestsStatus(probed(booted, { ...recheck, ok: false }, failure)).status, "failing", "a re-check that did not come up leaves the failure standing");
+  assert.equal(browserTestsStatus(probed(booted, { ...recheck, at: 999 }, failure)).status, "failing", "a re-check older than the failure proves nothing about it");
+  assert.equal(browserTestsStatus(probed(booted, { ...recheck, kind: "setup_pr" }, failure)).status, "failing", "the setup PR's own re-run of that config still does not");
+});
+
 test("bootHash fingerprints every boot key, servers and login included, independent of key order", () => {
   const base = { start: "npm start", url: "http://localhost:3000" };
   // Hashes stored before servers/login existed must not change for start/url-only configs.

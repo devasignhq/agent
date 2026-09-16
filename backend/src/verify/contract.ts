@@ -138,6 +138,9 @@ export type ResolveRequest = {
   giveUp?: boolean;
   // What this runner can do beyond the base contract; absent on CLIs older than 1.6.
   capabilities?: RunnerCapability[];
+  // Echoed straight back from the dispatch's client_payload: it is what proves this run is
+  // the one GitHub started for that boot re-check, and nothing else in the payload can.
+  probe?: { id: string; nonce: string };
 };
 
 export type RunnerPlan = {

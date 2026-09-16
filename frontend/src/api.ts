@@ -263,6 +263,8 @@ export type Repository = {
       missingSecrets?: string[] | null;
       lastError?: string | null;
       lastDiagnosis?: { code: string; message: string } | null;
+      // The last boot re-check the panel asked for; the probe it dispatches reports into `boot`.
+      bootCheck?: { at: number; probeId: string; dispatched: boolean; error?: string } | null;
     };
   };
   flakeRate?: { rate: number; flaky: number; total: number };
@@ -498,6 +500,8 @@ export type VerifyBoot = {
   logUrl: string | null;
   screenshotUrl: string | null;
   urlExpiresAt: number | null;
+  // Which probe this verdict came from, so a request can tell its own answer from another's.
+  probeId?: string;
 };
 export type VerifySetup = {
   onboarding: NonNullable<Repository["verify"]>["onboarding"];
@@ -509,6 +513,8 @@ export type VerifySetup = {
   // Absent on backends older than the boot probe; null until a probe reports.
   boot?: VerifyBoot | null;
   probeUnavailable?: { cliVersion: string; at: number } | null;
+  // Whether this repo's boot can be re-checked on demand, and why not when it can't.
+  bootCheck?: { available: boolean; reason?: string };
 };
 
 export type CriteriaRevision = {
@@ -1048,6 +1054,8 @@ export const api = {
     request<VerifySetup>(`/api/repositories/${repoId}/verify/setup`),
   requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string }) =>
     request<{ ok: true; queued: true }>(`/api/repositories/${repoId}/verify/setup-pr`, { method: "POST", body: JSON.stringify(opts) }),
+  requestBootCheck: (repoId: string) =>
+    request<{ ok: true; dispatched: boolean; reason?: string }>(`/api/repositories/${repoId}/verify/boot-check`, { method: "POST" }),
   criteriaRevisions: (reviewId: string) =>
     request<{ revisions: CriteriaRevision[]; repo: { owner: string; name: string }; prNumber: number }>(`/api/reviews/${reviewId}/criteria-revisions`),
 

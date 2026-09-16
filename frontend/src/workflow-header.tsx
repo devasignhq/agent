@@ -5,7 +5,7 @@ import React from "react";
 import { useSearchParams } from "react-router-dom";
 import { Icon } from "./icons";
 import { api, type Repository } from "./api";
-import { VERIFY_YML_REFERENCE, browserTestsRow, opensBrowserSetup, withoutBrowserSetup } from "./verify-setup-view";
+import { BOOT_CHECK_ASK_FAILED, VERIFY_YML_REFERENCE, bootCheckStarted, bootCheckView, browserTestsRow, opensBrowserSetup, withoutBrowserSetup } from "./verify-setup-view";
 
 export type WorkflowHeaderState = {
   repos: Repository[];
@@ -107,6 +107,8 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
   const [mode, setMode] = React.useState("separate");
   const [workflow, setWorkflow] = React.useState("");
   const [busy, setBusy] = React.useState(false);
+  const [checking, setChecking] = React.useState(false);
+  const [checkNote, setCheckNote] = React.useState(null);
   const load = React.useCallback(
     () => api.verifySetup(repo.id).then((s) => { setSetup(s); setFailed(false); }).catch(() => setFailed(true)),
     [repo.id]
@@ -120,6 +122,7 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
   const workflows = setup.detected?.existingWorkflows || [];
   const frameworks = (setup.detected?.frameworks || []).map((f) => f.name).join(", ");
   const browser = browserTestsRow(setup);
+  const bootCheck = bootCheckView(setup);
   const pillClass = ob.state === "verified" ? "ok" : ob.state === "pr_open" || ob.state === "pr_merged" ? "info" : "nit";
   const stateText =
     ob.state === "verified" ? "verified, a run succeeded" :
@@ -132,6 +135,15 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
       await api.requestSetupPr(repo.id, { mode, workflow: workflow || undefined });
       setTimeout(() => { void load(); setBusy(false); }, 2500);
     } catch { setBusy(false); }
+  };
+  const recheckBoot = async () => {
+    setChecking(true);
+    setCheckNote(null);
+    try {
+      const res = await api.requestBootCheck(repo.id);
+      setCheckNote(bootCheckStarted(res));
+      setTimeout(() => { if (res.dispatched) setCheckNote(null); void load(); setChecking(false); }, 2500);
+    } catch { setChecking(false); setCheckNote(BOOT_CHECK_ASK_FAILED); }
   };
 
   return (
@@ -152,6 +164,25 @@ function VerifySetupPanel({ repo }: { repo: Repository }) {
             </div>
           )}
           {browser.last && <div className="mute">{browser.last}</div>}
+          {bootCheck.evidence && (
+            <div className={bootCheck.evidence.tone === "warn" ? "t-warn" : "mute"}>
+              {bootCheck.evidence.line}
+              {bootCheck.evidence.links.map((l) => (
+                <React.Fragment key={l.href}>
+                  {" · "}
+                  <a className="wf-verify-link" href={l.href} target="_blank" rel="noreferrer">{l.label} <Icon name="external" size={10} /></a>
+                </React.Fragment>
+              ))}
+            </div>
+          )}
+          {(checkNote || bootCheck.note) && <div className="mute">{checkNote || bootCheck.note}</div>}
+          {bootCheck.button && (
+            <div>
+              <button type="button" className="btn ghost sm" disabled={checking} onClick={recheckBoot}>
+                {checking ? "Starting…" : bootCheck.button.label}
+              </button>
+            </div>
+          )}
           <div><a className="wf-verify-link" href={VERIFY_YML_REFERENCE} target="_blank" rel="noreferrer">verify block reference <Icon name="external" size={10} /></a></div>
         </dd>
       </dl>

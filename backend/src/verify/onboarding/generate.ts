@@ -216,8 +216,8 @@ export function guessVerifyConfig(setup: DetectedSetup, hints: StackHints, pkg: 
   const scripts = pkg?.scripts || {};
   const pmRun = setup.packageManager === "pnpm" ? "pnpm" : setup.packageManager === "yarn" ? "yarn" : setup.packageManager === "bun" ? "bun run" : "npm run";
   const cfg: DevasignVerifyConfig = { e2e: "auto" };
-  // The JS branches read root scripts, so they only speak for a root manifest;
-  // a nested app is inferred instead and arrives in `boot`.
+  // These branches only ever guess: a hardcoded port and whatever the root scripts are
+  // called. Anything inference could establish — root or nested — arrives in `boot` and wins.
   if (pkg && hints.nextjs) Object.assign(cfg, { build: scripts.build ? `${pmRun} build` : undefined, start: scripts.dev ? `${pmRun} dev` : `${pmRun} start`, url: "http://localhost:3000", ready: "/" });
   else if (pkg && hints.vite) Object.assign(cfg, { start: scripts.dev ? `${pmRun} dev -- --port 5173` : undefined, url: "http://localhost:5173", ready: "/" });
   else if (hints.fastapi) Object.assign(cfg, { start: "uvicorn app.main:app --port 8000", url: "http://localhost:8000", ready: "/docs" });

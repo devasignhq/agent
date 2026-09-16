@@ -97,6 +97,30 @@ test("bootSpec orders setup steps, then servers, then the app, and resolves each
   assert.deepEqual(clash.steps.map((s) => [s.name, s.cmd]), [["api", "s5"], ["app", "x"]], "a server may not share a step's name, or its log");
 });
 
+test("every process the boot starts is told this is CI and that there is no browser to open", { timeout: 60_000 }, async () => {
+  // vite has --open but no --no-open and ignores CI, so a config with `server.open: true`
+  // makes CI launch a browser; BROWSER=none is the variable it (and CRA) honour instead.
+  const ws = workspace();
+  const port = await freePort();
+  const dumped = path.join(ws.root, "env.json");
+  const keys = `JSON.stringify({ ci: process.env.CI ?? null, browser: process.env.BROWSER ?? null, color: process.env.FORCE_COLOR ?? null })`;
+  const spec = bootSpec({
+    install: exact(ws.root, "dump-setup.js", `require("fs").writeFileSync(${JSON.stringify(dumped + ".setup")}, ${keys});\n`),
+    start: script(ws.root, "dump-app.js", `require("fs").writeFileSync(${JSON.stringify(dumped + ".app")}, ${keys}); ${serverSource(port)}`),
+    url: `http://127.0.0.1:${port}`,
+    timeout: 20,
+  })!;
+  const res = await startApp(spec, ws, { pollMs: 100 });
+  try {
+    assert.equal(res.ok, true, JSON.stringify(!res.ok && res.diagnosis));
+    for (const kind of ["setup", "app"]) {
+      assert.deepEqual(JSON.parse(readFileSync(`${dumped}.${kind}`, "utf8")), { ci: "true", browser: "none", color: "0" }, `the ${kind} step`);
+    }
+  } finally {
+    await res.handle.stop();
+  }
+});
+
 test("startApp runs setup in order, starts each server only after the previous one is up, and stop() frees every port", { timeout: 60_000 }, async () => {
   const ws = workspace();
   const [apiPort, appPort] = [await freePort(), await freePort()];

@@ -107,6 +107,38 @@ test("install → onboarding PR with the workflow + .devasign.yml, expected/miss
   }
 });
 
+test("whether a dispatch can ever wake this repo's workflow is persisted, because only the file knows", async () => {
+  // extendWorkflow withholds the trigger from a multi-job file, and nothing can tell
+  // afterwards — so the panel would offer a check GitHub accepts and nothing ever runs.
+  const one = seed();
+  try {
+    await runVerifyOnboard(one.repo.id, { trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml" }, one.deps);
+    assert.equal(db.find("repositories", (r) => r.id === one.repo.id)!.verify!.onboarding.dispatchable, true);
+    assert.ok(parse(one.calls.files[".github/workflows/ci.yml"]).on.repository_dispatch, "and the file really did get the trigger");
+  } finally {
+    one.cleanup();
+  }
+
+  const many = seed();
+  try {
+    many.calls.files[".github/workflows/ci.yml"] =
+      "name: CI\non:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm test\n  lint:\n    runs-on: ubuntu-latest\n    steps:\n      - run: npm run lint\n";
+    await runVerifyOnboard(many.repo.id, { trigger: "manual", mode: "extend", workflow: ".github/workflows/ci.yml" }, many.deps);
+    assert.equal(db.find("repositories", (r) => r.id === many.repo.id)!.verify!.onboarding.dispatchable, false);
+    assert.equal(parse(many.calls.files[".github/workflows/ci.yml"]).on.repository_dispatch, undefined, "a dispatch would run their lint job too");
+  } finally {
+    many.cleanup();
+  }
+
+  const own = seed();
+  try {
+    await runVerifyOnboard(own.repo.id, { trigger: "manual" }, own.deps);
+    assert.equal(db.find("repositories", (r) => r.id === own.repo.id)!.verify!.onboarding.dispatchable, true, "our own workflow always carries the trigger");
+  } finally {
+    own.cleanup();
+  }
+});
+
 test("extend mode appends to the existing CI job; a repo that already runs the action is marked merged; closed/merged PRs move the state", async () => {
   const s = seed();
   try {

@@ -19,6 +19,7 @@ import { normalizeDoctor } from "../verify/doctor-normalize.js";
 import { normalizeBootReport, settleBootProbe } from "../verify/boot-probe.js";
 import { PROBE_EXPIRE_MS } from "../verify/reaper.js";
 import { patchRepoVerify } from "../verify/repo-state.js";
+import { timingSafeEqual } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
@@ -130,7 +131,16 @@ export function parseResolveBody(body: unknown): ResolveRequest | null {
     capabilities: Array.isArray(b.capabilities)
       ? [...new Set(b.capabilities.filter((c): c is RunnerCapability => typeof c === "string" && CAPABILITIES.has(c)))].slice(0, 10)
       : undefined,
+    probe: parseProbeToken(b.probe),
   };
+}
+
+/** The `{id, nonce}` the App put in its dispatch, as the runner echoed it back. Opaque, bounded. */
+function parseProbeToken(raw: unknown): { id: string; nonce: string } | undefined {
+  const t = (raw || {}) as Record<string, unknown>;
+  const id = typeof t.id === "string" ? t.id.slice(0, 64) : "";
+  const nonce = typeof t.nonce === "string" ? t.nonce.slice(0, 128) : "";
+  return id && nonce ? { id, nonce } : undefined;
 }
 
 const PACKAGE_MANAGERS = new Set(["npm", "pnpm", "yarn", "bun", "pip", "poetry", "go"]);
@@ -190,14 +200,81 @@ export const PROBE_UPLOAD_LIMITS = { maxFileBytes: 20 * 1024 * 1024, maxTotalByt
 // accumulate probe rows (and upload quota) without bound.
 export const MAX_PROBES_PER_PR = 20;
 
-/** Offer the setup PR's own CI run a boot of the config that PR proposes — or record why we can't. */
+// The App only ever fires repository_dispatch. Admitting workflow_dispatch too would let
+// any hand-startable default-branch workflow with id-token:write claim a re-check.
+const branchFromRef = (ref: string): string | null => /^refs\/heads\/(.+)$/.exec(ref || "")?.[1] ?? null;
+
+/**
+ * A re-check's verdict is credited to the default branch, so only a run DevAsign dispatched
+ * at that branch may act on one — never a pull_request run, whose ref names a PR.
+ */
+export function runnerMayRecheck(runner: RunnerIdentity): boolean {
+  const { event_name: event, ref } = runner.claims;
+  return event === "repository_dispatch" && prNumberFromRef(ref) === null && branchFromRef(ref) === runner.repo.defaultBranch;
+}
+
+const sameSecret = (a: string, b: string): boolean => {
+  const x = Buffer.from(a, "utf8");
+  const y = Buffer.from(b, "utf8");
+  return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
+};
+
+/** The run that is already this probe's, if one has claimed it. */
+export function claimedBy(probe: BootProbe, runner: RunnerIdentity): boolean {
+  return probe.actionsRunId === String(runner.claims.run_id) && probe.attempt === (Number(runner.claims.run_attempt) || 1);
+}
+
+// `pr` and `sha` are both public, so the nonce in the App's own dispatch is the only thing
+// separating this run from every other dispatch run in the repo — a contributor's PR re-run included.
+/** The re-check the App minted, when this signed run is the very one GitHub started for it. */
+export function pendingRecheckProbe(runner: RunnerIdentity, body: ResolveRequest): BootProbe | null {
+  if (!runnerMayRecheck(runner) || !body.probe) return null;
+  const now = Date.now();
+  const probe = db.find(
+    "bootProbes",
+    (p) => p.id === body.probe!.id && p.repoId === runner.repo.id && p.kind === "recheck" && p.status === "offered" && now - p.offeredAt <= PROBE_EXPIRE_MS
+  );
+  if (!probe || !probe.nonce || !sameSecret(probe.nonce, body.probe.nonce)) return null;
+  // The row's sha is the one the App resolved; the runner cannot redirect the probe at another commit.
+  if (probe.sha.toLowerCase() !== body.sha.toLowerCase()) return null;
+  // Once a run has claimed the row it is that run's alone: a second dispatch must not be
+  // handed it, spend its upload quota, or file its report.
+  return !probe.actionsRunId || claimedBy(probe, runner) ? probe : null;
+}
+
+export const RECHECK_RUNNER_OUTDATED = "the runner in CI is too old for boot checks — update @devasign/verify";
+
+// A runner that has boot_probe but does not echo the App's token is pre-1.8: the re-check it
+// was dispatched for can never be claimed, so say so instead of leaving the panel waiting 2h.
+function noteRecheckUnclaimable(runner: RunnerIdentity, body: ResolveRequest): void {
+  if (body.probe || !runnerMayRecheck(runner)) return;
+  const now = Date.now();
+  const probe = db.find(
+    "bootProbes",
+    (p) => p.repoId === runner.repo.id && p.kind === "recheck" && p.status === "offered" && now - p.offeredAt <= PROBE_EXPIRE_MS
+  );
+  if (!probe || probe.sha.toLowerCase() !== body.sha.toLowerCase()) return;
+  // The live row, not the one captured on the request: the click that recorded bootCheck
+  // happened after this runner's repo object was read.
+  const cur = db.find("repositories", (r) => r.id === runner.repo.id)?.verify?.onboarding?.bootCheck;
+  if (cur?.probeId !== probe.id || cur.error) return;
+  patchRepoVerify(runner.repo.id, (v) => ({
+    ...v,
+    onboarding: { ...v.onboarding, bootCheck: { ...v.onboarding.bootCheck!, error: RECHECK_RUNNER_OUTDATED } },
+  }));
+}
+
+/** Offer a run a boot of the config it checked out — the setup PR's own CI, or a dispatched re-check. */
 export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): BootProbeOffer | null {
   const ob = runner.repo.verify?.onboarding;
-  if (!ob?.prNumber || ob.prNumber !== body.pr || !ob.setupPrOpen) return null;
+  if (!ob?.prNumber || ob.prNumber !== body.pr) return null;
   // The claims are signed; body.event is whatever the runner typed, so it decides nothing.
-  if (runner.claims.event_name !== "pull_request") return null;
-  const prNumber = prNumberFromRef(runner.claims.ref);
-  if (prNumber !== ob.prNumber) return null;
+  const onSetupPr = !!ob.setupPrOpen && runner.claims.event_name === "pull_request" && prNumberFromRef(runner.claims.ref) === ob.prNumber;
+  const recheck = onSetupPr ? null : pendingRecheckProbe(runner, body);
+  if (!onSetupPr && !recheck) {
+    noteRecheckUnclaimable(runner, body);
+    return null;
+  }
 
   const now = Date.now();
   if (!body.capabilities?.includes("boot_probe")) {
@@ -208,9 +285,20 @@ export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): Bo
     return null;
   }
 
+  const prNumber = ob.prNumber;
   const attempt = Number(runner.claims.run_attempt) || 1;
   const actionsRunId = String(runner.claims.run_id);
   const uploadLimits = { ...PROBE_UPLOAD_LIMITS };
+  const capable = () => patchRepoVerify(runner.repo.id, (cur) => ({ ...cur, onboarding: { ...cur.onboarding, probeUnavailable: null } }));
+
+  if (recheck) {
+    // The click can precede CI by minutes, and `offeredAt` orders boot verdicts: stamp it
+    // when a run is really told to boot, or this loses to a probe offered while it queued.
+    if (!recheck.actionsRunId) db.update("bootProbes", (p) => p.id === recheck.id, { actionsRunId, attempt, offeredAt: now });
+    capable();
+    return { probeId: recheck.id, uploadLimits };
+  }
+
   // One row per CI job attempt. Every part of the key is signed — body.sha is the runner's
   // to choose, so keying on it would let one job mint a probe (and a fresh quota) per fake sha.
   const existing = db.find(
@@ -218,12 +306,14 @@ export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): Bo
     (p) => p.repoId === runner.repo.id && p.prNumber === prNumber && p.actionsRunId === actionsRunId && p.attempt === attempt
   );
   if (existing) return { probeId: existing.id, uploadLimits };
-  if (db.filter("bootProbes", (p) => p.repoId === runner.repo.id && p.prNumber === prNumber).length >= MAX_PROBES_PER_PR) return null;
+  // Re-checks are the App's own rows and carry no PR: they never eat the setup PR's budget.
+  if (db.filter("bootProbes", (p) => p.repoId === runner.repo.id && p.prNumber === prNumber && p.kind !== "recheck").length >= MAX_PROBES_PER_PR) return null;
 
   const probe = db.insert("bootProbes", {
     id: uuid(),
     schemaVersion: 1,
     repoId: runner.repo.id,
+    kind: "setup_pr",
     prNumber,
     actionsRunId,
     sha: body.sha,
@@ -233,7 +323,7 @@ export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): Bo
     uploadedBytes: 0,
     uploadedCount: 0,
   });
-  patchRepoVerify(runner.repo.id, (cur) => ({ ...cur, onboarding: { ...cur.onboarding, probeUnavailable: null } }));
+  capable();
   return { probeId: probe.id, uploadLimits };
 }
 
@@ -504,7 +594,7 @@ export async function artifactsHandler(req: RunnerRequest, res: Response): Promi
   res.json(signed.body);
 }
 
-/** The one guard both probe endpoints go through: this runner's repo, this PR, this sha, still offered, still young. */
+/** The one guard both probe endpoints go through: this runner's repo, its ref, this sha, still offered, still young. */
 export function probeForRunner(req: RunnerRequest, res: Response, sha?: string): BootProbe | null {
   const runner = req.runner!;
   const probe = db.find("bootProbes", (p) => p.id === String(req.params.probeId));
@@ -513,7 +603,10 @@ export function probeForRunner(req: RunnerRequest, res: Response, sha?: string):
     fail(res, 404, "probe_not_found");
     return null;
   }
-  if (prNumberFromRef(runner.claims.ref) !== probe.prNumber) {
+  // A re-check carries the onboarding PR's number but ran on the default branch, so the ref's
+  // PR says nothing about it: what has to match is the dispatched run that claimed the row.
+  const refOk = probe.kind === "recheck" ? runnerMayRecheck(runner) && claimedBy(probe, runner) : prNumberFromRef(runner.claims.ref) === probe.prNumber;
+  if (!refOk) {
     fail(res, 403, "pr_mismatch");
     return null;
   }

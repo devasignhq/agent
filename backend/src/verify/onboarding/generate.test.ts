@@ -7,6 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { parse } from "yaml";
 import type { DevasignVerifyConfig } from "../contract.js";
+import { bootConfigFrom, inferBootCandidates } from "../boot-inference.js";
 import { inferSetupFromTree } from "../detect.js";
 import {
   ACTION_REF,
@@ -384,6 +385,42 @@ test("guessVerifyConfig prefers the inferred nested boot config over its root-on
   assert.deepEqual(boot.env, ["NEXTAUTH_SECRET", "STRIPE_KEY"]);
   assert.match(boot.seed!, /prisma db seed/);
 });
+
+test("guessVerifyConfig prefers an inferred root boot config over its hardcoded 5173 guess, and keeps the legacy branches for the stacks inference cannot read", () => {
+  const rootVite: Stack = {
+    name: "single-package Vite app at the repo root",
+    paths: ["package.json", "package-lock.json", "vite.config.ts", "index.html", "src/main.tsx"],
+    packageJson: { scripts: { dev: "vite", build: "vite build" }, devDependencies: { vite: "^6.0.5" } },
+    files: { "vite.config.ts": "export default { server: { port: 3001 } };" },
+  };
+  const b = build(rootVite);
+  assert.equal(b.verify.start, "npm run dev -- --port 5173", "with nothing inferred the legacy root guess still stands");
+  assert.equal(b.verify.url, "http://localhost:5173");
+
+  const files: Record<string, string | null> = { "package.json": JSON.stringify(rootVite.packageJson), ...rootVite.files };
+  const boot = bootConfigFrom(inferBootCandidates({ paths: rootVite.paths, files, mode: "separate", workflowTexts: [] }), rootVite.paths, files);
+  const inferred = guessVerifyConfig(b.setup, b.hints, rootVite.packageJson as any, b.secrets, boot);
+  assert.equal(inferred.start, "npm run dev -- --port 3001 --strictPort", "the port the app's own config pins, and pinned so an occupied one fails loudly");
+  assert.equal(inferred.url, "http://localhost:3001");
+  assert.equal(inferred.ready, "/");
+
+  const nextFiles: Record<string, string | null> = { "package.json": JSON.stringify(STACKS[0].packageJson) };
+  const nb = build(STACKS[0]);
+  const nextBoot = bootConfigFrom(inferBootCandidates({ paths: STACKS[0].paths, files: nextFiles, mode: "separate", workflowTexts: [] }), STACKS[0].paths, nextFiles);
+  const nextInferred = guessVerifyConfig(nb.setup, nb.hints, STACKS[0].packageJson as any, nb.secrets, nextBoot);
+  assert.equal(nextInferred.start, "npm run dev", "a root next app boots from its own dev script");
+  assert.equal(nextInferred.url, "http://localhost:3000");
+  assert.equal(nextInferred.build, undefined, "next dev compiles on demand, so the guessed build goes with the rest of the guess");
+
+  // Inference reads node web apps only; every other stack keeps the guess it had.
+  const fastapi = build(STACKS[2]);
+  assert.equal(fastapi.verify.start, "uvicorn app.main:app --port 8000");
+  assert.equal(fastapi.verify.url, "http://localhost:8000");
+  const express = build(STACKS[1]);
+  assert.equal(express.verify.start, "npm start");
+  assert.equal(express.verify.url, "http://localhost:3000");
+});
+
 
 test("prBody lists expected secrets and flags the missing ones; patchWorkflowForDoctor fixes runtime + browsers only", () => {
   const b = build(STACKS[0]);

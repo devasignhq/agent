@@ -2,7 +2,7 @@
 // can influence that report, so it is whitelisted here and the PR comment is composed from the
 // repo's own .devasign.yml plus fixed per-stage text — never from a runner-supplied string.
 import { db } from "../db.js";
-import { postPRCommentReturningId, pullRequestHeadSha, readFileAtRefStrict, updatePRCommentResult, type CommentUpdate } from "../github/app.js";
+import { branchTipSha, postPRCommentReturningId, pullRequestHeadSha, readFileAtRefStrict, updatePRCommentResult, type CommentUpdate } from "../github/app.js";
 import { pushNotification } from "../notifications.js";
 import type { Installation, Repository, RepoVerifyState } from "../types.js";
 import type { BootReport, BootStage, DevasignVerifyConfig } from "./contract.js";
@@ -102,6 +102,7 @@ const SAFE_URL = /^https?:\/\/[A-Za-z0-9.-]+(:\d{1,5})?(\/[A-Za-z0-9\-._~/]*)?$/
 export type SettleDeps = {
   read?: (...a: any[]) => Promise<string | null>;
   prHeadSha?: (...a: any[]) => Promise<string | null>;
+  branchTip?: (...a: any[]) => Promise<string | null>;
   postComment?: (...a: any[]) => Promise<number | null>;
   updateComment?: (...a: any[]) => Promise<CommentUpdate>;
 };
@@ -109,6 +110,7 @@ export type SettleDeps = {
 type Deps = {
   read: (install: Installation, repo: Repository, path: string, ref: string) => Promise<string | null>;
   prHeadSha: (install: Installation, repo: Repository, prNumber: number) => Promise<string | null>;
+  branchTip: (install: Installation, repo: Repository, branch: string) => Promise<string | null>;
   postComment: (install: Installation, repo: Repository, prNumber: number, body: string) => Promise<number | null>;
   updateComment: (install: Installation, repo: Repository, commentId: number, body: string) => Promise<CommentUpdate>;
 };
@@ -116,6 +118,7 @@ type Deps = {
 const defaults: Deps = {
   read: (install, repo, path, ref) => readFileAtRefStrict(install.installationId, repo.owner, repo.name, path, ref),
   prHeadSha: (install, repo, prNumber) => pullRequestHeadSha(install.installationId, repo.owner, repo.name, prNumber),
+  branchTip: (install, repo, branch) => branchTipSha(install.installationId, repo.owner, repo.name, branch).catch(() => null),
   postComment: (install, repo, prNumber, body) => postPRCommentReturningId(install.installationId, repo.owner, repo.name, prNumber, body),
   updateComment: (install, repo, commentId, body) => updatePRCommentResult(install.installationId, repo.owner, repo.name, commentId, body),
 };
@@ -215,13 +218,15 @@ async function settleOne(probeId: string, deps: SettleDeps): Promise<void> {
   const install = repo ? db.find("installations", (i) => i.id === repo.installationId) : null;
   if (!repo || !install) return;
 
-  // The config the boot is credited to is read at the sha the App picked — the setup PR's
-  // own head — never at the sha the runner named. A probe of any other commit proves nothing.
-  const headSha = await d.prHeadSha(install, repo, probe.prNumber);
-  const onPrHead = !!headSha && headSha.toLowerCase() === probe.sha.toLowerCase();
-  const cfg = onPrHead ? parseDevasignVerify(await d.read(install, repo, DEVASIGN_YML_PATH, headSha!)) : null;
-  if (!onPrHead) {
-    console.warn(`[verify] boot probe ${probe.id} booted ${probe.sha}, not ${repo.owner}/${repo.name}#${probe.prNumber}'s head (${headSha ?? "unreadable"})`);
+  // The config the boot is credited to is read at the sha the App picked — the setup PR's own
+  // head, or the default branch's for a re-check — never at the sha the runner named.
+  const recheck = probe.kind === "recheck";
+  const headSha = recheck ? await d.branchTip(install, repo, repo.defaultBranch) : await d.prHeadSha(install, repo, probe.prNumber);
+  const onHead = !!headSha && headSha.toLowerCase() === probe.sha.toLowerCase();
+  const cfg = onHead ? parseDevasignVerify(await d.read(install, repo, DEVASIGN_YML_PATH, headSha!)) : null;
+  if (!onHead) {
+    const where = recheck ? repo.defaultBranch : `#${probe.prNumber}`;
+    console.warn(`[verify] boot probe ${probe.id} booted ${probe.sha}, not ${repo.owner}/${repo.name} ${where}'s head (${headSha ?? "unreadable"})`);
   }
 
   // DevAsign's own browser install failing says nothing about the repo's config, so it
@@ -229,9 +234,12 @@ async function settleOne(probeId: string, deps: SettleDeps): Promise<void> {
   if (report.stage !== "browsers") {
     const boot: NonNullable<RepoVerifyState["boot"]> = {
       ok: cameUp(report, cfg),
+      kind: recheck ? "recheck" : "setup_pr",
       configHash: bootHash(cfg) ?? "",
-      configSha: onPrHead ? headSha : null,
-      prNumber: probe.prNumber,
+      configSha: onHead ? headSha : null,
+      // A re-check ran on the default branch, so it has no PR of its own: the row carries the
+      // onboarding PR only to route the dispatch, and crediting the verdict to it would be a lie.
+      prNumber: recheck ? 0 : probe.prNumber,
       sha: probe.sha,
       at: probe.reportedAt ?? Date.now(),
       offeredAt: probe.offeredAt,
@@ -251,6 +259,14 @@ async function settleOne(probeId: string, deps: SettleDeps): Promise<void> {
   }
 
   const { markdown, plain } = bootCommentText(report, cfg, repo.id);
+  // A re-check has no PR to comment on: the panel and the notification are where it lands.
+  if (recheck) {
+    // Naming the branch for a commit the branch no longer holds would credit the boot to
+    // code that is not there; name the commit instead.
+    const where = onHead ? `${repo.defaultBranch}: ${plain}` : `${probe.sha.slice(0, 7)}: ${plain} — ${repo.defaultBranch} has moved past that commit`;
+    pushNotification(install.userId, "system", `Boot check on ${repo.owner}/${repo.name}`, where, { link: setupFixUrl(repo.id) });
+    return;
+  }
   const body = `${BOOT_COMMENT_MARKER}\n${markdown}`;
   // Keyed by comment id alone, GitHub would happily edit a closed PR's comment: only reuse
   // the handle when it belongs to the PR this probe ran on.

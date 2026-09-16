@@ -135,6 +135,9 @@ export type ResolveRequest = {
   cliVersion?: string;
   giveUp?: boolean;
   capabilities?: RunnerCapability[];
+  // Echoed from the dispatch's client_payload; it is what proves this run is the one
+  // GitHub started for that boot re-check.
+  probe?: { id: string; nonce: string };
 };
 
 export type RunnerPlan = {
