@@ -1,6 +1,6 @@
-// Boot config for repos whose app lives in a nested directory (frontend/, backend/).
-// Every command is re-derived from a template here and validated against the tree, so
-// no model output, diff or runner string can become part of a shell command.
+// Boot config for repos whose app lives at the root or in a nested directory
+// (frontend/, backend/). Every command is re-derived from a template here and validated
+// against the tree, so no model output, diff or runner string can become part of a shell command.
 import type { DevasignVerifyConfig } from "./contract.js";
 import { isPlainDir, nestedPackageDirs, PLAIN_DIR, pmFor, type BootPm } from "./detect.js";
 import { RESERVED_SERVER_NAMES } from "./yml.js";
@@ -15,6 +15,9 @@ export type BootPackageJson = {
   workspaces?: string[] | { packages?: string[] };
 };
 
+/** The repo root as a package directory: the app is the repository, with no prefix to run it under. */
+export const ROOT_DIR = ".";
+
 export type BootCandidates = {
   webApp: { dir: string; framework: "vite" | "next"; port: number } | null;
   servers: Array<{ dir: string; name: string; script: string; port: number }>;
@@ -28,7 +31,10 @@ const SERVER_NAME = /^[a-z0-9][a-z0-9-]{0,31}$/;
 const LOGIN_PATH = /^scripts\/devasign-login\.(mjs|js|cjs|sh)$/;
 const LOGIN_CMD = /^(?:node|bash) \.\/scripts\/devasign-login\.(?:mjs|js|cjs|sh)$/;
 const START_CMD =
-  /^(?:npm --prefix (\S+) run (\S+)|pnpm --dir (\S+) run (\S+)|yarn --cwd (\S+) run (\S+)|bun run --cwd (\S+) (\S+))(?: -- --port (\d+) --strictPort)?$/;
+  /^(?:npm --prefix (\S+) run (\S+)|pnpm --dir (\S+) run (\S+)|yarn --cwd (\S+) run (\S+)|bun run --cwd (\S+) (\S+)|npm run (\S+)|pnpm run (\S+)|yarn run (\S+)|bun run (\S+))(?: -- --port (\d+) --strictPort)?$/;
+const NESTED_FORMS: Array<[BootPm, number]> = [["npm", 1], ["pnpm", 3], ["yarn", 5], ["bun", 7]];
+const ROOT_FORMS: Array<[BootPm, number]> = [["npm", 9], ["pnpm", 10], ["yarn", 11], ["bun", 12]];
+const PORT_GROUP = 13;
 // A dev/start script that builds, tests or lints does not serve the app, whatever it is called.
 const NOT_A_START = /(?:^|[\s&|;(])(?:tsc|eslint|prettier|jest|vitest|mocha|ava|cypress|playwright|storybook)\b|\sbuild\b(?![/\\])/;
 const TEST_SUFFIXES = ["e2e", "ci", "ephemeral", "mock"];
@@ -61,20 +67,31 @@ const isServerPackage = (pkg: BootPackageJson) =>
   SERVER_DEPS.some((d) => hasDep(pkg, d)) ||
   [...Object.keys(pkg.dependencies || {}), ...Object.keys(pkg.devDependencies || {})].some((d) => d.startsWith("@nestjs/"));
 
+/** A file of one package: the root package owns the path itself, with no directory prefix. */
+const at = (dir: string, name: string) => (dir === ROOT_DIR ? name : `${dir}/${name}`);
+
+/** Every package CI installs: the root manifest, which is always installed, then the top-level ones. */
+const packageDirs = (paths: string[]) =>
+  paths.includes("package.json") ? [ROOT_DIR, ...nestedPackageDirs(paths)] : nestedPackageDirs(paths);
+
 function configPathFor(dir: string, paths: string[]): string | null {
-  for (const name of CONFIG_NAMES) if (paths.includes(`${dir}/${name}`)) return `${dir}/${name}`;
+  for (const name of CONFIG_NAMES) if (paths.includes(at(dir, name))) return at(dir, name);
   return null;
 }
 
 /** The only shape a start command ever takes. null when any part fails validation. */
 export function startCommandFor(pm: BootPm, dir: string, script: string, port?: number): string | null {
-  if (!isPlainDir(dir)) return null;
+  const root = dir === ROOT_DIR;
+  // "." is the repository itself, never an argument: it gets its own form rather than
+  // being spelled as a directory, and every other name still goes through the charset gate.
+  if (!root && !isPlainDir(dir)) return null;
   if (!SCRIPT_NAME.test(script)) return null;
   if (port !== undefined && !portOk(port)) return null;
   const base =
-    pm === "pnpm" ? `pnpm --dir ${dir} run ${script}`
-    : pm === "yarn" ? `yarn --cwd ${dir} run ${script}`
-    : pm === "bun" ? `bun run --cwd ${dir} ${script}`
+    pm === "pnpm" ? (root ? `pnpm run ${script}` : `pnpm --dir ${dir} run ${script}`)
+    : pm === "yarn" ? (root ? `yarn run ${script}` : `yarn --cwd ${dir} run ${script}`)
+    : pm === "bun" ? (root ? `bun run ${script}` : `bun run --cwd ${dir} ${script}`)
+    : root ? `npm run ${script}`
     : `npm --prefix ${dir} run ${script}`;
   return port === undefined ? base : `${base} -- --port ${port} --strictPort`;
 }
@@ -84,6 +101,9 @@ export function inferenceFilesFor(paths: string[]): string[] {
   const out: string[] = [];
   if (paths.includes("pnpm-workspace.yaml")) out.push("pnpm-workspace.yaml");
   if (paths.includes(".node-version")) out.push(".node-version");
+  // The root manifest and env files are read anyway; its vite/next config is not.
+  const rootCfg = paths.includes("package.json") ? configPathFor(ROOT_DIR, paths) : null;
+  if (rootCfg) out.push(rootCfg);
   for (const dir of nestedPackageDirs(paths).slice(0, MAX_DIRS)) {
     out.push(`${dir}/package.json`);
     const cfg = configPathFor(dir, paths);
@@ -145,6 +165,12 @@ function stripComments(text: string): string {
       out += c;
       continue;
     }
+    // Outside a quote a bare backslash only occurs inside a regex literal, so consuming what
+    // it escapes is safe — and stops the `\/` closing `/^~\//` from opening a line comment.
+    if (c === "\\") {
+      out += c + (text[++i] ?? "");
+      continue;
+    }
     if (c === "/" && next === "/") {
       while (i < text.length && text[i] !== "\n") i++;
       out += "\n";
@@ -180,13 +206,17 @@ function depthAt(src: string, index: number): number {
   return depth;
 }
 
+// The shallowest `server:` is the exported config's own: vitest's `test.server` and a
+// plugin option of that name sit deeper, and shadowing costs both the port and the servers.
 /** The `server: { … }` literal of a vite config, comments removed. */
 function serverBlock(text: string | null | undefined): string | null {
   if (!text) return null;
   const src = stripComments(text);
-  const m = /\bserver\s*:\s*\{/.exec(src);
-  if (!m) return null;
-  const start = m.index + m[0].length - 1;
+  const found = [...src.matchAll(/\bserver\s*:\s*\{/g)].map((m) => ({ index: m.index, length: m[0].length, depth: depthAt(src, m.index) }));
+  if (!found.length) return null;
+  const shallowest = Math.min(...found.map((f) => f.depth));
+  const m = found.filter((f) => f.depth === shallowest).pop()!;
+  const start = m.index + m.length - 1;
   let depth = 0;
   let quote: string | null = null;
   for (let i = start; i < src.length && i < start + 8000; i++) {
@@ -245,7 +275,7 @@ function declaredPorts(dir: string, script: string, files: Record<string, string
   if (flag) add(flag);
   for (const m of (script || "").matchAll(/\bPORT\s*=\s*(\d+)/g)) add(Number(m[1]));
   for (const name of ENV_NAMES) {
-    for (const m of (files[`${dir}/${name}`] || "").matchAll(/^\s*(?:export\s+)?(?:[A-Z][A-Z0-9_]*_)?PORT\s*=\s*"?(\d+)/gm)) add(Number(m[1]));
+    for (const m of (files[at(dir, name)] || "").matchAll(/^\s*(?:export\s+)?(?:[A-Z][A-Z0-9_]*_)?PORT\s*=\s*"?(\d+)/gm)) add(Number(m[1]));
   }
   return out;
 }
@@ -288,11 +318,15 @@ export function inferBootCandidates(args: {
   const rootless = !paths.includes("package.json");
   // CI only installs a nested package when we write the workflow ourselves and can add
   // the step, when the root workspaces cover it, or when their own PR CI installs it.
-  const eligibleDirs = dirs.filter((d) => mode === "separate" || covered(d) || (rootless && workflowInstalls(d, workflowTexts)));
+  // A root manifest is installed by every workflow there is, ours and theirs alike.
+  const eligibleDirs = [
+    ...(rootless ? [] : [ROOT_DIR]),
+    ...dirs.filter((d) => mode === "separate" || covered(d) || (rootless && workflowInstalls(d, workflowTexts))),
+  ];
 
   const packages: Candidate[] = [];
   for (const dir of eligibleDirs) {
-    const pkg = parsePkg(files[`${dir}/package.json`]);
+    const pkg = parsePkg(files[at(dir, "package.json")]);
     if (!pkg) continue;
     const cfg = configPathFor(dir, paths);
     packages.push({ dir, pkg, scripts: pkg.scripts && typeof pkg.scripts === "object" ? pkg.scripts : {}, configText: cfg ? files[cfg] ?? null : null });
@@ -309,20 +343,29 @@ export function inferBootCandidates(args: {
     .filter((p): p is Candidate & { framework: "vite" | "next"; port: number } => !!p);
 
   if (pool.length > 1) {
-    const installed = pool.filter((p) => workflowInstalls(p.dir, workflowTexts));
+    // Every workflow installs the root, so it names no directory and wins no tie-break.
+    const installed = pool.filter((p) => p.dir !== ROOT_DIR && workflowInstalls(p.dir, workflowTexts));
     if (installed.length) pool = installed;
   }
   if (pool.length > 1) {
     const preferred = pool.filter((p) => PREFERRED_WEB_DIRS.includes(p.dir.toLowerCase()));
     if (preferred.length) pool = preferred;
   }
+  if (pool.length > 1) {
+    // A root manifest that owns vite for a root vitest workspace is a container, not the app:
+    // any nested candidate beats it, whatever that directory happens to be called.
+    const nested = pool.filter((p) => p.dir !== ROOT_DIR);
+    if (nested.length) pool = nested;
+  }
   const web = pool.length === 1 ? pool[0] : null;
 
   const servers: BootCandidates["servers"] = [];
   if (web) {
     const ports = proxyPorts(web.framework, web.configText, web.port);
+    // The root is never a second process: a repo whose only package is the root has
+    // nothing else to boot, and one with nested packages serves its API from them.
     const backends = packages
-      .filter((p) => p.dir !== web.dir && isServerPackage(p.pkg))
+      .filter((p) => p.dir !== web.dir && p.dir !== ROOT_DIR && isServerPackage(p.pkg))
       .map((p) => ({ dir: p.dir, name: slug(p.dir), script: serverScript(p.scripts), scripts: p.scripts }))
       .filter((p): p is { dir: string; name: string; script: string; scripts: Record<string, string> } => !!p.name && !!p.script);
     // One proxy target and one server package is the only pairing we can trust, and only
@@ -346,7 +389,7 @@ export function inferBootCandidates(args: {
 
 /** The verify-block keys the candidates justify. Never returns env or services. */
 export function bootConfigFrom(candidates: BootCandidates, paths: string[], files: Record<string, string | null>): Partial<DevasignVerifyConfig> {
-  const dirs = new Set(nestedPackageDirs(paths));
+  const dirs = new Set(packageDirs(paths));
   const out: Partial<DevasignVerifyConfig> = {};
   const web = candidates.webApp;
   if (web && dirs.has(web.dir) && portOk(web.port)) {
@@ -376,15 +419,15 @@ export function bootConfigFrom(candidates: BootCandidates, paths: string[], file
 export function isKnownStartCommand(cmd: string, paths: string[], files: Record<string, string | null>): boolean {
   const m = START_CMD.exec(cmd);
   if (!m) return false;
-  const forms: Array<[BootPm, number]> = [["npm", 1], ["pnpm", 3], ["yarn", 5], ["bun", 7]];
-  const form = forms.find(([, i]) => m[i] !== undefined);
+  const nested = NESTED_FORMS.find(([, i]) => m[i] !== undefined);
+  const form = nested ?? ROOT_FORMS.find(([, i]) => m[i] !== undefined);
   if (!form) return false;
   const [pm, i] = form;
-  const dir = m[i];
-  const script = m[i + 1];
-  const port = m[9] === undefined ? undefined : Number(m[9]);
-  if (!nestedPackageDirs(paths).includes(dir) || pmFor(dir, paths) !== pm) return false;
-  const scripts = parsePkg(files[`${dir}/package.json`])?.scripts;
+  const dir = nested ? m[i] : ROOT_DIR;
+  const script = nested ? m[i + 1] : m[i];
+  const port = m[PORT_GROUP] === undefined ? undefined : Number(m[PORT_GROUP]);
+  if (!packageDirs(paths).includes(dir) || pmFor(dir, paths) !== pm) return false;
+  const scripts = parsePkg(files[at(dir, "package.json")])?.scripts;
   if (!scripts || typeof scripts[script] !== "string") return false;
   return startCommandFor(pm, dir, script, port) === cmd;
 }

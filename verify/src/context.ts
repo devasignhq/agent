@@ -13,6 +13,9 @@ export type RunContext = {
   runAttempt: number;
   runnerOs: string;
   jobUrl?: string;
+  // The boot re-check this run was dispatched for, when it was. Opaque here: the API
+  // matches it against the row it minted.
+  probe?: { id: string; nonce: string };
 };
 
 type Env = Record<string, string | undefined>;
@@ -27,14 +30,21 @@ export function readEventPayload(env: Env, read: (p: string) => string = (p) => 
   }
 }
 
-export function prAndShaFromEvent(event: string, payload: any): { pr?: number; sha?: string } {
+function probeToken(raw: any): { id: string; nonce: string } | undefined {
+  const id = typeof raw?.id === "string" ? raw.id : "";
+  const nonce = typeof raw?.nonce === "string" ? raw.nonce : "";
+  return id && nonce ? { id, nonce } : undefined;
+}
+
+export function prAndShaFromEvent(event: string, payload: any): { pr?: number; sha?: string; probe?: { id: string; nonce: string } } {
   if (!payload || typeof payload !== "object") return {};
   if (event === "pull_request" || event === "pull_request_target") {
     return { pr: Number(payload.pull_request?.number) || undefined, sha: payload.pull_request?.head?.sha || undefined };
   }
   if (event === "repository_dispatch") {
     const cp = payload.client_payload || {};
-    return { pr: Number(cp.pr) || undefined, sha: cp.sha || undefined };
+    const probe = probeToken(cp.probe);
+    return { pr: Number(cp.pr) || undefined, sha: cp.sha || undefined, ...(probe ? { probe } : {}) };
   }
   if (event === "workflow_dispatch") {
     const inputs = payload.inputs || {};
@@ -68,6 +78,7 @@ export function readContext(opts: { env?: Env; cwd?: string; pr?: number; sha?: 
     runId,
     runAttempt: Number(env.GITHUB_RUN_ATTEMPT) || 1,
     runnerOs: env.RUNNER_OS || process.platform,
+    ...(fromEvent.probe ? { probe: fromEvent.probe } : {}),
     jobUrl: repo && env.GITHUB_RUN_ID ? `${server}/${repo}/actions/runs/${env.GITHUB_RUN_ID}` : undefined,
   };
 }

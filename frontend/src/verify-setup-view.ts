@@ -77,6 +77,111 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
   return { status, tone, text, last: showLast ? `PR #${last.prNumber}: ${uiCriteriaCount(last.count)} checked without a browser` : null, boot };
 }
 
+// ---- "Re-check boot": proving a boot config without waiting for a setup PR ----
+
+// The backend answers with codes, not prose; the panel owns its own wording.
+const BOOT_CHECK_REASONS: Record<string, string> = {
+  no_setup_pr: "DevAsign has not set this repo up yet — open the setup PR first",
+  setup_pr_open: "The setup PR is still open — its own CI is what proves the config it proposes",
+  not_dispatchable: "This repo's verify job shares a workflow with others, so it has no repository_dispatch trigger for DevAsign to use",
+  requested: "DevAsign asked CI to boot the app — nothing has picked it up yet",
+  pending: "A check is already running — its result lands here when CI finishes",
+  cooldown: "A check was just asked for — try again in a minute",
+  rate_limited: "This repo has used its boot checks for today — try again tomorrow",
+  no_installation: "The DevAsign GitHub App is no longer installed on this repo",
+  head_unreadable: "DevAsign could not read the latest commit on the default branch",
+  dispatch_failed: "GitHub would not start the check — the workflow needs a repository_dispatch trigger",
+};
+export const BOOT_CHECK_ASK_FAILED = "Could not ask for the check — try again";
+
+export function bootCheckReason(reason?: string): string {
+  return (reason && BOOT_CHECK_REASONS[reason]) || "DevAsign cannot re-check this repo's boot right now";
+}
+
+/**
+ * The answer to a click: the request can be accepted and still dispatch nothing, and even an
+ * accepted dispatch only means GitHub took it — no run exists until one picks it up.
+ */
+export function bootCheckStarted(res: { dispatched: boolean; reason?: string }): string {
+  return res.dispatched ? "DevAsign asked CI to boot the app — the result lands here when it finishes" : `Could not start the check: ${bootCheckReason(res.reason)}`;
+}
+
+export type BootEvidence = {
+  /** The whole line: what the probe found (dropped when the row above already said it) and where it ran. */
+  line: string;
+  tone: "ok" | "warn";
+  links: Array<{ label: string; href: string }>;
+};
+
+export type BootCheckView = {
+  evidence: BootEvidence | null;
+  /** null when there is nothing to click; `note` then says why not. */
+  button: { label: string } | null;
+  note: string | null;
+};
+
+export type BootCheckSetup = Pick<VerifySetup, "browserTests" | "devasignYml" | "boot" | "probeUnavailable" | "bootCheck" | "onboarding">;
+
+/** What a probe that DID boot the app found: a sign-in is claimed only when it happened. */
+export function bootOkText(boot: NonNullable<VerifySetup["boot"]>): string {
+  if (boot.signedIn === true) return "The app came up in CI and DevAsign signed in";
+  if (boot.signedIn === false) return "The app came up in CI, but DevAsign did not sign in";
+  return "The app came up in CI";
+}
+
+/** A re-check runs on the default branch, so it has a sha to name but no PR of its own. */
+function bootSource(boot: NonNullable<VerifySetup["boot"]>): string | null {
+  if (boot.prNumber > 0) return `PR #${boot.prNumber}`;
+  return boot.sha ? boot.sha.slice(0, 7) : null;
+}
+
+function bootEvidence(setup: BootCheckSetup, now: number): BootEvidence | null {
+  const boot = setup.boot;
+  if (!boot) {
+    const runner = setup.probeUnavailable;
+    if (!runner) return null;
+    const line = runner.cliVersion
+      ? `The runner in CI (@devasign/verify ${runner.cliVersion}) is too old to check the boot — update it`
+      : "The runner in CI is too old to check the boot — update @devasign/verify";
+    return { line, tone: "warn", links: [] };
+  }
+  const row = browserTestsRow(setup);
+  const text = boot.ok ? bootOkText(boot) : bootFailureText(boot);
+  // The row above already made this claim; repeating it reads like two separate checks.
+  const said = text === row.text || (row.status === "proven" && boot.signedIn === null);
+  const where = bootSource(boot);
+  const line = said ? (where ? `Checked on ${where}` : null) : where ? `${text} · checked on ${where}` : text;
+  if (!line) return null;
+  const expired = !!boot.urlExpiresAt && boot.urlExpiresAt <= now;
+  const links = expired
+    ? []
+    : ([["boot log", boot.logUrl], ["screenshot", boot.screenshotUrl]] as const).flatMap(([label, href]) => (href ? [{ label, href }] : []));
+  return { line, tone: boot.ok && boot.signedIn !== false ? "ok" : "warn", links };
+}
+
+/** The "Re-check boot" control: what the last probe found, and whether another check can be asked for. */
+export function bootCheckView(setup: BootCheckSetup, now: number = Date.now()): BootCheckView {
+  const evidence = bootEvidence(setup, now);
+  const offer = setup.bootCheck;
+  if (!offer) return { evidence, button: null, note: null };
+  // Whether a check is already in flight is the backend's call (it holds the probe row), never a timer here.
+  if (!offer.available) return { evidence, button: null, note: bootCheckReason(offer.reason) };
+  const asked = setup.onboarding?.bootCheck ?? null;
+  // Only the request's OWN probe answers it: another probe's verdict landing in between is
+  // not a reply, and silently reading as one would hide a check that never ran.
+  const answered = !!setup.boot && (setup.boot.probeId ? setup.boot.probeId === asked?.probeId : setup.boot.at >= (asked?.at ?? 0));
+  const note = !asked
+    ? null
+    : asked.error
+      ? `The last check did not run: ${asked.error}`
+      : !asked.dispatched
+        ? "The last check did not reach CI"
+        : !answered
+          ? "The last check never reported back"
+          : null;
+  return { evidence, button: { label: setup.boot ? "Re-check boot" : "Check boot now" }, note };
+}
+
 /** A fix link names its repo; the panel opens only for that repo (or when none is named). */
 export function opensBrowserSetup(params: URLSearchParams, repoId: string): boolean {
   if (params.get("setup") !== "browser") return false;

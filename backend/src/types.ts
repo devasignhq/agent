@@ -181,6 +181,9 @@ export type RepoVerifyState = {
   // What the setup PR's own CI run found when it booted the proposed config.
   boot?: {
     ok: boolean;
+    // Which probe wrote this: a boot of the setup PR's own head, or an on-demand re-check
+    // of the default branch. Absent on rows written before re-checks existed (all setup_pr).
+    kind?: "setup_pr" | "recheck";
     configHash: string;
     // The sha the App read the hashed yml at (the setup PR's head), which must be the
     // commit the runner booted — `sha` — for the hash to stand for anything.
@@ -229,6 +232,12 @@ export type RepoVerifyState = {
     // The boot check's comment, scoped to the PR it lives on: GitHub edits a comment by id
     // alone, so a regenerated setup PR must never rewrite the old PR's comment.
     bootComment?: { prNumber: number; commentId: number } | null;
+    // The last on-demand re-check the panel asked for. `dispatched: false` with an `error`
+    // is the honest outcome when GitHub refused the repository_dispatch.
+    bootCheck?: { at: number; probeId: string; dispatched: boolean; error?: string } | null;
+    // Whether the workflow we wrote or extended listens for repository_dispatch. False means
+    // no dispatch can ever wake it, so a boot check would be asked for and never answered.
+    dispatchable?: boolean;
     lastError?: string | null;
   };
 };
@@ -1472,14 +1481,20 @@ export type VerifyArtifact = {
   owner?: "run" | "probe";
 };
 
-// One offer to boot the setup PR's proposed config in that PR's own CI, and what
-// came back. `report` arrives from the customer's runner: normalized, never trusted.
+// One offer to boot a config and what came back. `report` arrives from the customer's
+// runner: normalized, never trusted.
 export type BootProbe = {
   id: string;
   schemaVersion: 1;
   repoId: string;
+  // "recheck": the maintainer asked for a boot of the default branch on an already-onboarded
+  // repo, so the App minted the row and dispatched the run. Rows written before this are setup_pr.
+  kind?: "setup_pr" | "recheck";
   // prNumber, actionsRunId and attempt all come from the signed OIDC claims and together
   // key the row: one probe per CI job attempt, whatever the runner puts in the body.
+  // A recheck row is keyed by the App instead. `nonce` rides only in that dispatch's
+  // client_payload, so echoing it is what proves a run is the one GitHub started for it.
+  nonce?: string;
   prNumber: number;
   actionsRunId?: string;
   sha: string;

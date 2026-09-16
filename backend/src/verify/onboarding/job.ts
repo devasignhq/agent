@@ -206,7 +206,7 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
       }
 
       for (const [p, text] of Object.entries(out)) if (text === (at(p) ?? "")) delete out[p];
-      return { files: out, body: prBody({ mode, workflowPath, hints, setup, verify: effective, expected, missing, extendedJob, dispatch }), mode, workflowPath, ymlError };
+      return { files: out, body: prBody({ mode, workflowPath, hints, setup, verify: effective, expected, missing, extendedJob, dispatch }), mode, workflowPath, ymlError, dispatch };
     };
 
     const outcome = await writeSetupPr({
@@ -230,7 +230,7 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
     const cached = { sha: headSha, ...candidates };
     const built = outcome.built;
     if (outcome.status === "skipped") {
-      setOnboarding(repo, { setupPrOpen: false, workflowPath: built.workflowPath, workflowVersion: WORKFLOW_VERSION, lastError: built.ymlError ?? null, candidates: cached }, (cur) => ({ detected: cur.detected ?? setup }));
+      setOnboarding(repo, { setupPrOpen: false, workflowPath: built.workflowPath, workflowVersion: WORKFLOW_VERSION, lastError: built.ymlError ?? null, candidates: cached, dispatchable: built.dispatch }, (cur) => ({ detected: cur.detected ?? setup }));
       return { status: "skipped", reason: outcome.reason };
     }
     // A repo whose workflow already runs on the default branch is not un-verified by a
@@ -249,6 +249,9 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
       expectedSecrets: expected,
       missingSecrets: missing,
       candidates: cached,
+      // Whether a dispatch can ever wake this workflow: an extended file with other jobs
+      // deliberately gets no repository_dispatch trigger.
+      dispatchable: built.dispatch,
     }, (cur) => ({ detected: cur.detected ?? setup }));
     if (install.userId) {
       const verb = outcome.created ? "adds" : "updates";

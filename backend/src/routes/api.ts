@@ -1,10 +1,13 @@
 // REST API for the frontend.
 import express, { Router } from "express";
 import type { Request, Response } from "express";
+import { randomBytes } from "node:crypto";
 import { v4 as uuid } from "uuid";
 import { db, dbHealth } from "../db.js";
 import type {
+  Installation,
   RepoGuidanceItem,
+  RepoVerifyState,
   Repository,
   SecurityFinding,
   SecurityFindingEvent,
@@ -22,7 +25,7 @@ import { RULING_CODES, codeFitsAction, precedentFromRuling } from "../security/p
 import { contradictPrecedent, corpusForInstallations, revokePrecedent } from "../security/precedent-store.js";
 import { SECURITY_ENGINE } from "../security/audit.js";
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
-import { appJWT, gh, getOrgMembership } from "../github/app.js";
+import { appJWT, branchTipSha, gh, getOrgMembership, repositoryDispatch } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStellarConfigured, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
@@ -53,8 +56,10 @@ import { buildTestRows, latestRunPerReview, summarizeTestRows } from "../verify/
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
 import { refreshDefaultYml, type DefaultYmlDeps } from "../verify/default-yml.js";
-import { browserTestsStatus, setupFixUrl } from "../verify/repo-state.js";
+import { browserTestsStatus, patchRepoVerify, setupFixUrl } from "../verify/repo-state.js";
 import { signBootArtifacts } from "../verify/boot-probe.js";
+import { DISPATCH_EVENT } from "../verify/feedback.js";
+import { PROBE_EXPIRE_MS } from "../verify/reaper.js";
 import { enqueueVerifyOnboard } from "../queue.js";
 
 export const api = Router();
@@ -1402,7 +1407,8 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
       new Promise((resolve) => { timer = setTimeout(resolve, opts.waitMs ?? 4_000); }),
     ]);
     clearTimeout(timer);
-    const v = db.find("repositories", (r) => r.id === ctx.repo.id)?.verify ?? ctx.repo.verify;
+    const fresh = db.find("repositories", (r) => r.id === ctx.repo.id) ?? ctx.repo;
+    const v = fresh.verify ?? ctx.repo.verify;
     const boot = v?.boot ?? null;
     res.json({
       onboarding: v?.onboarding ?? { state: "none" },
@@ -1412,6 +1418,8 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
       // What the setup PR's own CI made of the proposed boot config, with short-lived evidence links.
       boot: boot ? { ...boot, ...(await signBootArtifacts(ctx.repo.id, boot)) } : null,
       probeUnavailable: v?.onboarding?.probeUnavailable ?? null,
+      // Whether the panel can ask for a fresh boot of the default branch right now.
+      bootCheck: bootCheckAvailability(fresh),
       browserTests: {
         ...browserTestsStatus(v),
         lastBrowserless: v?.lastBrowserless ?? null,
@@ -1423,6 +1431,121 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
 }
 export const verifySetupHandler = makeVerifySetupHandler();
 api.get("/repositories/:id/verify/setup", verifySetupHandler);
+
+// An already-onboarded repo never gets another setup PR, so a boot check on it can only
+// come from a run DevAsign dispatches itself and hands a probe to.
+export type BootCheckDeps = {
+  branchTip?: (install: Installation, repo: Repository, branch: string) => Promise<string | null>;
+  dispatch?: (install: Installation, repo: Repository, payload: Record<string, unknown>) => Promise<void>;
+};
+
+// A click reaches the customer's GitHub with their installation token, so the endpoint
+// needs its own throttle: `expensiveLimiter` is per-IP and shared with every other route.
+export const BOOT_CHECK_COOLDOWN_MS = 60_000;
+export const MAX_RECHECKS_PER_DAY = 10;
+const RECHECK_WINDOW_MS = 24 * 60 * 60 * 1000;
+// GitHub accepts a dispatch no workflow hears, so a request nothing claims must not hold
+// the button for the whole probe window.
+export const RECHECK_PICKUP_MS = 15 * 60_000;
+
+// The cap counts probe rows, but a click reaches GitHub before it has one: two at once
+// would each spend a branch-tip read. One in flight per repo is enough.
+const bootCheckInFlight = new Set<string>();
+
+/** Why the panel's boot-check button is live, or is not. */
+export function bootCheckAvailability(repo: Repository, now = Date.now()): { available: boolean; reason?: string } {
+  const ob = repo.verify?.onboarding;
+  if (!ob?.prNumber) return { available: false, reason: "no_setup_pr" };
+  // The setup PR's own CI is the evidence for the config that PR proposes; a boot of the
+  // default branch, which does not carry it, must not stand in for that verdict.
+  if (ob.setupPrOpen) return { available: false, reason: "setup_pr_open" };
+  // A workflow with no repository_dispatch trigger cannot hear the dispatch: GitHub would
+  // accept it, nothing would run, and the panel would claim a check was started.
+  if (ob.dispatchable === false) return { available: false, reason: "not_dispatchable" };
+  const pending = db.find(
+    "bootProbes",
+    (p) =>
+      p.repoId === repo.id && p.kind === "recheck" && p.status === "offered" &&
+      now - p.offeredAt <= (p.actionsRunId ? PROBE_EXPIRE_MS : RECHECK_PICKUP_MS)
+  );
+  // Only a row a run has actually claimed is a check that is running; until then it is a
+  // request nothing has picked up.
+  if (pending) return { available: false, reason: pending.actionsRunId ? "pending" : "requested" };
+  // A dispatch GitHub refuses expires its row, so the row count alone would re-arm the
+  // button instantly and make this an unthrottled write amplifier against their GitHub.
+  if (ob.bootCheck && now - ob.bootCheck.at < BOOT_CHECK_COOLDOWN_MS) return { available: false, reason: "cooldown" };
+  const recent = db.filter("bootProbes", (p) => p.repoId === repo.id && p.kind === "recheck" && now - p.offeredAt <= RECHECK_WINDOW_MS);
+  if (recent.length >= MAX_RECHECKS_PER_DAY) return { available: false, reason: "rate_limited" };
+  return { available: true };
+}
+
+export function makeBootCheckHandler(deps: BootCheckDeps = {}) {
+  return async function bootCheckHandler(req: Request, res: Response): Promise<void> {
+    const ctx = ownedRepo(req, res);
+    if (!ctx) return;
+    const repo = db.find("repositories", (r) => r.id === ctx.repo.id) ?? ctx.repo;
+    const availability = bootCheckAvailability(repo);
+    if (!availability.available) return void res.json({ ok: true, dispatched: false, reason: availability.reason });
+    const install = db.find("installations", (i) => i.id === repo.installationId);
+    if (!install) return void res.json({ ok: true, dispatched: false, reason: "no_installation" });
+
+    if (bootCheckInFlight.has(repo.id)) return void res.json({ ok: true, dispatched: false, reason: "cooldown" });
+    bootCheckInFlight.add(repo.id);
+    try {
+      // The App resolves the commit, so the probe is pinned to it before any runner is told about it.
+      const branchTip = deps.branchTip ?? ((i, r, branch) => branchTipSha(i.installationId, r.owner, r.name, branch));
+      const sha = await branchTip(install, repo, repo.defaultBranch).catch((err) => {
+        console.warn(`[verify] boot check could not read ${repo.owner}/${repo.name}@${repo.defaultBranch}:`, err instanceof Error ? err.message : err);
+        return null;
+      });
+      if (!sha) return void res.json({ ok: true, dispatched: false, reason: "head_unreadable" });
+
+      // Re-read after the round trip to GitHub, and mint before the next await: two clicks
+      // must not each get a re-check.
+      const now = Date.now();
+      const current = db.find("repositories", (r) => r.id === repo.id) ?? repo;
+      const still = bootCheckAvailability(current, now);
+      if (!still.available) return void res.json({ ok: true, dispatched: false, reason: still.reason });
+      const probe = db.insert("bootProbes", {
+        id: uuid(),
+        schemaVersion: 1,
+        repoId: repo.id,
+        kind: "recheck",
+        // Only this dispatch's client_payload carries it, so echoing it back is what tells
+        // the run GitHub started for us apart from every other dispatch run in the repo.
+        nonce: randomBytes(24).toString("base64url"),
+        prNumber: current.verify!.onboarding.prNumber!,
+        sha,
+        attempt: 1,
+        status: "offered",
+        offeredAt: now,
+        uploadedBytes: 0,
+        uploadedCount: 0,
+      });
+      const dispatch = deps.dispatch ?? ((i, r, payload) => repositoryDispatch(i.installationId, r.owner, r.name, DISPATCH_EVENT, payload));
+      const record = (bootCheck: RepoVerifyState["onboarding"]["bootCheck"]) =>
+        // The row can change while the dispatch is in flight; a bootCheck on a repo whose
+        // onboarding was reset would name a probe that no longer stands for anything.
+        patchRepoVerify(repo.id, (cur) => (cur.onboarding?.prNumber ? { ...cur, onboarding: { ...cur.onboarding, bootCheck } } : cur));
+      try {
+        await dispatch(install, repo, { pr: probe.prNumber, sha, probe: { id: probe.id, nonce: probe.nonce } });
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`[verify] boot-check repository_dispatch failed for ${repo.owner}/${repo.name}:`, msg);
+        // Nothing will ever report this row, and leaving it offered would block the next attempt.
+        db.update("bootProbes", (p) => p.id === probe.id, { status: "expired" });
+        record({ at: now, probeId: probe.id, dispatched: false, error: `${msg.slice(0, 300)} — the workflow needs a repository_dispatch trigger and the App needs contents:write` });
+        return void res.json({ ok: true, dispatched: false, reason: "dispatch_failed" });
+      }
+      record({ at: now, probeId: probe.id, dispatched: true });
+      res.json({ ok: true, dispatched: true });
+    } finally {
+      bootCheckInFlight.delete(repo.id);
+    }
+  };
+}
+export const bootCheckHandler = makeBootCheckHandler();
+api.post("/repositories/:id/verify/boot-check", expensiveLimiter, bootCheckHandler);
 
 export function setupPrHandler(req: Request, res: Response) {
   const ctx = ownedRepo(req, res);

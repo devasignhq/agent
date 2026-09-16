@@ -54,8 +54,10 @@ function recorder(yml: string | null, opts: { head?: string | null; ymlAt?: stri
   let nextId = 100;
   let update: "updated" | "gone" | "failed" = "updated";
   let post: "ok" | "fail" = "ok";
+  const read: string[] = [];
   const deps = {
-    prHeadSha: async () => head,
+    prHeadSha: async () => (read.push("pr"), head),
+    branchTip: async (_i: any, _r: any, branch: string) => (read.push(`branch:${branch}`), head),
     read: async (_i: any, _r: any, path: string, ref: string) => (path === ".devasign.yml" && ref === at ? yml : null),
     postComment: async (_i: any, _r: any, prNumber: number, body: string) => {
       if (post === "fail") return null;
@@ -67,7 +69,7 @@ function recorder(yml: string | null, opts: { head?: string | null; ymlAt?: stri
       return update;
     },
   };
-  return { posted, edited, deps, fail: { update: (u: typeof update) => (update = u), post: (p: typeof post) => (post = p) } };
+  return { posted, edited, read, deps, fail: { update: (u: typeof update) => (update = u), post: (p: typeof post) => (post = p) } };
 }
 
 const cfg = (yml: Partial<DevasignVerifyConfig>): DevasignVerifyConfig => yml as DevasignVerifyConfig;
@@ -443,6 +445,61 @@ test("a probe with no report, no repo or no row settles nothing", async () => {
     assert.equal(posted.length, 0);
     assert.equal(t.verify().boot, undefined);
   } finally {
+    t.cleanup();
+  }
+});
+
+test("a re-check reads the default branch's head and settles with no PR comment at all", async () => {
+  const t = repoWithProbe("boot-recheck", { kind: "recheck" });
+  const { posted, edited, read, deps } = recorder(LOGIN_YML);
+  try {
+    db.update("bootProbes", (p) => p.id === t.probeId, { report: report({ login: { ran: true, checked: true, ok: true, checkStatus: 200, cors: "ok" } }) });
+    await settleBootProbe(t.probeId, deps);
+    assert.deepEqual(read, ["branch:main"], "the setup PR's head says nothing about the branch this booted");
+    const boot = t.verify().boot!;
+    assert.deepEqual([boot.ok, boot.signedIn, boot.sha, boot.configSha, boot.probeId], [true, true, SHA, SHA, t.probeId]);
+    assert.match(boot.configHash, /^[0-9a-f]{16}$/);
+    // The row carries the onboarding PR only to route the dispatch; this boot ran on the
+    // default branch long after that PR merged, and crediting it to #7 is simply false.
+    assert.deepEqual([boot.kind, boot.prNumber], ["recheck", 0], "a re-check has a sha to name but no PR of its own");
+    assert.deepEqual([posted.length, edited.length], [0, 0], "there is no open PR to comment on");
+    assert.equal(t.verify().onboarding.bootComment, undefined);
+    const note = db.find("notifications", (n) => n.userId === t.userId)!;
+    assert.equal(note.meta, "main: Came up at http://localhost:3001 in 41s — signed in (check 200)");
+    assert.equal(note.link, setupFixUrl(t.repoId), "the panel, not a PR, is where the maintainer reads it");
+
+    // A setup-PR probe on the same repo still reads the PR's head and still comments.
+    const onPr = repoWithProbe("boot-recheck-contrast");
+    const pr = recorder(YML);
+    await settleBootProbe(onPr.probeId, pr.deps);
+    assert.deepEqual(pr.read, ["pr"]);
+    assert.equal(pr.posted.length, 1);
+    assert.deepEqual([onPr.verify().boot!.kind, onPr.verify().boot!.prNumber], ["setup_pr", 7], "that one really did run on the setup PR");
+    onPr.cleanup();
+  } finally {
+    t.cleanup();
+  }
+});
+
+test("a re-check of a commit the default branch has moved past is credited with no config", async () => {
+  const t = repoWithProbe("boot-recheck-moved", { kind: "recheck" });
+  // The branch advanced between the App resolving the head and the runner booting it.
+  const { posted, deps } = recorder(YML, { head: "f".repeat(40), ymlAt: SHA });
+  const warn = console.warn;
+  console.warn = () => {};
+  try {
+    await settleBootProbe(t.probeId, deps);
+    const boot = t.verify().boot!;
+    assert.equal(boot.configHash, "", "a config it never read cannot be credited");
+    assert.equal(boot.configSha, null);
+    assert.equal(boot.prNumber, 0);
+    assert.equal(posted.length, 0);
+    // Naming the branch would credit the boot to code the branch does not hold.
+    const note = db.find("notifications", (n) => n.userId === t.userId)!;
+    assert.equal(note.meta, `${SHA.slice(0, 7)}: Came up in 41s — main has moved past that commit`);
+    assert.doesNotMatch(note.meta, /^main:/, "the commit booted is provably not on the branch");
+  } finally {
+    console.warn = warn;
     t.cleanup();
   }
 });

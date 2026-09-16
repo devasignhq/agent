@@ -74,9 +74,9 @@ export function browserTestsStatus(v: RepoVerifyState | null | undefined): { sta
     const playwrightConfig = !!v.detected?.frameworks?.some((f) => f.name === "playwright" && !!f.configPath);
     const missing = (["start", "url"] as const).filter((k) => !parsed?.[k]);
     if (missing.length && !playwrightConfig) return { status: "not_configured", missing };
-    // A run that failed after the probe outranks it: the probe only ever proved one commit.
-    // So does an older one the probe cannot have fixed, because it booted that very config.
-    const sameConfigAsFailure = !!last?.bootHash && !!v.boot?.configHash && last.bootHash === v.boot.configHash;
+    // A failure after the probe outranks it, as does an older one of the very config it booted
+    // — but never against a re-check, whose hash always matches and so would never clear.
+    const sameConfigAsFailure = !!last?.bootHash && !!v.boot?.configHash && v.boot.kind !== "recheck" && last.bootHash === v.boot.configHash;
     if (failure && (!v.boot || failure.at >= v.boot.at || sameConfigAsFailure)) return { status: failure.status, missing: [] };
     if (bootProven(v, parsed)) return { status: "proven", missing: [] };
     if (failure) return { status: failure.status, missing: [] };

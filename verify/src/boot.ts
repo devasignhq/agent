@@ -140,7 +140,9 @@ async function stopProcs(procs: Proc[]): Promise<void> {
 const stopAll = () => stopProcs([...live]);
 
 function childEnv(extra: Record<string, string> = {}): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, ...extra, CI: "true", FORCE_COLOR: "0" };
+  // BROWSER=none is the escape hatch vite and CRA both honour: `server.open: true` in their
+  // own config would otherwise have CI try to launch a browser we then have to kill.
+  const env: NodeJS.ProcessEnv = { ...process.env, ...extra, CI: "true", FORCE_COLOR: "0", BROWSER: "none" };
   for (const k of Object.keys(env)) if (k.startsWith("NODE_TEST_")) delete env[k];
   return env;
 }

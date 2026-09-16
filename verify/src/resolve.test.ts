@@ -41,6 +41,20 @@ test("the setup payload rides only on the first poll", async () => {
   assert.ok(seen.slice(1).every((r) => r.setup === undefined), "later polls stay small");
 });
 
+test("a dispatched re-check's token rides on every poll, and nothing invents one", async () => {
+  // The API hands back the probe only to the run it dispatched, so a poll that drops the
+  // token gets no probe and the maintainer's boot check quietly never happens.
+  const probe = { id: "p-1", nonce: "n-1" };
+  const { api, seen } = pendingApi();
+  await resolvePlan(api, { ...ctx, event: "repository_dispatch", probe } as any, setup, 2_500);
+  assert.ok(seen.length >= 2);
+  assert.ok(seen.every((r) => r.probe === probe), "every poll, not just the first");
+
+  const plain = pendingApi();
+  await resolvePlan(plain.api, ctx as any, setup, 2_500);
+  assert.ok(plain.seen.every((r) => r.probe === undefined), "an ordinary PR run claims no probe");
+});
+
 test("a server give-up hint shortens the wait, but can never extend it", () => {
   const t0 = 1_000_000;
   const caller = t0 + 600_000;
