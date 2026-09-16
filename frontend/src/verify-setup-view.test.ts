@@ -1,7 +1,7 @@
 // node --test src/verify-setup-view.test.ts
 import test from "node:test";
 import assert from "node:assert/strict";
-import type { BrowserTests } from "./api.ts";
+import type { BrowserTests, LastBrowserless } from "./api.ts";
 import { browserTestsRow, opensBrowserSetup, uiCriteriaCount, withoutBrowserSetup } from "./verify-setup-view.ts";
 
 const bt = (over: Partial<BrowserTests>): BrowserTests => ({
@@ -33,7 +33,7 @@ test("failing, unproven, disabled and unknown each read differently", () => {
   const failing = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing", lastBrowserless: last({ count: 1, reason: "did_not_start", prNumber: 40 }) }) });
   assert.equal(failing.text, "The app did not start in CI on PR #40");
   assert.equal(failing.last, "PR #40: 1 UI criterion checked without a browser");
-  assert.equal(browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing" }) }).text, "The app did not start in CI");
+  assert.equal(browserTestsRow({ devasignYml: null, browserTests: bt({ status: "failing" }) }).text, "Browser tests could not run", "with no run to blame the boot, the weaker claim");
   const ok = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "unproven" }) });
   assert.deepEqual([ok.text, ok.tone], ["Configured", "ok"]);
   const off = browserTestsRow({ devasignYml: null, browserTests: bt({ status: "disabled", lastBrowserless: last() }) });
@@ -49,6 +49,8 @@ test("a failing run says which of the two happened, with or without a PR number"
   assert.equal(failing({ reason: "browser_errored", prNumber: 40 }), "Browser tests could not run on PR #40");
   assert.equal(failing({ reason: "browser_errored", prNumber: 0 }), "Browser tests could not run");
   assert.doesNotMatch(failing({ reason: "browser_errored", prNumber: 40 }), /did not start/, "the boot is not blamed once the browser tests ran");
+  // Only a run that said the app never came up blames the boot: a reason this build does not know must not.
+  assert.equal(failing({ reason: "added_later" as LastBrowserless["reason"], prNumber: 40 }), "Browser tests could not run on PR #40");
 });
 
 test("runner_outdated asks for a newer runner and still names the last browser-less run", () => {

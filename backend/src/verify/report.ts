@@ -15,7 +15,7 @@ import { formatCardHeader, spliceCardHeader } from "../review/comment.js";
 import { codeFence } from "../review/render.js";
 import type { Criterion, PRReview, Repository, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { RunnerResult } from "./contract.js";
-import { browserlessSummary, type BrowserlessSummary } from "./browserless.js";
+import { browserlessSummary, inheritedCriteria, type BrowserlessSummary } from "./browserless.js";
 import { mdInline } from "./md.js";
 import { hasRunnerEvidence, updateRun } from "./runs.js";
 
@@ -185,7 +185,14 @@ export function buildVerificationView(args: {
   for (const r of rows) counts[r.verdict] += 1;
   const browserless =
     state === "completed" && run?.verdicts.length
-      ? browserlessSummary({ criteria: args.criteria.filter(isVerifiable), verdicts: run.verdicts, plan, withheld: run.runnerMeta?.e2eWithheld, doctor: run.doctor })
+      ? browserlessSummary({
+          criteria: args.criteria.filter(isVerifiable),
+          verdicts: run.verdicts,
+          plan,
+          withheld: run.runnerMeta?.e2eWithheld,
+          doctor: run.doctor,
+          inherited: inheritedCriteria({ inheritFromRunId: run.inheritFromRunId, candidates: run.verdicts.map((v) => v.criterionId), plan, results }),
+        })
       : null;
   return {
     state,

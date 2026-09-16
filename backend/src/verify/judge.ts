@@ -19,7 +19,7 @@ import { artifactStorage } from "./storage.js";
 import { notifyForReview } from "../notifications.js";
 import { afterFeedbackRunSettled } from "./feedback.js";
 import { noteRunSucceeded, postDoctorFollowup } from "./onboarding/job.js";
-import { appNeverStarted, browserlessSummary, type E2eWithheld } from "./browserless.js";
+import { appNeverStarted, browserlessSummary, inheritedCriteria, type E2eWithheld } from "./browserless.js";
 import { patchRepoVerify } from "./repo-state.js";
 import { v4 as uuid } from "uuid";
 
@@ -176,13 +176,23 @@ export function mergeModelVerdicts(code: CriterionVerdict[], model: ModelVerdict
 }
 
 /** repo.verify.lastBrowserless after a judged run; a run with no UI criteria, or one the doctor flagged, leaves another PR's flag alone. */
-function noteBrowserless(run: VerifyRun, criteria: Criterion[], verdicts: CriterionVerdict[], results: RunnerResult[], doctor: DoctorDiagnosis | null, plan: VerifyPlan | null, at: number): void {
+function noteBrowserless(args: {
+  run: VerifyRun;
+  criteria: Criterion[];
+  verdicts: CriterionVerdict[];
+  results: RunnerResult[];
+  doctor: DoctorDiagnosis | null;
+  plan: VerifyPlan | null;
+  inherited: Set<string>;
+  at: number;
+}): void {
+  const { run, criteria, verdicts, results, doctor, plan, inherited, at } = args;
   const browser = plan?.browser;
   if (!browser) return;
   const withheld = run.runnerMeta?.e2eWithheld ?? null;
   // A paused run says nothing about the repo's setup, so whatever the last real run found stands.
   if (withheld === "managed_boot_off") return;
-  const s = browserlessSummary({ criteria, verdicts, plan, withheld, doctor });
+  const s = browserlessSummary({ criteria, verdicts, plan, withheld, doctor, inherited });
   const cur = db.find("repositories", (r) => r.id === run.repoId)?.verify?.lastBrowserless ?? null;
   let next: RepoVerifyState["lastBrowserless"] = s && s.reason !== "paused" ? { count: s.count, reason: s.reason, runId: run.id, prNumber: run.prNumber, at } : null;
   if (!s) {
@@ -196,7 +206,8 @@ function noteBrowserless(run: VerifyRun, criteria: Criterion[], verdicts: Criter
       if (cur?.reason === reason) return;
       next = { count: 0, reason, runId: run.id, prNumber: run.prNumber, at };
     } else {
-      if (browser.policy !== "never" && (doctor || !verdicts.some((v) => ui.has(v.criterionId)))) return;
+      // A criterion this run only carried over proves nothing about its browser either way.
+      if (browser.policy !== "never" && (doctor || !verdicts.some((v) => ui.has(v.criterionId) && !inherited.has(v.criterionId)))) return;
       if (cur == null) return;
     }
   }
@@ -278,9 +289,9 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
   const prior = run.inheritFromRunId ? db.find("verifyRuns", (r) => r.id === run.inheritFromRunId) : null;
   const inherited = new Map<string, CriterionVerdict>();
   if (prior) {
-    const covered = new Set([...results.payload.results.flatMap((r) => r.criterionIds), ...(plan?.tests ?? []).flatMap((t) => t.criterionIds), ...(plan?.unverifiable ?? []).map((u) => u.criterionId)]);
+    const fromPrior = inheritedCriteria({ inheritFromRunId: run.inheritFromRunId, candidates: prior.verdicts.map((v) => v.criterionId), plan, results: results.payload.results });
     for (const v of prior.verdicts) {
-      if (!covered.has(v.criterionId) && all.some((x) => x.criterionId === v.criterionId)) inherited.set(v.criterionId, { ...v, reason: `${v.reason} (from the previous run)` });
+      if (fromPrior.has(v.criterionId) && all.some((x) => x.criterionId === v.criterionId)) inherited.set(v.criterionId, { ...v, reason: `${v.reason} (from the previous run)` });
     }
   }
   const code = all.filter((v) => !inherited.has(v.criterionId));
@@ -347,7 +358,7 @@ export async function runVerifyJudge(runId: string, deps: JudgeDeps = {}): Promi
         tokenUsage: { ...run.tokenUsage, judge: usageByProvider() },
       });
       try {
-        noteBrowserless(run, criteria, verdicts, results.payload.results, doctor, plan, judgedAt);
+        noteBrowserless({ run, criteria, verdicts, results: results.payload.results, doctor, plan, inherited: new Set(inherited.keys()), at: judgedAt });
       } catch (err) {
         console.warn("[verify] lastBrowserless update failed:", err);
       }

@@ -480,6 +480,24 @@ test("browser tests that ran and decided nothing blame the tests, not the boot",
 
   // A diagnosis about anything but the boot leaves the app up.
   assert.equal(judgedView(fellBack, allowed, doctored("tests", "unknown", "playwright exited 1")).browserless?.reason, "browser_errored");
+  assert.equal(judgedView(fellBack, allowed, doctored("browsers", "browser_install_failed", "no chromium")).browserless?.reason, "browser_errored");
+
+  // Everything before the tests is the app coming up, however the runner names the step it died in.
+  for (const d of [doctored("install", "install_failed", "the install command failed"), doctored("build", "install_failed", "the build command failed"), doctored("services", "unknown", "the seed command failed"), doctored("checkout", "unknown", "the checkout was empty")]) {
+    assert.equal(judgedView(fellBack, allowed, d).browserless?.reason, "did_not_start", `${d.doctor!.stage}/${d.doctor!.code}`);
+  }
+});
+
+test("a re-run counts only the criteria it checked, never the verdicts it carried over", () => {
+  const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" }, {
+    tests: [{ id: "t1", path: "a.spec.ts", level: "e2e", origin: "generated", runner: "playwright", criterionIds: ["1"] }],
+  });
+  const carried: CriterionVerdict = { ...verdict("2", "unverifiable", "fallback"), reason: "the app did not start for browser tests (from the previous run)" };
+  const reRun = judgedView([verdict("1", "pass", "fallback"), carried, verdict("5", "pass")], allowed, { inheritFromRunId: "run-before" });
+  assert.deepEqual(reRun.browserless, { count: 1, criterionIds: ["1"], reason: "browser_errored", fixUrl: FIX }, "the earlier run's criterion is not re-attributed to this one's boot");
+  const body = formatTestsComment(reRun, "acme/widgets");
+  assert.ok(body.includes(`\n1 UI criterion was checked without a browser because its browser test could not run — [see setup](${FIX})\n`), body);
+  assert.match(body, /did not start for browser tests[^\n]*from the previous run/, "the carried row keeps the cause of the run it came from");
 });
 
 test("under e2e: always a fallback the judge refused is still noted; criteria withheld for want of boot config and flaky browser runs are not", () => {

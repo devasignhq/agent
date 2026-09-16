@@ -218,6 +218,7 @@ test("browserBanner blames the browser tests when every flagged repo errored the
   assert.equal(both.text, "UI criteria on 2 repositories were checked without a browser because their browser tests could not run");
   const mixed = browserBanner([errored("r1", 1), didNotStart("r2", 50)])!;
   assert.equal(mixed.text, "UI criteria on 2 repositories were checked without a browser", "two causes under one status name neither");
+  assert.equal(mixed.action, "see setup", "both repos already have browser tests, whichever way they failed");
   assert.equal(browserBanner([didNotStart("r1", 1), didNotStart("r2", 2)])!.text, "UI criteria on 2 repositories were checked without a browser because the app did not start in CI");
 });
 

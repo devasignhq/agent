@@ -33,9 +33,10 @@ export function browserTestsRow(setup: Pick<VerifySetup, "browserTests" | "devas
     text = "Not set up — add verify.start and verify.url to .devasign.yml";
     if (missing.length) text += ` (missing: ${missing.map((k) => `verify.${k}`).join(", ")})`;
   } else if (status === "failing") {
-    // "failing" covers both an app that never came up and browser tests that ran and could not decide.
+    // "failing" covers both an app that never came up and browser tests that ran and could not
+    // decide; only a run that said so blames the boot, since that is the stronger claim.
     const onPr = last?.prNumber ? ` on PR #${last.prNumber}` : "";
-    text = last?.reason === "browser_errored" ? `Browser tests could not run${onPr}` : `The app did not start in CI${onPr}`;
+    text = last?.reason === "did_not_start" ? `The app did not start in CI${onPr}` : `Browser tests could not run${onPr}`;
   } else if (status === "runner_outdated") {
     text = "The runner in CI is too old for verify.servers or verify.login — update @devasign/verify";
   } else if (status === "unproven") {

@@ -138,8 +138,9 @@ export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): Br
   if (hit.length === 0) return null;
   const repos = hit.map((e) => e.repo);
   const causes = new Set(hit.map(bannerCause));
-  // Mixed causes name none of them.
+  // Mixed causes name none of them, but the status they share still says where to send the maintainer.
   const cause = causes.size === 1 ? [...causes][0] : null;
+  const configured = hit.every((e) => e.status === "failing");
   const where = repos.length === 1 ? repos[0] : `${repos.length} repositories`;
   const because =
     cause === "did_not_start" ? " because the app did not start in CI" :
@@ -147,7 +148,7 @@ export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): Br
     cause === "runner_outdated" ? " because the runner in CI is too old" : "";
   return {
     text: `UI criteria on ${where} were checked without a browser${because}`,
-    action: cause === "did_not_start" || cause === "browser_errored" ? "see setup" : cause === "runner_outdated" ? "update the runner" : "set up browser tests",
+    action: configured ? "see setup" : cause === "runner_outdated" ? "update the runner" : "set up browser tests",
     href: setupPath(hit[0].fixUrl, hit[0].repoId),
     repos,
   };
