@@ -403,6 +403,8 @@ const verdict = (criterionId: string, v: CriterionVerdict["verdict"], browser?: 
 });
 const judgedView = (verdicts: VerifyRun["verdicts"], plan: any, run: Partial<VerifyRun> = {}) =>
   buildVerificationView({ run: baseRun({ status: "completed", timings: { forkedAt: 1, resolvedAt: 2 }, verdicts, ...run }), review, repo, criteria: uiCriteria, plan, results: [], artifacts: [] });
+const doctored = (stage: string, code: string, message: string): Partial<VerifyRun> => ({ doctor: { stage, code, message } as VerifyRun["doctor"] });
+const bootDoctor = doctored("start", "app_not_ready", "the app never answered on http://localhost:3001");
 
 test("UI criteria decided without a browser get a note in the comment, the check-run summary and text; the conclusion is unchanged", () => {
   // Criterion 4 stayed unverifiable, so it was not checked at all; 5 is not a UI criterion.
@@ -437,27 +439,77 @@ test("UI criteria decided without a browser get a note in the comment, the check
   assert.equal(withDoctor.output.summary, `the app did not start — criteria are unverifiable, not failed.\n\n${note}`);
 });
 
-test("one UI criterion reads singular; browser tests that could not run say the app did not start", () => {
+test("one UI criterion reads singular; a doctor that blames the boot says the app did not start", () => {
   const one = judgedView([verdict("1", "pass"), verdict("5", "pass")], browserPlan({}));
   assert.match(formatTestsComment(one, "acme/widgets"), new RegExp(`\\n1 UI criterion was checked without a browser — \\[set up browser tests\\]\\(${FIX.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\)\\n`));
   assert.doesNotMatch(formatTestsComment(one, "acme/widgets"), /criteria were/);
 
   const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" });
-  const didNotStart = judgedView([verdict("1", "pass", "fallback"), verdict("2", "fail", "fallback"), verdict("3", "pass", "ran"), verdict("4", "pass")], allowed);
+  const fellBack = [verdict("1", "pass", "fallback"), verdict("2", "fail", "fallback"), verdict("3", "pass", "ran"), verdict("4", "pass")];
+  const didNotStart = judgedView(fellBack, allowed, bootDoctor);
   assert.equal(didNotStart.browserless?.reason, "did_not_start");
   const note = `2 UI criteria were checked without a browser because the app did not start in CI — [see setup](${FIX})`;
   assert.ok(formatTestsComment(didNotStart, "acme/widgets").includes(`\n${note}\n`));
   assert.ok(verifyCheckRunPayload(didNotStart, "abc").output.summary.endsWith(`\n\n${note}`));
   assert.ok(verifyCheckRunPayload(didNotStart, "abc").output.text.includes(`\n\n${note}\n\n`));
-  assert.doesNotMatch(formatTestsComment(didNotStart, "acme/widgets"), /set up browser tests/);
+  assert.doesNotMatch(formatTestsComment(didNotStart, "acme/widgets"), /set up browser tests|browser tests could not run/);
+
+  for (const d of [doctored("login", "login_failed", "sign-in never completed"), doctored("start", "no_start_command", "no start command")]) {
+    assert.equal(judgedView(fellBack, allowed, d).browserless?.reason, "did_not_start", d.doctor!.code);
+  }
+});
+
+// devasignhq/agent#247: the app was up ("signed in (session checked)") and the specs timed out on a selector.
+test("browser tests that ran and decided nothing blame the tests, not the boot", () => {
+  const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" });
+  const fellBack = [verdict("1", "pass", "fallback"), verdict("2", "fail", "fallback"), verdict("3", "pass", "ran"), verdict("4", "pass")];
+  const errored = judgedView(fellBack, allowed);
+  assert.deepEqual(errored.browserless, { count: 2, criterionIds: ["1", "2"], reason: "browser_errored", fixUrl: FIX });
+  const note = `2 UI criteria were checked without a browser because their browser tests could not run — [see setup](${FIX})`;
+  const body = formatTestsComment(errored, "acme/widgets");
+  assert.ok(body.includes(`\n${note}\n`), body);
+  assert.doesNotMatch(body, /did not start|set up browser tests/, "the app came up; only the browser tests did not decide");
+  const check = verifyCheckRunPayload(errored, "abc");
+  assert.ok(check.output.summary.endsWith(`\n\n${note}`));
+  assert.ok(check.output.text.includes(`\n\n${note}\n\n`));
+  assert.equal(check.conclusion, verifyCheckRunPayload(judgedView(fellBack, allowed, bootDoctor), "abc").conclusion, "the cause never changes the conclusion");
+
+  const one = formatTestsComment(judgedView([verdict("1", "pass", "fallback"), verdict("5", "pass")], allowed), "acme/widgets");
+  assert.ok(one.includes(`\n1 UI criterion was checked without a browser because its browser test could not run — [see setup](${FIX})\n`), one);
+  assert.doesNotMatch(one, /criteria were|their browser tests/);
+
+  // A diagnosis about anything but the boot leaves the app up.
+  assert.equal(judgedView(fellBack, allowed, doctored("tests", "unknown", "playwright exited 1")).browserless?.reason, "browser_errored");
+  assert.equal(judgedView(fellBack, allowed, doctored("browsers", "browser_install_failed", "no chromium")).browserless?.reason, "browser_errored");
+
+  // Everything before the tests is the app coming up, however the runner names the step it died in.
+  for (const d of [doctored("install", "install_failed", "the install command failed"), doctored("build", "install_failed", "the build command failed"), doctored("services", "unknown", "the seed command failed"), doctored("checkout", "unknown", "the checkout was empty")]) {
+    assert.equal(judgedView(fellBack, allowed, d).browserless?.reason, "did_not_start", `${d.doctor!.stage}/${d.doctor!.code}`);
+  }
+});
+
+test("a re-run counts only the criteria it checked, never the verdicts it carried over", () => {
+  const allowed = browserPlan({ allowed: true, bootConfigured: true, reason: "ok" }, {
+    tests: [{ id: "t1", path: "a.spec.ts", level: "e2e", origin: "generated", runner: "playwright", criterionIds: ["1"] }],
+  });
+  const carried: CriterionVerdict = { ...verdict("2", "unverifiable", "fallback"), reason: "the app did not start for browser tests (from the previous run)" };
+  const reRun = judgedView([verdict("1", "pass", "fallback"), carried, verdict("5", "pass")], allowed, { inheritFromRunId: "run-before" });
+  assert.deepEqual(reRun.browserless, { count: 1, criterionIds: ["1"], reason: "browser_errored", fixUrl: FIX }, "the earlier run's criterion is not re-attributed to this one's boot");
+  const body = formatTestsComment(reRun, "acme/widgets");
+  assert.ok(body.includes(`\n1 UI criterion was checked without a browser because its browser test could not run — [see setup](${FIX})\n`), body);
+  assert.match(body, /did not start for browser tests[^\n]*from the previous run/, "the carried row keeps the cause of the run it came from");
 });
 
 test("under e2e: always a fallback the judge refused is still noted; criteria withheld for want of boot config and flaky browser runs are not", () => {
   const strict = browserPlan({ policy: "always", allowed: true, bootConfigured: true, reason: "ok" });
   const refused: CriterionVerdict = { ...verdict("1", "unverifiable", "fallback"), reason: "the app did not start for browser tests", fixUrl: FIX };
-  const view = judgedView([refused, verdict("2", "pass", "ran"), verdict("5", "pass")], strict);
+  const view = judgedView([refused, verdict("2", "pass", "ran"), verdict("5", "pass")], strict, bootDoctor);
   assert.deepEqual(view.browserless, { count: 1, criterionIds: ["1"], reason: "did_not_start", fixUrl: FIX });
   assert.ok(formatTestsComment(view, "acme/widgets").includes(`\n1 UI criterion was checked without a browser because the app did not start in CI — [see setup](${FIX})\n`));
+
+  const undecided = judgedView([{ ...refused, reason: "no browser test could decide this criterion" }, verdict("2", "pass", "ran"), verdict("5", "pass")], strict);
+  assert.deepEqual(undecided.browserless, { count: 1, criterionIds: ["1"], reason: "browser_errored", fixUrl: FIX });
+  assert.ok(formatTestsComment(undecided, "acme/widgets").includes(`\n1 UI criterion was checked without a browser because its browser test could not run — [see setup](${FIX})\n`));
 
   assert.equal(judgedView([{ ...verdict("1", "unverifiable", "ran"), flaky: true }, verdict("5", "pass")], strict).browserless, undefined);
   const withheld = judgedView([verdict("1", "unverifiable"), verdict("2", "unverifiable"), verdict("5", "pass")], browserPlan({ policy: "always" }));
