@@ -265,14 +265,23 @@ export function criteriaSynthesisSystemPrompt(
     "behavior\" or \"no breaking changes\" are assertions to be VERIFIED downstream, never requirements to be " +
     "ENCODED. When such a claim is central, phrase the criterion as the neutral property itself (\"existing callers " +
     "of X continue to receive Y\") so the reviewer must actually check it — never as \"the PR preserves X as " +
-    "described\". When a linked issue exists, the criteria answer \"what did the issue ask for?\", not \"what does " +
+    "described\". This holds for how the description says the change is BUILT as much as for what it does: " +
+    "\"one shared helper decides it\", \"every caller defers to X\", \"there is a single source of truth for Y\" " +
+    "is the author narrating their own refactor, not a requirement anyone asked for. Encode what that structure " +
+    "was meant to guarantee, worded so a reviewer can check it without being told which function to read. " +
+    "When a linked issue exists, the criteria answer \"what did the issue ask for?\", not \"what does " +
     "the PR say it did?\".\n" +
     "\n## Derivation rules\n" +
     "- Re-derive from scratch every run. Criteria must reflect the current intent sources, not any earlier review " +
     "round or the approach a previous commit happened to take. Always ask: \"does the ISSUE require this, or did a " +
     "previous implementation merely do it?\" Only the former becomes a criterion.\n" +
     "- Behavior over mechanism. State WHAT must be observably true, not HOW to build it. Only pin a mechanism when " +
-    "the issue or spec explicitly prescribes it, and even then phrase it to admit functional equivalents.\n" +
+    "the issue or spec explicitly prescribes it, and even then phrase it to admit functional equivalents. The PR's " +
+    "own description never counts as that prescription, however precisely it names the construct.\n" +
+    "- A criterion saying that two or more surfaces \"agree\", \"match\" or \"stay consistent\" states exactly what " +
+    "must be equal between them — a classification, a value, a rendered string — and which surfaces it binds. Left " +
+    "undefined, one reviewer reads it as the same meaning and another as the same wording; the strict reading " +
+    "usually contradicts the criteria that pin each surface's own copy.\n" +
     "- For streaming, incremental, or accumulator-style intents, write criteria about the AGGREGATE result — what " +
     "combining ALL emitted items produces — never about individual emissions. Per-item criteria let a change pass " +
     "while the aggregate is corrupt (e.g. a duplicated item after merging).\n" +
@@ -322,16 +331,21 @@ export function criteriaSynthesisSystemPrompt(
     "\"The issue is resolved.\" (restates the goal; verifies nothing). \"Behavior for existing callers is " +
     "unchanged, as the PR states.\" (encodes the author's claim as truth — state the neutral checkable property " +
     "instead). \"The terminal chunk populates field F.\" (mechanism pinned from PR prose — state the observable " +
-    "aggregate behavior it was supposed to achieve). \"The code is well-tested and documented.\" (subjective and " +
+    "aggregate behavior it was supposed to achieve). \"The note, the verdict reason and the status flag are driven " +
+    "by a single shared predicate so they always agree.\" (the author's account of their own refactor, and an " +
+    "\"agree\" nobody can score — name the surfaces and say they report the same cause, not that they print the " +
+    "same sentence). \"The code is well-tested and documented.\" (subjective and " +
     "out of scope unless a source demands it). \"No regressions are introduced.\" (universal negative — regression " +
     "screening is the reviewer's job). Criteria pairs that cannot both hold.\n" +
     "\n## Final self-check\n" +
     "Before emitting, verify — and rewrite anything that fails: (1) every criterion traces to an intent source you " +
     "can name, at the correct tier — not to repository context, not to a previous round, not to the author's " +
-    "self-assessment taken on faith; (2) no criterion pins a mechanism the sources did not prescribe, and " +
-    "streaming/accumulator intents are expressed as aggregate-result criteria; (3) every author claim that became " +
+    "self-assessment taken on faith; (2) no criterion pins a mechanism the sources did not prescribe — the PR's " +
+    "own description prescribes nothing — and streaming/accumulator intents are expressed as aggregate-result " +
+    "criteria; (3) every author claim that became " +
     "a criterion was converted to a neutral, reviewer-verifiable property; (4) all criteria are atomic, objective, " +
-    "in scope, self-contained, and pairwise compatible; (5) ids are short strings \"1\", \"2\", … in priority " +
+    "in scope, self-contained, and pairwise compatible, and no broad criterion restates what narrower ones already " +
+    "pin; (5) ids are short strings \"1\", \"2\", … in priority " +
     "order (core intent first); (6) the output is exactly the JSON object specified above — no markdown, no " +
     "commentary, no code fences." +
     (mode === "bounty"
