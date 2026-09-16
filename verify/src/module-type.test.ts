@@ -5,7 +5,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, writeFileSync } from 
 import os from "node:os";
 import path from "node:path";
 import { runCommand } from "./exec.js";
-import { detectModuleSyntax, inheritedModuleType, onDiskPath, planModuleTypeShims, writeModuleTypeShims } from "./module-type.js";
+import { detectModuleSyntax, inheritedModuleType, onDiskPath, planModuleTypeShims, retargetRenamed, writeModuleTypeShims } from "./module-type.js";
 import { executePlan } from "./run.js";
 import { commandForFile } from "./runners/index.js";
 import type { PlanTest } from "./types.js";
@@ -265,6 +265,54 @@ test("relocated ESM tests run against an ESM package the repo root does not decl
     assert.equal(existsSync(path.join(root, dir, "package.json")), false, `${dir}: no scope to declare once the extension settles it`);
   }
   ws.cleanup();
+});
+
+// The other half of the rename: a generated test that imports a generated helper names it
+// by the plan path, and nothing maps `./helper.js` onto the `helper.mts` that lands on disk.
+test("a generated test's reference to a generated sibling follows it through the rename", async () => {
+  const root = repo({ "package.json": { name: "app" } });
+  const helper = planTest({ id: "helper", path: ".devasign/tests/src/factory.ts", content: "export const make = () => [1, 2];\n" });
+  const referrer = planTest({
+    id: "referrer",
+    path: ".devasign/tests/src/total.test.ts",
+    content: ["// criteria 1", 'import test from "node:test";', 'import assert from "node:assert/strict";', 'import { make } from "./factory.js";', 'test("total", () => assert.equal(make().length, 2));', ""].join("\n"),
+  });
+  const ws = new Workspace(root);
+  const { results } = await executePlan(
+    {
+      planId: "plan-sib",
+      criteriaRevision: 1,
+      criteria: [{ id: "1", text: "The factory makes two", kind: "code" }],
+      tests: [referrer, helper],
+      commands: [],
+      playwright: null,
+      retries: { generated: 0, existing: 0 },
+      uploadLimits: { maxFileBytes: 1e6, maxTotalBytes: 1e6, maxFiles: 10 },
+    },
+    ws,
+    { yml: null, testTimeoutMs: 60_000, setup: undefined }
+  );
+  assert.deepEqual(results.map((r) => [r.testId, r.status]).sort(), [["helper", "pass"], ["referrer", "pass"]], JSON.stringify(results.map((r) => r.error)));
+  // The specifier that shipped has to name the file onDiskPath actually wrote.
+  const onDisk = onDiskPath(helper);
+  assert.equal(onDisk, ".devasign/tests/src/factory.mts", "the helper is renamed, so the reference to it cannot stand as written");
+  const written = readFileSync(path.join(root, onDiskPath(referrer)), "utf8");
+  assert.match(written, new RegExp(`from "\\./${path.posix.basename(onDisk).replace(".", "\\.")}"`), written);
+  ws.cleanup();
+});
+
+// The rewrite is for renamed generated siblings only. A `./x.js` naming a repo `.ts` file is
+// what a tsx-style package is meant to write, and an earlier attempt at this bug broke it.
+test("retargetRenamed leaves every specifier that does not name a renamed sibling alone", () => {
+  const renamed = new Map([[".devasign/tests/src/factory", ".devasign/tests/src/factory.mts"]]);
+  const at = ".devasign/tests/src/total.test.ts";
+  for (const spec of ["../../../src/cart.js", "./helper.js", "../fixtures/data.json", "node:test", "./factory-other.js"]) {
+    assert.equal(retargetRenamed(`import { a } from "${spec}";\n`, at, renamed), `import { a } from "${spec}";\n`, spec);
+  }
+  assert.equal(retargetRenamed('import { a } from "./factory.js";\n', at, renamed), 'import { a } from "./factory.mts";\n');
+  assert.equal(retargetRenamed('import { a } from "./factory";\n', at, renamed), 'import { a } from "./factory.mts";\n', "an extensionless reference lands on the same file");
+  assert.equal(retargetRenamed('const p = "./factory.js";\n', at, renamed), 'const p = "./factory.js";\n', "a plain string is not an import");
+  assert.equal(retargetRenamed('import { a } from "./factory.js";\n', at, new Map()), 'import { a } from "./factory.js";\n', "nothing renamed, nothing rewritten");
 });
 
 const ESM = 'import test from "node:test";\n';

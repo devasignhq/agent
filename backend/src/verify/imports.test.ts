@@ -3,7 +3,7 @@
 //   node --import tsx/esm --test src/verify/imports.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildImportAllowList, disallowedImports, hasRenderStack, packageRoot, unresolvedRelativeImports } from "./imports.js";
+import { buildImportAllowList, disallowedImports, hasRenderStack, importTarget, packageRoot, unresolvedRelativeImports } from "./imports.js";
 import type { DetectedSetup, TestRunner } from "./contract.js";
 
 const setup = (over: Partial<DetectedSetup> = {}): DetectedSetup => ({
@@ -108,5 +108,27 @@ test("unresolvedRelativeImports: names relative specifiers that reach no reposit
   assert.deepEqual(unresolvedRelativeImports(content, "tests/x.test.ts", exists), ["./helper.ts", "./lazy.js"]);
   // A sibling the model believes it wrote beside the test, at the root it named.
   assert.deepEqual(unresolvedRelativeImports('import { a } from "./tests-view.ts";', ".devasign/tests/ledger.test.ts", exists), ["./tests-view.ts"]);
-  assert.deepEqual(unresolvedRelativeImports('import { a } from "../../src/handler.ts";', "tests/x.test.ts", exists), [], "above the root is the rebase step's call, not this one's");
+  // A climb past the root is a miscount the move will correct, so it is judged on where it
+  // lands — not left to a rewrite step that used to decline it and report it to nobody.
+  assert.deepEqual(unresolvedRelativeImports('import { a } from "../../src/handler.ts";', "tests/x.test.ts", exists), [], "clamps onto src/handler.ts, which is there");
+  assert.deepEqual(unresolvedRelativeImports('import { a } from "../../nope/gone.ts";', "tests/x.test.ts", exists), ["../../nope/gone.ts"], "clamps onto nothing, so it leaves the repository");
+  // A generated sibling is as real as a tree path once the plan writes it.
+  const siblings = new Map([["src/factory", ".devasign/tests/src/factory.ts"]]);
+  const withSibling = (p: string) => exists(p) || p === ".devasign/tests/src/factory.ts";
+  assert.deepEqual(unresolvedRelativeImports('import { m } from "../../src/factory.js";', "tests/x.test.ts", withSibling, siblings), [], "it follows the sibling to where the plan writes it");
+});
+
+test("importTarget: the repository file a specifier lands on once its test has moved", () => {
+  const tree = new Set(["frontend/src/verify-setup-view.ts"]);
+  const exists = (p: string) => tree.has(p);
+  // The run-35094936934 specifier, from the directory the model believed it was writing in.
+  assert.deepEqual(importTarget("../../frontend/src/verify-setup-view.ts", "frontend", { exists }), { target: "frontend/src/verify-setup-view.ts" });
+  assert.deepEqual(importTarget("../../../../frontend/src/verify-setup-view.js", "frontend", { exists }), { target: "frontend/src/verify-setup-view.js" }, "the model's own extension is kept");
+  assert.deepEqual(importTarget("../../elsewhere/thing.ts", "frontend", { exists }), { reason: "above_root" });
+  assert.deepEqual(importTarget("../../frontend/src/verify-setup-view.ts", "frontend", {}), { reason: "above_root" }, "nothing to gate the guess on");
+  assert.deepEqual(importTarget("./${name}.js", "frontend", { exists }), { reason: "interpolated" });
+  assert.deepEqual(importTarget("../..", "frontend/src", { exists }), { target: "." }, "the repository root is still inside it");
+  assert.deepEqual(importTarget("../../..", "frontend/src", { exists }), { reason: "above_root" }, "a bare climb clamps to nothing");
+  // In-root and simply wrong is not a miscounted climb: it is left where it points.
+  assert.deepEqual(importTarget("../frontend/src/verify-setup-view.ts", "backend/src", { exists }), { target: "backend/frontend/src/verify-setup-view.ts" });
 });

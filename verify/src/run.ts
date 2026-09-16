@@ -10,7 +10,7 @@ import { detectSetup, readDevasignVerify, repoHasPlaywright } from "./detect.js"
 import { diagnoseMissingDependencies, diagnosePlaywrightOutput, preflight } from "./doctor.js";
 import { log, setOutput } from "./log.js";
 import type { TokenSource } from "./oidc.js";
-import { onDiskPath, writeModuleTypeShims } from "./module-type.js";
+import { diskKey, onDiskPath, retargetRenamed, writeModuleTypeShims } from "./module-type.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
 import { CLI_COMMIT, CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
@@ -86,10 +86,18 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
 
   // Generated files go under .devasign/ only; their content is evidence too.
   const disk = new Map(plan.tests.map((t) => [t.id, onDiskPath(t)]));
+  // A specifier was written against a sibling's plan path, so a rename it does not follow
+  // leaves it naming a file that is not there.
+  const renamed = new Map<string, string>();
+  for (const t of plan.tests) {
+    const file = disk.get(t.id) ?? t.path;
+    if (t.origin === "generated" && file !== t.path) renamed.set(diskKey(t.path), file);
+  }
   for (const t of plan.tests) {
     if (t.origin !== "generated" || !t.content) continue;
     const file = disk.get(t.id) ?? t.path;
-    const full = ws.write(file, t.content);
+    const body = retargetRenamed(t.content, t.path, renamed);
+    const full = ws.write(file, body);
     if (file !== t.path) log.info(`${t.path}: written as ${path.posix.basename(file)} so it loads as the ${/\.m[jt]s$/.test(file) ? "ES module" : "CommonJS module"} it is written in`);
     artifacts.push({ clientRef: `test_file:${t.id}`, kind: "test_file", path: full, displayPath: t.path, contentType: "text/plain", testId: t.id, criterionIds: t.criterionIds });
   }

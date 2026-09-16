@@ -186,6 +186,21 @@ export async function buildRepoIndex(
 // ─── Full build ───────────────────────────────────────────────────────────
 
 export type TreeEntry = { path: string; type: string; size?: number; sha: string };
+/** `truncated`: GitHub capped the listing, so a path missing from it proves nothing. */
+export type RepoTree = { tree: TreeEntry[]; truncated: boolean };
+
+/** The recursive git tree at `sha` (blobs + trees), with GitHub's own completeness flag. */
+export async function fetchRepoTree(
+  repo: Pick<Repository, "owner" | "name">,
+  install: Pick<Installation, "installationId">,
+  sha: string
+): Promise<RepoTree> {
+  const tree = await gh<{ tree?: TreeEntry[]; truncated?: boolean }>(
+    install.installationId,
+    `/repos/${repo.owner}/${repo.name}/git/trees/${sha}?recursive=1`
+  );
+  return { tree: Array.isArray(tree?.tree) ? tree.tree : [], truncated: tree?.truncated === true };
+}
 
 /** The recursive git tree at `sha` (blobs + trees). */
 export async function fetchTree(
@@ -193,11 +208,7 @@ export async function fetchTree(
   install: Pick<Installation, "installationId">,
   sha: string
 ): Promise<TreeEntry[]> {
-  const tree = await gh<{ tree?: TreeEntry[] }>(
-    install.installationId,
-    `/repos/${repo.owner}/${repo.name}/git/trees/${sha}?recursive=1`
-  );
-  return Array.isArray(tree?.tree) ? tree.tree : [];
+  return (await fetchRepoTree(repo, install, sha)).tree;
 }
 
 async function runFullIndex(repo: Repository, install: Installation): Promise<IndexSummary> {

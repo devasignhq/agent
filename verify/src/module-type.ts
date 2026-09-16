@@ -23,6 +23,35 @@ export function onDiskPath(t: Pick<PlanTest, "path" | "content" | "origin" | "ru
   return type ? t.path.replace(RENAMABLE_EXT, type === "module" ? ".m$1" : ".c$1") : t.path;
 }
 
+// Mirrors the specifier forms backend/src/verify/imports.ts rewrites; keep the two in step.
+const IMPORT_LEAD = [
+  String.raw`(?:^|\n)[ \t]*(?:import|export)[^'"\`]*?\bfrom\s*`,
+  String.raw`(?:^|\n)[ \t]*import\s*`,
+  String.raw`\b(?:import|require(?:\.resolve)?)\s*\(\s*`,
+].join("|");
+const RELATIVE_IMPORT = new RegExp(`(${IMPORT_LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`\\n]*)?)\\2`, "g");
+const REWRITABLE_EXT = /\.[cm]?[jt]sx?$/;
+
+/** The key a specifier's target is looked up by: a repo path without its extension. */
+export const diskKey = (p: string): string => p.replace(REWRITABLE_EXT, "");
+
+/**
+ * Point a specifier that names a generated sibling at the name that sibling has on disk.
+ * No loader maps `./helper.js` onto `helper.mts`, and onDiskPath renames every generated
+ * node-test file, so the plan's own cross-references would die on import.
+ */
+export function retargetRenamed(content: string, planPath: string, renamed: ReadonlyMap<string, string>): string {
+  if (!renamed.size) return content;
+  const dir = path.posix.dirname(planPath);
+  return content.replace(RELATIVE_IMPORT, (match, lead: string, quote: string, spec: string) => {
+    if (spec.includes("${")) return match;
+    const disk = renamed.get(diskKey(path.posix.normalize(path.posix.join(dir, spec))));
+    if (!disk) return match;
+    const next = spec.replace(/[^/]+$/, path.posix.basename(disk));
+    return next === spec ? match : `${lead}${quote}${next}${quote}`;
+  });
+}
+
 const ESM_SYNTAX = /^[ \t]*(?:import|export)(?:[ \t]+[A-Za-z_$*{"']|[ \t]*[{*"'])/m;
 const CJS_SYNTAX = /(?:^|[^.\w$])require[ \t]*\(|^[ \t]*(?:module\.exports\b|exports\.[A-Za-z_$])/m;
 const STRING_OR_LINE_COMMENT = /"(?:\\.|[^"\\\n])*"|'(?:\\.|[^'\\\n])*'|\/\/[^\n]*/g;

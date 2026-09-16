@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { parse } from "yaml";
 import { db } from "../../db.js";
-import { adoptedPath, adoptGeneratedTests, noteOnboardingPrClosed, noteRunSucceeded, postDoctorFollowup, runVerifyOnboard, type OnboardDeps } from "./job.js";
+import { adoptedPath, adoptGeneratedTests, noteOnboardingPrClosed, noteRunSucceeded, postDoctorFollowup, runVerifyOnboard, scriptSelects, type OnboardDeps } from "./job.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "../runs.js";
 import { ACTION_REF, DEVASIGN_YML_PATH, generateWorkflow, ONBOARDING_BRANCH, WORKFLOW_PATH, WORKFLOW_VERSION } from "./generate.js";
 
@@ -334,6 +334,251 @@ test("adopt: generated tests land under tests/devasign/ on a branch off the PR h
   } finally {
     s.cleanup();
   }
+});
+
+function seedAdoptRun(s: ReturnType<typeof seed>, prNumber = 7) {
+  const review = db.insert("prReviews", { id: uuid(), repoId: s.repo.id, prNumber, prTitle: "t", headSha: "abc1234", baseSha: "d", status: "reviewing", verdict: null, criteria: [], taskId: null, additions: 0, deletions: 0, changedFiles: 0, createdAt: 0, updatedAt: 0 } as any);
+  const run = createVerifyRun({ review, repo: s.repo, status: "completed", triggeredBy: { kind: "pr_event" } });
+  const plan = db.insert("verifyPlans", { id: uuid(), schemaVersion: 1, runId: run.id, repoId: s.repo.id, criteriaRevision: 1, commands: [], unverifiable: [], createdAt: 0, tests: [
+    { id: "t1", path: ".devasign/tests/criterion-1.test.ts", content: "import { total } from '../../src/cart.js';\n", criterionIds: ["1"], level: "unit", levelReason: "", origin: "generated", runner: "node-test", testSignature: "s", strategyVersion: 1, targetFiles: [] },
+  ] });
+  db.update("verifyRuns", (r) => r.id === run.id, { planId: plan.id });
+  const drop = () => {
+    db.remove("verifyPlans", (p) => p.id === plan.id);
+    db.remove("verifyRuns", (r) => r.id === run.id);
+    db.remove("reviewLogs", (l) => l.reviewId === review.id);
+    db.remove("prReviews", (r) => r.id === review.id);
+  };
+  return { review, run, plan, drop };
+}
+
+test("adopt: a repo whose test script globs its own src is told the adopted files will not run, and what to change", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    s.contents["package.json"] = JSON.stringify({ scripts: { test: "node --experimental-strip-types --test 'src/**/*.test.ts'" } });
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    assert.match(body, /Merging this into `feature\/refunds` commits them, but no test command in this repository selects `tests\/devasign\/`, so they will not run with the rest of the suite:/);
+    assert.ok(body.includes("- `package.json` — `node --experimental-strip-types --test 'src/**/*.test.ts'`"), `the offending command is named verbatim:\n${body}`);
+    assert.match(body, /Add `tests\/devasign\/\*\*` to one of those commands' paths\. Their relative imports are anchored 2 directories deep, so a different destination would have to sit at the same depth\./);
+    assert.ok(!/move these files/.test(body), "moving them off tests/devasign/ would break the ../ counts they were committed with");
+    assert.ok(!body.includes("keeps them as part of the repository's own suite"), "and the false claim is gone");
+    assert.ok(s.calls.reads.some((r) => r === `package.json@${a.run.sha}`), "the claim is read off the repo at the reviewed sha, not assumed");
+    assert.deepEqual(Object.keys(s.calls.files), ["tests/devasign/criterion-1.test.ts"], "the file is still committed");
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: a repo whose own test command already reaches tests/devasign still gets the plain suite claim", async () => {
+  for (const script of ["vitest run", "jest --ci", "node --import tsx/esm --test 'src/**/*.test.ts' 'tests/**/*.test.ts'"]) {
+    const s = seed();
+    const a = seedAdoptRun(s);
+    try {
+      s.contents["package.json"] = JSON.stringify({ scripts: { test: script } });
+      assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+      const body: string = s.calls.prs[0].body;
+      assert.match(body, /Merging this into `feature\/refunds` keeps them as part of the repository's own suite\./, `${script} covers the destination`);
+      assert.ok(!body.includes("will not run with the rest of the suite"), `${script} must not be warned about`);
+    } finally {
+      a.drop();
+      s.cleanup();
+    }
+  }
+});
+
+test("adopt: in a repo with no root manifest, every package's own suite is named — none of them can see a root-level file", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    delete s.contents["package.json"];
+    s.contents["frontend/package.json"] = JSON.stringify({ scripts: { test: "node --experimental-strip-types --test 'src/**/*.test.ts'" } });
+    s.contents["backend/package.json"] = JSON.stringify({ scripts: { test: "vitest run" } });
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { detected: { languages: ["ts"], frameworks: [], packages: ["backend", "frontend"], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] } } as any });
+
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    assert.match(body, /no test command in this repository selects `tests\/devasign\/`/);
+    assert.ok(body.includes("- `backend/package.json` — `vitest run`"), `a package that would cover its own tree still cannot reach the repo root:\n${body}`);
+    assert.ok(body.includes("- `frontend/package.json` — `node --experimental-strip-types --test 'src/**/*.test.ts'`"), body);
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: a root command that does run the adopted files is not called out for a package command that cannot see them", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    s.contents["package.json"] = JSON.stringify({ workspaces: ["packages/*"], scripts: { test: "jest" } });
+    s.contents["packages/ui/package.json"] = JSON.stringify({ scripts: { test: "jest" } });
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { detected: { languages: ["ts"], frameworks: [], packages: ["packages/ui"], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] } } as any });
+
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    // Bare `jest` at the root selects tests/devasign/ with its default testMatch; whether
+    // packages/ui's own run does is not a second opinion about a file it never sees.
+    assert.match(body, /keeps them as part of the repository's own suite\./);
+    assert.ok(!body.includes("no test command in this repository selects"), `one command running them is enough:\n${body}`);
+    assert.ok(!body.includes("- `package.json` — `jest`"), "and the command that does run them is not named as one that does not");
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: a single package with no root manifest still cannot reach a root-level file", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    delete s.contents["package.json"];
+    s.contents["backend/package.json"] = JSON.stringify({ scripts: { test: "vitest run" } });
+    db.update("repositories", (r) => r.id === s.repo.id, { verify: { detected: { languages: ["ts"], frameworks: [], packages: ["backend"], testCommands: [], envExampleVars: [], existingWorkflows: [], services: [] } } as any });
+
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    // The only verdict in play: `vitest run` would cover its own tree, so this says nothing
+    // unless a command that runs from backend/ is read as blind to a file outside it.
+    assert.match(body, /no test command in this repository selects `tests\/devasign\/`/);
+    assert.ok(body.includes("- `backend/package.json` — `vitest run`"), body);
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: a config the command names by path is read as a config, not as an absent one", async () => {
+  for (const [script, config] of [
+    ["jest --config config/jest.json", "config/jest.json"],
+    ["vitest run --config vitest.ci.mts", "vitest.ci.mts"],
+    ["jest --config=config/jest.json", "config/jest.json"],
+  ] as const) {
+    const s = seed();
+    const a = seedAdoptRun(s);
+    try {
+      s.contents["package.json"] = JSON.stringify({ scripts: { test: script } });
+      s.contents[config] = "export default { roots: ['<rootDir>/src'] };\n";
+      assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+      const body: string = s.calls.prs[0].body;
+      assert.ok(!body.includes("keeps them as part of the repository's own suite"), `${script} runs a config this cannot read:\n${body}`);
+      assert.match(body, /If this repository's test command selects files by path, add that directory/, script);
+    } finally {
+      a.drop();
+      s.cleanup();
+    }
+  }
+});
+
+test("adopt: a framework config under any of its names stops the suite claim, however it scopes the run", async () => {
+  for (const [file, text] of [
+    ["jest.config.mts", "export default { roots: ['<rootDir>/src'] };\n"],
+    ["jest.config.json", '{ "roots": ["<rootDir>/src"] }'],
+    ["vitest.config.mjs", "export default { test: { dir: 'src' } };\n"],
+    ["vitest.workspace.ts", "export default ['packages/*'];\n"],
+  ] as const) {
+    const s = seed();
+    const a = seedAdoptRun(s);
+    try {
+      s.contents["package.json"] = JSON.stringify({ scripts: { test: file.startsWith("jest") ? "jest" : "vitest run" } });
+      s.contents[file] = text;
+      assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+      assert.ok(!s.calls.prs[0].body.includes("keeps them as part of the repository's own suite"), `${file}:\n${s.calls.prs[0].body}`);
+    } finally {
+      a.drop();
+      s.cleanup();
+    }
+  }
+});
+
+test("adopt: a package.json `jest` key is a config too, whatever shape it has", async () => {
+  for (const jest of ["./config/jest.js", { preset: "ts-jest" }] as const) {
+    const s = seed();
+    const a = seedAdoptRun(s);
+    try {
+      s.contents["package.json"] = JSON.stringify({ scripts: { test: "jest" }, jest });
+      assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+      assert.ok(!s.calls.prs[0].body.includes("keeps them as part of the repository's own suite"), s.calls.prs[0].body);
+    } finally {
+      a.drop();
+      s.cleanup();
+    }
+  }
+});
+
+test("adopt: a vitest config that narrows include is hedged rather than counted as a default that covers everything", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    s.contents["package.json"] = JSON.stringify({ scripts: { test: "vitest run" } });
+    s.contents["vitest.config.ts"] = "export default { test: { include: ['src/**/*.test.ts'] } };\n";
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    assert.ok(!body.includes("keeps them as part of the repository's own suite"), `a narrowed include is not vitest's default:\n${body}`);
+    assert.match(body, /If this repository's test command selects files by path, add that directory/);
+    assert.ok(s.calls.reads.some((r) => r === `vitest.config.ts@${a.run.sha}`), "and the config really was read");
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: a repo whose test command cannot be read is hedged, never claimed either way", async () => {
+  const s = seed();
+  const a = seedAdoptRun(s);
+  try {
+    s.contents["package.json"] = JSON.stringify({ scripts: { test: "make check" } });
+    assert.equal((await adoptGeneratedTests(a.run.id, null, s.deps)).status, "opened");
+    const body: string = s.calls.prs[0].body;
+    assert.match(body, /commits them under `tests\/devasign\/`\. If this repository's test command selects files by path, add that directory so they run with the rest of the suite\./);
+    assert.ok(!body.includes("keeps them as part of the repository's own suite"), "an unreadable command is not evidence for the claim");
+  } finally {
+    a.drop();
+    s.cleanup();
+  }
+});
+
+test("adopt: the traversal gate still refuses a generated path that would escape the adopt directory", () => {
+  assert.equal(adoptedPath(".devasign/tests/../../.github/workflows/ci.yml"), null);
+  assert.equal(adoptedPath("/etc/passwd"), null);
+  assert.equal(adoptedPath(".devasign/tests/./e2e/x.spec.ts"), null);
+  assert.equal(adoptedPath(".devasign/tests/e2e/x.spec.ts"), "tests/devasign/e2e/x.spec.ts");
+});
+
+test("scriptSelects reads a test script's own paths: a src-only glob excludes the adopt directory, a tests glob includes it", () => {
+  const dest = "tests/devasign/criterion-1.test.ts";
+  assert.equal(scriptSelects("node --experimental-strip-types --test 'src/**/*.test.ts'", dest), false);
+  assert.equal(scriptSelects("DATABASE_URL= node --import tsx/esm --test 'src/**/*.test.ts'", dest), false, "a leading env assignment is not a path");
+  assert.equal(scriptSelects("node --import tsx/esm --test 'tests/**/*.test.ts'", dest), true);
+  assert.equal(scriptSelects("node --import tsx/esm --test '**/*.test.ts'", dest), true);
+  assert.equal(scriptSelects("vitest run", dest), true, "vitest's default include covers any *.test.ts");
+  assert.equal(scriptSelects("vitest run src/", dest), false, "a vitest filter is a substring of the path");
+  assert.equal(scriptSelects("npm run test:unit", dest, { "test:unit": "vitest run" }), true, "a script that delegates is followed one hop");
+  assert.equal(scriptSelects("make check", dest), null);
+  // ADOPT_DIR's own depth is what the committed imports were re-anchored for.
+  assert.equal(scriptSelects("node --test 'tests/devasign/**/*.test.ts'", dest), true);
+  // A named project or shard is part of the suite, not its default include.
+  assert.equal(scriptSelects("vitest run --project ui", dest), null);
+  assert.equal(scriptSelects("jest --shard=1/3", dest), null);
+  assert.equal(scriptSelects("vitest run --reporter=dot", dest), true, "a flag that is not about selection still leaves the default include");
+});
+
+// A jest positional is a regex, and it comes out of the PR head's package.json: compiling it
+// here handed a contributor the backend's event loop.
+test("scriptSelects never compiles a pattern the repository wrote", () => {
+  const dest = "tests/devasign/criterion-1.test.ts";
+  const started = Date.now();
+  assert.equal(scriptSelects("jest '((.*)*)*Z'", dest), null, "unreadable, not a guess");
+  assert.equal(scriptSelects("jest '(a+)+$'", dest), null);
+  assert.ok(Date.now() - started < 1000, "and it answered without backtracking");
+  assert.equal(scriptSelects("jest tests/devasign", dest), true, "a plain fragment is still a substring match");
+  assert.equal(scriptSelects("jest src", dest), false);
+  assert.equal(scriptSelects("jest src/foo.test.ts tests/devasign", dest), true, "one arg matching is enough");
+  const globs = Date.now();
+  assert.equal(scriptSelects(`node --test '${"**".repeat(30)}Z'`, dest), null, "and an unbounded glob is declined the same way");
+  assert.ok(Date.now() - globs < 1000);
 });
 
 test("a manual regenerate reaches a repo that already merged its setup PR — the only path that can update one", async () => {
