@@ -4,8 +4,9 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { BOOT_PAUSED_REASON, buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, NO_BROWSER_REASON, RUNNER_OUTDATED_REASON, runVerifyJudge } from "./judge.js";
+import { BOOT_PAUSED_REASON, BROWSER_UNDECIDED_REASON, buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, NO_BROWSER_REASON, RUNNER_OUTDATED_REASON, runVerifyJudge } from "./judge.js";
 import { createVerifyRun, snapshotCriteriaRevision, updateRun } from "./runs.js";
+import { browserTestsStatus } from "./repo-state.js";
 import type { Criterion, CriterionVerdict, RepoVerifyState, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { DoctorDiagnosis, RunnerAttempt, RunnerResult } from "./contract.js";
 
@@ -253,14 +254,34 @@ test("e2e: always turns every verdict the browser could not decide into unverifi
     ["6", "unverifiable", undefined, fixUrl],
     ["7", "fail", undefined, undefined],
   ]);
-  for (const i of [0, 1, 4, 5]) assert.equal(strict[i].reason, "the app did not start for browser tests", `criterion ${strict[i].criterionId}`);
+  // Both are agreed wording the model may not rewrite, so the text is pinned here, not just the mapping.
+  assert.deepEqual([NO_BROWSER_REASON, BROWSER_UNDECIDED_REASON], ["the app did not start for browser tests", "no browser test could decide this criterion"]);
+  // Nothing said the app failed to boot, so the refusal blames the browser tests, not the boot.
+  for (const i of [0, 1, 4, 5]) assert.equal(strict[i].reason, BROWSER_UNDECIDED_REASON, `criterion ${strict[i].criterionId}`);
   assert.ok(strict[0].evidenceRefs.some((r) => r.artifactId === "f1"), "the fallback's evidence stays cited");
   assert.equal(strict[5].flaky, undefined, "the browser, not the flaky test below it, is why it went unverified");
   assert.match(strict[6].reason, /assertion failed/, "a non-UI criterion is never refused");
 
   const doctored = computeVerdicts({ ...args, plan: browser("always"), doctor: { stage: "start", code: "app_not_ready", message: "app did not come up", logArtifactId: "log" } });
-  assert.deepEqual([doctored[4].verdict, doctored[4].reason, doctored[4].fixUrl], ["unverifiable", "the app did not start for browser tests", fixUrl]);
+  assert.deepEqual([doctored[4].verdict, doctored[4].reason, doctored[4].fixUrl], ["unverifiable", NO_BROWSER_REASON, fixUrl]);
   assert.deepEqual(doctored[4].evidenceRefs, [{ artifactId: "log" }]);
+  for (const i of [0, 1, 5]) assert.equal(doctored[i].reason, NO_BROWSER_REASON, `criterion ${doctored[i].criterionId}`);
+  const offTarget = computeVerdicts({ ...args, plan: browser("always"), doctor: { stage: "tests", code: "unknown", message: "playwright exited 1" } });
+  assert.equal(offTarget[0].reason, BROWSER_UNDECIDED_REASON, "a diagnosis about anything but the boot leaves the app up");
+  assert.equal(computeVerdicts({ ...args, plan: browser("always"), doctor: { stage: "browsers", code: "browser_install_failed", message: "no chromium" } })[0].reason, BROWSER_UNDECIDED_REASON, "a missing browser is not a missing app");
+  // A managed boot that dies in a setup step never reaches the app either (verify/src/boot.ts SETUP_DIAG).
+  const beforeStart: DoctorDiagnosis[] = [
+    { stage: "install", code: "install_failed", message: "the install command failed" },
+    { stage: "build", code: "install_failed", message: "the build command failed" },
+    { stage: "services", code: "unknown", message: "the seed command failed" },
+    { stage: "services", code: "missing_secret", message: "DATABASE_URL is not set in this job" },
+    { stage: "install", code: "wrong_runtime_version", message: "the repository wants Node >=22" },
+    { stage: "install", code: "missing_dependencies", message: "dependencies are not installed" },
+    { stage: "checkout", code: "unknown", message: "the checkout was empty" },
+  ];
+  for (const d of beforeStart) {
+    assert.equal(computeVerdicts({ ...args, plan: browser("always"), doctor: d })[0].reason, NO_BROWSER_REASON, `${d.stage}/${d.code}`);
+  }
 
   const auto = computeVerdicts({ ...args, plan: browser("auto") });
   assert.deepEqual(auto.map((v) => [v.criterionId, v.verdict, v.browser]), [["1", "pass", "fallback"], ["2", "fail", "fallback"], ["3", "pass", "ran"], ["4", "pass", undefined], ["5", "unverifiable", undefined], ["6", "unverifiable", undefined], ["7", "fail", undefined]]);
@@ -278,12 +299,14 @@ test("e2e: always turns every verdict the browser could not decide into unverifi
     ],
     []
   );
-  assert.equal(merged[0].reason, "the app did not start for browser tests", "the strict reason is fixed wording");
+  assert.equal(merged[0].reason, BROWSER_UNDECIDED_REASON, "the strict reason is fixed wording");
   assert.equal(merged[0].browser, "fallback");
   assert.equal(merged[0].fixUrl, "https://app/workflow?repo=r&setup=browser");
   assert.equal(merged[2].verdict, "unverifiable");
   assert.equal(merged[2].browser, "ran", "a model downgrade keeps the stamp");
-  assert.equal(merged[4].reason, "the app did not start for browser tests", "fixed wording on an unstamped row too");
+  assert.equal(merged[4].reason, BROWSER_UNDECIDED_REASON, "fixed wording on an unstamped row too");
+  const mergedBoot = mergeModelVerdicts(doctored, [{ criterionId: "1", verdict: "unverifiable", reason: "The browser never loaded.", evidenceArtifactIds: [] }], []);
+  assert.equal(mergedBoot[0].reason, NO_BROWSER_REASON, "the boot wording is fixed too");
   assert.equal(merged[6].reason, "The total is wrong.");
   assert.equal(merged[7].reason, "The browser never loaded.");
   assert.equal(merged[7].browser, "fallback");
@@ -352,7 +375,7 @@ test("browser tests withheld from the runner: covered UI criteria fall back, e2e
   for (const i of [0, 1, 2, 6]) assert.equal(off[i].reason, BOOT_PAUSED_REASON, `criterion ${off[i].criterionId}`);
   const offAuto = computeVerdicts({ ...args, plan: plan("auto"), withheld: "managed_boot_off" });
   assert.deepEqual([offAuto[0].verdict, offAuto[0].browser, offAuto[2].reason, offAuto[2].fixUrl], ["pass", "fallback", BOOT_PAUSED_REASON, undefined]);
-  assert.ok(!off.some((v) => v.reason === NO_BROWSER_REASON), "never reads as an app that did not start");
+  assert.ok(!off.some((v) => v.reason === NO_BROWSER_REASON || v.reason === BROWSER_UNDECIDED_REASON), "never reads as an app that did not start, nor as a test that could not decide");
   assert.equal(mergeModelVerdicts(off, [{ criterionId: "1", verdict: "unverifiable", reason: "Browser missing.", evidenceArtifactIds: [] }], [])[0].reason, BOOT_PAUSED_REASON);
 
   const notWithheld = computeVerdicts({ ...args, plan: plan("always") });
@@ -448,6 +471,7 @@ async function judgeWithBrowserPlan(args: {
   doctor?: DoctorDiagnosis;
   tests?: VerifyPlan["tests"];
   withheld?: NonNullable<VerifyRun["runnerMeta"]>["e2eWithheld"];
+  inherit?: CriterionVerdict[];
 }) {
   const originalFetch = globalThis.fetch;
   globalThis.fetch = (async () => ({ ok: false, status: 404, json: async () => ({}), text: async () => "" })) as any;
@@ -456,19 +480,21 @@ async function judgeWithBrowserPlan(args: {
   const repo = db.insert("repositories", { id: uuid(), installationId: installId, owner: "acme", name: "w", defaultBranch: "main", private: false, defaultModel: "m", modelOverrides: {}, reviewsEnabled: true, ...(args.lastBrowserless ? { verify: { onboarding: { state: "none" }, lastBrowserless: args.lastBrowserless } } : {}) } as any);
   const review = db.insert("prReviews", { id: uuid(), repoId: repo.id, prNumber: 7, prTitle: "t", headSha: "abc", baseSha: "d", status: "reviewing", verdict: null, criteria: args.criteria, taskId: null, additions: 0, deletions: 0, changedFiles: 0, createdAt: 0, updatedAt: 0 } as any);
   snapshotCriteriaRevision(review.id, review.criteria, null);
-  const run = createVerifyRun({ review, repo, status: "judging", triggeredBy: { kind: "pr_event" } });
+  const before = args.inherit ? createVerifyRun({ review, repo, status: "completed", triggeredBy: { kind: "pr_event" } }) : null;
+  if (before) updateRun(before.id, { verdicts: args.inherit! });
+  const run = createVerifyRun({ review, repo, status: "judging", triggeredBy: { kind: "pr_event" }, inheritFromRunId: before?.id ?? null });
   const plan = db.insert("verifyPlans", { id: uuid(), schemaVersion: 1, runId: run.id, repoId: repo.id, criteriaRevision: 1, commands: [], unverifiable: [], createdAt: 0, tests: args.tests ?? [], ...(args.browser ? { browser: args.browser } : {}) });
   const results = db.insert("verifyResults", {
     id: uuid(), schemaVersion: 1, runId: run.id, createdAt: 0,
     payload: { runId: run.id, sha: "abc", planId: plan.id, cliVersion: "0.1", existingTestsTouchingDiff: [], timings: { startedAt: 0, finishedAt: 1 }, results: args.results, ...(args.doctor ? { doctor: args.doctor } : {}) },
   });
-  updateRun(run.id, { planId: plan.id, resultsId: results.id, ...(args.withheld ? { runnerMeta: { e2eWithheld: args.withheld } } : {}) });
+  updateRun(run.id, { planId: plan.id, resultsId: results.id, doctor: args.doctor ?? null, ...(args.withheld ? { runnerMeta: { e2eWithheld: args.withheld } } : {}) });
   try {
     const out = await runVerifyJudge(run.id, { llm: async () => "{}" });
     return { run: out!, verify: db.find("repositories", (r) => r.id === repo.id)?.verify };
   } finally {
     globalThis.fetch = originalFetch;
-    db.remove("verifyRuns", (r) => r.id === run.id);
+    db.remove("verifyRuns", (r) => r.id === run.id || r.id === before?.id);
     db.remove("verifyPlans", (p) => p.id === plan.id);
     db.remove("verifyResults", (r) => r.id === results.id);
     db.remove("criteriaRevisions", (c) => c.reviewId === review.id);
@@ -490,13 +516,25 @@ test("a judged run records which UI criteria went without a browser on the repo,
   assert.deepEqual({ ...unconfigured.verify?.lastBrowserless, at: 0 }, { count: 2, reason: "not_configured", runId: unconfigured.run.id, prNumber: 7, at: 0 });
   assert.ok(unconfigured.verify!.lastBrowserless!.at > 1);
 
-  const didNotStart = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: browser({ allowed: true, bootConfigured: true, reason: "ok" }), lastBrowserless: earlier });
+  // The app came up and the Playwright spec errored anyway: the browser tests are what could not decide.
+  const booted2 = browser({ allowed: true, bootConfigured: true, reason: "ok" });
+  const browserErrored = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: booted2, lastBrowserless: earlier });
+  assert.deepEqual([browserErrored.verify?.lastBrowserless?.reason, browserErrored.verify?.lastBrowserless?.count], ["browser_errored", 1]);
+  const bootFailed = { stage: "start", code: "app_not_ready", message: "app did not come up" } as DoctorDiagnosis;
+  const didNotStart = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: booted2, lastBrowserless: earlier, doctor: bootFailed });
   assert.equal(didNotStart.verify?.lastBrowserless?.reason, "did_not_start");
   assert.equal(didNotStart.verify?.lastBrowserless?.count, 1);
+  const loginFailed = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: booted2, lastBrowserless: earlier, doctor: { stage: "login", code: "login_failed", message: "sign-in failed" } });
+  assert.equal(loginFailed.verify?.lastBrowserless?.reason, "did_not_start");
 
-  const strict = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: browser({ policy: "always", allowed: true, bootConfigured: true, reason: "ok" }), lastBrowserless: earlier });
+  const strictBooted = browser({ policy: "always", allowed: true, bootConfigured: true, reason: "ok" });
+  const strict = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: strictBooted, lastBrowserless: earlier });
   assert.equal(strict.run.verdicts[0].verdict, "unverifiable");
-  assert.deepEqual([strict.verify?.lastBrowserless?.reason, strict.verify?.lastBrowserless?.count], ["did_not_start", 1], "a fallback e2e: always refused still marks the app as not starting");
+  assert.equal(strict.run.verdicts[0].reason, BROWSER_UNDECIDED_REASON);
+  assert.deepEqual([strict.verify?.lastBrowserless?.reason, strict.verify?.lastBrowserless?.count], ["browser_errored", 1], "a fallback e2e: always refused still records why");
+  const strictDown = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error"), unitPass("1")], browser: strictBooted, lastBrowserless: earlier, doctor: bootFailed });
+  assert.equal(strictDown.run.verdicts[0].reason, NO_BROWSER_REASON);
+  assert.equal(strictDown.verify?.lastBrowserless?.reason, "did_not_start");
   const strictNoBoot = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [], browser: browser({ policy: "always" }), lastBrowserless: earlier });
   assert.equal(strictNoBoot.verify?.lastBrowserless, null, "a UI criterion withheld from the planner was never checked, so it is not counted");
 
@@ -505,19 +543,28 @@ test("a judged run records which UI criteria went without a browser on the repo,
 
   const booted = browser({ allowed: true, bootConfigured: true, reason: "ok" });
   const startedBefore = { count: 3, reason: "did_not_start" as const, runId: "pr-a", prNumber: 4, at: 1 };
-  const browserOnly = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error")], browser: booted, lastBrowserless: startedBefore });
+  const browserOnly = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error")], browser: booted, lastBrowserless: startedBefore, doctor: bootFailed });
   assert.equal(browserOnly.run.verdicts[0].verdict, "unverifiable");
-  assert.deepEqual(browserOnly.verify?.lastBrowserless, startedBefore, "browser tests that could not run keep the app-did-not-start flag");
+  assert.deepEqual(browserOnly.verify?.lastBrowserless, startedBefore, "a browser test nothing stood below keeps the app-did-not-start flag");
+  const erroredOnly = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error")], browser: booted, lastBrowserless: startedBefore });
+  assert.deepEqual({ ...erroredOnly.verify?.lastBrowserless, at: 0 }, { count: 0, reason: "browser_errored", runId: erroredOnly.run.id, prNumber: 7, at: 0 }, "with the app up it is the browser tests that failed, so the cause changes");
+  assert.equal(browserTestsStatus(erroredOnly.verify).status, "failing", "the repo still reads as failing after a cause flip that counted nothing");
   const firstNoStart = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "skipped")], browser: booted, lastBrowserless: earlier });
-  assert.deepEqual({ ...firstNoStart.verify?.lastBrowserless, at: 0 }, { count: 0, reason: "did_not_start", runId: firstNoStart.run.id, prNumber: 7, at: 0 }, "and record one when there was none");
-  const strictBrowserOnly = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error")], browser: { ...booted, policy: "always" }, lastBrowserless: startedBefore });
-  assert.equal(strictBrowserOnly.run.verdicts[0].reason, "the app did not start for browser tests");
+  assert.deepEqual({ ...firstNoStart.verify?.lastBrowserless, at: 0 }, { count: 0, reason: "browser_errored", runId: firstNoStart.run.id, prNumber: 7, at: 0 }, "and record one when there was none");
+  const strictBrowserOnly = await judgeWithBrowserPlan({ criteria: [crit("1", "ui")], results: [e2e("1", "error")], browser: { ...booted, policy: "always" }, lastBrowserless: startedBefore, doctor: bootFailed });
+  assert.equal(strictBrowserOnly.run.verdicts[0].reason, NO_BROWSER_REASON);
   assert.deepEqual(strictBrowserOnly.verify?.lastBrowserless, startedBefore);
   const doctored = await judgeWithBrowserPlan({ criteria: [crit("1", "ui"), crit("2", "ui")], results: [], browser: booted, lastBrowserless: startedBefore, doctor: { stage: "start", code: "app_not_ready", message: "app did not come up" } });
   assert.match(doctored.run.verdicts[0].reason, /setup needs attention/);
   assert.deepEqual(doctored.verify?.lastBrowserless, startedBefore, "a run the doctor flagged proves nothing about the app starting");
   const oneStarted = await judgeWithBrowserPlan({ criteria: [crit("1", "ui"), crit("2", "ui")], results: [e2e("1", "error"), e2e("2", "pass")], browser: booted, lastBrowserless: startedBefore });
   assert.equal(oneStarted.verify?.lastBrowserless, null, "one browser test that ran shows the app started");
+
+  // A feedback re-run carries the earlier verdicts, browser stamp and all; this run's boot says nothing about them.
+  const carried: CriterionVerdict = { criterionId: "2", verdict: "pass", reason: NO_BROWSER_REASON, evidenceRefs: [], browser: "fallback" };
+  const reRun = await judgeWithBrowserPlan({ criteria: [crit("1", "ui"), crit("2", "ui")], results: [e2e("1", "pass")], browser: booted, lastBrowserless: startedBefore, inherit: [carried] });
+  assert.match(reRun.run.verdicts[1].reason, /from the previous run/);
+  assert.equal(reRun.verify?.lastBrowserless, null, "a criterion carried over from a failed run never re-attributes it to this one");
 
   const never = await judgeWithBrowserPlan({ criteria: [crit("1")], results: [unitPass("1")], browser: browser({ policy: "never", reason: "never" }), lastBrowserless: earlier });
   assert.equal(never.verify?.lastBrowserless, null, "e2e: never clears it even without UI criteria");

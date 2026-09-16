@@ -165,7 +165,7 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
             combinedOutput += out.output;
           }
           const allErrored = results.filter((r) => r.runner === "playwright").every((r) => r.status === "error");
-          if (allErrored) doctor = diagnosePlaywrightOutput(combinedOutput);
+          if (allErrored) doctor = diagnosePlaywrightOutput(combinedOutput, booted?.baseUrl ?? null);
         }
       } finally {
         if (boot?.handle) await boot.handle.stop();

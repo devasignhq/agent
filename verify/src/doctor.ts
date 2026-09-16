@@ -111,15 +111,33 @@ export function diagnoseMissingDependencies(results: RunnerResult[], root: strin
   };
 }
 
-/** Turn a Playwright boot failure (from its output) into a diagnosis, or null. */
-export function diagnosePlaywrightOutput(output: string): DoctorDiagnosis | null {
+// What was refused: "net::ERR_CONNECTION_REFUSED at http://localhost:3002/" (Playwright) or
+// "connect ECONNREFUSED 127.0.0.1:3002" (node fetch). Ports compare; loopback host names do not.
+const REFUSED_AT = /net::ERR_CONNECTION_REFUSED(?:\s+at\s+(\S+))?|ECONNREFUSED\s+(?:\d[\d.]*|\[[^\]\s]*\]):(\d+)/gi;
+
+function refusedTheApp(output: string, bootedUrl: string): boolean {
+  if (!URL.canParse(bootedUrl)) return true;
+  const portOf = (u: URL) => u.port || (u.protocol === "https:" ? "443" : "80");
+  const named = new Set<string>();
+  for (const m of output.matchAll(REFUSED_AT)) {
+    const at = m[1] && URL.canParse(m[1]) ? new URL(m[1]) : null;
+    const port = at ? portOf(at) : m[2];
+    if (port) named.add(port);
+  }
+  // A refusal that named no address could still be the app's own.
+  return named.size === 0 || named.has(portOf(new URL(bootedUrl)));
+}
+
+/** Turn a Playwright boot failure (from its output) into a diagnosis, or null. `bootedUrl` is the app
+ * this runner started and saw answer, so a refusal elsewhere is the tests' doing, not the boot's. */
+export function diagnosePlaywrightOutput(output: string, bootedUrl?: string | null): DoctorDiagnosis | null {
   if (/Executable doesn't exist|browserType\.launch: .*Executable/i.test(output)) {
     return { stage: "browsers", code: "browser_install_failed", message: "Playwright's Chromium is not installed on this runner", suggestedFix: { kind: "manual", instructions: "The runner installs Chromium automatically; if that failed, add `npx playwright install --with-deps chromium` to the workflow." } };
   }
   if (/Process from config\.webServer was not able to start|Error: Timed out waiting .* from config\.webServer|webServer.*exited/i.test(output)) {
     return { stage: "start", code: "app_not_ready", message: "the app did not become reachable at verify.url before the timeout", suggestedFix: { kind: "yml_patch", instructions: "Check verify.start and verify.url in .devasign.yml; make sure the start command serves that URL and needed env vars/services are provided." } };
   }
-  if (/net::ERR_CONNECTION_REFUSED|ECONNREFUSED/i.test(output)) {
+  if (/net::ERR_CONNECTION_REFUSED|ECONNREFUSED/i.test(output) && (!bootedUrl || refusedTheApp(output, bootedUrl))) {
     return { stage: "start", code: "app_not_ready", message: "the browser could not connect to the app URL", suggestedFix: { kind: "yml_patch", instructions: "Set verify.start/verify.url in .devasign.yml so the runner boots the app before the tests." } };
   }
   return null;

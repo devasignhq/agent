@@ -32,6 +32,18 @@ test("Playwright output maps to browser/boot diagnoses", () => {
   assert.equal(diagnosePlaywrightOutput("1 failed"), null);
 });
 
+test("once the runner has booted the app, only a refusal at the app's own address blames the boot", () => {
+  const app = "http://localhost:3001";
+  const at = (url: string) => `page.goto: net::ERR_CONNECTION_REFUSED at ${url}\n`;
+  assert.equal(diagnosePlaywrightOutput(at("http://localhost:3001/dashboard"), app)?.code, "app_not_ready");
+  assert.equal(diagnosePlaywrightOutput(at("http://127.0.0.1:3001/"), app)?.code, "app_not_ready", "the loopback name changes, the port does not");
+  assert.equal(diagnosePlaywrightOutput(at("http://localhost:4000/api/orders"), app), null, "another service the tests reached for is not the app");
+  assert.equal(diagnosePlaywrightOutput("apiRequest: connect ECONNREFUSED 127.0.0.1:5432\n", app), null, "and neither is a database socket");
+  assert.equal(diagnosePlaywrightOutput(`${at("http://localhost:4000/api")}${at("http://localhost:3001/")}`, app)?.code, "app_not_ready", "one refusal at the app is enough");
+  assert.equal(diagnosePlaywrightOutput("page.goto: net::ERR_CONNECTION_REFUSED", app)?.code, "app_not_ready", "a refusal that names no address could be the app's");
+  assert.equal(diagnosePlaywrightOutput(at("http://localhost:4000/api"))?.code, "app_not_ready", "without a booted app there is nothing to compare against");
+});
+
 function errored(error: string): RunnerResult {
   return { id: "r-1", testId: "1", criterionIds: ["1"], test: ".devasign/tests/a.test.ts", runner: "node-test", level: "unit", origin: "generated", status: "error", attempts: [{ n: 1, status: "error", durationMs: 1, error, artifactIds: [] }], durationMs: 1, error, artifactIds: [] };
 }

@@ -15,7 +15,7 @@ import { formatCardHeader, spliceCardHeader } from "../review/comment.js";
 import { codeFence } from "../review/render.js";
 import type { Criterion, PRReview, Repository, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
 import type { RunnerResult } from "./contract.js";
-import { browserlessSummary, type BrowserlessSummary } from "./browserless.js";
+import { browserlessSummary, inheritedCriteria, type BrowserlessSummary } from "./browserless.js";
 import { mdInline } from "./md.js";
 import { hasRunnerEvidence, updateRun } from "./runs.js";
 
@@ -185,7 +185,14 @@ export function buildVerificationView(args: {
   for (const r of rows) counts[r.verdict] += 1;
   const browserless =
     state === "completed" && run?.verdicts.length
-      ? browserlessSummary({ criteria: args.criteria.filter(isVerifiable), verdicts: run.verdicts, plan, withheld: run.runnerMeta?.e2eWithheld })
+      ? browserlessSummary({
+          criteria: args.criteria.filter(isVerifiable),
+          verdicts: run.verdicts,
+          plan,
+          withheld: run.runnerMeta?.e2eWithheld,
+          doctor: run.doctor,
+          inherited: inheritedCriteria({ inheritFromRunId: run.inheritFromRunId, candidates: run.verdicts.map((v) => v.criterionId), plan, results }),
+        })
       : null;
   return {
     state,
@@ -216,9 +223,11 @@ function browserlessNote(b: BrowserlessSummary | null | undefined): string | nul
   if (b.reason === "runner_outdated") {
     return `${subject} checked without a browser because the runner in CI is too old for verify.servers or verify.login — [update @devasign/verify](${VERIFY_NPM_URL})`;
   }
-  return b.reason === "did_not_start"
-    ? `${subject} checked without a browser because the app did not start in CI — [see setup](${b.fixUrl})`
-    : `${subject} checked without a browser — [set up browser tests](${b.fixUrl})`;
+  if (b.reason === "did_not_start") return `${subject} checked without a browser because the app did not start in CI — [see setup](${b.fixUrl})`;
+  if (b.reason === "browser_errored") {
+    return `${subject} checked without a browser because ${b.count === 1 ? "its browser test" : "their browser tests"} could not run — [see setup](${b.fixUrl})`;
+  }
+  return `${subject} checked without a browser — [set up browser tests](${b.fixUrl})`;
 }
 
 function stateLine(view: VerificationView): string {
