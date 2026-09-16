@@ -1139,6 +1139,14 @@ export function testFileSystemPrompt(): string {
     "tests: take every import, export, value, type and context shape from the request's `Source under test` — " +
     "the code as this PR's head has it, with the runner's config when there is one — never from memory or from a " +
     "name alone; an expected value that source does not show is a guess that fails a correct change. " +
+    "Build the case the criterion names, whatever the level: where it is about a condition — a branch, a mode, a " +
+    "configuration, a failure shape — find in that source the guard that selects it, give the code under test " +
+    "inputs that satisfy it, and assert the marker that path sets before asserting the outcome. A fixture that " +
+    "lands on another branch proves nothing however right the value it expects; a criterion's own words for a case " +
+    "(\"when X errored\", \"under Y\") are not the shape the code reads, so take that shape from the guard. Take a " +
+    "value and the setup that produces it from the same place: an expectation copied out of an existing test needs " +
+    "that test's fixture with it, not one you rebuilt beside it. Assert nothing the criterion does not name — an " +
+    "extra assertion can only fail a change the criterion would have passed. " +
     "Playwright tests: " +
     "before writing any setup, find in the request's `App source` every way the app reaches a populated state — " +
     "a template or sample menu, an import, a store key it persists to, a fixture route — and start from the most " +
@@ -1177,7 +1185,13 @@ export function verificationJudgmentSystemPrompt(): string {
     "\nYou judge what happened, not what the code does: you never see the diff. For each criterion write a one-line " +
     "reason grounded in the evidence and pick the artifact ids that best support it. You may DOWNGRADE a provisional " +
     "pass or fail to \"unverifiable\" only when the evidence shows the test did not actually exercise the criterion " +
-    "(it asserted something else, it errored before asserting, the log contradicts its status). Never upgrade " +
+    "(it asserted something else, it errored before asserting, the log contradicts its status). A test DevAsign " +
+    "generated is shown with its own source when its failure is what fails a criterion: read the fixture before you " +
+    "accept that failure. Downgrade it to \"unverifiable\" when the fixture does not build the case the criterion " +
+    "names — its inputs miss the branch, mode, configuration or failure shape the criterion is about — when the " +
+    "value it expects was taken from a setup it did not reproduce, or when the assertion that failed is about " +
+    "something the criterion never claimed. A fixture that does build that case, failing on the criterion's own " +
+    "claim, stays a fail: a real red withdrawn is as costly as a false one kept. Never upgrade " +
     "unverifiable to pass or fail, never flip pass to fail or fail to pass, and never treat a broken test, a missing " +
     "selector, a timeout, a boot failure, or a missing environment variable as evidence that the PR is wrong — those " +
     "are unverifiable. A false red costs more trust than an honest could-not-verify. Keep flaky verdicts as given.\n" +

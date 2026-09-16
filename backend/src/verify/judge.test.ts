@@ -4,7 +4,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { BOOT_PAUSED_REASON, BROWSER_UNDECIDED_REASON, buildJudgeUserPrompt, computeVerdicts, FLAKY_REASON, mergeModelVerdicts, NO_BROWSER_REASON, RUNNER_OUTDATED_REASON, runVerifyJudge } from "./judge.js";
+import { BOOT_PAUSED_REASON, BROWSER_UNDECIDED_REASON, buildJudgeUserPrompt, computeVerdicts, failingGeneratedTestFiles, FLAKY_REASON, mergeModelVerdicts, NO_BROWSER_REASON, RUNNER_OUTDATED_REASON, runVerifyJudge } from "./judge.js";
 import { createVerifyRun, snapshotCriteriaRevision, updateRun } from "./runs.js";
 import { browserTestsStatus } from "./repo-state.js";
 import type { Criterion, CriterionVerdict, RepoVerifyState, VerifyArtifact, VerifyPlan, VerifyRun } from "../types.js";
@@ -442,6 +442,32 @@ test("the judge's evidence never presents a Playwright file's test() blocks as r
   // Other runners re-run the whole file, so their entries really are retries.
   assert.match(prompt, /, 2 attempt\(s\)/);
   assert.match(prompt, /attempt 2: fail/);
+});
+
+test("the judge reads the source of a generated test whose failure fails a criterion, and of no other", () => {
+  const criteria = [crit("1"), crit("2"), crit("3"), crit("4")];
+  const results = [
+    result({ testId: "t1", criterionIds: ["1"], status: "fail", attempts: [attempt(1, "fail", "expected 'unverifiable', got 'pass'")] }),
+    result({ testId: "t2", criterionIds: ["2"], status: "pass", attempts: [attempt(1, "pass")] }),
+    result({ testId: "t3", criterionIds: ["3"], status: "fail", attempts: [attempt(1, "fail", "boom")] }),
+    result({ testId: "t4", criterionIds: ["4"], status: "fail", attempts: [attempt(1, "fail", "boom")] }),
+  ];
+  const artifacts = [art("src1", "test_file", "t1"), art("src2", "test_file", "t2"), art("src3", "test_file", "t3"), art("src4", "test_file", "t4")];
+  const planTest = (id: string, origin: string) => ({ id, path: `${id}.test.ts`, content: null, criterionIds: [], level: "unit", levelReason: "", origin, runner: "node-test", testSignature: id, strategyVersion: 1, targetFiles: [] });
+  const plan = { tests: [planTest("t1", "generated"), planTest("t2", "generated"), planTest("t3", "existing"), planTest("t4", "generated")] } as unknown as VerifyPlan;
+  const code = computeVerdicts({ criteria, results, plan, doctor: null, artifacts });
+
+  const picked = failingGeneratedTestFiles({ code, artifacts, plan });
+  assert.deepEqual(picked.map((a) => a.id), ["src1", "src4"], "a passing test's source, and the repository's own, say nothing about a false red");
+  assert.deepEqual(failingGeneratedTestFiles({ code, artifacts, plan, max: 1 }).map((a) => a.id), ["src1"], "the budget bounds a run with many failures");
+  assert.deepEqual(failingGeneratedTestFiles({ code, artifacts, plan: null }), [], "a run with no plan knows of no generated test");
+
+  const body = ["// [1] the criterion", ...Array.from({ length: 320 }, (_, i) => `line ${i}`)].join("\n");
+  const prompt = buildJudgeUserPrompt({ criteria, code, results, artifacts, logs: new Map(), doctor: null, testFiles: new Map([["t1", body]]) });
+  assert.match(prompt, /this test's own source — DevAsign generated it/);
+  assert.match(prompt, /\/\/ \[1\] the criterion/);
+  assert.match(prompt, /… 21 more line\(s\)/, "a long file is cut, and says so");
+  assert.equal(prompt.split("this test's own source").length - 1, 1, "only the test whose source was fetched carries one");
 });
 
 test("only re-runs of one test are reported as failing on every attempt", () => {

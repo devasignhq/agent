@@ -98,6 +98,20 @@ test("the test author is told to write ES-module syntax for the runners that loa
   assert.match(testFileSystemPrompt(), /node:test, the bundled runner or vitest, write ES-module syntax only[\s\S]*never `require\(\)`/);
 });
 
+// devasignhq/agent#249: a fixture that asserted the right constant against a case it never
+// built failed a correct PR, and the judge could not see the fixture to say so.
+test("the test author builds the case its criterion names, and the judge reads that fixture before accepting a red", () => {
+  const author = testFileSystemPrompt();
+  assert.match(author, /find in that source the guard that selects it[\s\S]*inputs that satisfy it/);
+  assert.match(author, /assert the marker that path sets before asserting the outcome/);
+  assert.match(author, /an expectation copied out of an existing test needs that test's fixture with it/);
+  assert.match(author, /Assert nothing the criterion does not name/);
+  const judge = verificationJudgmentSystemPrompt();
+  assert.match(judge, /read the fixture before you accept that failure/);
+  assert.match(judge, /Downgrade it to "unverifiable" when the fixture does not build the case the criterion names/);
+  assert.match(judge, /stays a fail/, "a real red must survive the new licence to downgrade");
+});
+
 test("emoji ban is stated in every stage prompt", () => {
   for (const [prompt] of CASES) {
     assert.match(prompt, /Never use emoji/);
