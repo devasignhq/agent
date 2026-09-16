@@ -4,6 +4,7 @@
 // future move to two real queues backed by separate topics.
 
 import { v4 as uuid } from "uuid";
+import type { DevasignVerifyConfig } from "./verify/contract.js";
 
 export type MaintainerComment = {
   body: string;
@@ -139,7 +140,14 @@ export type VerifyFeedbackJob = {
 export type VerifyOnboardJob = {
   id: string;
   type: "verify_onboard";
-  payload: { repoId: string; trigger: "install" | "manual" | "doctor"; mode?: "separate" | "extend"; workflow?: string };
+  payload: {
+    repoId: string;
+    trigger: "install" | "manual" | "doctor";
+    mode?: "separate" | "extend";
+    workflow?: string;
+    // Setup-panel answers, already validated into yml keys.
+    answers?: Partial<DevasignVerifyConfig>;
+  };
   enqueuedAt: number;
   attempts: number;
 };
@@ -329,11 +337,31 @@ export function enqueueVerifyFeedback(reviewId: string, comment: MaintainerComme
   return job;
 }
 
+/** One waiting job per repo, carrying both asks: a manual regenerate must not be lost behind an install trigger. */
+export function mergeOnboardPayload(
+  waiting: VerifyOnboardJob["payload"],
+  next: VerifyOnboardJob["payload"]
+): VerifyOnboardJob["payload"] {
+  const answers = waiting.answers || next.answers ? { ...waiting.answers, ...next.answers } : undefined;
+  return {
+    repoId: waiting.repoId,
+    // Only manual is load-bearing: runVerifyOnboard branches on `!== "manual"` and nothing else,
+    // so a queued doctor giving way to a later install changes the log line, not the run.
+    trigger: waiting.trigger === "manual" || next.trigger === "manual" ? "manual" : next.trigger,
+    ...(next.mode ?? waiting.mode ? { mode: next.mode ?? waiting.mode } : {}),
+    ...(next.workflow ?? waiting.workflow ? { workflow: next.workflow ?? waiting.workflow } : {}),
+    ...(answers ? { answers } : {}),
+  };
+}
+
 export function enqueueVerifyOnboard(payload: VerifyOnboardJob["payload"]): VerifyOnboardJob {
   const waiting = pending.verify.find(
     (j): j is VerifyOnboardJob => j.type === "verify_onboard" && j.payload.repoId === payload.repoId
   );
-  if (waiting) return waiting;
+  if (waiting) {
+    waiting.payload = mergeOnboardPayload(waiting.payload, payload);
+    return waiting;
+  }
   const job: VerifyOnboardJob = { id: uuid(), type: "verify_onboard", payload, enqueuedAt: Date.now(), attempts: 0 };
   pending.verify.push(job);
   process.nextTick(notify);
