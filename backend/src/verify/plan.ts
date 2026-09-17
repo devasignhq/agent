@@ -313,16 +313,25 @@ const MAX_UNRESOLVED = 50;
 
 /** Generated files keyed by extensionless origin path. Two survivors claiming one origin
  *  make no redirect knowably right, so neither is redirected. */
-export function movedSiblings<T extends { path: string; rebaseFrom?: string }>(tests: readonly T[]): Map<string, string> {
-  const siblings = new Map<string, string>();
-  const ambiguous = new Set<string>();
-  for (const t of tests) {
+export function movedSiblings<T extends { path: string; rebaseFrom?: string }>(
+  shipped: readonly T[],
+  // Everything that claimed an origin, shipped or not. An origin two tests claimed names no
+  // one file, so a referrer that imports it must not be handed whichever twin survived.
+  claimed: readonly { rebaseFrom?: string }[] = shipped
+): Map<string, string> {
+  const claims = new Map<string, number>();
+  for (const t of claimed) {
     if (!t.rebaseFrom) continue;
     const stem = withoutExt(t.rebaseFrom);
-    if (siblings.has(stem) && siblings.get(stem) !== t.path) ambiguous.add(stem);
-    else siblings.set(stem, t.path);
+    claims.set(stem, (claims.get(stem) ?? 0) + 1);
   }
-  for (const stem of ambiguous) siblings.delete(stem);
+  const siblings = new Map<string, string>();
+  for (const t of shipped) {
+    if (!t.rebaseFrom) continue;
+    const stem = withoutExt(t.rebaseFrom);
+    if ((claims.get(stem) ?? 0) > 1) continue;
+    siblings.set(stem, t.path);
+  }
   return siblings;
 }
 
@@ -333,9 +342,9 @@ export function movedSiblings<T extends { path: string; rebaseFrom?: string }>(t
  */
 export function rebaseGeneratedContent<T extends { path: string; content: string | null; rebaseFrom?: string }>(
   tests: readonly T[],
-  opts: { exists?: (p: string) => boolean } = {}
+  opts: { exists?: (p: string) => boolean; claimed?: readonly { rebaseFrom?: string }[] } = {}
 ): { tests: T[]; unresolved: UnresolvedImport[] } {
-  const siblings = movedSiblings(tests);
+  const siblings = movedSiblings(tests, opts.claimed ?? tests);
   const unresolved: UnresolvedImport[] = [];
   const out = tests.map((t) => {
     // Only JS/TS imports are re-anchored; a pytest or go file is relocated too,
@@ -1106,6 +1115,9 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         const writtenPaths = new Set(withContent.map((t) => t.path));
         const { tests: rebased, unresolved } = rebaseGeneratedContent(withContent, {
           exists: ctx.treeComplete ? (p) => ctx.treePaths.has(p) || writtenPaths.has(p) : undefined,
+          // Survivors, not the written set: a twin dropped while its body was authored still
+          // makes its origin ambiguous, so the referrer is reported rather than redirected.
+          claimed: survivors,
         });
         // Minting the id here keeps buildCommands(finalTests) from ever running
         // against a stale array or ids that no longer exist.

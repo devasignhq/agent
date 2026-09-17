@@ -1875,3 +1875,29 @@ test("a body importing a relative path that exists nowhere is repaired once, nam
     s.cleanup();
   }
 });
+
+test("an origin two generated tests claimed is never redirected onto whichever twin survived", () => {
+  const twin = (tag: string) => ({ path: `${GENERATED_TEST_PREFIX}/src/factory.test.ts`, rebaseFrom: "src/factory.test.ts", content: `export const f = () => "${tag}";\n` });
+  const referrer = {
+    path: `${GENERATED_TEST_PREFIX}/src/total.test.ts`,
+    rebaseFrom: "src/total.test.ts",
+    content: 'import { f } from "./factory.test.js";\n',
+  };
+  // Both twins claimed src/factory.test.ts; one's body was dropped while it was authored.
+  const survivors = [twin("a"), twin("b"), referrer];
+  const shipped = [twin("a"), referrer];
+  const exists = (p: string) => shipped.some((t) => t.path === p);
+
+  const { tests, unresolved } = rebaseGeneratedContent(shipped, { exists, claimed: survivors });
+  assert.doesNotMatch(tests[1].content!, /"\.\/factory\.test/, "the referrer is not pointed at the twin that happened to survive");
+  assert.deepEqual(
+    unresolved.map((u) => [u.specifier, u.reason]),
+    [["./factory.test.js", "missing"]],
+    "it is reported instead, so the criterion is not silently covered by a dead import"
+  );
+
+  // A stem only one test ever claimed still follows its move.
+  const lone = { path: `${GENERATED_TEST_PREFIX}/src/only.test.ts`, rebaseFrom: "src/only.test.ts", content: "export const x = 1;\n" };
+  const one = [lone, { ...referrer, content: 'import { x } from "./only.test.js";\n' }];
+  assert.match(rebaseGeneratedContent(one, { claimed: one }).tests[1].content!, /"\.\/only\.test\.js"/, "a lone sibling still redirects");
+});
