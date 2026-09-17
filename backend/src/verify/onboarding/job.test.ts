@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { parse } from "yaml";
 import { db } from "../../db.js";
-import { adoptedPath, adoptGeneratedTests, noteOnboardingPrClosed, noteRunSucceeded, postDoctorFollowup, runVerifyOnboard, scriptSelects, type OnboardDeps } from "./job.js";
+import { adoptedPath, adoptGeneratedTests, answersForTree, noteOnboardingPrClosed, noteRunSucceeded, postDoctorFollowup, runVerifyOnboard, scriptSelects, type OnboardDeps } from "./job.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "../runs.js";
 import { ACTION_REF, DEVASIGN_YML_PATH, generateWorkflow, ONBOARDING_BRANCH, WORKFLOW_PATH, WORKFLOW_VERSION } from "./generate.js";
 
@@ -920,6 +920,107 @@ test("a merged setup PR force-refreshes the default-branch yml snapshot; a close
     assert.ok(snap.bootHash);
     assert.equal(repoRow(s.repo.id).verify!.onboarding.state, "pr_merged");
   } finally {
+    s.cleanup();
+  }
+});
+
+test("an answered command the tree does not back is dropped, not written into .devasign.yml", async () => {
+  const s = seed();
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try {
+    // The API validated the shape without a tree, so it built npm commands for directories
+    // this repository does not have.
+    const out = await runVerifyOnboard(s.repo.id, { trigger: "manual", answers: {
+      start: "npm --prefix frontend run dev -- --port 3001 --strictPort",
+      url: "http://localhost:3001",
+      ready: "/health",
+      servers: [{ name: "backend", start: "npm --prefix backend run dev", url: "http://localhost:8787", ready: "/" }],
+      env: ["API_KEY"],
+      timeout: 240,
+    } }, s.deps);
+    assert.equal(out.status, "opened");
+    const yml = parse(s.calls.files[DEVASIGN_YML_PATH]).verify;
+    assert.equal(yml.start, "npm run dev -- --port 5173 --strictPort", "the inferred start stands");
+    assert.equal(yml.url, "http://localhost:5173", "and so does the port it actually listens on");
+    assert.equal(yml.ready, "/");
+    assert.equal(yml.servers, undefined, "the only server answered was dropped, so none were claimed");
+    // Only commands are re-checked here; the rest of the answers are the maintainer's to give.
+    assert.deepEqual(yml.env, ["API_KEY"]);
+    assert.equal(yml.timeout, 240);
+    assert.ok(warned.some((w) => w.includes("npm --prefix frontend run dev")), warned.join("\n"));
+    assert.ok(warned.some((w) => w.includes("npm --prefix backend run dev")), warned.join("\n"));
+  } finally {
+    console.warn = warn;
+    s.cleanup();
+  }
+});
+
+test("an answered command the tree does back is written as given", async () => {
+  const s = seed();
+  try {
+    await runVerifyOnboard(s.repo.id, { trigger: "manual", answers: {
+      start: "npm run dev -- --port 4000 --strictPort",
+      url: "http://localhost:4000",
+      ready: "/",
+    } }, s.deps);
+    const yml = parse(s.calls.files[DEVASIGN_YML_PATH]).verify;
+    assert.equal(yml.start, "npm run dev -- --port 4000 --strictPort");
+    assert.equal(yml.url, "http://localhost:4000");
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("an answered server that takes the inferred app's port is dropped", async () => {
+  const s = seed();
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try {
+    // The maintainer answered only the servers section, so the validator never saw the 5173
+    // inference gave the app; both processes would race for it at boot.
+    await runVerifyOnboard(s.repo.id, { trigger: "manual", answers: {
+      servers: [
+        { name: "api", start: "npm run dev", url: "http://localhost:5173", ready: "/" },
+        { name: "worker", start: "npm run dev", url: "http://localhost:8787", ready: "/" },
+      ],
+    } }, s.deps);
+    const yml = parse(s.calls.files[DEVASIGN_YML_PATH]).verify;
+    assert.equal(yml.url, "http://localhost:5173", "the inferred app port stands");
+    assert.deepEqual(yml.servers, [{ name: "worker", start: "npm run dev", url: "http://localhost:8787", ready: "/" }]);
+    assert.ok(warned.some((w) => w.includes("the app's port 5173")), warned.join("\n"));
+  } finally {
+    console.warn = warn;
+    s.cleanup();
+  }
+});
+
+test("an answered login script the tree does not have is dropped, like a start command", async () => {
+  const s = seed();
+  const warn = console.warn;
+  const warned: string[] = [];
+  console.warn = (...args: unknown[]) => { warned.push(args.map(String).join(" ")); };
+  try {
+    // The panel validated this against its cached tree; by now the file is gone, and a login
+    // step that cannot run fails every boot after the merge.
+    await runVerifyOnboard(s.repo.id, { trigger: "manual", answers: {
+      login: { script: "node ./scripts/devasign-login.mjs", check: "/api/me" },
+      env: ["API_KEY"],
+    } }, s.deps);
+    const yml = parse(s.calls.files[DEVASIGN_YML_PATH]).verify;
+    assert.equal(yml.login?.script, undefined, "no login step for a script that is not there");
+    assert.equal(yml.login?.check, undefined, "and no check that only that script could satisfy");
+    assert.deepEqual(yml.env, ["API_KEY"], "the rest of the answers still stand");
+    assert.ok(warned.some((w) => w.includes("scripts/devasign-login.mjs")), warned.join("\n"));
+    assert.deepEqual(
+      answersForTree({ login: { script: "node ./scripts/devasign-login.mjs" } }, ["scripts/devasign-login.mjs"], {}),
+      { login: { script: "node ./scripts/devasign-login.mjs" } },
+      "a script the tree does have is kept",
+    );
+  } finally {
+    console.warn = warn;
     s.cleanup();
   }
 });

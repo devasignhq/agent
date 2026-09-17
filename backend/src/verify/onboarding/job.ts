@@ -11,7 +11,7 @@ import { pushNotification } from "../../notifications.js";
 import type { Installation, Repository, VerifyRun } from "../../types.js";
 import type { DevasignVerifyConfig, DoctorDiagnosis } from "../contract.js";
 import { inferSetupFromTree, envVarNames } from "../detect.js";
-import { bootConfigFrom, inferBootCandidates, inferenceFilesFor } from "../boot-inference.js";
+import { bootConfigFrom, inferBootCandidates, inferenceFilesFor, isKnownStartCommand } from "../boot-inference.js";
 import { updateRun } from "../runs.js";
 import { mdInline } from "../md.js";
 import { codeFence } from "../../review/render.js";
@@ -96,6 +96,55 @@ const WORKFLOW_FILE = /^\.github\/workflows\/[^/]+\.ya?ml$/;
 const MAX_WORKFLOWS = 10;
 const runsTheAction = (text: string | null | undefined) => (text || "").includes(ACTION_REF.split("@")[0]);
 
+const urlPort = (url: string | undefined): string | undefined => /:(\d{1,5})(?:\/|$)/.exec(url ?? "")?.[1];
+// Exactly the shape validateSetupAnswers writes: "node ./scripts/login.mjs".
+const loginScriptPath = (cmd: string | undefined): string | undefined => cmd?.replace(/^(?:node|bash)\s+\.\//, "");
+
+/** The API validates an answer's shape; only here are the real tree and the inferred config known.
+ *  Anything they do not back is dropped rather than written, so no answer reaches the customer's CI. */
+export function answersForTree(
+  answers: Partial<DevasignVerifyConfig> | undefined,
+  paths: string[],
+  files: Record<string, string | null>,
+  inferred?: DevasignVerifyConfig
+): Partial<DevasignVerifyConfig> | undefined {
+  if (!answers) return undefined;
+  const out = { ...answers };
+  const known = (cmd: string) => isKnownStartCommand(cmd, paths, files);
+  if (out.start && !known(out.start)) {
+    console.warn(`[verify] dropped an answered start command the tree does not back: ${out.start}`);
+    delete out.start;
+    // url and ready only exist because start did; keeping them would name a port nothing boots.
+    delete out.url;
+    delete out.ready;
+  }
+  if (out.servers?.length) {
+    // The validator compares answered ports only with each other, so a server can be given the port
+    // inference already handed the app; the boot then dies on "something else was already answering".
+    const appPort = urlPort(out.url ?? inferred?.url);
+    const reasonToDrop = (s: NonNullable<DevasignVerifyConfig["servers"]>[number]) =>
+      !known(s.start) ? "the tree does not back"
+      : appPort && urlPort(s.url) === appPort ? `that would take the app's port ${appPort}`
+      : null;
+    const kept = out.servers.filter((s) => {
+      const reason = reasonToDrop(s);
+      if (reason) console.warn(`[verify] dropped an answered server ${reason}: ${s.start}`);
+      return !reason;
+    });
+    // Dropping every row would read as the maintainer having cleared their servers.
+    if (kept.length) out.servers = kept;
+    else delete out.servers;
+  }
+  // The panel validated the script against a cached tree that can be older than this one; a login
+  // step pointing at a file that is gone fails every boot, which is worse than no login step.
+  const script = loginScriptPath(out.login?.script);
+  if (script && !paths.includes(script)) {
+    console.warn(`[verify] dropped an answered login script the tree does not have: ${script}`);
+    delete out.login;
+  }
+  return out;
+}
+
 /** Which workflow bodies are worth spending a read on, most interesting first. */
 function byWorkflowInterest(recorded: string | undefined, asked: string | undefined): (a: string, b: string) => number {
   const rank = (p: string) =>
@@ -163,6 +212,7 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
 
     const candidates = inferBootCandidates({ paths, files, mode: mode0, workflowTexts: workflows.map((w) => w.text) });
     const verify = guessVerifyConfig(setup, hints, pkg, expected, bootConfigFrom(candidates, paths, files));
+    const answers = answersForTree(opts.answers, paths, files, verify);
 
     const build = (current: Record<string, string | null>) => {
       const at = (p: string): string | null => (p in current ? current[p] : files[p]) ?? null;
@@ -195,7 +245,7 @@ export async function runVerifyOnboard(repoId: string, opts: OnboardOptions, dep
       if (mode === "separate" && workflowPath === WORKFLOW_PATH) out[WORKFLOW_PATH] = generateWorkflow(setup, hints, expected, paths);
 
       let ymlError: string | undefined;
-      const merged = mergeDevasignYml(at(DEVASIGN_YML_PATH), verify, opts.answers);
+      const merged = mergeDevasignYml(at(DEVASIGN_YML_PATH), verify, answers);
       // What the PR body describes is the file the PR actually proposes — which keeps the
       // maintainer's own boot keys, and drops anything the runner's parser would refuse.
       let effective = verify;

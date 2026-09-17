@@ -25,7 +25,7 @@ import { RULING_CODES, codeFitsAction, precedentFromRuling } from "../security/p
 import { contradictPrecedent, corpusForInstallations, revokePrecedent } from "../security/precedent-store.js";
 import { SECURITY_ENGINE } from "../security/audit.js";
 import { clearSessionCookie, getSessionUser, peekSessionUserId } from "../github/oauth.js";
-import { appJWT, branchTipSha, gh, getOrgMembership, repositoryDispatch } from "../github/app.js";
+import { appJWT, branchTipSha, gh, getOrgMembership, pushEmptyCommit, repositoryDispatch, updatePullRequestBranch } from "../github/app.js";
 import { addInstallMember, installationsForUser, userInInstall } from "../github/installations.js";
 import { config, isAnnualConfigured, isDbConfigured, isGithubAppConfigured, isLLMLive, isStellarConfigured, isStripeConfigured } from "../config.js";
 import { postBugFixCommentForAttachment } from "../review/pipeline.js";
@@ -55,7 +55,11 @@ import { buildRunView } from "../verify/runs.js";
 import { buildTestRows, latestRunPerReview, summarizeTestRows } from "../verify/test-rows.js";
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
+import { ONBOARDING_BRANCH } from "../verify/onboarding/generate.js";
 import { refreshDefaultYml, type DefaultYmlDeps } from "../verify/default-yml.js";
+import { setupCandidates } from "../verify/setup-candidates.js";
+import { validateSetupAnswers } from "../verify/setup-answers.js";
+import { cachedSetupTree, setupSnapshot, type SetupSnapshot } from "../verify/setup-snapshot.js";
 import { browserTestsStatus, patchRepoVerify, setupFixUrl } from "../verify/repo-state.js";
 import { signBootArtifacts } from "../verify/boot-probe.js";
 import { DISPATCH_EVENT } from "../verify/feedback.js";
@@ -1389,8 +1393,12 @@ api.post("/reviews/:id/verify/archive", archiveTestsHandler);
 
 // Verification setup checklist for a repo, and "Regenerate setup PR". Tests pass deps so the
 // default-branch yml refresh never reaches GitHub; a slow GitHub gets the stored snapshot after waitMs.
-export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: number; refresh?: typeof refreshDefaultYml } = {}) {
+export function makeVerifySetupHandler(
+  deps?: DefaultYmlDeps,
+  opts: { waitMs?: number; refresh?: typeof refreshDefaultYml; snapshot?: typeof setupSnapshot } = {}
+) {
   const refresh = opts.refresh ?? refreshDefaultYml;
+  const snapshotOf = opts.snapshot ?? setupSnapshot;
   return async function verifySetupHandler(req: Request, res: Response): Promise<void> {
     const ctx = ownedRepo(req, res);
     if (!ctx) return;
@@ -1402,8 +1410,17 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
         console.warn(`[verify] default-yml refresh failed for repo ${ctx.repo.id}:`, err instanceof Error ? err.message : err);
         return null;
       });
+    // The tree is read at the sha the refresh just settled on, so the pickers and the yml the
+    // panel judges them against never come from two different commits.
+    let snap: SetupSnapshot = { proposed: null, tree: null };
+    const snapshot = refreshed
+      .then((cur) => snapshotOf(ctx.repo.id, cur?.sha ?? ctx.repo.verify?.defaultYml?.sha ?? null))
+      .then((s) => { snap = s; })
+      .catch((err) => {
+        console.warn(`[verify] setup snapshot failed for repo ${ctx.repo.id}:`, err instanceof Error ? err.message : err);
+      });
     await Promise.race([
-      refreshed,
+      snapshot,
       new Promise((resolve) => { timer = setTimeout(resolve, opts.waitMs ?? 4_000); }),
     ]);
     clearTimeout(timer);
@@ -1420,6 +1437,9 @@ export function makeVerifySetupHandler(deps?: DefaultYmlDeps, opts: { waitMs?: n
       probeUnavailable: v?.onboarding?.probeUnavailable ?? null,
       // Whether the panel can ask for a fresh boot of the default branch right now.
       bootCheck: bootCheckAvailability(fresh),
+      // What the open setup PR proposes today, so the checklist edits that rather than a guess.
+      proposed: snap.proposed,
+      candidates: setupCandidates({ repo: { owner: fresh.owner, name: fresh.name }, verify: v, ...(snap.tree ? { tree: snap.tree } : {}) }),
       browserTests: {
         ...browserTestsStatus(v),
         lastBrowserless: v?.lastBrowserless ?? null,
@@ -1552,10 +1572,67 @@ export function setupPrHandler(req: Request, res: Response) {
   if (!ctx) return;
   const mode = req.body?.mode === "extend" ? "extend" : "separate";
   const workflow = typeof req.body?.workflow === "string" ? req.body.workflow.slice(0, 200) : undefined;
-  enqueueVerifyOnboard({ repoId: ctx.repo.id, trigger: "manual", mode, workflow });
+  // With the tree the panel just read, this checks the package manager, the script and the login
+  // path too; without it the shape is all that can be judged, and the job re-checks the commands.
+  const answered = validateSetupAnswers(req.body?.answers, cachedSetupTree(ctx.repo.id));
+  if (!answered.ok) return void res.status(400).json({ error: "invalid_answers", message: answered.error });
+  const answers = Object.keys(answered.answers).length ? answered.answers : undefined;
+  enqueueVerifyOnboard({ repoId: ctx.repo.id, trigger: "manual", mode, workflow, ...(answers ? { answers } : {}) });
   res.json({ ok: true, queued: true });
 }
 api.post("/repositories/:id/verify/setup-pr", expensiveLimiter, setupPrHandler);
+
+// Re-run the setup PR's own CI, which is the only thing that can prove the config that PR
+// proposes. A click pushes to the customer's branch, so it gets its own per-repo cooldown.
+export const RECHECK_COOLDOWN_MS = 120_000;
+export const RECHECK_COMMIT_MESSAGE = "DevAsign: re-run the verification setup check";
+
+export type SetupRecheckDeps = {
+  updateBranch?: (install: Installation, repo: Repository, prNumber: number) => Promise<boolean>;
+  emptyCommit?: (install: Installation, repo: Repository, branch: string, message: string) => Promise<string | null>;
+};
+
+const recheckInFlight = new Set<string>();
+
+export function makeSetupRecheckHandler(deps: SetupRecheckDeps = {}) {
+  return async function setupRecheckHandler(req: Request, res: Response): Promise<void> {
+    const ctx = ownedRepo(req, res);
+    if (!ctx) return;
+    const repo = db.find("repositories", (r) => r.id === ctx.repo.id) ?? ctx.repo;
+    const ob = repo.verify?.onboarding;
+    // What re-runs is that PR's checks; with no open setup PR there is nothing to push to.
+    if (!ob?.prNumber || !ob.setupPrOpen) return void res.json({ ok: true, pushed: false, reason: "no_setup_pr" });
+    const install = db.find("installations", (i) => i.id === repo.installationId);
+    if (!install) return void res.json({ ok: true, pushed: false, reason: "no_installation" });
+
+    const now = Date.now();
+    const waited = now - (ob.recheckedAt ?? 0);
+    if (waited < RECHECK_COOLDOWN_MS || recheckInFlight.has(repo.id)) {
+      return void res.status(429).json({ ok: true, pushed: false, reason: "cooldown", retryAfterMs: Math.max(RECHECK_COOLDOWN_MS - waited, 0) });
+    }
+    // Claim the window before the round trip: two clicks must not each push a commit. A push
+    // GitHub refuses holds it too — retrying instantly is what would hammer their repo.
+    patchRepoVerify(repo.id, (cur) => (cur.onboarding?.prNumber ? { ...cur, onboarding: { ...cur.onboarding, recheckedAt: now } } : cur));
+    recheckInFlight.add(repo.id);
+    try {
+      const updateBranch = deps.updateBranch ?? ((i, r, n) => updatePullRequestBranch(i.installationId, r.owner, r.name, n));
+      const emptyCommit = deps.emptyCommit ?? ((i, r, b, m) => pushEmptyCommit(i.installationId, r.owner, r.name, b, m));
+      const merged = await updateBranch(install, repo, ob.prNumber).catch((err) => {
+        console.warn(`[verify] re-check could not update ${repo.owner}/${repo.name}#${ob.prNumber}:`, err instanceof Error ? err.message : err);
+        return false;
+      });
+      if (merged) return void res.json({ ok: true, pushed: true, how: "update_branch" });
+      // Already up to date: GitHub pushed nothing, so nothing fired `synchronize`.
+      const sha = await emptyCommit(install, repo, ONBOARDING_BRANCH, RECHECK_COMMIT_MESSAGE);
+      if (!sha) return void res.json({ ok: true, pushed: false, reason: "push_failed" });
+      res.json({ ok: true, pushed: true, how: "empty_commit" });
+    } finally {
+      recheckInFlight.delete(repo.id);
+    }
+  };
+}
+export const setupRecheckHandler = makeSetupRecheckHandler();
+api.post("/repositories/:id/verify/recheck", expensiveLimiter, setupRecheckHandler);
 // "Adopt this test": commit generated tests from a run into the customer's suite via a PR.
 export async function adoptTestsHandler(req: Request, res: Response): Promise<void> {
   const user = getSessionUser(req);

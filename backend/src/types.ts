@@ -235,6 +235,9 @@ export type RepoVerifyState = {
     // The last on-demand re-check the panel asked for. `dispatched: false` with an `error`
     // is the honest outcome when GitHub refused the repository_dispatch.
     bootCheck?: { at: number; probeId: string; dispatched: boolean; error?: string } | null;
+    // When the panel last pushed to the setup branch to re-run its CI. Holds the re-check
+    // cooldown across a restart, the way bootCheck.at holds the boot check's.
+    recheckedAt?: number;
     // Whether the workflow we wrote or extended listens for repository_dispatch. False means
     // no dispatch can ever wake it, so a boot check would be asked for and never answered.
     dispatchable?: boolean;
