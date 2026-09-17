@@ -4,9 +4,11 @@
 //   DATABASE_URL= ANTHROPIC_API_KEY= node --import tsx/esm --test src/verify/plan.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { posix } from "node:path";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
-import { buildCommands, enforcePlanPolicy, hasUntriedRung, MISSING_IMPORT_REASON, MISSING_PACKAGE_REASON, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runnerAvailable, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildCommands, enforcePlanPolicy, hasUntriedRung, makeTestFileValidator, MISSING_IMPORT_REASON, MISSING_PACKAGE_REASON, movedSiblings, NO_BOOT_REASON, GENERATED_TEST_PREFIX, normalizeGeneratedPath, normalizeRawTests, PLAN_CUT_OFF_REASON, PLAN_UNUSABLE_REASON, rebaseGeneratedContent, rebaseRelativeImports, planPolicy, RETIRED_REASON, runnerAvailable, runVerifyPlan, type PlannerDeps } from "./plan.js";
+import { buildImportAllowList, importTarget, resolvesInRepo, unresolvedRelativeImports } from "./imports.js";
 import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
 import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
@@ -414,6 +416,7 @@ test("a node:test body written in CommonJS is repaired once, told the runner loa
   const cjs = "// criteria 1\nconst { test } = require('node:test');\nconst { shape } = require('../../src/shape.js');\ntest('shape', () => {});\n";
   const esm = "// criteria 1\nimport { test } from 'node:test';\nimport { shape } from '../../src/shape.js';\ntest('shape', () => {});\n";
   const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, "src/shape.ts"],
     responses: [{ tests: [gen("1", "unit", { path: "src/shape.test.ts" })] }],
     bodies: { "src/shape.test.ts": [{ path: "src/shape.test.ts", content: cjs }, { path: "src/shape.test.ts", content: esm }] },
   });
@@ -425,7 +428,7 @@ test("a node:test body written in CommonJS is repaired once, told the runner loa
     assert.match(attempts[0].reason, /CommonJS syntax \(`const \{ test \} = require\('node:test'\);`\)[^;]*loads as an ES module/);
     assert.equal(attempts[1].kind, "repair");
     const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
-    assert.equal(plan.tests[0].content, esm);
+    assert.equal(plan.tests[0].content, esm.replace("'../../src/shape.js'", "'../../../src/shape.js'"), "and its over-climbing specifier is re-anchored on the way out");
   } finally {
     s.cleanup();
   }
@@ -866,6 +869,161 @@ test("an origin claimed by two survivors falls back to the plain re-anchor", () 
   assert.equal(tests[2].content, 'import { u } from "../../../src/util.js";');
 });
 
+const VIEW = "frontend/src/verify-setup-view.ts";
+const viewTree = (extra: string[] = []) => {
+  const tree = new Set([VIEW, ...extra]);
+  return (p: string) => tree.has(p);
+};
+const REACT_SETUP: DetectedSetup = {
+  languages: ["typescript"], packageManager: "npm", monorepo: null, frameworks: [], testCommands: [],
+  envExampleVars: [], existingWorkflows: [], services: [], dependencies: ["react"],
+};
+
+// One generated file through normalizeRawTests + rebaseGeneratedContent, reporting the
+// specifier that ships and where it resolves from the directory the runner writes it to.
+function ship(modelPath: string, content: string, runner: string, exists?: (p: string) => boolean) {
+  const raw = { tests: [{ path: modelPath, content, criterionIds: ["1"], origin: "generated", level: runner === "playwright" ? "e2e" : "unit", runner }] };
+  const planned = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  const { tests, unresolved } = rebaseGeneratedContent(planned, { exists });
+  const specs = [...tests[0].content!.matchAll(/from "([^"]+)"/g)].map((m) => m[1]);
+  return {
+    path: tests[0].path,
+    specs,
+    resolves: specs.map((s) => posix.normalize(posix.join(posix.dirname(tests[0].path), s))),
+    unresolved: unresolved.map((u) => [u.specifier, u.reason]),
+    accepted: makeTestFileValidator(
+      buildImportAllowList(REACT_SETUP, planned[0].runner),
+      undefined,
+      planned[0].rebaseFrom ?? planned[0].path,
+      planned[0].runner,
+      exists ? { exists, siblings: movedSiblings(planned) } : undefined
+    )({ content }).ok,
+  };
+}
+
+// The failure in repository_dispatch run 35094936934 on devasignhq/agent: the model wrote
+// `../../frontend/src/...` beside frontend/, which is above the root there, so the rewriter
+// declined it — and two levels deeper it addressed .devasign/frontend/src/verify-setup-view.ts.
+test("a specifier that climbs past the repository root is re-anchored on the directory the file will run from", () => {
+  const exists = viewTree();
+  const node = ship("frontend/verify-setup-view-recheck-label.generated.test.ts", `import { bootCheckView } from "../../${VIEW}";`, "node-test", exists);
+  assert.equal(node.path, ".devasign/tests/frontend/verify-setup-view-recheck-label.generated.test.ts");
+  assert.equal(node.specs[0], "../../../frontend/src/verify-setup-view.ts");
+  assert.equal(node.resolves[0], VIEW, "CI loaded .devasign/frontend/src/verify-setup-view.ts and the test never ran");
+  assert.deepEqual(node.unresolved, []);
+
+  // Its sibling on the same PR wrote one more `../` and passed by luck; both must now land.
+  const lucky = ship("frontend/verify-setup-view-clear-failing.generated.test.ts", `import { bootCheckView } from "../../../${VIEW}";`, "node-test", exists);
+  assert.equal(lucky.resolves[0], VIEW);
+
+  // A deeper model directory over-climbing by the same one level fails identically.
+  const deep = ship("backend/src/verify/x.generated.test.ts", `import { v } from "../../../../${VIEW}";`, "node-test", exists);
+  assert.equal(deep.path, ".devasign/tests/backend/src/verify/x.generated.test.ts");
+  assert.equal(deep.resolves[0], VIEW);
+});
+
+// Playwright lands one directory deeper, under .devasign/tests/e2e/, so the `../` count that
+// happens to work for a node test is wrong for the browser twin of the same specifier.
+test("a playwright spec's over-climbing specifier is re-anchored to its own extra level", () => {
+  const exists = viewTree();
+  for (const climb of ["../../", "../../../", "../../../../"]) {
+    const spec = ship("frontend/flow.generated.spec.ts", `import { v } from "${climb}${VIEW}";`, "playwright", exists);
+    assert.equal(spec.path, ".devasign/tests/e2e/frontend/flow.generated.spec.ts");
+    assert.equal(spec.specs[0], "../../../../frontend/src/verify-setup-view.ts", climb);
+    assert.equal(spec.resolves[0], VIEW, climb);
+  }
+});
+
+// The model may write the destination itself, so from and to are the same directory and
+// there is no move to hang the correction on — the root is still the ceiling.
+test("a model path already under the generated prefix has its above-root specifier clamped too", () => {
+  const exists = viewTree();
+  const same = ship(".devasign/tests/frontend/x.generated.test.ts", `import { v } from "../../../../${VIEW}";`, "node-test", exists);
+  assert.equal(same.path, ".devasign/tests/frontend/x.generated.test.ts");
+  assert.equal(same.specs[0], "../../../frontend/src/verify-setup-view.ts");
+  assert.equal(same.resolves[0], VIEW);
+  // In-root and simply wrong is not a miscounted climb: it is left as written and rejected,
+  // so the model gets a repair round instead of a test that dies on import.
+  const wrong = ship(".devasign/tests/frontend/x.generated.test.ts", `import { v } from "../../${VIEW}";`, "node-test", exists);
+  assert.equal(wrong.specs[0], `../../${VIEW}`);
+  assert.equal(wrong.accepted, false);
+});
+
+// Clamping is a guess about intent, so it is gated on the file being there. A specifier that
+// really does point outside the checkout must keep saying so rather than resolve elsewhere.
+test("a specifier pointing outside the repository is still reported rather than clamped onto something that exists", () => {
+  const outside = ship("src/a.generated.test.ts", 'import x from "../../../../outside.js";', "node-test", viewTree());
+  assert.equal(outside.specs[0], "../../../../outside.js", "left exactly as the model wrote it");
+  assert.deepEqual(outside.unresolved, [["../../../../outside.js", "above_root"]]);
+  assert.equal(outside.accepted, false, "and the model is asked to say what it meant");
+  // Without a view of the repository there is nothing to gate on, so nothing is clamped.
+  const blind = ship("frontend/a.generated.test.ts", `import { v } from "../../${VIEW}";`, "node-test");
+  assert.deepEqual(blind.unresolved, [[`../../${VIEW}`, "above_root"]]);
+});
+
+// A clamped specifier is still a specifier: if it lands on another generated file, it has to
+// follow that file to where the runner writes it.
+test("an over-climbing reference to another generated file still follows its sibling", () => {
+  const raw = {
+    tests: [
+      { path: "frontend/a.generated.test.ts", content: 'import { make } from "../../frontend/factory.js";', criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
+      { path: "frontend/factory.ts", content: "export const make = () => [];", criterionIds: ["1"], origin: "generated", level: "unit", runner: "vitest" },
+    ],
+  };
+  const planned = normalizeRawTests(raw, new Set(["1"]), "vitest");
+  const paths = new Set(planned.flatMap((t) => [t.path, ...(t.rebaseFrom ? [t.rebaseFrom] : [])]));
+  const [ref] = rebaseGeneratedContent(planned, { exists: (p) => paths.has(p) }).tests;
+  assert.equal(ref.content, 'import { make } from "./factory.js";', "the sibling moved into the same directory");
+  assert.equal(posix.normalize(posix.join(posix.dirname(ref.path), "./factory.js")), ".devasign/tests/frontend/factory.js");
+});
+
+// The invariant the CI log states: the bytes that ship must resolve from the directory the
+// file is written to. Anything the rewriter cannot fix must be rejected while the model can
+// still repair it — never accepted and then shipped dead, which is what run 35094936934 did.
+test("no generated test is accepted with a relative import that fails to resolve once it has moved", () => {
+  const exists = viewTree();
+  const dead: string[] = [];
+  // The other half of the invariant: over-rejecting costs a criterion just as surely, so the
+  // sweep has to fail on a body turned away when the specifier it wrote does reach a file.
+  const refused: string[] = [];
+  for (const dir of ["", "frontend/", "backend/src/verify/", "tests/unit/", "packages/ui/src/"])
+    for (const climb of [1, 2, 3, 4, 5, 6])
+      for (const ext of [".ts", ".js"])
+        for (const runner of ["node-test", "playwright", "vitest"]) {
+          const spec = `${"../".repeat(climb)}${VIEW.replace(".ts", ext)}`;
+          const name = runner === "playwright" ? "a.generated.spec.ts" : "a.generated.test.ts";
+          const s = ship(`${dir}${name}`, `import { v } from "${spec}";`, runner, exists);
+          const aimed = importTarget(spec, posix.dirname(`${dir}${name}`), { exists });
+          const reachable = "target" in aimed && resolvesInRepo(aimed.target, exists);
+          if (s.accepted && !resolvesInRepo(s.resolves[0], exists)) dead.push(`${dir}${name} ${runner} ${spec} -> ${s.resolves[0]}`);
+          if (!s.accepted && reachable) refused.push(`${dir}${name} ${runner} ${spec} -> ${aimed.target}`);
+        }
+  assert.deepEqual(dead, []);
+  assert.deepEqual(refused, []);
+});
+
+// The rewriter reads code spans before it reads specifiers; the validator has to read the
+// same ones, or a test that quotes module source at itself loses its criterion to a repair
+// round it can never pass.
+test("module source quoted inside a test body is data to the validator too", () => {
+  const exists = viewTree();
+  const body = ['import { test } from "node:test";', "const fixture = `", 'import { a } from "../../gone.js";', "`;", '// import { b } from "../../also-gone.js";', 'test("x", () => fixture);', ""].join("\n");
+  assert.deepEqual(unresolvedRelativeImports(body, "src/a.test.ts", exists), [], "neither the template literal nor the comment is an import");
+  const validate = makeTestFileValidator(buildImportAllowList(REACT_SETUP, "node-test"), undefined, "src/a.test.ts", "node-test", { exists });
+  assert.equal(validate({ content: body }).ok, true);
+});
+
+// The guard this replaced returned early whenever the file did not change directory, so a
+// model that wrote the destination itself kept its miscounted climb — run 35094936934's bug,
+// reachable with no siblings at all.
+test("a rebase within one directory still clamps an above-root specifier", () => {
+  const exists = viewTree();
+  const at = `${GENERATED_TEST_PREFIX}/frontend/x.generated.test.ts`;
+  const out = rebaseRelativeImports(`import { v } from "../../../../${VIEW}";`, at, at, { exists });
+  assert.equal(out, `import { v } from "../../../${VIEW}";`);
+  assert.equal(posix.normalize(posix.join(posix.dirname(at), `../../../${VIEW}`)), VIEW);
+});
+
 // Findings 3+4 live in the ORDER of the planner's steps, so they are pinned where
 // that order actually runs. DIFF touches only src/handler.ts, so a code criterion
 // is capped at integration and a component-level test is dropped by policy.
@@ -929,6 +1087,81 @@ test("when the dropped sibling's path is a real repo file, the fallback now poin
   }
 });
 
+// GitHub caps /git/trees?recursive=1, and a path missing from a capped listing is not a path
+// that is missing. Rejecting on that view would drop criteria the repo can verify.
+test("a tree GitHub says it truncated is not evidence that an imported file is absent", async () => {
+  const s = seed([crit("1")]);
+  const content = 'import { test } from "node:test";\nimport { v } from "../../frontend/src/verify-setup-view.ts";\ntest("x", () => v());\n';
+  const manifest = { tests: [referrer({ path: "frontend/a.generated.test.ts", content, runner: "node-test" })] };
+  const full = deps({ responses: [structuredClone(manifest)], bodies: { "frontend/a.generated.test.ts": [{ path: "frontend/a.generated.test.ts", content }, { path: "frontend/a.generated.test.ts", content }] } });
+  try {
+    await runVerifyPlan(s.run.id, full.deps);
+    assert.deepEqual(planned(s.run.id).unverifiable, [{ criterionId: "1", reason: MISSING_IMPORT_REASON }], "with a complete tree the file really is absent");
+  } finally {
+    s.cleanup();
+  }
+
+  const t = seed([crit("1")]);
+  const capped = deps({ responses: [structuredClone(manifest)] });
+  capped.deps.fetchTree = async () => ({ tree: BASE_TREE.map((path) => ({ path, type: "blob", sha: "s", size: 10 })), truncated: true });
+  try {
+    await runVerifyPlan(t.run.id, capped.deps);
+    const plan = planned(t.run.id);
+    assert.deepEqual(plan.unverifiable, [], "the same tree, capped, proves nothing about frontend/src/verify-setup-view.ts");
+    assert.equal(plan.tests.length, 1);
+    assert.equal(capped.bodyPrompts.length, 1, "and there is nothing to repair, so no second body call");
+  } finally {
+    t.cleanup();
+  }
+});
+
+// The clamp is gated on the file being in the repository the runner sees, and a rebaseFrom
+// is not in it: it is the path the model named, which nothing ever writes. Two survivors
+// claiming one origin drop the redirect, so only that gate is left holding the specifier.
+test("a clamp is never landed on a model path the runner does not write", async () => {
+  const s = seed([crit("1"), crit("2")]);
+  const { deps: d } = deps({
+    responses: [{ tests: [referrer({ content: 'import { make } from "../../src/factory.js";' }), sibling({ criterionIds: ["2"] }), sibling({ criterionIds: ["2"] })] }],
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = planned(s.run.id);
+    assert.deepEqual(
+      plan.tests.map((t) => t.path).sort(),
+      [".devasign/tests/src/factory-2.ts", ".devasign/tests/src/factory.ts"],
+      "the referrer is not among them: src/factory.* is a path the plan renamed away from"
+    );
+    assert.deepEqual(plan.unverifiable, [{ criterionId: "1", reason: MISSING_IMPORT_REASON }]);
+    const attempts = (db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/src/total.test.ts`];
+    assert.match(attempts[0].reason, /it imports "\.\.\/\.\.\/src\/factory\.js" relative to src\/total\.test\.ts/);
+  } finally {
+    s.cleanup();
+  }
+});
+
+// The window the pure ship() helper cannot open: exists and siblings are built from the
+// survivors, but the rebase runs on what authoring actually produced. A body cut off twice
+// is a file nothing writes, and its referrer must not be re-anchored onto it in silence.
+test("a sibling whose body never arrived is not a file the referrer can be pointed at", async () => {
+  const s = seed([crit("1")]);
+  const cut = { __stop: "max_tokens", raw: "export const make = () =>" };
+  const { deps: d } = deps({
+    responses: [{ tests: [referrer(), sibling()] }],
+    bodies: { "src/factory.ts": [cut, cut] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    const plan = planned(s.run.id);
+    assert.equal(plan.tests.length, 1, "the referrer survived its own authoring");
+    const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+    const reported = ((log.meta as any).unresolvedImports as Array<{ specifier: string; reason: string }>).map((u) => [u.specifier, u.reason]);
+    assert.deepEqual(reported, [["./factory.js", "missing"]], `src/factory.* is in no tree and was never written:\n${log.detail}`);
+    assert.match(String(log.detail), /unresolved imports: \.devasign\/tests\/src\/total\.test\.ts → \.\/factory\.js \(missing\)/);
+  } finally {
+    s.cleanup();
+  }
+});
+
 // Both planner batches are written into the same checkout, so they share one
 // sibling scope. Under per-call scoping this specifier would be re-anchored away.
 test("a sibling generated by the re-plan batch is still followed", async () => {
@@ -951,19 +1184,39 @@ test("a sibling generated by the re-plan batch is still followed", async () => {
 });
 
 // The cheapest guard against moving the rewrite and forgetting to call it.
-test("the persisted plan carries rewritten content, and unresolved imports reach the log", async () => {
+test("the persisted plan carries rewritten content", async () => {
   const s = seed([crit("1")]);
   const { deps: d } = deps({
     tree: [...BASE_TREE, "src/total.ts"],
-    responses: [{ tests: [referrer({ content: 'import { orderTotal } from "./total.js";\nimport x from "../../../../outside.js";' })] }],
+    responses: [{ tests: [referrer({ content: 'import { orderTotal } from "./total.js";' })] }],
   });
   try {
     await runVerifyPlan(s.run.id, d);
     const test0 = planned(s.run.id).tests[0];
     assert.match(test0.content!, /from "\.\.\/\.\.\/\.\.\/src\/total\.js"/, "content is rewritten on the way to the runner");
+  } finally {
+    s.cleanup();
+  }
+});
+
+// A climb no move can rescue reaches no repository file from any directory, so it is put to
+// the model while it can still say what it meant, instead of shipped to die on import.
+test("a specifier that leaves the repository is repaired once, and the criterion keeps its missing-import reason", async () => {
+  const s = seed([crit("1")]);
+  const outside = 'import { test } from "node:test";\nimport x from "../../../../outside.js";\ntest("x", () => x());\n';
+  const { deps: d, bodyPrompts } = deps({
+    tree: [...BASE_TREE, "src/total.ts"],
+    responses: [{ tests: [referrer({ content: outside })] }],
+    bodies: { "src/total.test.ts": [{ path: "src/total.test.ts", content: outside }, { path: "src/total.test.ts", content: outside }] },
+  });
+  try {
+    await runVerifyPlan(s.run.id, d);
+    assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
     const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
-    assert.match(String(log.detail), /unresolved imports: .*outside\.js \(above_root\)/);
-    assert.equal((log.meta?.unresolvedImports as unknown[]).length, 1);
+    const attempts = (log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/src/total.test.ts`];
+    assert.match(attempts[0].reason, /it imports "\.\.\/\.\.\/\.\.\/\.\.\/outside\.js" relative to src\/total\.test\.ts/);
+    assert.equal(planned(s.run.id).tests.length, 0, "nothing ships that cannot load");
+    assert.deepEqual(planned(s.run.id).unverifiable, [{ criterionId: "1", reason: MISSING_IMPORT_REASON }]);
   } finally {
     s.cleanup();
   }
@@ -1621,4 +1874,30 @@ test("a body importing a relative path that exists nowhere is repaired once, nam
   } finally {
     s.cleanup();
   }
+});
+
+test("an origin two generated tests claimed is never redirected onto whichever twin survived", () => {
+  const twin = (tag: string) => ({ path: `${GENERATED_TEST_PREFIX}/src/factory.test.ts`, rebaseFrom: "src/factory.test.ts", content: `export const f = () => "${tag}";\n` });
+  const referrer = {
+    path: `${GENERATED_TEST_PREFIX}/src/total.test.ts`,
+    rebaseFrom: "src/total.test.ts",
+    content: 'import { f } from "./factory.test.js";\n',
+  };
+  // Both twins claimed src/factory.test.ts; one's body was dropped while it was authored.
+  const survivors = [twin("a"), twin("b"), referrer];
+  const shipped = [twin("a"), referrer];
+  const exists = (p: string) => shipped.some((t) => t.path === p);
+
+  const { tests, unresolved } = rebaseGeneratedContent(shipped, { exists, claimed: survivors });
+  assert.doesNotMatch(tests[1].content!, /"\.\/factory\.test/, "the referrer is not pointed at the twin that happened to survive");
+  assert.deepEqual(
+    unresolved.map((u) => [u.specifier, u.reason]),
+    [["./factory.test.js", "missing"]],
+    "it is reported instead, so the criterion is not silently covered by a dead import"
+  );
+
+  // A stem only one test ever claimed still follows its move.
+  const lone = { path: `${GENERATED_TEST_PREFIX}/src/only.test.ts`, rebaseFrom: "src/only.test.ts", content: "export const x = 1;\n" };
+  const one = [lone, { ...referrer, content: 'import { x } from "./only.test.js";\n' }];
+  assert.match(rebaseGeneratedContent(one, { claimed: one }).tests[1].content!, /"\.\/only\.test\.js"/, "a lone sibling still redirects");
 });

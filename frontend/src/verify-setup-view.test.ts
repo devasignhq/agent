@@ -253,3 +253,42 @@ test("with nothing probed yet, an old runner in CI is the thing worth saying", (
   assert.equal(bootCheckView(payload({ probeUnavailable: { cliVersion: "", at: 5 } }), 2000).evidence?.line, "The runner in CI is too old to check the boot — update @devasign/verify");
   assert.equal(bootCheckView(payload({ boot: bootProbe(), probeUnavailable: { cliVersion: "1.5.1", at: 5 } }), 2000).evidence?.line, "The app came up in CI · checked on PR #7", "a real result outranks a note about an old runner");
 });
+
+const RUNNER_TOO_OLD = "the runner in CI is too old for boot checks — update @devasign/verify";
+
+test("a check its runner already refused says so, instead of reporting itself as still running", () => {
+  const running = bootCheckView(payload({ bootCheck: { available: false, reason: "pending" }, onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 10_500);
+  assert.equal(running.note, "The last check did not run: the runner in CI is too old for boot checks — update @devasign/verify");
+  assert.notEqual(running.note, "A check is already running — its result lands here when CI finishes", "a run that can never claim the probe is not a result on its way");
+  assert.equal(running.button, null, "the backend still holds the probe row, so there is still nothing to click");
+  const unclaimed = bootCheckView(payload({ bootCheck: { available: false, reason: "requested" }, onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 10_500);
+  assert.equal(unclaimed.note, `The last check did not run: ${RUNNER_TOO_OLD}`, "a row nothing picked up is the same story");
+  const cooling = bootCheckView(payload({ bootCheck: { available: false, reason: "cooldown" }, onboarding: { state: "verified", bootCheck: asked({ dispatched: false, error: "GitHub would not take the dispatch" }) } }), 10_500);
+  assert.equal(cooling.note, "The last check did not run: GitHub would not take the dispatch", "nothing is cooling down after a request that never reached CI");
+  // The day's cap counts the requests themselves, so it is reached by clicking a check the
+  // runner keeps refusing — "come back tomorrow" would bury the one sentence that fixes it.
+  const spent = bootCheckView(payload({ bootCheck: { available: false, reason: "rate_limited" }, boot: bootProbe({ at: 900, probeId: "p0" }), onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 10_500);
+  assert.equal(spent.note, `The last check did not run: ${RUNNER_TOO_OLD}`);
+  assert.notEqual(spent.note, "This repo has used its boot checks for today — try again tomorrow", "a day spent on refusals is not a reason to wait a day");
+  assert.equal(spent.evidence?.line, "The app came up in CI · checked on PR #7", "the evidence line speaks for an older probe, so it cannot carry this");
+});
+
+test("a request with nothing recorded against it still reads as waiting, not as a runner that refused", () => {
+  const waiting = bootCheckView(payload({ bootCheck: { available: false, reason: "pending" }, onboarding: { state: "verified", bootCheck: asked() } }), 10_500);
+  assert.equal(waiting.note, "A check is already running — its result lands here when CI finishes");
+  assert.doesNotMatch(waiting.note!, /too old|did not run/, "silence is not a refusal");
+  const quiet = bootCheckView(payload({ bootCheck: { available: true }, onboarding: { state: "verified", bootCheck: asked() } }), 10_500);
+  assert.equal(quiet.note, "The last check never reported back");
+  const noPr = bootCheckView(payload({ bootCheck: { available: false, reason: "no_setup_pr" }, onboarding: { state: "none", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 10_500);
+  assert.equal(noPr.note, "DevAsign has not set this repo up yet — open the setup PR first", "a refusal about the repo is not displaced by one about a request");
+});
+
+test("a recorded failure lasts until its own probe answers, and no further", () => {
+  const ours = bootCheckView(payload({ bootCheck: { available: true }, boot: bootProbe({ at: 11_000, probeId: "p1" }), onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 12_000);
+  assert.equal(ours.note, null, "the probe this request dispatched reported after all");
+  assert.equal(ours.evidence?.line, "The app came up in CI · checked on PR #7", "and that verdict is what the panel shows");
+  const fresh = bootCheckView(payload({ bootCheck: { available: false, reason: "requested" }, boot: bootProbe({ at: 11_000, probeId: "p1" }), onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 12_000);
+  assert.equal(fresh.note, "DevAsign asked CI to boot the app — nothing has picked it up yet", "a settled failure must not be read as the new request's");
+  const theirs = bootCheckView(payload({ bootCheck: { available: false, reason: "pending" }, boot: bootProbe({ at: 11_000, probeId: "p2", prNumber: 12 }), onboarding: { state: "verified", bootCheck: asked({ error: RUNNER_TOO_OLD }) } }), 12_000);
+  assert.equal(theirs.note, `The last check did not run: ${RUNNER_TOO_OLD}`, "another probe's verdict does not answer this request");
+});

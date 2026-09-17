@@ -129,7 +129,7 @@ import {
   devasignDocsSystemPrompt,
   type CriteriaMode,
 } from "./prompts.js";
-import { fetchTree, runPool } from "./indexer.js";
+import { fetchRepoTree, runPool } from "./indexer.js";
 import { formatRawDiff, truncateDiffAtHunkBoundary, stripGutterArtifacts } from "./diff-format.js";
 import { extractJSON, repairBledProseField } from "./parse.js";
 
@@ -382,7 +382,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // let it run under criteria synthesis instead of on the plan's critical path. Gated on
     // the stage: a repo with verification off must not pay for a tree nobody reads.
     const verifyTreeSha = review.headSha;
-    const verifyTree = install && wf.stages.verify && !context.headFromFork ? fetchTree(repo, install, verifyTreeSha).catch(() => null) : null;
+    const verifyTree = install && wf.stages.verify && !context.headFromFork ? fetchRepoTree(repo, install, verifyTreeSha).catch(() => null) : null;
     log(review.id, "ingest", "Context ingested", {
       detail: `${context.sources.length} source(s)`,
       meta: {
@@ -641,7 +641,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         ...(verifyTree
           ? {
               fetchTree: async (r: Repository, i: Installation, sha: string) =>
-                (sha === verifyTreeSha ? await verifyTree : null) ?? fetchTree(r, i, sha),
+                (sha === verifyTreeSha ? await verifyTree : null) ?? fetchRepoTree(r, i, sha),
             }
           : {}),
       },

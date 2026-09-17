@@ -57,8 +57,49 @@ export function hasRenderStack(setup: DetectedSetup): boolean {
 
 const RESOLVE_EXTS = [".ts", ".tsx", ".mts", ".cts", ".js", ".mjs", ".cjs", ".jsx", ".json"];
 
-/** Relative specifiers that resolve to nothing in the repository, as written, from `fromPath`. */
-export function unresolvedRelativeImports(content: string, fromPath: string, exists: (p: string) => boolean): string[] {
+export const withoutExt = (p: string): string => p.replace(/\.[cm]?[jt]sx?$/, "");
+
+/** Whether a repository path names a file, allowing the extension swaps a loader makes. */
+export function resolvesInRepo(target: string, exists: (p: string) => boolean): boolean {
+  const stem = withoutExt(target);
+  return [target, ...RESOLVE_EXTS.map((e) => stem + e), ...RESOLVE_EXTS.map((e) => `${target}/index${e}`)].some(exists);
+}
+
+export type ImportTargetOpts = {
+  // Other generated files in the same plan, keyed by extensionless origin path: they
+  // move too, so a specifier pointing at one follows it.
+  siblings?: ReadonlyMap<string, string>;
+  // The repository as the runner will see it. Without it a specifier that climbs past
+  // the root cannot be told from one that means to.
+  exists?: (p: string) => boolean;
+};
+export type ImportTarget = { target: string } | { reason: "interpolated" | "above_root" };
+
+/** The repository file a relative specifier written in `fromDir` points at. The rewriter ships
+ *  posix.relative(toDir, target) and the validator checks this target, so what ships is checked. */
+export function importTarget(spec: string, fromDir: string, opts: ImportTargetOpts = {}): ImportTarget {
+  if (spec.includes("${")) return { reason: "interpolated" };
+  let target = posix.normalize(posix.join(fromDir, spec));
+  // A climb past the root is a miscount — the root is the ceiling — so clamp, but only onto
+  // a file that is there: one meaning somewhere outside the checkout keeps pointing there.
+  if (target.startsWith("..")) {
+    const clamped = target.replace(/^(?:\.\.\/)+/, "");
+    const known = !!clamped && !clamped.startsWith("..") && (opts.siblings?.has(withoutExt(clamped)) || (!!opts.exists && resolvesInRepo(clamped, opts.exists)));
+    if (!known) return { reason: "above_root" };
+    target = clamped;
+  }
+  const moved = opts.siblings?.get(withoutExt(target));
+  // Keep the specifier's own basename (the model may write .js for a .ts file).
+  return { target: moved ? posix.join(posix.dirname(moved), posix.basename(target)) : target };
+}
+
+/** Relative specifiers that reach no repository file from where the test will actually run. */
+export function unresolvedRelativeImports(
+  content: string,
+  fromPath: string,
+  exists: (p: string) => boolean,
+  siblings?: ReadonlyMap<string, string>
+): string[] {
   const spans = codeSpans(content);
   const dir = posix.dirname(fromPath.replace(/^\.\//, ""));
   const missing = new Set<string>();
@@ -67,11 +108,8 @@ export function unresolvedRelativeImports(content: string, fromPath: string, exi
     if (!isRewritableSpecifier(spans, m.index, lead, spec)) continue;
     if (/\b(?:import|export)\s+type\b/.test(lead)) continue;
     if (!spec.startsWith("./") && !spec.startsWith("../")) continue;
-    const target = posix.normalize(posix.join(dir, spec));
-    if (target.startsWith("..")) continue; // reported by the rebase step as above_root
-    const stem = target.replace(/\.[cm]?[jt]sx?$/, "");
-    const candidates = [target, ...RESOLVE_EXTS.map((e) => stem + e), ...RESOLVE_EXTS.map((e) => `${target}/index${e}`)];
-    if (!candidates.some(exists)) missing.add(spec);
+    const t = importTarget(spec, dir, { siblings, exists });
+    if (!("target" in t) || !resolvesInRepo(t.target, exists)) missing.add(spec);
   }
   return [...missing];
 }

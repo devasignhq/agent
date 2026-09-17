@@ -159,26 +159,29 @@ function bootEvidence(setup: BootCheckSetup, now: number): BootEvidence | null {
   return { line, tone: boot.ok && boot.signedIn !== false ? "ok" : "warn", links };
 }
 
+// The refusals the backend derives from the request history itself (the probe rows and
+// onboarding.bootCheck), so the only ones a failure recorded against that request outranks.
+const REASONS_ABOUT_LAST_REQUEST = new Set(["requested", "pending", "cooldown", "rate_limited"]);
+
 /** The "Re-check boot" control: what the last probe found, and whether another check can be asked for. */
 export function bootCheckView(setup: BootCheckSetup, now: number = Date.now()): BootCheckView {
   const evidence = bootEvidence(setup, now);
   const offer = setup.bootCheck;
   if (!offer) return { evidence, button: null, note: null };
-  // Whether a check is already in flight is the backend's call (it holds the probe row), never a timer here.
-  if (!offer.available) return { evidence, button: null, note: bootCheckReason(offer.reason) };
   const asked = setup.onboarding?.bootCheck ?? null;
   // Only the request's OWN probe answers it: another probe's verdict landing in between is
   // not a reply, and silently reading as one would hide a check that never ran.
   const answered = !!setup.boot && (setup.boot.probeId ? setup.boot.probeId === asked?.probeId : setup.boot.at >= (asked?.at ?? 0));
-  const note = !asked
-    ? null
-    : asked.error
-      ? `The last check did not run: ${asked.error}`
-      : !asked.dispatched
-        ? "The last check did not reach CI"
-        : !answered
-          ? "The last check never reported back"
-          : null;
+  // What the backend recorded against a request its own probe has not answered; once that
+  // probe reports, the verdict above is the story and the recorded failure is stale.
+  const failed = !asked || answered ? null : asked.error ? `The last check did not run: ${asked.error}` : !asked.dispatched ? "The last check did not reach CI" : null;
+  // Whether a check is in flight is the backend's call (it holds the probe row), never a timer
+  // here — but a request CI already refused must not be reported as one that is still going.
+  if (!offer.available) {
+    const generic = bootCheckReason(offer.reason);
+    return { evidence, button: null, note: failed && REASONS_ABOUT_LAST_REQUEST.has(offer.reason ?? "") ? failed : generic };
+  }
+  const note = failed ?? (asked && !answered ? "The last check never reported back" : null);
   return { evidence, button: { label: setup.boot ? "Re-check boot" : "Check boot now" }, note };
 }
 

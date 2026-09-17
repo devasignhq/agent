@@ -20,7 +20,7 @@ import {
 } from "../llm.js";
 import { modelForPlan } from "../billing/plans.js";
 import { ghText, repositoryDispatch } from "../github/app.js";
-import { fetchTree, runPool, type TreeEntry } from "../review/indexer.js";
+import { fetchRepoTree, runPool, type RepoTree, type TreeEntry } from "../review/indexer.js";
 import { testFileSystemPrompt, testPlannerSystemPrompt } from "../review/prompts.js";
 import { planManifestTool, planTestFileTool } from "../review/tools.js";
 import { withMaintainerInstructions } from "../review/decisions.js";
@@ -29,7 +29,7 @@ import { formatRawDiff, truncateDiffAtHunkBoundary } from "../review/diff-format
 import type { Criterion, Installation, Repository, VerifyPlan, VerifyPlanBrowser, VerifyRun, VerifyStageUsage } from "../types.js";
 import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLevel, TestRunner } from "./contract.js";
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
-import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, unresolvedRelativeImports, type ImportAllowList } from "./imports.js";
+import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, importTarget, resolvesInRepo, unresolvedRelativeImports, withoutExt, type ImportAllowList, type ImportTargetOpts } from "./imports.js";
 import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
@@ -63,7 +63,7 @@ export type PlannerDeps = {
   llm?: PlannerLLM;
   // Feedback re-runs plan only the criteria a comment changed; the rest inherit verdicts.
   onlyCriteriaIds?: string[];
-  fetchTree?: (repo: Repository, install: Installation, sha: string) => Promise<TreeEntry[]>;
+  fetchTree?: (repo: Repository, install: Installation, sha: string) => Promise<TreeEntry[] | RepoTree>;
   readFile?: (install: Installation, repo: Repository, path: string, sha: string) => Promise<string | null>;
   fetchDiff?: (install: Installation, repo: Repository, prNumber: number) => Promise<string>;
   dispatch?: (install: Installation, repo: Repository, payload: Record<string, unknown>) => Promise<void>;
@@ -212,50 +212,36 @@ export function normalizeGeneratedPath(p: string, runner: TestRunner): { path: s
 // a comment, or a template literal is left as the data it is.
 const RELATIVE_IMPORT = new RegExp(`(${IMPORT_LEAD})(['"\`])(\\.{1,2}(?:/[^'"\`]*)?)\\2`, "g");
 
-const withoutExt = (p: string): string => p.replace(/\.[cm]?[jt]sx?$/, "");
-
-export type SkippedSpecifier = { specifier: string; reason: "interpolated" | "above_root" };
+export type SkippedSpecifier = { specifier: string; reason: "interpolated" | "above_root" | "missing" };
 
 export function rebaseRelativeImports(
   content: string,
   from: string,
   to: string,
-  opts: {
-    // Other generated files in the same plan, keyed by extensionless origin path:
-    // they move too, so a specifier pointing at one follows it rather than staying
-    // behind at a path the runner never writes.
-    siblings?: ReadonlyMap<string, string>;
+  opts: ImportTargetOpts & {
     // Specifiers left alone on purpose. They cannot resolve after the move, so the
     // caller reports them instead of shipping a silent load failure.
     onUnresolved?: (skipped: SkippedSpecifier) => void;
   } = {}
 ): string {
-  const siblings = opts.siblings ?? new Map<string, string>();
   const fromDir = posix.dirname(from);
   const toDir = posix.dirname(to);
-  if (fromDir === toDir && !siblings.size) return content;
   const spans = codeSpans(content);
   return content.replace(RELATIVE_IMPORT, (match, lead: string, quote: string, spec: string, offset: number) => {
     // Before the checks below, so a `${` inside a string is never counted as an
     // unresolved import.
     if (!isRewritableSpecifier(spans, offset, lead, spec)) return match;
-    if (spec.includes("${")) {
-      opts.onUnresolved?.({ specifier: spec, reason: "interpolated" });
+    const t = importTarget(spec, fromDir, { siblings: opts.siblings, exists: opts.exists });
+    if (!("target" in t)) {
+      opts.onUnresolved?.({ specifier: spec, reason: t.reason });
       return match;
     }
-    const target = posix.normalize(posix.join(fromDir, spec));
-    // Above the repo root: no re-anchoring can make that resolve, and rewriting
-    // it would only disguise where the model meant to point.
-    if (target.startsWith("..")) {
-      opts.onUnresolved?.({ specifier: spec, reason: "above_root" });
-      return match;
-    }
-    const movedSibling = siblings.get(withoutExt(target));
-    // Keep the specifier's own basename (the model may write .js for a .ts file).
-    const resolved = movedSibling ? posix.join(posix.dirname(movedSibling), posix.basename(target)) : target;
-    const next = posix.relative(toDir, resolved);
-    if (next === posix.relative(toDir, target) && fromDir === toDir) return match;
-    return `${lead}${quote}${next.startsWith("./") || next.startsWith("../") ? next : `./${next}`}${quote}`;
+    // Anchored on the directory the file is written to, so this is what resolves in CI —
+    // and when nothing is there, the caller hears about it instead of shipping a dead load.
+    if (opts.exists && !resolvesInRepo(t.target, opts.exists)) opts.onUnresolved?.({ specifier: spec, reason: "missing" });
+    const rel = posix.relative(toDir, t.target);
+    const next = rel.startsWith("../") ? rel : `./${rel}`;
+    return next === spec ? match : `${lead}${quote}${next}${quote}`;
   });
 }
 
@@ -325,26 +311,40 @@ export type UnresolvedImport = SkippedSpecifier & { path: string };
 const REWRITABLE_EXT = /\.[cm]?[jt]sx?$/;
 const MAX_UNRESOLVED = 50;
 
+/** Generated files keyed by extensionless origin path. Two survivors claiming one origin
+ *  make no redirect knowably right, so neither is redirected. */
+export function movedSiblings<T extends { path: string; rebaseFrom?: string }>(
+  shipped: readonly T[],
+  // Everything that claimed an origin, shipped or not. An origin two tests claimed names no
+  // one file, so a referrer that imports it must not be handed whichever twin survived.
+  claimed: readonly { rebaseFrom?: string }[] = shipped
+): Map<string, string> {
+  const claims = new Map<string, number>();
+  for (const t of claimed) {
+    if (!t.rebaseFrom) continue;
+    const stem = withoutExt(t.rebaseFrom);
+    claims.set(stem, (claims.get(stem) ?? 0) + 1);
+  }
+  const siblings = new Map<string, string>();
+  for (const t of shipped) {
+    if (!t.rebaseFrom) continue;
+    const stem = withoutExt(t.rebaseFrom);
+    if ((claims.get(stem) ?? 0) > 1) continue;
+    siblings.set(stem, t.path);
+  }
+  return siblings;
+}
+
 /**
  * Re-anchor the generated tests that actually ship. Filters nothing and never
  * touches `path` — testSignature reads it, so moving one would reset that test's
  * flake history.
  */
 export function rebaseGeneratedContent<T extends { path: string; content: string | null; rebaseFrom?: string }>(
-  tests: readonly T[]
+  tests: readonly T[],
+  opts: { exists?: (p: string) => boolean; claimed?: readonly { rebaseFrom?: string }[] } = {}
 ): { tests: T[]; unresolved: UnresolvedImport[] } {
-  const siblings = new Map<string, string>();
-  const ambiguous = new Set<string>();
-  for (const t of tests) {
-    if (!t.rebaseFrom) continue;
-    const stem = withoutExt(t.rebaseFrom);
-    if (siblings.has(stem) && siblings.get(stem) !== t.path) ambiguous.add(stem);
-    else siblings.set(stem, t.path);
-  }
-  // Two survivors claiming one origin: no redirect is knowably right, so fall
-  // back to the plain re-anchor.
-  for (const stem of ambiguous) siblings.delete(stem);
-
+  const siblings = movedSiblings(tests, opts.claimed ?? tests);
   const unresolved: UnresolvedImport[] = [];
   const out = tests.map((t) => {
     // Only JS/TS imports are re-anchored; a pytest or go file is relocated too,
@@ -352,6 +352,7 @@ export function rebaseGeneratedContent<T extends { path: string; content: string
     if (!t.rebaseFrom || !t.content || !REWRITABLE_EXT.test(t.path)) return t;
     const content = rebaseRelativeImports(t.content, t.rebaseFrom, t.path, {
       siblings,
+      exists: opts.exists,
       onUnresolved: (skipped) => {
         if (unresolved.length < MAX_UNRESOLVED) unresolved.push({ path: t.path, ...skipped });
       },
@@ -566,6 +567,9 @@ export type PlanContext = {
   criteria: Criterion[];
   diff: string;
   treePaths: Set<string>;
+  // False when GitHub capped the tree listing: a path absent from treePaths may still be there,
+  // so nothing may be rejected or re-anchored for being missing.
+  treeComplete: boolean;
   setup: DetectedSetup;
   yml: DevasignVerifyConfig | null;
   ymlFrom: "head" | "base" | "base_boot" | null;
@@ -674,7 +678,7 @@ export function makeTestFileValidator(
   path?: string,
   runner?: TestRunner,
   // Where the file's relative imports are anchored and what exists there; absent = unchecked.
-  resolve?: { exists: (p: string) => boolean }
+  resolve?: { exists: (p: string) => boolean; siblings?: ReadonlyMap<string, string> }
 ): (input: unknown) => Validation<{ content: string }> {
   let calls = 0;
   return (input) => {
@@ -684,8 +688,9 @@ export function makeTestFileValidator(
     const bad = disallowedImports(content, allow);
     const file = path ?? (typeof given?.path === "string" ? given.path : "");
     const unparsable = syntaxError(file, content);
-    // Checked every time: a relative import of nothing is a suite that never loads.
-    const missing = resolve && file ? unresolvedRelativeImports(content, file, resolve.exists) : [];
+    // Checked every time, against the target the rebase will anchor on rather than the
+    // specifier as written: a relative import of nothing is a suite that never loads.
+    const missing = resolve && file ? unresolvedRelativeImports(content, file, resolve.exists, resolve.siblings) : [];
     // First answer only: a pattern check is a nudge, and a spec that insists may be right.
     // Asked later, it would drop a file whose only repair went to a syntax error.
     const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content), ...moduleSyntaxLint(file, content, runner)] : [];
@@ -801,9 +806,11 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
   const criteria = all.filter((c) => (c.kind ?? "code") !== "unverifiable" && !c.notApplicable && !c.supersededBy && (!only || only.has(c.id)));
   const [diff, tree] = await Promise.all([
     (deps.fetchDiff ?? defaultFetchDiff)(install, repo, run.prNumber),
-    (deps.fetchTree ?? fetchTree)(repo, install, run.sha),
+    (deps.fetchTree ?? fetchRepoTree)(repo, install, run.sha),
   ]);
-  const paths = tree.filter((e) => e.type === "blob").map((e) => e.path);
+  // A capped listing is not an answer about what the repo holds, only about what was read.
+  const listed: RepoTree = Array.isArray(tree) ? { tree, truncated: false } : tree;
+  const paths = listed.tree.filter((e) => e.type === "blob").map((e) => e.path);
   const treePaths = new Set(paths);
   const readFile = deps.readFile ?? defaultReadFile;
   const [headYml, packageJson, envExample] = await Promise.all([
@@ -859,6 +866,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
     criteria: planned,
     diff,
     treePaths,
+    treeComplete: !listed.truncated,
     setup,
     yml,
     ymlFrom: boot.from,
@@ -1043,8 +1051,12 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
           if (!headReads.has(p)) headReads.set(p, (deps.readFile ?? defaultReadFile)(install, repo, p, run.sha));
           return headReads.get(p)!;
         };
-        // A sibling planned in this batch is as real as a tree path once it is written.
-        const plannedPaths = new Set(survivors.flatMap((s) => [s.path, ...(s.rebaseFrom ? [s.rebaseFrom] : [])]));
+        // A sibling planned in this batch is as real as a tree path once it is written — but
+        // only where it IS written: a rebaseFrom is the path the model named, which nothing
+        // creates, so counting one would let a clamp land on a file that never exists.
+        const plannedPaths = new Set(survivors.map((s) => s.path));
+        const inRepo = (p: string) => ctx.treePaths.has(p) || plannedPaths.has(p);
+        const plannedSiblings = movedSiblings(survivors);
         const author = async (t: (typeof survivors)[number]) => {
           // Per test, not per run: the allow-list depends on t.runner and the pool runs
           // three of these at once.
@@ -1058,7 +1070,7 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
             },
             t.rebaseFrom ?? t.path,
             t.runner,
-            { exists: (p) => ctx.treePaths.has(p) || plannedPaths.has(p) }
+            ctx.treeComplete ? { exists: inRepo, siblings: plannedSiblings } : undefined
           );
           try {
             // vitest reads the Vite config when it has none of its own, and a Vite app keeps its
@@ -1100,7 +1112,13 @@ export async function runVerifyPlan(runId: string, deps: PlannerDeps = {}): Prom
         // Only here is the written set final — both planner batches, past policy,
         // retirement and authoring — so a sibling redirect can only point at a file
         // the runner actually writes. Any filter added after this reopens that bug.
-        const { tests: rebased, unresolved } = rebaseGeneratedContent(withContent);
+        const writtenPaths = new Set(withContent.map((t) => t.path));
+        const { tests: rebased, unresolved } = rebaseGeneratedContent(withContent, {
+          exists: ctx.treeComplete ? (p) => ctx.treePaths.has(p) || writtenPaths.has(p) : undefined,
+          // Survivors, not the written set: a twin dropped while its body was authored still
+          // makes its origin ambiguous, so the referrer is reported rather than redirected.
+          claimed: survivors,
+        });
         // Minting the id here keeps buildCommands(finalTests) from ever running
         // against a stale array or ids that no longer exist.
         const finalTests: PlanTest[] = rebased.map((t) => ({

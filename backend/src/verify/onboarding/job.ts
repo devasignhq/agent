@@ -344,6 +344,256 @@ export function adoptedPath(generatedPath: string): string | null {
   return `${ADOPT_DIR}/${rel}`;
 }
 
+// Committing a test is not the same as joining the suite: a repo whose test
+// command names its own paths never looks at ADOPT_DIR. Reach is read, not assumed.
+export type SuiteScript = { manifest: string; script: string };
+export type SuiteReach = { covered: boolean | null; scripts: SuiteScript[] };
+
+const SUITE_PROBE_LIMIT = 6;
+const ENV_ASSIGN = /^[A-Za-z_]\w*=/;
+const WRAPPERS = new Set(["npm", "npx", "pnpm", "pnpx", "yarn", "bun", "bunx", "exec", "dlx", "run", "cross-env", "dotenv", "--"]);
+const FLAG_TAKES_VALUE =
+  /^(?:--(?:import|loader|require|experimental-loader|env-file|test-reporter|test-reporter-destination|test-name-pattern|test-shard|test-concurrency|reporter|outputFile|max-workers|maxWorkers|runner|environment)|-r|-w)$/;
+const CONFIG_FLAG = /^(?:--config|-c)$/;
+// A named project, workspace or shard runs part of the suite, so the framework's default
+// include is no longer what decides.
+const NARROWING_FLAG = /^(?:--(?:project|projects|workspace|shard|dir|root|rootDir|testPathPattern|testPathPatterns)|-p)$/;
+const VITEST_SUBCOMMANDS = new Set(["run", "watch", "related", "bench", "list", "dev", "typecheck"]);
+const VITEST_CONFIGS = ["vitest.config.ts", "vitest.config.mts", "vitest.config.js", "vitest.config.mjs", "vitest.workspace.ts", "vitest.workspace.js", "vite.config.ts", "vite.config.mts", "vite.config.js"];
+const JEST_CONFIGS = ["jest.config.ts", "jest.config.mts", "jest.config.js", "jest.config.mjs", "jest.config.cjs", "jest.config.json"];
+const CONFIG_READ_BUDGET = 24;
+// Repo-authored patterns are never compiled as regexes here, and a glob is only expanded
+// when it is small enough that a miss cannot backtrack for long.
+const REGEX_META = /[\\^$*+?()[\]{}|]/;
+const globSafe = (g: string) => g.length <= 120 && (g.match(/\*/g)?.length ?? 0) <= 6;
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function splitCommands(script: string): string[][] {
+  const out: string[][] = [];
+  let cur: string[] = [];
+  let tok = "";
+  let quoted = false;
+  let quote: string | null = null;
+  const pushTok = () => {
+    if (tok || quoted) cur.push(tok);
+    tok = "";
+    quoted = false;
+  };
+  const endCmd = () => {
+    pushTok();
+    if (cur.length) out.push(cur);
+    cur = [];
+  };
+  for (let i = 0; i < script.length; i++) {
+    const c = script[i];
+    if (quote) {
+      if (c === quote) quote = null;
+      else tok += c;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      quote = c;
+      quoted = true;
+      continue;
+    }
+    if (c === " " || c === "\t" || c === "\n" || c === "\r") {
+      pushTok();
+      continue;
+    }
+    if (c === "&" || c === "|" || c === ";") {
+      endCmd();
+      if (script[i + 1] === c) i++;
+      continue;
+    }
+    tok += c;
+  }
+  endCmd();
+  return out;
+}
+
+/** Whether a shell glob (or a bare directory) selects a repo-relative path. */
+export function globSelects(glob: string, path: string): boolean {
+  const g = glob.replace(/^\.\//, "").replace(/\/+$/, "");
+  if (!g) return false;
+  let re = "";
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*" && g[i + 1] === "*") {
+      i++;
+      if (g[i + 1] === "/") {
+        i++;
+        re += "(?:[^/]*/)*";
+      } else re += ".*";
+    } else if (c === "*") re += "[^/]*";
+    else if (c === "?") re += "[^/]";
+    else if (c === "{" && g.indexOf("}", i) > i) {
+      const end = g.indexOf("}", i);
+      re += `(?:${g.slice(i + 1, end).split(",").map(escapeRe).join("|")})`;
+      i = end;
+    } else re += escapeRe(c);
+  }
+  // Adjacent wildcards would make a miss backtrack over every split of the path.
+  return new RegExp(`^(?:${re.replace(/(?:\.\*)+/g, ".*")})(?:/|$)`).test(path);
+}
+
+// `defaults` marks a framework invocation with no path filters: its default include covers
+// the destination unless a config narrows it, and `config` is the one the command names.
+type Select = { v: boolean | null; defaults?: "vitest" | "jest"; config?: string };
+
+function commandSelects(tokens: string[], rel: string, scripts: Record<string, string>, depth: number): Select {
+  let i = 0;
+  while (i < tokens.length && (ENV_ASSIGN.test(tokens[i]) || WRAPPERS.has(tokens[i]))) i++;
+  const name = (tokens[i] ?? "").split("/").pop() ?? "";
+  if (!name) return { v: null };
+  if (depth < 2 && typeof scripts[name] === "string") return scriptSelect(scripts[name], rel, scripts, depth + 1);
+  const args: string[] = [];
+  let config: string | undefined;
+  let narrowed = false;
+  for (let j = i + 1; j < tokens.length; j++) {
+    const tok = tokens[j];
+    if (!tok.startsWith("-")) {
+      args.push(tok);
+      continue;
+    }
+    const eq = tok.indexOf("=");
+    const flag = eq > 0 ? tok.slice(0, eq) : tok;
+    const inline = eq > 0 ? tok.slice(eq + 1) : null;
+    if (CONFIG_FLAG.test(flag)) config = inline ?? tokens[++j] ?? "";
+    else if (NARROWING_FLAG.test(flag)) narrowed = true;
+    else if (inline === null && FLAG_TAKES_VALUE.test(flag)) j++;
+  }
+  if (name === "vitest") {
+    const filters = args.filter((a, k) => !(k === 0 && VITEST_SUBCOMMANDS.has(a)));
+    if (narrowed) return { v: null };
+    if (!filters.length) return { v: true, defaults: "vitest", config };
+    return { v: filters.some((f) => rel.includes(f.replace(/^\.\//, ""))) };
+  }
+  if (name === "jest") {
+    if (narrowed) return { v: null };
+    if (!args.length) return { v: true, defaults: "jest", config };
+    // jest matches these as regexes, but they come out of the PR head's package.json, so
+    // only a plain fragment is read — anything with regex syntax in it is unreadable.
+    const pats = args.map((a) => a.replace(/^\.\//, ""));
+    if (pats.some((a) => !REGEX_META.test(a) && rel.includes(a))) return { v: true };
+    return { v: pats.some((a) => REGEX_META.test(a)) ? null : false };
+  }
+  if (name === "node") {
+    if (!tokens.includes("--test") || !args.length) return { v: null };
+    return { v: args.every(globSafe) ? args.some((a) => globSelects(a, rel)) : null };
+  }
+  return { v: null };
+}
+
+function scriptSelect(script: string, rel: string, scripts: Record<string, string>, depth: number): Select {
+  let unknown = false;
+  let negative = false;
+  for (const tokens of splitCommands(script)) {
+    if (!tokens.length) continue;
+    const r = commandSelects(tokens, rel, scripts, depth);
+    if (r.v === true) return r;
+    if (r.v === false) negative = true;
+    else unknown = true;
+  }
+  return { v: unknown ? null : negative ? false : null };
+}
+
+/** true: this script runs `rel`. false: it names paths and none of them is `rel`. null: unreadable. */
+export function scriptSelects(script: string, rel: string, scripts: Record<string, string> = {}): boolean | null {
+  return scriptSelect(script, rel, scripts, 0).v;
+}
+
+/**
+ * Whether anything could narrow the framework's default include. A config we cannot parse
+ * is not a config that covers everything, so its mere presence is enough to stop the claim.
+ */
+async function configNarrows(
+  read: (path: string) => Promise<string | null>,
+  dir: string,
+  fw: "vitest" | "jest",
+  pkg: any,
+  budget: { left: number },
+  named?: string
+): Promise<boolean> {
+  const at = (p: string) => (dir ? `${dir}/${p}` : p);
+  // A command that names its own config is running that config, whatever it holds.
+  if (named !== undefined) return true;
+  if (fw === "jest" && pkg?.jest) return true;
+  for (const name of fw === "vitest" ? VITEST_CONFIGS : JEST_CONFIGS) {
+    if (budget.left <= 0) return true;
+    budget.left--;
+    if ((await read(at(name))) !== null) return true;
+  }
+  return false;
+}
+
+/** Do the repo's own `npm test` commands run files committed at `dests`? */
+export async function suiteReach(read: (path: string) => Promise<string | null>, packageDirs: string[], dests: string[]): Promise<SuiteReach> {
+  const all = [...new Set(["", ...packageDirs])];
+  const dirs = all.slice(0, SUITE_PROBE_LIMIT);
+  const scripts: SuiteScript[] = [];
+  const budget = { left: CONFIG_READ_BUDGET };
+  const configs = new Map<string, Promise<boolean>>();
+  // Per destination, across every manifest: "does the suite run this file" is a question
+  // one command can answer yes to on its own, so the verdicts join as a disjunction.
+  const verdict = new Map<string, boolean | null>();
+  const merge = (dest: string, v: boolean | null) => {
+    const cur = verdict.get(dest);
+    if (cur === true) return;
+    if (v === true || cur === undefined) verdict.set(dest, v);
+    else if (v === null) verdict.set(dest, null);
+  };
+  for (const dir of dirs) {
+    const manifest = dir ? `${dir}/package.json` : "package.json";
+    const text = await read(manifest);
+    let pkg: any = null;
+    try {
+      pkg = text ? JSON.parse(text) : null;
+    } catch {
+      pkg = null;
+    }
+    const script = pkg?.scripts?.test;
+    if (typeof script !== "string" || !script.trim()) continue;
+    scripts.push({ manifest, script });
+    for (const dest of dests) {
+      // A package's command runs from its own directory: a file outside it is not something
+      // that command declines, it is something it never sees. Silence, not a verdict.
+      if (dir && !dest.startsWith(`${dir}/`)) continue;
+      const sel = scriptSelect(script, dir ? dest.slice(dir.length + 1) : dest, pkg.scripts, 0);
+      if (sel.v === true && sel.defaults) {
+        const key = `${dir}\u0000${sel.defaults}\u0000${sel.config ?? ""}`;
+        if (!configs.has(key)) configs.set(key, configNarrows(read, dir, sel.defaults, pkg, budget, sel.config));
+        merge(dest, (await configs.get(key)!) ? null : true);
+      } else merge(dest, sel.v);
+    }
+  }
+  // No command that could even see a destination is not silence about it: nothing runs it.
+  const seen = dests.map((d) => (verdict.has(d) ? verdict.get(d)! : scripts.length ? false : null));
+  const covered = !scripts.length ? null : seen.some((v) => v === false) ? false : seen.some((v) => v === null) ? null : true;
+  // A package list this stopped short of could hold the command that does run them.
+  return { covered: covered === false && all.length > dirs.length ? null : covered, scripts };
+}
+
+const inlineCode = (s: string) => s.replace(/[\r\n]+/g, " ").replace(/`/g, "'").slice(0, 200);
+
+export function adoptLead(prNumber: number, base: string, reach: SuiteReach): string[] {
+  const head = `These tests were generated by DevAsign from PR #${prNumber}'s acceptance criteria and ran in CI as verification evidence.`;
+  if (reach.covered === true) return [`${head} Merging this into \`${base}\` keeps them as part of the repository's own suite.`];
+  if (reach.covered === null)
+    return [
+      `${head} Merging this into \`${base}\` commits them under \`${ADOPT_DIR}/\`. If this repository's test command selects files by path, add that directory so they run with the rest of the suite.`,
+    ];
+  return [
+    `${head} Merging this into \`${base}\` commits them, but no test command in this repository selects \`${ADOPT_DIR}/\`, so they will not run with the rest of the suite:`,
+    "",
+    ...reach.scripts.slice(0, 4).map((s) => `- \`${s.manifest}\` — \`${inlineCode(s.script)}\``),
+    ...(reach.scripts.length > 4 ? [`- …and ${reach.scripts.length - 4} more`] : []),
+    "",
+    // Not "or move them": their relative imports were re-anchored for ADOPT_DIR's depth and
+    // are committed verbatim, so a destination at any other depth breaks every one of them.
+    `Add \`${ADOPT_DIR}/**\` to one of those commands' paths. Their relative imports are anchored ${ADOPT_DIR.split("/").length} directories deep, so a different destination would have to sit at the same depth.`,
+  ];
+}
+
 /** Open a PR (against the reviewed PR's branch) that commits generated tests into the customer's suite. */
 export async function adoptGeneratedTests(runId: string, testIds: string[] | null, deps: OnboardDeps = {}): Promise<{ status: "opened" | "skipped" | "failed"; prNumber?: number; prUrl?: string; reason?: string }> {
   const d = { ...defaults, ...deps };
@@ -357,13 +607,21 @@ export async function adoptGeneratedTests(runId: string, testIds: string[] | nul
   try {
     const base = await d.prHeadRef(install, repo, run.prNumber);
     if (!base) return { status: "failed", reason: "could not resolve the PR's branch" };
+    const detected = repo.verify?.detected;
+    let reach: SuiteReach = { covered: null, scripts: [] };
+    try {
+      const dirs = [...(detected?.packages ?? []), ...(detected?.monorepo?.packages ?? [])];
+      reach = await suiteReach((p) => d.read(install, repo, p, run.sha), dirs, tests.map((t) => adoptedPath(t.path)!));
+    } catch (err) {
+      console.warn(`[verify] adopt-test suite probe failed for run ${run.id}:`, err);
+    }
     const branch = `devasign/adopt-${run.id.slice(0, 8)}`;
     await d.ensureBranch(install, repo, branch, run.sha);
     for (const t of tests) await d.putFile(install, repo, branch, adoptedPath(t.path)!, t.content!, `Adopt DevAsign test for criteria ${t.criterionIds.join(", ")}`);
     const pr = await d.createPr(install, repo, {
       title: `Adopt DevAsign generated tests (PR #${run.prNumber})`,
       body: [
-        `These tests were generated by DevAsign from PR #${run.prNumber}'s acceptance criteria and ran in CI as verification evidence. Merging this into \`${base}\` keeps them as part of the repository's own suite.`,
+        ...adoptLead(run.prNumber, base, reach),
         "",
         ...tests.map((t) => `- \`${adoptedPath(t.path)}\` — criteria ${t.criterionIds.join(", ")} (${t.level}, ${t.runner})`),
         "",
