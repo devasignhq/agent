@@ -3,6 +3,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { appSourceFor, entryPaths, localImports, persistKey, sourceUnderTest, waysIn } from "./app-source.js";
+import { appRoutes } from "./app-routes.js";
 
 const files: Record<string, string> = {
   "index.html": '<div id="root"></div>\n<script type="module" src="/src/main.tsx"></script>\n',
@@ -32,17 +33,19 @@ test("localImports resolves relative specifiers to tree paths: extensionless, in
   assert.deepEqual(localImports("src/a.ts", "import x from '../../outside'\n", tree), [], "nothing above the repo root");
 });
 
-test("the author sees the test's targets first, then the entry and the screens it mounts, and never a test file", async () => {
+test("the author sees the test's targets first, then the entry and the screens between it and them, and never a test file", async () => {
   const out = await appSourceFor({ targetFiles: ["src/components/Pill.tsx", "src/components/Canvas.test.tsx"], tree, read });
+  // App and Canvas are the path from the entry down to Pill; Palette and the two below Pill are
+  // not, so they rank behind the store the flow's own screens read.
   assert.deepEqual(out.map((f) => f.path), [
     "src/components/Pill.tsx",
     "src/main.tsx",
-    "src/components/Deep.tsx",
     "src/App.tsx",
-    "src/components/Deeper.tsx",
     "src/components/Canvas.tsx",
-    "src/components/Palette.tsx",
     "src/store/index.ts",
+    "src/components/Deep.tsx",
+    "src/components/Deeper.tsx",
+    "src/components/Palette.tsx",
   ]);
   assert.ok(out.every((f) => !f.truncated));
 });
@@ -87,6 +90,114 @@ test("labels, templates and sample data reach the author after the screens that 
   ]);
   const screensOnly = await appSourceFor({ targetFiles: [], tree: appTree, read: appRead, limits: { files: 4, fileChars: 12_000, totalChars: 90_000, depth: 8 } });
   assert.deepEqual(screensOnly.map((f) => f.path), ["src/main.tsx", "src/App.tsx", "src/components/Palette.tsx", "src/components/TemplateMenu.tsx"], "a short budget drops data before screens");
+});
+
+// Measured against this repo's own frontend: nine screens spent all 140K characters, the crawl
+// stopped before routes.ts, and the spec went to "/" — which redirects to /agent, not /workflow.
+const screen = (name: string) => `export function ${name}() {}\n// ${"x".repeat(13_000)}\n`;
+const routed: Record<string, string> = {
+  "index.html": '<script type="module" src="/src/main.tsx"></script>\n',
+  "src/main.tsx": "import App from './app'\n",
+  "src/app.tsx": [
+    "import { ROUTE_PATHS, DEFAULT_ROUTE } from './routes'",
+    "import { WorkflowPage } from './screen-workflow'",
+    "import { AgentPage } from './screen-agent'",
+    "import { BountiesPage } from './screen-bounties'",
+    "import { TestsPage } from './screen-tests'",
+    "import { FundPage } from './screen-fund-bounty'",
+    "  <Route path={ROUTE_PATHS.workflow} element={<WorkflowPage />} />",
+    "  <Route path={ROUTE_PATHS.agent} element={<AgentPage />} />",
+    "  <Route path={ROUTE_PATHS.bounty} element={<BountiesPage />} />",
+    "  <Route path={ROUTE_PATHS.tests} element={<TestsPage />} />",
+    "  <Route path={ROUTE_PATHS.root} element={<Navigate to={DEFAULT_ROUTE} replace />} />",
+  ].join("\n"),
+  "src/routes.ts": "export const ROUTE_PATHS = { agent: '/agent', workflow: '/workflow', tests: '/tests', bounty: '/bounty', root: '/' } as const\nexport const DEFAULT_ROUTE = ROUTE_PATHS.agent\n",
+  "src/screen-workflow.tsx": `import { SEED_REPO } from './seed'\nexport function WorkflowPage() {}\n// ${"w".repeat(3_000)}\n`,
+  "src/seed.ts": "export const SEED_REPO = 'ephemeral-tester/demo'\n",
+  "src/screen-agent.tsx": screen("AgentPage"),
+  "src/screen-bounties.tsx": screen("BountiesPage"),
+  "src/screen-tests.tsx": screen("TestsPage"),
+  "src/screen-fund-bounty.tsx": screen("FundPage"),
+};
+const routedTree = new Set(Object.keys(routed));
+const routedRead = async (p: string) => routed[p] ?? null;
+const unopened = ["src/screen-agent.tsx", "src/screen-bounties.tsx", "src/screen-tests.tsx", "src/screen-fund-bounty.tsx"];
+
+test("the module holding the app's URLs outranks the screens the flow never opens", async () => {
+  const decisive = ["src/screen-workflow.tsx", "src/routes.ts", "src/app.tsx", "src/main.tsx", "src/seed.ts"];
+  const totalChars = decisive.reduce((n, f) => n + routed[f].length, 0);
+  const out = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree: routedTree, read: routedRead, limits: { files: 60, fileChars: 12_000, totalChars, depth: 8 } });
+  assert.equal(out[0].path, "src/screen-workflow.tsx", "the target first");
+  assert.deepEqual(out.map((f) => f.path).slice(1).sort(), decisive.slice(1).sort(), "then the URL table and the way to the target — the four screens it never opens no longer fit");
+  assert.ok(out.every((f) => !f.truncated));
+  assert.match(out.find((f) => f.path === "src/routes.ts")!.content, /workflow: '\/workflow'/, "the URL literal itself: app.tsx names only ROUTE_PATHS.workflow");
+  assert.equal(out.reduce((n, f) => n + f.content.length, 0), totalChars, "and the budget is still spent to the full");
+  const roomy = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree: routedTree, read: routedRead });
+  assert.deepEqual(roomy.map((f) => f.path).slice(5), unopened, "with room to spare they come last, not first");
+});
+
+test("a shell too long to show whole still shows the route table at its foot", async () => {
+  // The measured failure: app.tsx was 45K with its <Route> table at 39K, so head-first truncation
+  // cut every route and the prompt's URL map came out empty on the app it was written for.
+  const bloated: Record<string, string> = { ...routed, "src/app.tsx": `${"// shell\n".repeat(1_200)}${routed["src/app.tsx"]}` };
+  const tree = new Set(Object.keys(bloated));
+  const read = async (p: string) => bloated[p] ?? null;
+  const out = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree, read, limits: { files: 60, fileChars: 4_000, totalChars: 90_000, depth: 8 } });
+  const shell = out.find((f) => f.path === "src/app.tsx")!;
+  assert.ok(shell.content.length <= 4_000, "still inside its per-file budget");
+  assert.ok(shell.truncated, "and still announced as partial — the author must not read it as the whole shell");
+  const urls = appRoutes(out, tree);
+  assert.deepEqual(urls.map((r) => r.path).sort(), ["/", "/agent", "/bounty", "/tests", "/workflow"], "every URL survives the cut");
+  assert.deepEqual(urls.find((r) => r.path === "/"), { path: "/", redirectsTo: "/agent" }, "including the redirect that left specs waiting on the wrong screen");
+});
+
+test("a route table at the foot survives on the last of the shared budget, not just the per-file one", async () => {
+  // The window was sized against fileChars and then head-sliced by `add` to the smaller room the
+  // shared budget had left — which is the head-first cut the window exists to avoid.
+  const shell = `${"// shell\n".repeat(1_200)}<Routes>
+  <Route path="/workflow" element={<WorkflowPage />} />
+  <Route path="/agent" element={<AgentPage />} />
+  <Route path="/" element={<Navigate to="/agent" replace />} />
+</Routes>
+`;
+  const f: Record<string, string> = {
+    "index.html": '<script type="module" src="/src/main.tsx"></script>\n',
+    "src/main.tsx": "import App from './app'\n",
+    "src/app.tsx": shell,
+    "src/screen-workflow.tsx": `export function WorkflowPage() {}\n// ${"w".repeat(9_000)}\n`,
+  };
+  const t = new Set(Object.keys(f));
+  const limits = { files: 60, fileChars: 12_000, totalChars: 11_600, depth: 8 };
+  const out = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree: t, read: async (p) => f[p] ?? null, limits });
+  const emitted = out.find((x) => x.path === "src/app.tsx")!;
+  assert.ok(emitted.content.length < limits.fileChars, "the target ahead of it left under a per-file budget to spend");
+  assert.ok(emitted.truncated, "and it is still announced as partial");
+  assert.deepEqual(appRoutes(out, t).map((r) => r.path), ["/workflow", "/agent", "/"], "every URL survives the squeeze");
+});
+
+test("the labels the shell imports keep their rank when the shell is the file holding the routes", async () => {
+  // The shell is normally the <Route> table too, and ranking it as one took it out of the seed
+  // for the plain modules, dropping its labels past every screen to the foot of the list.
+  const f: Record<string, string> = {
+    "index.html": '<script type="module" src="/src/main.tsx"></script>\n',
+    "src/main.tsx": "import App from './app'\n",
+    "src/app.tsx": "import { WorkflowPage } from './screen-workflow'\nimport { LABELS } from './labels'\n  <Route path=\"/workflow\" element={<WorkflowPage />} />\n  <Route path=\"/agent\" element={<AgentPage />} />\n  <Route path=\"/\" element={<Navigate to=\"/agent\" replace />} />\n",
+    "src/screen-workflow.tsx": "import { WorkflowChild } from './workflow-child'\nexport function WorkflowPage() {}\n",
+    "src/workflow-child.tsx": "export function WorkflowChild() {}\n",
+    "src/labels.ts": "export const LABELS = { save: 'Save graph' }\n",
+  };
+  const out = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree: new Set(Object.keys(f)), read: async (p) => f[p] ?? null });
+  assert.deepEqual(out.map((x) => x.path), ["src/screen-workflow.tsx", "src/app.tsx", "src/main.tsx", "src/labels.ts", "src/workflow-child.tsx"]);
+});
+
+test("a PR that changed a dozen large screens cannot starve the URL table", async () => {
+  // Measured on this repo's own frontend: twelve changed files of 12K spent the whole budget
+  // between them, routes.ts fell off the end and the URL map went from 21 lines to none.
+  const targets = ["src/screen-workflow.tsx", ...unopened];
+  const spent = targets.reduce((n, f) => n + Math.min(routed[f].length, 12_000), 0);
+  const out = await appSourceFor({ targetFiles: targets, tree: routedTree, read: routedRead, limits: { files: 60, fileChars: 12_000, totalChars: spent, depth: 8 } });
+  assert.deepEqual(out.slice(0, targets.length).map((f) => f.path), targets, "the targets still come first");
+  assert.deepEqual(appRoutes(out, routedTree).map((r) => r.path), ["/workflow", "/agent", "/bounty", "/tests", "/"], "and the URL map survives a budget the targets alone would spend");
 });
 
 test("a unit or component test's author sees the runner's config, then the code it calls and what that imports, two levels down", async () => {
