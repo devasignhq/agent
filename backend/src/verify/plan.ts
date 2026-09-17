@@ -31,6 +31,7 @@ import type { DetectedSetup, DevasignVerifyConfig, PlanCommand, PlanTest, TestLe
 import { codeSpans, isRewritableSpecifier } from "./code-spans.js";
 import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, importTarget, resolvesInRepo, unresolvedRelativeImports, withoutExt, type ImportAllowList, type ImportTargetOpts } from "./imports.js";
 import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
+import { routeLines } from "./app-routes.js";
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
 import { specLint } from "./spec-lint.js";
@@ -760,6 +761,7 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
       ? `- strategy version: ${t.strategyVersion} — the previous version of this test was flaky; take a different approach (explicit state assertions, role/test-id selectors, isolated data).`
       : "",
     "",
+    ...(t.runner === "playwright" ? routeLines(source, ctx.treePaths) : []),
     ...(t.runner === "playwright" ? waysIn(source, ctx.treePaths) : []),
     ...(!source.length
       ? []
@@ -771,6 +773,15 @@ export function buildTestFilePrompt(ctx: PlanContext, t: RawPlanTest & { strateg
             ...source.map(renderSourceFile),
           ]),
     ...(t.runner === "playwright" ? libraryNotes(ctx.setup.dependencies) : []),
+    // Measured on a real run: 9 of 18 spec timeouts sat on "/" waiting for a screen mounted at
+    // another URL, and 3 more asserted on seeded data the spec had invented.
+    ...(t.runner === "playwright"
+      ? [
+          "## Writing the spec",
+          "Navigate to the URL that renders the flow — take it from the URL map above when one is listed. `/` is often a redirect, and a spec that waits there for a screen mounted elsewhere times out.",
+          "Assert only on data the spec creates itself or that the source shows is built in. Never invent an entity name; where a list only has to be non-empty, discover its first row instead of naming one.",
+        ]
+      : []),
     `Write the complete file and submit it with ${planTestFileTool.name}.`,
   ]
     .filter(Boolean)

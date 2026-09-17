@@ -3,6 +3,7 @@
 // components it mounts; for a unit or component test, the code it calls and what that imports.
 import { posix } from "node:path";
 import { isTestPath } from "./detect.js";
+import { isRouteModule, routeWindow } from "./app-routes.js";
 
 export type SourceFile = { path: string; content: string; truncated: boolean };
 
@@ -10,6 +11,8 @@ export type SourceFile = { path: string; content: string; truncated: boolean };
 export const APP_SOURCE_LIMITS = { files: 60, fileChars: 12_000, totalChars: 140_000, depth: 8 };
 
 const UI_FILE = /\.(tsx|jsx|vue|svelte)$/;
+// Above this a route table is a shell with its screens in it, which earns its place on its own.
+const ROUTE_TABLE_CHARS = 4_000;
 const CODE_EXTS = [".tsx", ".ts", ".jsx", ".js", ".vue", ".svelte", ".mjs"];
 const ENTRY_CANDIDATES = [
   "src/main.tsx", "src/main.jsx", "src/main.ts", "src/main.js", "src/index.tsx", "src/index.jsx",
@@ -44,29 +47,48 @@ export function localImports(from: string, content: string, tree: ReadonlySet<st
 
 type Limits = typeof APP_SOURCE_LIMITS;
 type Reader = (path: string) => Promise<string | null>;
+type Read = { path: string; content: string };
+
+// Reads each path once, never a test file or vendored code.
+function fetcher(tree: ReadonlySet<string>, readFile: Reader) {
+  const seen = new Set<string>();
+  const take = async (paths: string[], cap = Infinity): Promise<Read[]> => {
+    // Deduped before the seen check: two files in one batch often import the same module.
+    const fresh = [...new Set(paths)]
+      .filter((p) => tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"))
+      .slice(0, Math.max(0, cap));
+    for (const p of fresh) seen.add(p);
+    const read = await Promise.all(fresh.map(async (path) => ({ path, content: await readFile(path) })));
+    return read.filter((f): f is Read => typeof f.content === "string");
+  };
+  return { seen, take };
+}
+
+// One budget, spent in the order it is handed files; the file that crosses it is truncated,
+// because a half-read screen still names its buttons.
+function spender(lim: Limits, reserved = 0) {
+  const out: SourceFile[] = [];
+  let total = 0;
+  let held = reserved;
+  const room = (pinned = false) => Math.min(lim.fileChars, lim.totalChars - total - (pinned ? 0 : held));
+  const add = (f: Read & { partial?: boolean }, pinned = false): boolean => {
+    const fits = room(pinned);
+    if (out.length >= lim.files || fits <= 0) return false;
+    const truncated = f.content.length > fits || f.partial === true;
+    out.push({ path: f.path, content: truncated ? f.content.slice(0, fits) : f.content, truncated });
+    total += Math.min(f.content.length, fits);
+    if (pinned) held = Math.max(0, held - Math.min(f.content.length, fits));
+    return true;
+  };
+  return { out, add, room };
+}
 
 // The files an author is shown, read breadth first within one budget.
 function crawler(tree: ReadonlySet<string>, readFile: Reader, lim: Limits) {
-  const seen = new Set<string>();
-  const out: SourceFile[] = [];
-  let total = 0;
-  const take = async (paths: string[]) => {
-    // Deduped before the seen check: two files in one batch often import the same module.
-    const fresh = [...new Set(paths)].filter((p) => tree.has(p) && !seen.has(p) && !isTestPath(p) && !p.startsWith(".devasign/") && !p.includes("node_modules/"));
-    for (const p of fresh) seen.add(p);
-    const read = await Promise.all(fresh.map(async (path) => ({ path, content: await readFile(path) })));
-    return read.filter((f): f is { path: string; content: string } => typeof f.content === "string");
-  };
-  const add = (f: { path: string; content: string }): boolean => {
-    const room = Math.min(lim.fileChars, lim.totalChars - total);
-    if (out.length >= lim.files || room <= 0) return false;
-    const truncated = f.content.length > room;
-    out.push({ path: f.path, content: truncated ? f.content.slice(0, room) : f.content, truncated });
-    total += Math.min(f.content.length, room);
-    return true;
-  };
+  const { take } = fetcher(tree, readFile);
+  const { out, add } = spender(lim);
   // Breadth first; false once the budget is spent.
-  const crawl = async (start: Array<{ path: string; content: string }>, follow: (path: string) => boolean): Promise<boolean> => {
+  const crawl = async (start: Read[], follow: (path: string) => boolean): Promise<boolean> => {
     let frontier = start;
     for (let depth = 0; frontier.length; depth++) {
       const next: string[] = [];
@@ -82,16 +104,107 @@ function crawler(tree: ReadonlySet<string>, readFile: Reader, lim: Limits) {
   return { out, take, crawl };
 }
 
-/** The test's own target files first, then the screens from the entry down, then the modules they import. */
+/**
+ * The source a browser test's author is shown, emitted by relevance rather than by breadth: the
+ * test's targets, the module holding the app's URLs, the entry and the screens between it and a
+ * target, the labels and sample data those import, then whatever screens are left.
+ */
 export async function appSourceFor(args: { targetFiles: string[]; tree: ReadonlySet<string>; read: Reader; limits?: Limits }): Promise<SourceFile[]> {
-  const { out, take, crawl } = crawler(args.tree, args.read, args.limits ?? APP_SOURCE_LIMITS);
+  const lim = args.limits ?? APP_SOURCE_LIMITS;
+  const { seen, take } = fetcher(args.tree, args.read);
   const isUi = (p: string) => UI_FILE.test(p);
+  const order: string[] = [];
+  const content = new Map<string, string>();
+  const imports = new Map<string, string[]>();
+  // Discovery no longer stops when the budget does: nine unrelated screens spent every character
+  // before the crawl ever reached routes.ts, so the spec guessed at "/" and hung on /agent.
+  const walk = async (start: Read[], follow: (path: string) => boolean) => {
+    let frontier = start;
+    for (let depth = 0; frontier.length; depth++) {
+      const next: string[] = [];
+      for (const f of frontier) {
+        order.push(f.path);
+        content.set(f.path, f.content);
+        const imp = localImports(f.path, f.content, args.tree);
+        imports.set(f.path, imp);
+        next.push(...imp.filter(follow));
+      }
+      if (depth >= lim.depth) break;
+      frontier = await take(next, lim.files - seen.size);
+    }
+  };
   const indexHtml = args.tree.has("index.html") ? await args.read("index.html") : null;
-  if (!(await crawl(await take([...args.targetFiles, ...entryPaths(args.tree, indexHtml)]), isUi))) return out;
-  // Then the plain modules the screens import: labels, templates and sample data live there,
-  // and a name the author never saw is still a guess however well it knows the screen.
-  const imported = out.flatMap((f) => localImports(f.path, f.content, args.tree)).filter((p) => !isUi(p));
-  await crawl(await take(imported), (p) => !isUi(p));
+  const entries = entryPaths(args.tree, indexHtml);
+  await walk(await take([...args.targetFiles, ...entries], lim.files), isUi);
+  const plain = order.flatMap((p) => imports.get(p) ?? []).filter((p) => !isUi(p));
+  await walk(await take(plain, lim.files - seen.size), (p) => !isUi(p));
+
+  const claimed = new Set<string>();
+  const ranks: string[][] = [];
+  const rank = (paths: string[]) => {
+    const fresh = paths.filter((p) => content.has(p) && !claimed.has(p));
+    for (const p of fresh) claimed.add(p);
+    ranks.push(fresh);
+    return fresh;
+  };
+  // Plain modules pulled in transitively — a template's data often sits one import past the
+  // module the screen names.
+  const plainUnder = (from: string[]): string[] => {
+    const out: string[] = [];
+    const queue = from.flatMap((p) => imports.get(p) ?? []).filter((p) => !isUi(p));
+    const walked = new Set<string>();
+    for (let i = 0; i < queue.length; i++) {
+      const p = queue[i];
+      if (walked.has(p) || !content.has(p)) continue;
+      walked.add(p);
+      if (!claimed.has(p)) out.push(p);
+      queue.push(...(imports.get(p) ?? []).filter((q) => !isUi(q)));
+    }
+    return out;
+  };
+  const targets = rank(order.filter((p) => args.targetFiles.includes(p)));
+  const routeModules = new Set(order.filter((p) => isRouteModule(p, content.get(p)!)));
+  rank([...routeModules]);
+  const reaching = targets.length ? ancestors(targets, imports) : null;
+  const shell = rank(order.filter((p) => entries.includes(p) || (reaching ? reaching.has(p) && isUi(p) : isUi(p))));
+  rank(plainUnder([...targets, ...shell]));
+  const rest = rank(order.filter(isUi));
+  rank(plainUnder(rest));
+  // Anything the rules above missed is still worth its characters, and silently dropping a file
+  // the crawl paid to read would show up only as a spec guessing at a name.
+  rank(order);
+
+  // Twelve changed screens spend the whole budget on their own, and the thousand characters
+  // naming the URLs are worth more to a spec than the twelfth screen's last page.
+  const pinned = new Set([...routeModules].filter((p) => content.get(p)!.length <= ROUTE_TABLE_CHARS));
+  const { out, add, room } = spender(lim, [...pinned].reduce((n, p) => n + content.get(p)!.length, 0));
+  let owed = pinned.size;
+  for (const p of ranks.flat()) {
+    const c = content.get(p)!;
+    // Windowed against the room `add` will actually grant, not fileChars: with less of the shared
+    // budget left it head-sliced the window and cut off the very <Route> table it had kept.
+    const shown = routeModules.has(p) ? routeWindow(c, room(pinned.has(p))) : c;
+    if (add({ path: p, content: shown, partial: shown.length < c.length }, pinned.has(p))) {
+      if (pinned.has(p)) owed--;
+    } else if (!owed) break;
+  }
+  return out;
+}
+
+// Which of the crawled files lead to a target, however deep: the screens a test's flow passes
+// through on its way there, told apart from the screens it never opens.
+function ancestors(targets: string[], imports: ReadonlyMap<string, string[]>): Set<string> {
+  const parents = new Map<string, string[]>();
+  for (const [p, imp] of imports) for (const q of imp) parents.set(q, [...(parents.get(q) ?? []), p]);
+  const out = new Set<string>();
+  const queue = [...targets];
+  for (let i = 0; i < queue.length; i++) {
+    for (const p of parents.get(queue[i]) ?? []) {
+      if (out.has(p)) continue;
+      out.add(p);
+      queue.push(p);
+    }
+  }
   return out;
 }
 
