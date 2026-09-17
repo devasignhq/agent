@@ -615,6 +615,45 @@ export async function updatePullRequestBranch(installationId: number, owner: str
 // devasign/enable-verification must not arrive as devasign%2Fenable-verification.
 const refSegment = (ref: string) => encodeURIComponent(ref).replace(/%2F/g, "/");
 
+/** Fire `synchronize` on a PR whose branch update-branch would no-op: already up to date means
+ *  GitHub pushes nothing, so the setup PR's own CI never re-runs. Same tree, new commit, no force. */
+export async function pushEmptyCommit(
+  installationId: number,
+  owner: string,
+  name: string,
+  branch: string,
+  message: string
+): Promise<string | null> {
+  const seg = refSegment(`heads/${branch}`);
+  try {
+    const ref = await gh<{ object?: { sha?: string } }>(installationId, `/repos/${owner}/${name}/git/ref/${seg}`);
+    const parent = ref?.object?.sha;
+    if (typeof parent !== "string") return null;
+
+    const head = await gh<{ tree?: { sha?: string } }>(installationId, `/repos/${owner}/${name}/git/commits/${parent}`);
+    const tree = head?.tree?.sha;
+    if (typeof tree !== "string") return null;
+
+    const made = await gh<{ sha?: string }>(installationId, `/repos/${owner}/${name}/git/commits`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message, tree, parents: [parent] }),
+    });
+    const sha = made?.sha;
+    if (typeof sha !== "string") return null;
+
+    await gh(installationId, `/repos/${owner}/${name}/git/refs/${seg}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ sha, force: false }),
+    });
+    return sha;
+  } catch (err) {
+    console.warn(`[github] failed to push an empty commit to ${owner}/${name}@${branch}:`, err);
+    return null;
+  }
+}
+
 /** A compare response's behind_by, or null when it did not state one. 0 is what callers
  *  read as "caught up, safe to write", so an unrecognised body must never become one. */
 export function behindByFrom(cmp: unknown): number | null {
