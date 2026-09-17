@@ -1,5 +1,8 @@
 // Ways a Playwright spec can be written that fail at run time however right the rest of it is.
 // Each was seen live; the author is told once, with the fix, as it is for a syntax error.
+import { codeSpans } from "./code-spans.js";
+import type { TestRunner } from "./contract.js";
+
 const EDGE = /Edge from|react-flow__edge|rf__edge-/;
 const DECLARED = /\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]*)/g;
 // A helper's text, up to the first line that only closes a block.
@@ -8,6 +11,13 @@ const CLICK = /\.(?:click|dblclick)\(/;
 const NARROWED = /\.(?:first|last)\(\)|\.nth\(\s*\d+\s*\)/;
 const WAITS_VISIBLE = /\.waitFor\((?!\s*\{[^)]*state:\s*['"](?:attached|detached|hidden)['"])|toBeVisible\(/;
 const UNSCOPED_ROLE = /\bpage\.getByRole\(\s*(['"])[a-z]+\1\s*\)\s*\.(?:first|last|nth)\(/;
+// The wait and the state it is given in one match, so the word alone — a fixture, a mocked body,
+// a comment about this rule — is not a wait. `\s*` spans the newline a formatter leaves behind.
+const IDLE_STATE = /\.waitForLoadState\s*\(\s*(['"`])networkidle\1/g;
+// `waitUntil` only waits when a navigation is handed it; one nested call deep is as far as a
+// formatted argument list goes.
+const IDLE_NAV = /\.(?:goto|reload|setContent|waitForURL|waitForNavigation|goBack|goForward)\s*\((?:[^()]|\([^()]*\))*?\bwaitUntil\s*:\s*(['"`])networkidle\1/g;
+const HARD_SLEEP = /\.waitForTimeout\s*\(|\bnew Promise\s*\((?:[^()]|\([^()]*\)){0,80}?setTimeout\s*\(/g;
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const uses = (name: string) => new RegExp(`(?<![\\w$])${esc(name)}(?![\\w$])`);
@@ -19,9 +29,49 @@ const derives = (name: string) => new RegExp(`(?<![\\w$])${esc(name)}\\s*(?:\\(|
 const code = (l: string) =>
   l.replace(/`(?:[^`\\]|\\.)*`|'(?:[^'\\\n]|\\.)*'|"(?:[^"\\\n]|\\.)*"/g, (s) => (s[0] === "`" ? (s.match(/\$\{[^}]*\}/g) ?? []).join(" ") : "''"));
 
+// The runner settles it where the planner knows one; otherwise any mention of the package,
+// since a spec may `require` it or take its fixtures from a repo module.
+const isSpec = (content: string, runner?: TestRunner) => (runner ? runner === "playwright" : /@playwright\/test/.test(content));
+
+/** The first match in code position: the same text inside a string, a comment or a regex is data. */
+function inCode(content: string, spans: Uint8Array, re: RegExp): RegExpMatchArray | null {
+  for (const m of content.matchAll(re)) if (m.index != null && spans[m.index] === 1) return m;
+  return null;
+}
+
+// As written, through the end of the match, so a call a formatter wrapped reads as one line.
+function quoteMatch(content: string, m: RegExpMatchArray): string {
+  const at = m.index ?? 0;
+  const from = content.lastIndexOf("\n", at) + 1;
+  const nl = content.indexOf("\n", at + m[0].length);
+  return `\`${content.slice(from, nl < 0 ? content.length : nl).replace(/\s+/g, " ").trim().slice(0, 120)}\``;
+}
+
+function neverReturns(content: string, spans: Uint8Array): string[] {
+  const idle = inCode(content, spans, IDLE_STATE) ?? inCode(content, spans, IDLE_NAV);
+  if (!idle) return [];
+  return [
+    `it waits for the network to fall idle (${quoteMatch(content, idle)}): \`networkidle\` resolves only once 500ms pass with no connection in flight, and any app that holds one open by design — a Server-Sent Events stream, a websocket, a poll — never reaches that, so the wait burns the whole timeout; Playwright discourages it for that reason. Wait for what the step should produce instead — \`await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()\` retries until the page settles — rather than swapping in \`page.waitForTimeout()\``,
+  ];
+}
+
+/** The waits that can never return, whatever the repository: refused on every answer, repairs included. */
+export function specLintCertain(content: string, runner?: TestRunner): string[] {
+  if (!isSpec(content, runner)) return [];
+  return neverReturns(content, codeSpans(content).code);
+}
+
 /** What a Playwright spec will trip over at run time; empty for anything else. */
-export function specLint(content: string, packages: Iterable<string>): string[] {
-  if (!/from\s+['"]@playwright\/test['"]/.test(content)) return [];
+export function specLint(content: string, packages: Iterable<string>, runner?: TestRunner): string[] {
+  if (!isSpec(content, runner)) return [];
+  const spans = codeSpans(content).code;
+  const problems = neverReturns(content, spans);
+  const slept = inCode(content, spans, HARD_SLEEP);
+  if (slept) {
+    problems.push(
+      `it sleeps for a fixed time (${quoteMatch(content, slept)}): nothing about the app's timing is fixed, so the sleep either ends before the app is ready or spends the run's budget waiting after it was. Wait for what the step should produce — \`await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()\` returns as soon as it is there and keeps retrying until then`
+    );
+  }
   // A statement a formatter split over lines — a chain, or a declaration broken after its
   // `=` or `=>` — reads as one.
   const lines = content
@@ -30,7 +80,6 @@ export function specLint(content: string, packages: Iterable<string>): string[] 
     .split("\n")
     .filter((l) => !/^\s*\/\//.test(l));
   const quote = (l: string) => `\`${l.trim().slice(0, 120)}\``;
-  const problems: string[] = [];
   const unscoped = lines.find((l) => UNSCOPED_ROLE.test(l));
   if (unscoped) {
     problems.push(

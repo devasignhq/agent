@@ -33,7 +33,7 @@ import { buildImportAllowList, disallowedImports, hasRenderStack, IMPORT_LEAD, i
 import { appSourceFor, sourceUnderTest, waysIn, type SourceFile } from "./app-source.js";
 import { libraryNotes } from "./library-notes.js";
 import { syntaxError } from "./syntax.js";
-import { specLint } from "./spec-lint.js";
+import { specLint, specLintCertain } from "./spec-lint.js";
 import { historyLint } from "./history-lint.js";
 import { moduleSyntaxLint } from "./module-syntax-lint.js";
 import { withDomEnvironment } from "./dom-env.js";
@@ -692,8 +692,12 @@ export function makeTestFileValidator(
     // specifier as written: a relative import of nothing is a suite that never loads.
     const missing = resolve && file ? unresolvedRelativeImports(content, file, resolve.exists, resolve.siblings) : [];
     // First answer only: a pattern check is a nudge, and a spec that insists may be right.
-    // Asked later, it would drop a file whose only repair went to a syntax error.
-    const patterns = calls++ === 0 ? [...specLint(content, allow.names), ...historyLint(content), ...moduleSyntaxLint(file, content, runner)] : [];
+    // Asked later, it would drop a file whose only repair went to a syntax error. A wait that
+    // can never return is not a nudge — it is refused every time, as `unparsable` is.
+    const patterns =
+      calls++ === 0
+        ? [...specLint(content, allow.names, runner), ...historyLint(content), ...moduleSyntaxLint(file, content, runner)]
+        : specLintCertain(content, runner);
     if (!bad.length && !unparsable && !patterns.length && !missing.length) return { ok: true, value: { content } };
     // Reported every failure, empty included, so a later syntax-only miss is not blamed on a package.
     onReject?.(bad, missing);
