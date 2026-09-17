@@ -175,6 +175,21 @@ test("a route table at the foot survives on the last of the shared budget, not j
   assert.deepEqual(appRoutes(out, t).map((r) => r.path), ["/workflow", "/agent", "/"], "every URL survives the squeeze");
 });
 
+test("the labels the shell imports keep their rank when the shell is the file holding the routes", async () => {
+  // The shell is normally the <Route> table too, and ranking it as one took it out of the seed
+  // for the plain modules, dropping its labels past every screen to the foot of the list.
+  const f: Record<string, string> = {
+    "index.html": '<script type="module" src="/src/main.tsx"></script>\n',
+    "src/main.tsx": "import App from './app'\n",
+    "src/app.tsx": "import { WorkflowPage } from './screen-workflow'\nimport { LABELS } from './labels'\n  <Route path=\"/workflow\" element={<WorkflowPage />} />\n  <Route path=\"/agent\" element={<AgentPage />} />\n  <Route path=\"/\" element={<Navigate to=\"/agent\" replace />} />\n",
+    "src/screen-workflow.tsx": "import { WorkflowChild } from './workflow-child'\nexport function WorkflowPage() {}\n",
+    "src/workflow-child.tsx": "export function WorkflowChild() {}\n",
+    "src/labels.ts": "export const LABELS = { save: 'Save graph' }\n",
+  };
+  const out = await appSourceFor({ targetFiles: ["src/screen-workflow.tsx"], tree: new Set(Object.keys(f)), read: async (p) => f[p] ?? null });
+  assert.deepEqual(out.map((x) => x.path), ["src/screen-workflow.tsx", "src/app.tsx", "src/main.tsx", "src/labels.ts", "src/workflow-child.tsx"]);
+});
+
 test("a PR that changed a dozen large screens cannot starve the URL table", async () => {
   // Measured on this repo's own frontend: twelve changed files of 12K spent the whole budget
   // between them, routes.ts fell off the end and the URL map went from 21 lines to none.

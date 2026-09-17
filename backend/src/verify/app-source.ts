@@ -164,10 +164,12 @@ export async function appSourceFor(args: { targetFiles: string[]; tree: Readonly
   };
   const targets = rank(order.filter((p) => args.targetFiles.includes(p)));
   const routeModules = new Set(order.filter((p) => isRouteModule(p, content.get(p)!)));
-  rank([...routeModules]);
+  const tables = rank([...routeModules]);
   const reaching = targets.length ? ancestors(targets, imports) : null;
   const shell = rank(order.filter((p) => entries.includes(p) || (reaching ? reaching.has(p) && isUi(p) : isUi(p))));
-  rank(plainUnder([...targets, ...shell]));
+  // Seeded from the tables too: the shell is usually the file holding the <Route> table, and
+  // without it the labels it imports fell past every screen to the bottom of the list.
+  rank(plainUnder([...targets, ...tables, ...shell]));
   const rest = rank(order.filter(isUi));
   rank(plainUnder(rest));
   // Anything the rules above missed is still worth its characters, and silently dropping a file
