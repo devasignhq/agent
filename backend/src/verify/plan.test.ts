@@ -487,6 +487,39 @@ test("a browser spec that clicks a line is sent back once with how to select it,
   }
 });
 
+test("a browser spec that waits for the network to fall idle is sent back, and refused again rather than shipped", async () => {
+  // Dispatch 35200873400: this line timed out at 30.5s on all three attempts, three runs running.
+  const idle = "import { test, expect } from '@playwright/test'\ntest('boot', async ({ page }) => {\n  await page.goto('/')\n  await page.waitForLoadState(\"networkidle\")\n  await expect(page.getByRole('heading', { name: 'Dashboard' })).toBeVisible()\n})\n";
+  const fixed = idle.replace('  await page.waitForLoadState("networkidle")\n', "");
+  for (const second of [fixed, idle]) {
+    const s = seed([crit("1", "ui")]);
+    const { deps: d, bodyPrompts } = deps({
+      tree: [...BASE_TREE, ".devasign.yml"],
+      files: { ".devasign.yml": BOOT_YML },
+      diff: UI_DIFF,
+      responses: [{ tests: [gen("1", "e2e", { path: "e2e/boot.spec.ts" })] }],
+      bodies: { "e2e/boot.spec.ts": [{ path: "e2e/boot.spec.ts", content: idle }, { path: "e2e/boot.spec.ts", content: second }] },
+    });
+    try {
+      await runVerifyPlan(s.run.id, d);
+      assert.equal(bodyPrompts.length, 2, "exactly one repair pass");
+      const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify")!;
+      const attempts = (log.meta as any).attempts.bodies[`${GENERATED_TEST_PREFIX}/e2e/boot.spec.ts`];
+      assert.match(attempts[0].reason, /waits for the network to fall idle \(`await page\.waitForLoadState\("networkidle"\)`\).*toBeVisible\(\)/);
+      const plan = db.find("verifyPlans", (p) => p.runId === s.run.id)!;
+      assert.ok(!plan.tests.some((t) => /networkidle/.test(t.content ?? "")), "the wait the rule is named for never reaches the runner");
+      if (second === fixed) assert.equal(plan.tests.find((t) => t.level === "e2e")?.content, fixed, "a repaired spec ships");
+      else {
+        // Unlike the nudges above, this one is checked on the repair too: it can never pass.
+        assert.match(attempts[1].reason, /waits for the network to fall idle/);
+        assert.deepEqual(plan.unverifiable.map((u) => [u.criterionId, u.reason]), [["1", PLAN_UNUSABLE_REASON]], "a spec that insists loses its criterion instead");
+      }
+    } finally {
+      s.cleanup();
+    }
+  }
+});
+
 test("a test that reads git history is sent back once with what a one-commit checkout holds, and ships if the author insists", async () => {
   // The live miss: CI's depth-1 checkout has no HEAD^, so this errored on all three attempts.
   const diffs = 'import { test } from "node:test";\nimport { execFileSync } from "node:child_process";\ntest("the lockfile was updated", () => {\n  execFileSync("git", ["diff", "--name-only", "HEAD^", "HEAD"]);\n});\n';
