@@ -5323,15 +5323,23 @@ input[type="checkbox"]:focus-visible { outline: 1px solid var(--accent); outline
 .wf-verify-dot.verified { background: var(--lemon); }
 .wf-verify-dot.pr_open, .wf-verify-dot.pr_merged { background: var(--info); }
 .wf-verify-dot.pr_closed { background: var(--warn); }
-.wf-verify-pop {
-  position: absolute; top: calc(100% + 8px); right: 0; z-index: 60; width: 360px;
-  background: var(--bg-1); border: 1px solid var(--line-2);
-  box-shadow: 0 12px 32px rgba(0, 0, 0, 0.55), 0 2px 6px rgba(0, 0, 0, 0.4);
-  animation: notifPopIn 120ms ease-out;
+/* Modal drawer, not a popover: the browser-tests checklist is long enough that a
+   popover clipped it. Chrome reuses the node panel's head/body/field classes. */
+.wf-verify-scrim {
+  position: fixed; inset: 0; z-index: 80;
+  background: rgba(6, 8, 10, 0.6);
+  display: flex; justify-content: flex-end;
+  animation: drawerFade 160ms ease-out;
 }
-.wf-verify-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--line); }
-.wf-verify-title { font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; color: var(--fg-dim); }
-.wf-verify-body { padding: 12px 14px; display: flex; flex-direction: column; gap: 10px; }
+.wf-verify-drawer {
+  width: 460px; max-width: 100vw; height: 100%;
+  background: var(--bg-1); border-left: 1px solid var(--line-2);
+  display: flex; flex-direction: column; min-height: 0;
+  box-shadow: -20px 0 60px rgba(0, 0, 0, 0.45);
+  animation: drawerSlide 220ms cubic-bezier(0.2, 0.7, 0.2, 1);
+}
+.wf-verify-drawer:focus { outline: none; }
+.wf-verify-body { display: flex; flex-direction: column; gap: 12px; }
 .wf-verify-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
 .wf-verify-link { display: inline-flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 11px; color: var(--fg-dim); text-decoration: underline; }
 .wf-verify-facts { display: grid; grid-template-columns: auto 1fr; gap: 4px 12px; margin: 0; font-size: 11px; line-height: 1.45; }
@@ -5348,6 +5356,55 @@ input[type="checkbox"]:focus-visible { outline: 1px solid var(--accent); outline
   background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='10' viewBox='0 0 16 16' fill='none' stroke='%23a0a6ad' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 6l5 5 5-5'/%3E%3C/svg%3E");
   background-repeat: no-repeat; background-position: right 8px center;
 }
+.wf-verify-foot {
+  border-top: 1px solid var(--line); background: var(--bg-1);
+  padding: 12px 16px; display: flex; flex-direction: column; gap: 8px;
+}
+.wf-verify-foot .btn.primary { margin-left: auto; }
+
+/* Browser-tests checklist: one row per thing that must be settled before CI can
+   boot the app, with the control that settles it directly underneath. */
+.wf-check-title {
+  margin: 6px 0 0; font-family: var(--mono); font-size: 10px; letter-spacing: 0.06em;
+  text-transform: uppercase; color: var(--fg-dim); font-weight: 400;
+}
+.wf-check { border-top: 1px solid var(--line); padding: 10px 0 2px; display: flex; flex-direction: column; gap: 6px; }
+.wf-check.is-ask { border-left: 2px solid var(--warn); padding-left: 10px; }
+.wf-check-head { display: flex; align-items: center; gap: 8px; }
+.wf-check-dot { width: 6px; height: 6px; flex: 0 0 auto; background: var(--fg-faint); }
+.wf-check-dot.ok { background: var(--lemon); }
+.wf-check-dot.warn { background: var(--warn); }
+.wf-check-label { font-family: var(--mono); font-size: 12px; color: var(--fg); }
+.wf-check-ask {
+  margin-left: auto; font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--warn);
+}
+.wf-check-text { font-size: 11px; line-height: 1.5; }
+.wf-check-hint { font-size: 10px; line-height: 1.45; }
+.wf-check-err { font-family: var(--mono); font-size: 11px; color: var(--danger); line-height: 1.45; }
+.wf-check-cmd { display: flex; gap: 8px; font-size: 11px; color: var(--fg-dim); line-height: 1.5; }
+.wf-check-cmd-k {
+  flex: 0 0 84px; font-family: var(--mono); font-size: 10px; letter-spacing: 0.05em;
+  text-transform: uppercase; color: var(--fg-mute); padding-top: 1px;
+}
+.wf-check-links { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; font-size: 11px; }
+
+/* Answer controls. .wf-field's own top margin is for a stacked panel, not for a
+   grid of three boxes on one line. */
+.wf-answer { display: flex; flex-direction: column; gap: 8px; }
+.wf-answer .wf-field { margin-top: 0; gap: 4px; }
+.wf-answer .wf-field .input, .wf-answer .wf-field .textarea { font-size: 11px; }
+.wf-answer-opts { flex-direction: row; flex-wrap: wrap; gap: 4px 16px; }
+.wf-answer-grid { display: grid; grid-template-columns: 1fr 1fr 72px; gap: 8px; }
+.wf-answer-grid.two { grid-template-columns: 1fr 1fr; }
+.wf-answer-row {
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+  padding: 8px; background: var(--bg-2); border: 1px solid var(--line);
+}
+.wf-answer-row > * { width: 100%; }
+.wf-answer-row > .btn { width: auto; }
+.wf-opt { display: flex; align-items: center; gap: 7px; font-size: 11px; color: var(--fg-dim); cursor: pointer; }
+.wf-opt input { accent-color: var(--accent); }
 
 /* Mobile: drop the floating overlay and stack the sections; canvas is desktop-first. */
 .is-mobile .wf-layout { display: flex; flex-direction: column; overflow: auto; }
@@ -5367,6 +5424,8 @@ input[type="checkbox"]:focus-visible { outline: 1px solid var(--accent); outline
 .is-mobile .wf-head-stat { display: none; }
 .is-mobile .wf-verify-btn { padding: 0 8px; }
 .is-mobile .wf-verify-btn > span { display: none; }
+.is-mobile .wf-verify-drawer { width: 100vw; border-left: 0; }
+.is-mobile .wf-answer-grid, .is-mobile .wf-answer-grid.two { grid-template-columns: 1fr; }
 /* Narrow desktop windows: shed the header details before anything overflows. */
 @media (max-width: 1280px) { .wf-head-stat { display: none; } }
 @media (max-width: 1080px) { .wf-verify-state { display: none; } .wf-repo-btn { max-width: 220px; } }

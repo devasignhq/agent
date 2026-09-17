@@ -255,6 +255,8 @@ export type Repository = {
     detected?: unknown;
     onboarding: {
       state: "none" | "pr_open" | "pr_closed" | "pr_merged" | "verified";
+      // A follow-up setup PR on an onboarded repo moves only this flag, not `state`.
+      setupPrOpen?: boolean;
       prNumber?: number;
       prUrl?: string;
       mode?: "separate" | "extend";
@@ -503,6 +505,62 @@ export type VerifyBoot = {
   // Which probe this verdict came from, so a request can tell its own answer from another's.
   probeId?: string;
 };
+// The verify block the open setup PR proposes today (backend/src/verify/contract.ts).
+export type SetupProposed = {
+  e2e?: "auto" | "always" | "never";
+  install?: string;
+  build?: string;
+  start?: string;
+  url?: string;
+  ready?: string;
+  seed?: string;
+  timeout?: number;
+  servers?: Array<{ name: string; start: string; url: string; ready?: string }>;
+  services?: Array<{ name: "postgres" | "mysql" | "redis"; image?: string; env?: Record<string, string> }>;
+  login?: {
+    script?: string;
+    check?: string;
+    // Legacy strategies still parse, but nothing applies them — the panel says so.
+    strategy?: "none" | "storage_state" | "form" | "cookie";
+    storageState?: string;
+    form?: { url: string; user: string; pass: string; submit?: string };
+  };
+  env?: string[];
+};
+// What the form may offer: every package here is one the generator can build a command for.
+// A null secret list means the App could not read them, which is not the same as "none".
+export type SetupCandidates = {
+  packages: Array<{
+    dir: string;
+    pm: "npm" | "pnpm" | "yarn" | "bun";
+    framework: "vite" | "next" | "server" | null;
+    scripts: string[];
+    port?: number;
+    proxyPort?: number;
+  }>;
+  loginScripts: string[];
+  secretNames: string[] | null;
+  missingSecrets: string[] | null;
+  secretsUrl: string;
+};
+// Only what inference could not get right (backend/src/verify/setup-answers.ts). "none" clears
+// that key; omitting it keeps whatever inference chose.
+export type SetupAnswers = {
+  start?: { dir: string; script: string; port: number };
+  servers?: Array<{ dir: string; script: string; port: number; ready?: string }> | "none";
+  services?: Array<"postgres" | "mysql" | "redis">;
+  env?: string[];
+  login?: { script: string; check?: string } | "none";
+  e2e?: "auto" | "always" | "never";
+  timeout?: number;
+};
+export type SetupRecheckResult = {
+  ok: true;
+  pushed: boolean;
+  how?: "update_branch" | "empty_commit";
+  reason?: "no_setup_pr" | "no_installation" | "push_failed" | "cooldown";
+  retryAfterMs?: number;
+};
 export type VerifySetup = {
   onboarding: NonNullable<Repository["verify"]>["onboarding"];
   detected: { frameworks: Array<{ name: string; configPath?: string }>; existingWorkflows: string[]; services: string[] } | null;
@@ -515,6 +573,9 @@ export type VerifySetup = {
   probeUnavailable?: { cliVersion: string; at: number } | null;
   // Whether this repo's boot can be re-checked on demand, and why not when it can't.
   bootCheck?: { available: boolean; reason?: string };
+  // Absent on backends older than the answers form; proposed is null with no setup PR open.
+  proposed?: SetupProposed | null;
+  candidates?: SetupCandidates;
 };
 
 export type CriteriaRevision = {
@@ -1052,10 +1113,21 @@ export const api = {
     }),
   verifySetup: (repoId: string) =>
     request<VerifySetup>(`/api/repositories/${repoId}/verify/setup`),
-  requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string }) =>
+  requestSetupPr: (repoId: string, opts: { mode: "separate" | "extend"; workflow?: string; answers?: SetupAnswers }) =>
     request<{ ok: true; queued: true }>(`/api/repositories/${repoId}/verify/setup-pr`, { method: "POST", body: JSON.stringify(opts) }),
   requestBootCheck: (repoId: string) =>
     request<{ ok: true; dispatched: boolean; reason?: string }>(`/api/repositories/${repoId}/verify/boot-check`, { method: "POST" }),
+  // The per-repo cooldown answers 429 with its own body, and the panel renders it as "try again
+  // in Ns", so it comes back as data; a limiter 429 carries no reason and stays an error.
+  requestSetupRecheck: async (repoId: string): Promise<SetupRecheckResult> => {
+    try {
+      return await request<SetupRecheckResult>(`/api/repositories/${repoId}/verify/recheck`, { method: "POST" });
+    } catch (err) {
+      const body = err instanceof ApiError && err.status === 429 ? (err.body as SetupRecheckResult | null) : null;
+      if (body?.reason !== "cooldown") throw err;
+      return body;
+    }
+  },
   criteriaRevisions: (reviewId: string) =>
     request<{ revisions: CriteriaRevision[]; repo: { owner: string; name: string }; prNumber: number }>(`/api/reviews/${reviewId}/criteria-revisions`),
 
