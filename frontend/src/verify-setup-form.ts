@@ -112,6 +112,7 @@ function serversItem(
   servers: Array<{ name: string }> | null,
   startDir: string | null,
   packages: SetupCandidates["packages"],
+  unseen: boolean,
 ): ChecklistItem {
   if (servers === null) return item("servers", "Servers", "mute", "Not checked yet");
   if (servers.length) {
@@ -119,7 +120,7 @@ function serversItem(
     return item("servers", "Servers", "ok", `${servers.length === 1 ? "1 server" : `${servers.length} servers`}: ${names}`);
   }
   const extra = packages.filter((p) => p.framework === "server" && p.dir !== startDir).map((p) => p.dir);
-  if (!extra.length) return item("servers", "Servers", "mute", "None — the app boots on its own");
+  if (!extra.length) return item("servers", "Servers", "mute", unseen ? "Not checked yet" : "None — the app boots on its own");
   const text =
     extra.length === 1
       ? `${extra[0]} looks like a server the app needs — add it or say there is none`
@@ -200,7 +201,7 @@ export function checklistItems(setup: VerifySetup): ChecklistItem[] {
   const unseen = !pr && (!!yml || state === "pr_merged" || state === "verified" || !packages.length);
   return [
     startItem(yml, packages),
-    serversItem(serverView(setup), parseStart(yml?.start)?.dir ?? null, packages),
+    serversItem(serverView(setup), parseStart(yml?.start)?.dir ?? null, packages, unseen),
     servicesItem(setup, pr, unseen),
     secretsItem(setup.candidates, pr),
     loginItem(setup.candidates, pr, unseen),

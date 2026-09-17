@@ -438,10 +438,10 @@ function VerifySetupDrawer({ repo, onClose, opener }: { repo: Repository; onClos
             {probe && !saidByRow(probe.line) && <div className={probe.tone === "warn" ? "t-warn" : probe.tone === "mute" ? "mute" : undefined}>{probe.line}</div>}
             {bootCheck.evidence && (
               <div className={bootCheck.evidence.tone === "warn" ? "t-warn" : "mute"}>
-                {bootCheck.evidence.line}
-                {bootCheck.evidence.links.map((l) => (
+                {!saidByRow(bootCheck.evidence.line) && bootCheck.evidence.line}
+                {bootCheck.evidence.links.map((l, i) => (
                   <React.Fragment key={l.href}>
-                    {" · "}
+                    {(i > 0 || !saidByRow(bootCheck.evidence.line)) && " · "}
                     <a className="wf-verify-link" href={l.href} target="_blank" rel="noreferrer">{l.label} <Icon name="external" size={10} /></a>
                   </React.Fragment>
                 ))}

@@ -452,6 +452,17 @@ test("servers the panel knows only by name are never answered away", () => {
   assert.equal(serversLocked(setupOf({ browserTests: branchYml(), candidates: twoPackages })), null);
 });
 
+test("a repo nothing has been read for does not claim it needs no servers", () => {
+  // Seen rendered against the ephemeral backend: three rows read "Not checked yet" and this one
+  // read "None — the app boots on its own", which nothing had established.
+  const blank = row(setupOf({ candidates: cand() }), "servers");
+  assert.equal(blank.text, "Not checked yet");
+  assert.equal(blank.tone, "mute");
+  // A repo whose packages HAVE been read, and which runs no server among them, still says so.
+  const read = row(setupOf({ candidates: cand({ packages: [pkg("frontend", ["dev"], { framework: "vite", port: 3001 })] }) }), "servers");
+  assert.equal(read.text, "None — the app boots on its own");
+});
+
 test("a port an untouched server holds is taken, whichever side of the form asks for it", () => {
   const s = setupOf({ proposed, candidates: twoPackages });
   const base = formFromSetup(s);
