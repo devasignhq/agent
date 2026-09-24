@@ -57,7 +57,7 @@ export ENVDIR=backend/deploy/gcp
   If that ever returns 403, or the deploy is refused (an org policy such as
   `run.managed.requireInvokerIam`), stop: the org policy needs an exception first.
 
-- [ ] **P2. Add `API_ORIGIN` to the env file.** This is safe to run more than once:
+- [x] **P2. Add `API_ORIGIN` to the env file.** Done 2026-09-24. Safe to run again:
   ```bash
   grep -q '^API_ORIGIN:' $ENVDIR/.env.cloudrun.yaml || echo "API_ORIGIN: \"$API\"" >> $ENVDIR/.env.cloudrun.yaml
   grep -E '^(API_ORIGIN|WEB_ORIGIN|CONTRIBUTOR_ORIGIN|GITHUB_APP_NAME):' $ENVDIR/.env.cloudrun.yaml
@@ -65,7 +65,7 @@ export ENVDIR=backend/deploy/gcp
   Expect `WEB_ORIGIN` to be `https://devasign-sponsor.vercel.app` and `GITHUB_APP_NAME` to be
   `devasign-agent`.
 
-- [ ] **P3. Confirm the latest `main` image built.** Open Cloud Build → History (region
+- [x] **P3. Confirm the latest `main` image built.** Done 2026-09-24: `api:latest` = `980ece2`, green. Re-check on cutover day. Open Cloud Build → History (region
   **global**) and check that the newest `devasign-api-main` run is green. Its short SHA should
   match the newest backend merge on `main`.
   ```bash
@@ -89,9 +89,11 @@ export ENVDIR=backend/deploy/gcp
   - **Linear** (Linear → Settings → API → your OAuth application): add
     `$API/api/auth/linear/callback` as an extra callback URL now.
 
-- [ ] **P6. Prepare the verify action change.** In `devasignhq/verify-action`, open a PR that
-  changes the `api-url` default in `action.yml` from `$RENDER` to `$API`, but don't merge it.
-  Customer workflows use `@v1`, so step 5 moves that tag.
+- [x] **P6. Prepare the verify action change.** Done:
+  [devasignhq/verify-action#3](https://github.com/devasignhq/verify-action/pull/3) changes the
+  `api-url` default (and the README table) from `$RENDER` to `$API`. **Leave it unmerged until
+  step 5.** Customer workflows use `@v1`, so step 5 moves that tag. Note that `v1` currently
+  points at `fa565e1` (an untagged sync from this repo), **not** at `v1.1.2`.
 
 - [ ] **P7. Check access.** You'll need GitHub org admin, the Stripe dashboard, Linear admin,
   both Vercel projects (sponsor and contributor) and the Render dashboard.
@@ -172,10 +174,13 @@ now be on `devasign-api-161910310724.us-east4.run.app`, marked `HttpOnly; Secure
 SameSite=None`. Sign in on the contributor app as well.
 
 ### 5. Move the verify action (2 min)
-Merge the P6 PR in `devasignhq/verify-action`, tag it, and move `v1`:
+Merge [devasignhq/verify-action#3](https://github.com/devasignhq/verify-action/pull/3), then,
+in a checkout of `devasignhq/verify-action`, tag it `v1.2.0` (it contains the untagged
+`fa565e1` sync as well as the URL change) and move `v1`:
 ```bash
-git tag v1.1.3 && git push origin v1.1.3
-git tag -f v1 v1.1.3 && git push -f origin v1
+git switch main && git pull
+git tag v1.2.0 && git push origin v1.2.0
+git tag -f v1 v1.2.0 && git push -f origin v1
 ```
 Verify: the next customer verify run calls `$API`, which you can see in the Cloud Run logs.
 
@@ -223,7 +228,9 @@ The durability barrier means every write Cloud Run acknowledged is already in Ne
 loads it all when it boots again.
 
 **Before step 6 (Render still running):** reverse steps 5 → 3. Point the webhooks, OAuth,
-Vercel `VITE_API_BASE` (then redeploy) and verify-action `v1` (back to `v1.1.2`) at `$RENDER`.
+Vercel `VITE_API_BASE` (then redeploy) and verify-action `v1` at `$RENDER`. For the action, move
+`v1` back to `fa565e1`, **not** `v1.1.2`, which would also undo the sync:
+`git tag -f v1 fa565e1 && git push -f origin v1`.
 Then:
 ```bash
 gcloud run services delete devasign-api --region=$REGION --project=$P --quiet
