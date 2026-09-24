@@ -29,7 +29,14 @@ export const reviewVerdictTool: StructuredTool = {
         type: "array",
         items: {
           type: "object",
-          properties: { id: str, met: { type: "boolean" }, evidence: str, evidenceCode: codeRef, suggestedChange: patch },
+          properties: {
+            id: str,
+            met: { type: "boolean" },
+            unverifiable: { type: "boolean" },
+            evidence: str,
+            evidenceCode: codeRef,
+            suggestedChange: patch,
+          },
           required: ["id", "met", "evidence"],
         },
       },
@@ -56,6 +63,21 @@ export const reviewVerdictTool: StructuredTool = {
       },
     },
     required: ["verdict", "summary", "criteria", "comments", "suggestions"],
+  },
+};
+
+// Not a structured-output tool: the review may call it before submitting its
+// verdict. Reads are pinned to the PR head commit and never leave the repo.
+export const readRepoFileTool: StructuredTool = {
+  name: "read_repo_file",
+  description:
+    "Read a file (or list a directory) from this repository as it exists at the PR head commit, including files the " +
+    "diff does not touch — e.g. .gitignore, .dockerignore, package.json, CI workflows, existing config. Use it before " +
+    "failing a criterion for lack of evidence outside the diff. Pass a repo-relative path; \"\" lists the root.",
+  inputSchema: {
+    type: "object",
+    properties: { path: str },
+    required: ["path"],
   },
 };
 

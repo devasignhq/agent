@@ -80,6 +80,9 @@ function criterionHeading(item: ReviewItem): string {
   if (item.scoreKind === "criterion-unevaluated") {
     return `### 📋 Acceptance criterion could not be evaluated${id}`;
   }
+  if (item.scoreKind === "criterion-unverifiable") {
+    return `### 🔍 Acceptance criterion could not be verified${id}`;
+  }
   return `### 📋 Acceptance criterion not met${id}`;
 }
 
@@ -171,6 +174,15 @@ export function threadDetailLines(item: ReviewItem, opts: ThreadBodyOpts = {}): 
           (item.reason || "").trim() ||
           "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it)."
         }`,
+        ""
+      );
+    } else if (item.scoreKind === "criterion-unverifiable") {
+      lines.push(
+        `**Why it couldn't be verified:** ${
+          (item.reason || "").trim() || "It depends on repository state outside the diff that the reviewer could not read."
+        }`,
+        "",
+        "_Not a failure: confirm it by hand._",
         ""
       );
     } else if (item.scoreKind === "criterion-regressed") {
