@@ -1,0 +1,36 @@
+# Run by the devasign-api-main Cloud Build trigger on pushes to main that touch backend/.
+# Deploy stays off (_DEPLOY=false) until the Render cutover; flip it on the trigger, not here.
+substitutions:
+  _REGION: us-east4
+  _SERVICE: devasign-api
+  _IMAGE: us-east4-docker.pkg.dev/${PROJECT_ID}/devasign-api/api
+  _DEPLOY: "false"
+
+steps:
+  - id: test
+    name: node:22-bookworm-slim
+    dir: backend
+    entrypoint: bash
+    args: ["-c", "npm ci --no-audit --no-fund && npm test"]
+
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args: ["build", "-t", "${_IMAGE}:${SHORT_SHA}", "-t", "${_IMAGE}:latest", "backend"]
+
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args: ["push", "--all-tags", "${_IMAGE}"]
+
+  # Image-only deploy: env, secrets, scaling and service account stay as configured on the service.
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        if [ "${_DEPLOY}" != "true" ]; then echo "Deploy disabled (_DEPLOY=${_DEPLOY}); image ${_IMAGE}:${SHORT_SHA} pushed only."; exit 0; fi
+        gcloud run deploy "${_SERVICE}" --image="${_IMAGE}:${SHORT_SHA}" --region="${_REGION}" --quiet
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+timeout: 1200s
