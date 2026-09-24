@@ -37,6 +37,8 @@
 //    "## PR state" CI results, similarity-scored code chunks) are omitted;
 //    prompts only reference sections our user prompts actually emit.
 
+import { UNTRUSTED_DIRECTIVE } from "../untrusted.js";
+
 // ---------------------------------------------------------------------------
 // Shared fragments
 // ---------------------------------------------------------------------------
@@ -410,6 +412,17 @@ export function reviewSystemPrompt(): string {
     "ONLY on positive evidence that it is unsatisfied — the changed code does the wrong thing, or the diff plainly " +
     "should implement the requirement and does not. When satisfaction plausibly depends on unchanged code you " +
     "cannot see and the diff gives no positive evidence either way, do not newly fail it; say so in `evidence`.\n" +
+    "- Repository state outside the diff is checkable, not assumed. When a criterion turns on something the diff " +
+    "does not show — ignore rules (.gitignore, .dockerignore, .gcloudignore), existing config, CI workflows, " +
+    "package.json fields, an existing file the change relies on — first use the `# Repository state outside the " +
+    "diff` section when present (its ignore verdicts are resolved like `git check-ignore -v`, including rules that " +
+    "predate this PR), then call `read_repo_file` when that tool is available. A rule that already exists at the PR " +
+    "head satisfies the criterion exactly as if the PR had added it; never ask the author to duplicate it. Cite the " +
+    "file and line you read in `evidence`.\n" +
+    "- If you still cannot determine the outside-the-diff state (no tool, the read failed, or the answer needs " +
+    "something no file shows), set `unverifiable: true` with `met: false` and say in `evidence` exactly what you " +
+    "could not check. \"I cannot confirm this from the provided context\" is an unverifiable verdict, never a failed " +
+    "one. Never use `unverifiable` for behavior the diff itself implements or omits — judge that directly.\n" +
     "- If the diff is marked truncated, treat any criterion you cannot verify as unchanged from its previous " +
     "verdict rather than newly failing it.\n" +
     "- Check the criteria for mutual consistency as you review: if two criteria cannot both be satisfied by any " +
@@ -534,7 +547,7 @@ export function reviewSystemPrompt(): string {
     "\n## Output contract\n" +
     "Answer only by calling the `submit_review_verdict` tool; its input is " +
     "{\"verdict\": \"passed\"|\"changes_requested\", \"summary\": string, " +
-    "\"criteria\": [{\"id\": string, \"met\": boolean, \"evidence\": string, " +
+    "\"criteria\": [{\"id\": string, \"met\": boolean, \"unverifiable\"?: boolean, \"evidence\": string, " +
     "\"evidenceCode\": {\"path\": string, \"startLine\": number, \"language\": string | null, \"code\": string} | null, " +
     "\"suggestedChange\": {\"path\": string, \"startLine\": number, \"original\": string, \"suggested\": string} | null}], " +
     "\"comments\": [{\"path\": string, \"line\": number, \"body\": string}], " +
@@ -543,7 +556,8 @@ export function reviewSystemPrompt(): string {
     "\"suggestedChange\"?: {\"path\": string, \"startLine\": number, \"original\": string, \"suggested\": string}, " +
     "\"fixPrompt\": string}]}. " +
     "The `summary` must be consistent with the criteria verdicts AND the suggestions emitted in this same " +
-    "response. Never use emoji in any text you output."
+    "response. Never use emoji in any text you output." +
+    UNTRUSTED_DIRECTIVE
   );
 }
 

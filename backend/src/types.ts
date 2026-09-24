@@ -675,6 +675,9 @@ export type Criterion = {
   text: string;
   met: boolean | null;
   evidence: string | null;
+  // met is null because the verdict turns on repository state the reviewer
+  // could not read — "confirm by hand", not "not met".
+  unverifiable?: boolean;
   // Optional structured evidence/fix (additive — absent on legacy rows).
   // evidenceCode backs any verdict tied to specific code; suggestedChange is
   // attached to UNMET criteria and cleared whenever a dispute flips `met`.

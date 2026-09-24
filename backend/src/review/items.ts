@@ -194,7 +194,9 @@ function criterionItem(
       : state === "regressed"
         ? "criterion-regressed"
         : unevaluated
-          ? "criterion-unevaluated"
+          ? c.unverifiable
+            ? "criterion-unverifiable"
+            : "criterion-unevaluated"
           : "criterion-unmet";
   return {
     key: itemKey({ criterionId: c.id, concern: c.text }),

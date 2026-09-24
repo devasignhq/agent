@@ -39,6 +39,7 @@ export type ReviewVerdict = {
   criteria: Array<{
     id: string;
     met: boolean;
+    unverifiable?: boolean;
     evidence: string;
     evidenceCode?: EvidenceCode | null;
     suggestedChange?: SuggestedChange | null;

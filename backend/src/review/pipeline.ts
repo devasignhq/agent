@@ -7,7 +7,7 @@
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { contributorNotifyTarget } from "../users.js";
-import { deletePRComment, dismissPRReview, dispatchWorkflow, gh, ghText, postPRCommentReturningId, updatePRComment } from "../github/app.js";
+import { deletePRComment, dismissPRReview, dispatchWorkflow, gh, ghText, isMissingFileError, postPRCommentReturningId, readFileAtRefStrict, updatePRComment } from "../github/app.js";
 import { createPRReview, updatePRReview } from "../github/review-comments.js";
 import { joinVerifyBranch, startVerifyBranch, type VerifyBranch } from "../verify/branch.js";
 import { blastRadiusCriteria } from "../verify/blast-radius.js";
@@ -21,8 +21,10 @@ import {
 import { latestRunForReview } from "../verify/runs.js";
 import { updateRun as updateVerifyRun } from "../verify/runs.js";
 import { progressCommentBody, reviewFailedCommentBody } from "./progress-comment.js";
-import { complete, completeStructured, completeWithMeta, currentUsage, detectVideoProvider, retryStructured, summarizeLinearFile, summarizeVideo, withModel, withUsage, type LLMMessage, type StructuredAttempt, type VideoSummary } from "../llm.js";
-import { reviewVerdictTool } from "./tools.js";
+import { complete, completeStructured, completeStructuredWithLookups, completeWithMeta, currentUsage, detectVideoProvider, retryStructured, summarizeLinearFile, summarizeVideo, withModel, withUsage, type LLMMessage, type StructuredAttempt, type VideoSummary } from "../llm.js";
+import { readRepoFileTool, reviewVerdictTool } from "./tools.js";
+import { gatherIgnoreFacts, renderRepoStateSection, runRepoRead, type ReadFileAt, type ReadRepoPath } from "./repo-state.js";
+import { boundaryNotice, newBoundaryToken } from "../untrusted.js";
 import { track } from "../statsig.js";
 import { broadcastVerdict } from "../integrations/broadcast.js";
 import { notifyForReview, pushNotification } from "../notifications.js";
@@ -118,7 +120,7 @@ import {
 } from "./criteria-format.js";
 import { effectiveWorkflow } from "./workflow.js";
 import { buildGuidanceSection } from "./guidance.js";
-import { prStateOf, resolveReviewEvent, resolveVerdictStatus, withMaintainerInstructions } from "./decisions.js";
+import { awaitsConfirmation, criterionOutcome, prStateOf, resolveReviewEvent, resolveVerdictStatus, withMaintainerInstructions } from "./decisions.js";
 import {
   criteriaSynthesisSystemPrompt,
   reviewSystemPrompt,
@@ -650,7 +652,14 @@ export async function runReviewJob(reviewId: string): Promise<void> {
 
     // c. Review the diff against the criteria. priorVerdicts anchors criteria an
     // earlier commit already satisfied so a follow-up commit doesn't re-fail them.
-    const verdict = await reviewDiff(review, context, criteria, priorVerdicts, wf.prompts?.review);
+    const verdict = await reviewDiff(
+      review,
+      context,
+      criteria,
+      priorVerdicts,
+      wf.prompts?.review,
+      install ? headRepoAccess(install.installationId, repo, review.headSha) : undefined
+    );
     // Match each criterion to its verdict by NORMALIZED id (trim + lowercase).
     // The review LLM occasionally echoes ids in a different case/whitespace than
     // synthesis produced ("c1" vs "C1"); a strict === match would silently drop
@@ -661,14 +670,16 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     );
     const filledCriteria: Criterion[] = criteria.map((c) => {
       const m = verdictById.get(String(c.id ?? "").trim().toLowerCase());
+      const outcome = criterionOutcome(m ?? {});
       return {
         ...c,
-        met: m?.met ?? null,
+        met: outcome.met,
+        unverifiable: outcome.unverifiable,
         evidence: m?.evidence ?? null,
         evidenceCode: m?.evidenceCode ?? null,
         // A fix only makes sense on an unmet criterion; drop anything the
         // model attached to a met one (the prompt says met → null already).
-        suggestedChange: m?.met === false ? m?.suggestedChange ?? null : null,
+        suggestedChange: outcome.met === false ? m?.suggestedChange ?? null : null,
       };
     });
     const liveCriteria = filledCriteria.filter((c) => !isRetiredCriterion(c));
@@ -1104,14 +1115,31 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // of REQUEST_CHANGES → COMMENT — lives in a pure helper so it's unit-tested
     // offline (decisions.test.ts). The internal `status` stays as computed; only
     // the GitHub review event is softened.
-    const { event: reviewEvent, postConversationReview, includeEndGoalCTA, downgradedToComment, securityBlockerHeld } =
-      resolveReviewEvent({
-        status,
-        specless,
-        blocking: wf.verdict.blocking,
-        endGoalAlreadyRequested: !!task.endGoalRequestedAt,
-        hasSecurityBlocker,
+    const {
+      event: reviewEvent,
+      postConversationReview,
+      includeEndGoalCTA,
+      downgradedToComment,
+      securityBlockerHeld,
+      confirmationPending,
+    } = resolveReviewEvent({
+      status,
+      specless,
+      blocking: wf.verdict.blocking,
+      endGoalAlreadyRequested: !!task.endGoalRequestedAt,
+      hasSecurityBlocker,
+      awaitingConfirmation: awaitsConfirmation({
+        hasBlocker,
+        liveCount: liveCriteria.length,
+        metCount: liveCriteria.filter((c) => c.met === true).length,
+        unverifiableCount: liveCriteria.filter((c) => c.unverifiable).length,
+      }),
+    });
+    if (confirmationPending) {
+      log(review.id, "verdict", "Only unverifiable criteria remain — posting a neutral review", {
+        detail: "Nothing failed; the remaining criteria depend on repository state the reviewer could not check.",
       });
+    }
     if (downgradedToComment) {
       log(review.id, "verdict", "Comment-only mode — merge not blocked", {
         detail: "Workflow set to advisory: posting a COMMENT instead of REQUEST_CHANGES.",
@@ -1126,6 +1154,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     const verdictAction =
       status === "blocked"
         ? "Blocked"
+        : confirmationPending
+        ? "Needs manual confirmation"
         : status !== "passed"
         ? "Changes requested"
         : specless
@@ -1148,6 +1178,8 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     const notifyTitle =
       status === "blocked"
         ? `PR #${review.prNumber} — Blocked`
+        : confirmationPending
+        ? `PR #${review.prNumber} — Needs manual confirmation`
         : status !== "passed"
         ? `PR #${review.prNumber} — Changes requested`
         : specless
@@ -1155,7 +1187,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
         : `PR #${review.prNumber} — All criteria met`;
     notifyForReview(
       review.id,
-      status === "passed" ? "review" : "blocker",
+      status === "passed" || confirmationPending ? "review" : "blocker",
       notifyTitle,
       `${repo.owner}/${repo.name} — ${review.prTitle}`
     );
@@ -1199,6 +1231,7 @@ export async function runReviewJob(reviewId: string): Promise<void> {
       diff: context.diff,
       holistic: holisticVerdict,
       event: reviewEvent,
+      awaitingConfirmation: confirmationPending,
       postConversationReview,
       endGoalCTA: includeEndGoalCTA,
       progressCommentId,
@@ -2344,14 +2377,39 @@ function coerceEvidenceCode(v: unknown): EvidenceCode | null {
   };
 }
 
-async function reviewDiff(
-  review: PRReview,
-  context: Context,
-  criteria: Criterion[],
-  prior: Map<string, PriorVerdict> = new Map(),
-  extra?: string
-): Promise<ReviewVerdict> {
-  const system = withMaintainerInstructions(reviewSystemPrompt(), extra);
+export type RepoAccess = { readFile: ReadFileAt; readPath: ReadRepoPath };
+
+// Read-only access to the repository at exactly the reviewed commit.
+function headRepoAccess(installationId: number, repo: Repository, headSha: string): RepoAccess {
+  return {
+    readFile: (path) => readFileAtRefStrict(installationId, repo.owner, repo.name, path, headSha),
+    readPath: async (path) => {
+      const encoded = path.split("/").map(encodeURIComponent).join("/");
+      let body: unknown;
+      try {
+        body = await gh<unknown>(installationId, `/repos/${repo.owner}/${repo.name}/contents/${encoded}?ref=${headSha}`);
+      } catch (err) {
+        if (isMissingFileError(err)) return null;
+        throw err;
+      }
+      if (Array.isArray(body)) {
+        return { kind: "dir", entries: body.map((e: any) => `${e?.type === "dir" ? "dir " : "file"} ${e?.path ?? e?.name}`) };
+      }
+      const file = body as { type?: string; content?: string; encoding?: string } | null;
+      if (file?.type !== "file" || typeof file.content !== "string") return null;
+      return { kind: "file", content: Buffer.from(file.content, (file.encoding as BufferEncoding) || "base64").toString("utf8") };
+    },
+  };
+}
+
+export function buildReviewUserText(args: {
+  criteria: Criterion[];
+  prior: Map<string, PriorVerdict>;
+  context: Pick<Context, "diff" | "commits" | "guidance" | "sources">;
+  repoState?: string;
+  boundaryToken?: string;
+}): string {
+  const { criteria, prior, context } = args;
   // Keep the head of the diff, cut at a hunk boundary (never mid-hunk), and
   // mark when we drop the tail so the model reads a missing hunk as "not shown"
   // rather than "not done" (which, combined with the prior-verdict anchoring in
@@ -2370,26 +2428,70 @@ async function reviewDiff(
     (diffTruncated
       ? "\n[diff truncated — later hunks omitted; absence of a change here is NOT evidence it is missing]"
       : "");
-  const userText =
+  return (
     `# Criteria\n${buildCriteriaSection(criteria, prior)}\n\n` +
     (context.commits ? `# Commits in this PR\n${context.commits}\n\n` : "") +
     `# Diff\n\`\`\`diff\n${diffBody}\n\`\`\`\n\n` +
+    // Outside-the-diff facts sit right after the diff: they answer questions the
+    // diff alone can't, e.g. whether a file the change writes is already ignored.
+    (args.repoState ? `${args.repoState}\n\n` : "") +
     // Maintainer guidance gets its own untruncated section up top so it can't be
     // squeezed out by the 6-source supporting-context cap below; it's already
     // filtered out of that slice to avoid showing it twice.
     (context.guidance ? `# Review guidelines (binding — maintainer-attached)\n${context.guidance}\n\n` : "") +
+    (args.boundaryToken ? `${boundaryNotice(args.boundaryToken)}\n\n` : "") +
     `# Supporting context\n` +
     context.sources
       .filter((s) => s.kind !== "diff" && s.kind !== "repo_guidance")
       .slice(0, 6)
       .map((s) => `## ${s.kind}\n${s.text.slice(0, 2000)}`)
-      .join("\n\n");
+      .join("\n\n")
+  );
+}
+
+async function reviewDiff(
+  review: PRReview,
+  context: Context,
+  criteria: Criterion[],
+  prior: Map<string, PriorVerdict> = new Map(),
+  extra?: string,
+  repoAccess?: RepoAccess
+): Promise<ReviewVerdict> {
+  const system = withMaintainerInstructions(reviewSystemPrompt(), extra);
+  const facts = repoAccess
+    ? await gatherIgnoreFacts({ diff: context.diff, criteria, read: repoAccess.readFile }).catch((err) => {
+        console.warn(`[review] ignore-rule lookup failed for ${review.id}:`, err);
+        return [];
+      })
+    : [];
+  const repoState = renderRepoStateSection(facts);
+  const boundaryToken = repoAccess ? newBoundaryToken() : undefined;
+  const userText = buildReviewUserText({ criteria, prior, context, repoState, boundaryToken });
+  if (facts.length) {
+    log(review.id, "review", "Resolved ignore rules outside the diff", {
+      detail: repoState,
+      meta: { paths: facts.length, ignored: facts.filter((f) => f.match?.ignored).length },
+    });
+  }
+  const lookups = repoAccess
+    ? [{ tool: readRepoFileTool, run: (input: unknown) => runRepoRead(input, repoAccess.readPath, boundaryToken) }]
+    : [];
+  const lookedUp: string[] = [];
   // An unusable verdict must fail the review, never post as all-unmet: the
   // merge defaults every criterion it can't match to unmet.
   const expectedIds = criteria.map((c) => c.id);
   const messages: LLMMessage[] = [{ role: "user", content: userText }];
   const { value, attempts } = await retryStructured<ReviewVerdict>({
-    call: (maxTokens, msgs) => completeStructured({ system, cacheSystem: true, maxTokens, messages: msgs, tool: reviewVerdictTool }),
+    call: (maxTokens, msgs) =>
+      completeStructuredWithLookups({
+        system,
+        cacheSystem: true,
+        maxTokens,
+        messages: msgs,
+        tool: reviewVerdictTool,
+        lookups,
+        onLookup: (_name, input) => lookedUp.push(String((input as { path?: unknown } | null)?.path ?? "")),
+      }),
     messages,
     budgets: [16_384, 32_768],
     validate: (input) => {
@@ -2409,6 +2511,12 @@ async function reviewDiff(
       );
     },
   });
+  if (lookedUp.length) {
+    log(review.id, "review", `Read ${lookedUp.length} file(s) outside the diff`, {
+      detail: [...new Set(lookedUp)].map((p) => p || "/").join("\n"),
+      meta: { lookups: lookedUp.length },
+    });
+  }
   if (value) return value;
   if (criteria.length > 0) {
     log(review.id, "error", "Review verdict unusable after retries", {
@@ -2607,7 +2715,9 @@ export function buildConsolidatedFixPrompt(args: {
       lines.push(`### ${i + 1}. Required: ${c.text} (${c.id})`);
       lines.push(
         `What's wrong now: ${
-          c.met === null
+          c.unverifiable
+            ? `Not shown to be wrong — the reviewer could not verify it against repository state outside the diff. ${(c.evidence || "").trim()} Confirm it already holds before changing anything; add code only if it does not.`
+            : c.met === null
             ? (c.evidence || "").trim() ||
               "The reviewer could not evaluate this requirement against the diff (no verdict was returned for it) — verify it holds and make it pass."
             : reasonOrFallback(c.evidence)
@@ -2779,6 +2889,24 @@ function completedVerification(
   return view.state === "completed" ? view : null;
 }
 
+// GitHub treats a neutral conclusion as passing for required checks, so an
+// unverifiable-only verdict informs without holding the merge.
+export function endGoalCheck(
+  status: PRReviewStatus,
+  awaitingConfirmation: boolean,
+  specless: boolean
+): { conclusion: "success" | "neutral" | "action_required"; title: string } {
+  if (status === "passed") {
+    return {
+      conclusion: "success",
+      title: specless ? "No issues found — add an end goal for acceptance-criteria review" : "All acceptance criteria met",
+    };
+  }
+  if (status === "blocked") return { conclusion: "action_required", title: "Blocked" };
+  if (awaitingConfirmation) return { conclusion: "neutral", title: "Needs manual confirmation" };
+  return { conclusion: "action_required", title: "Changes requested" };
+}
+
 async function postGithubOutput(
   review: PRReview,
   repo: { owner: string; name: string },
@@ -2797,6 +2925,8 @@ async function postGithubOutput(
     // REQUEST_CHANGES review, which would render as a second conversation block,
     // so we never submit one); COMMENT -> nothing.
     event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
+    // Only unverifiable criteria are open: the check run goes neutral, not red.
+    awaitingConfirmation?: boolean;
     // When false, no fresh conversation comment is posted — used on repeat
     // reviews of a still-spec-less PR where we've already asked for an end goal.
     // Threads are still reconciled: a stale finding must not be left shouting.
@@ -2827,7 +2957,7 @@ async function postGithubOutput(
 ): Promise<{ verdictPosted: boolean }> {
   if (!install) return { verdictPosted: false }; // dev: nothing to post to
   const installationId = install.installationId; // captured so the closures below keep the non-null narrowing
-  const conclusion = status === "passed" ? "success" : "action_required";
+  const { title: checkTitle, conclusion } = endGoalCheck(status, !!args.awaitingConfirmation, args.criteria.length === 0);
   const specless = args.criteria.length === 0;
   const repoFullName = `${repo.owner}/${repo.name}`;
 
@@ -2857,17 +2987,7 @@ async function postGithubOutput(
         head_sha: review.headSha,
         status: "completed",
         conclusion,
-        output: {
-          title:
-            status === "passed"
-              ? specless
-                ? "No issues found — add an end goal for acceptance-criteria review"
-                : "All acceptance criteria met"
-              : status === "blocked"
-              ? "Blocked"
-              : "Changes requested",
-          summary: args.summary || "",
-        },
+        output: { title: checkTitle, summary: args.summary || "" },
       }),
       headers: { "Content-Type": "application/json" },
     });
@@ -3226,8 +3346,9 @@ async function postChangesRequestedNotice(
   review: PRReview,
   repo: { owner: string; name: string },
   install: { installationId: number },
-  args: { event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; summary: string }
+  args: { event: "APPROVE" | "REQUEST_CHANGES" | "COMMENT"; summary: string; awaitingConfirmation?: boolean }
 ): Promise<void> {
+  const check = endGoalCheck("changes_requested", !!args.awaitingConfirmation, false);
   try {
     await gh(install.installationId, `/repos/${repo.owner}/${repo.name}/check-runs`, {
       method: "POST",
@@ -3235,8 +3356,8 @@ async function postChangesRequestedNotice(
         name: "DevAsign · End goal",
         head_sha: review.headSha,
         status: "completed",
-        conclusion: "action_required",
-        output: { title: "Changes requested", summary: args.summary || "" },
+        conclusion: check.conclusion,
+        output: { title: check.title, summary: args.summary || "" },
       }),
       headers: { "Content-Type": "application/json" },
     });
@@ -4145,7 +4266,7 @@ export async function runMaintainerFeedbackJob(
       if (r.met && c.met !== true) cleared.push({ id: c.id, text: c.text, evidence: r.evidence });
       // A flipped verdict invalidates the review-time structured evidence/fix —
       // stale code excerpts must not survive under the new verdict.
-      return { ...c, met: r.met, evidence: r.evidence, evidenceCode: null, suggestedChange: null };
+      return { ...c, met: r.met, unverifiable: false, evidence: r.evidence, evidenceCode: null, suggestedChange: null };
     });
     log(review.id, "criteria", "Re-evaluated disputed criteria against the codebase", {
       detail: `${cleared.length} of ${refined.disputed.length} disputed criterion/criteria verified and cleared`,
@@ -4344,15 +4465,24 @@ export async function runMaintainerFeedbackJob(
         console.warn("[feedback] failed to post dispute resolution comment:", err);
       }
       const wf = effectiveWorkflow(repo);
-      const { event: reviewEvent } = resolveReviewEvent({
-        status: "changes_requested",
+      const { event: reviewEvent, confirmationPending } = resolveReviewEvent({
+        status,
         specless: criteria.length === 0,
         blocking: wf.verdict.blocking,
         endGoalAlreadyRequested: !!task?.endGoalRequestedAt,
+        awaitingConfirmation: awaitsConfirmation({
+          hasBlocker: status === "blocked",
+          liveCount: live.length,
+          metCount: live.filter((c) => c.met === true).length,
+          unverifiableCount: live.filter((c) => c.unverifiable).length,
+        }),
       });
       await postChangesRequestedNotice(review, repo, install, {
         event: reviewEvent,
-        summary: "Re-reviewed the disputed criteria; changes are still requested.",
+        awaitingConfirmation: confirmationPending,
+        summary: confirmationPending
+          ? "Re-reviewed the disputed criteria; what remains could not be verified and needs manual confirmation."
+          : "Re-reviewed the disputed criteria; changes are still requested.",
       });
     }
     return;

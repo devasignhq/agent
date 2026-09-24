@@ -162,18 +162,9 @@ export type StructuredTool = { name: string; description: string; inputSchema: R
 export type StructuredResult = { input: unknown | null; text: string; stopReason: string | null; raw: string };
 
 async function sendMessages(opts: CompleteOpts, tool?: StructuredTool): Promise<Anthropic.Message> {
-  const sys = opts.system
-    ? opts.cacheSystem
-      ? [{ type: "text" as const, text: opts.system, cache_control: { type: "ephemeral" as const } }]
-      : opts.system
-    : undefined;
-
-  const model = opts.model || modelContext.getStore() || config.llm.model;
-  const resp = await client!.messages.create({
-    model,
-    max_tokens: opts.maxTokens ?? 2048,
-    system: sys as any,
-    messages: opts.messages.map((m, i) =>
+  return sendParams(
+    opts,
+    opts.messages.map((m, i) =>
       i === opts.messages.length - 1 && opts.images?.length
         ? {
             role: m.role,
@@ -187,10 +178,33 @@ async function sendMessages(opts: CompleteOpts, tool?: StructuredTool): Promise<
           }
         : { role: m.role, content: m.content }
     ),
-    ...(tool
+    tool ? { tools: [tool], choice: { type: "tool", name: tool.name } } : undefined
+  );
+}
+
+type ToolChoice = { type: "any" } | { type: "tool"; name: string };
+
+async function sendParams(
+  opts: Pick<CompleteOpts, "system" | "cacheSystem" | "model" | "maxTokens">,
+  messages: Anthropic.MessageParam[],
+  tooling?: { tools: StructuredTool[]; choice: ToolChoice }
+): Promise<Anthropic.Message> {
+  const sys = opts.system
+    ? opts.cacheSystem
+      ? [{ type: "text" as const, text: opts.system, cache_control: { type: "ephemeral" as const } }]
+      : opts.system
+    : undefined;
+
+  const model = opts.model || modelContext.getStore() || config.llm.model;
+  const resp = await client!.messages.create({
+    model,
+    max_tokens: opts.maxTokens ?? 2048,
+    system: sys as any,
+    messages,
+    ...(tooling
       ? {
-          tools: [{ name: tool.name, description: tool.description, input_schema: tool.inputSchema as any }],
-          tool_choice: { type: "tool" as const, name: tool.name },
+          tools: tooling.tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema as any })),
+          tool_choice: tooling.choice,
         }
       : {}),
   });
@@ -261,6 +275,75 @@ export async function completeStructured(opts: CompleteOpts & { tool: Structured
   const input = stopReason === "max_tokens" || !call ? null : call.input;
   const raw = call ? JSON.stringify(call.input) : text;
   return { input, text, stopReason, raw };
+}
+
+// A read-only tool the model may call any number of times (up to the turn cap)
+// before it must answer with the structured tool.
+export type LookupTool = { tool: StructuredTool; run: (input: unknown) => Promise<string> };
+
+export type SendTurn = (messages: Anthropic.MessageParam[], choice: ToolChoice) => Promise<Anthropic.Message>;
+
+// The first user message carries a cache breakpoint so each lookup turn re-reads
+// the (large) diff prompt from cache instead of paying for it again.
+export async function runLookupLoop(args: {
+  send: SendTurn;
+  messages: LLMMessage[];
+  tool: StructuredTool;
+  lookups: LookupTool[];
+  maxLookupTurns: number;
+  onLookup?: (name: string, input: unknown) => void;
+}): Promise<StructuredResult> {
+  const convo: Anthropic.MessageParam[] = args.messages.map((m, i) =>
+    i === 0 && m.role === "user"
+      ? { role: "user", content: [{ type: "text", text: m.content, cache_control: { type: "ephemeral" } }] }
+      : { role: m.role, content: m.content }
+  );
+  const byName = new Map(args.lookups.map((l) => [l.tool.name, l]));
+  for (let turn = 0; ; turn++) {
+    const final = turn >= args.maxLookupTurns;
+    const resp = await args.send(convo, final ? { type: "tool", name: args.tool.name } : { type: "any" });
+    const stopReason = resp.stop_reason ?? null;
+    const text = textOf(resp);
+    const uses = resp.content.filter((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
+    const answer = uses.find((b) => b.name === args.tool.name);
+    if (answer || stopReason === "max_tokens" || !uses.length || final) {
+      const input = stopReason === "max_tokens" || !answer ? null : answer.input;
+      return { input, text, stopReason, raw: answer ? JSON.stringify(answer.input) : text };
+    }
+    const results: Anthropic.ToolResultBlockParam[] = [];
+    for (const use of uses) {
+      const lookup = byName.get(use.name);
+      args.onLookup?.(use.name, use.input);
+      const content = lookup
+        ? await lookup.run(use.input).catch((err) => `Lookup failed: ${err instanceof Error ? err.message : String(err)}`)
+        : `Unknown tool ${use.name}.`;
+      results.push({ type: "tool_result", tool_use_id: use.id, content });
+    }
+    convo.push({ role: "assistant", content: resp.content as Anthropic.MessageParam["content"] });
+    convo.push({ role: "user", content: results });
+  }
+}
+
+// completeStructured, but the model may first call read-only `lookups`. Offline
+// (mock) runs skip the lookups and answer exactly like completeStructured.
+export async function completeStructuredWithLookups(
+  opts: CompleteOpts & { tool: StructuredTool; lookups: LookupTool[]; maxLookupTurns?: number; onLookup?: (name: string, input: unknown) => void }
+): Promise<StructuredResult> {
+  if (!client || !opts.lookups.length || opts.images?.length) return completeStructured(opts);
+  const tools = [...opts.lookups.map((l) => l.tool), opts.tool];
+  try {
+    return await runLookupLoop({
+      send: (messages, choice) => sendParams(opts, messages, { tools, choice }),
+      messages: opts.messages,
+      tool: opts.tool,
+      lookups: opts.lookups,
+      maxLookupTurns: opts.maxLookupTurns ?? 6,
+      onLookup: opts.onLookup,
+    });
+  } catch (err) {
+    if (!rejectsTools(err)) throw err;
+    return completeStructured(opts);
+  }
 }
 
 export type StructuredAttempt = {

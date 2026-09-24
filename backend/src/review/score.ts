@@ -16,6 +16,7 @@ export type ScoreKind =
   | "criterion-regressed"
   | "criterion-unmet"
   | "criterion-unevaluated"
+  | "criterion-unverifiable"
   | "criterion-met"
   | "finding";
 
@@ -31,6 +32,7 @@ const CRITERION_WEIGHTS: Record<ScoreKind, number> = {
   "criterion-regressed": 20,
   "criterion-unmet": 15,
   "criterion-unevaluated": 5,
+  "criterion-unverifiable": 5,
   "criterion-met": 0,
   finding: 0,
 };

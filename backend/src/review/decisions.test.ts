@@ -5,6 +5,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
   acceptsMaintainerFeedback,
+  awaitsConfirmation,
   prStateOf,
   resolveReviewEvent,
   resolveVerdictStatus,
@@ -207,4 +208,55 @@ test("prStateOf: merged wins over closed; open is the default", () => {
   assert.equal(prStateOf({ merged: false, state: "closed" }), "closed");
   assert.equal(prStateOf({ state: "open" }), "open");
   assert.equal(prStateOf({}), "open");
+});
+
+// ── unverifiable criteria → neutral review ──────────────────────────────────
+test("awaitsConfirmation: only when every live criterion is met or unverifiable, and one is unverifiable", () => {
+  const base = { hasBlocker: false, liveCount: 3 };
+  assert.equal(awaitsConfirmation({ ...base, metCount: 2, unverifiableCount: 1 }), true);
+  assert.equal(awaitsConfirmation({ ...base, metCount: 0, unverifiableCount: 3 }), true);
+  assert.equal(awaitsConfirmation({ ...base, metCount: 1, unverifiableCount: 1 }), false, "a failed criterion remains");
+  assert.equal(awaitsConfirmation({ ...base, metCount: 3, unverifiableCount: 0 }), false, "that is a pass");
+  assert.equal(awaitsConfirmation({ ...base, hasBlocker: true, metCount: 2, unverifiableCount: 1 }), false);
+});
+
+test("resolveReviewEvent: awaiting confirmation → neutral COMMENT, even in blocking mode", () => {
+  const r = resolveReviewEvent({
+    status: "changes_requested",
+    specless: false,
+    blocking: true,
+    endGoalAlreadyRequested: false,
+    awaitingConfirmation: true,
+  });
+  assert.equal(r.event, "COMMENT");
+  assert.equal(r.confirmationPending, true);
+  assert.equal(r.downgradedToComment, false);
+  assert.equal(r.postConversationReview, true);
+});
+
+test("resolveReviewEvent: awaiting confirmation never softens a blocked verdict or a security blocker", () => {
+  const blocked = resolveReviewEvent({
+    status: "blocked",
+    specless: false,
+    blocking: true,
+    endGoalAlreadyRequested: false,
+    awaitingConfirmation: true,
+  });
+  assert.equal(blocked.event, "REQUEST_CHANGES");
+  assert.equal(blocked.confirmationPending, false);
+  const security = resolveReviewEvent({
+    status: "changes_requested",
+    specless: false,
+    blocking: true,
+    endGoalAlreadyRequested: false,
+    hasSecurityBlocker: true,
+    awaitingConfirmation: true,
+  });
+  assert.equal(security.event, "REQUEST_CHANGES");
+});
+
+test("resolveReviewEvent: without awaitingConfirmation, changes_requested still requests changes", () => {
+  const r = resolveReviewEvent({ status: "changes_requested", specless: false, blocking: true, endGoalAlreadyRequested: false });
+  assert.equal(r.event, "REQUEST_CHANGES");
+  assert.equal(r.confirmationPending, false);
 });

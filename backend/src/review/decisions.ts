@@ -36,6 +36,18 @@ export function prStateOf(pr: { merged?: boolean; merged_at?: string | null; sta
 
 export type ReviewEvent = "APPROVE" | "REQUEST_CHANGES" | "COMMENT";
 
+// Nothing failed: every live criterion is met or could not be checked. That is a
+// question for a human, so it gets a neutral review rather than changes requested.
+export function awaitsConfirmation(args: {
+  hasBlocker: boolean;
+  liveCount: number;
+  metCount: number;
+  unverifiableCount: number;
+}): boolean {
+  const { hasBlocker, liveCount, metCount, unverifiableCount } = args;
+  return !hasBlocker && unverifiableCount > 0 && metCount + unverifiableCount === liveCount;
+}
+
 // Map a finished review to its GitHub review action, honoring the workflow's
 // verdict mode. We never auto-APPROVE a PR we had no acceptance criteria to
 // verify against: a clean spec-less pass posts a neutral COMMENT and (exactly
@@ -53,18 +65,24 @@ export function resolveReviewEvent(args: {
   blocking: boolean;
   endGoalAlreadyRequested: boolean;
   hasSecurityBlocker?: boolean;
+  // awaitsConfirmation(): only unverifiable criteria stand between the PR and a pass.
+  awaitingConfirmation?: boolean;
 }): {
   event: ReviewEvent;
   postConversationReview: boolean;
   includeEndGoalCTA: boolean;
   downgradedToComment: boolean;
   securityBlockerHeld: boolean;
+  confirmationPending: boolean;
 } {
   const { status, specless, blocking, endGoalAlreadyRequested, hasSecurityBlocker = false } = args;
   let event: ReviewEvent;
   let postConversationReview = true;
   let includeEndGoalCTA = false;
-  if (status !== "passed") {
+  const confirmationPending = status === "changes_requested" && !!args.awaitingConfirmation && !hasSecurityBlocker;
+  if (confirmationPending) {
+    event = "COMMENT";
+  } else if (status !== "passed") {
     event = "REQUEST_CHANGES";
   } else if (!specless) {
     event = "APPROVE";
@@ -84,7 +102,7 @@ export function resolveReviewEvent(args: {
       downgradedToComment = true;
     }
   }
-  return { event, postConversationReview, includeEndGoalCTA, downgradedToComment, securityBlockerHeld };
+  return { event, postConversationReview, includeEndGoalCTA, downgradedToComment, securityBlockerHeld, confirmationPending };
 }
 
 // Apply the per-repo trigger policy to an incoming pull_request event. Pure: the
@@ -123,4 +141,26 @@ export function withMaintainerInstructions(system: string, extra?: string): stri
     text +
     "\n</maintainer_instructions>"
   );
+}
+
+// "I can't confirm this from the provided context" is an admission the reviewer
+// never looked, not evidence the requirement is unmet (PR #263 failed on it).
+const HEDGE_VERB = /\b(?:cannot|can(?:'|’)t|can not|could not|couldn(?:'|’)t|unable to|not able to)\s+(?:confirm|verify|determine|tell|establish|see whether|check)\b/i;
+const HEDGE_SCOPE =
+  /\b(?:(?:from|in|with(?:in)?)\s+the\s+(?:provided|available|given|visible|supplied)\s+(?:context|diff|code|files?)|outside (?:of )?(?:the|this) diff|not (?:shown|visible|included|present) in the diff)/i;
+
+export function isHedgedEvidence(evidence: string | null | undefined): boolean {
+  const e = evidence ?? "";
+  return HEDGE_VERB.test(e) && HEDGE_SCOPE.test(e);
+}
+
+// What a criterion's verdict means once the reviewer's own uncertainty is
+// honoured: unverifiable criteria carry met: null, never a failure.
+export function criterionOutcome(v: { met?: unknown; unverifiable?: unknown; evidence?: string | null }): {
+  met: boolean | null;
+  unverifiable: boolean;
+} {
+  if (v.met === true) return { met: true, unverifiable: false };
+  if (v.unverifiable === true || (v.met === false && isHedgedEvidence(v.evidence))) return { met: null, unverifiable: true };
+  return { met: v.met === false ? false : null, unverifiable: false };
 }
