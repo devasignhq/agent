@@ -33,4 +33,5 @@ steps:
 
 options:
   logging: CLOUD_LOGGING_ONLY
+  dynamicSubstitutions: true
 timeout: 1200s
