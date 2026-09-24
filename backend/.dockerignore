@@ -13,6 +13,4 @@ data
 
 **/*.test.ts
 deploy
-Dockerfile
-.dockerignore
 .gcloudignore
