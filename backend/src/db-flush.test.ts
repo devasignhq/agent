@@ -511,3 +511,79 @@ test("a hanging pool.connect() is bounded by connectTimeoutMs and surfaces as a 
   assert.equal(h.writeThrough, "degraded", "degraded + alertable, not stuck silent");
   assert.notEqual(h.lastFlushError, null, "the real connect failure is surfaced");
 });
+
+// Healthy pool factory that counts builds, so any rebuild = a stall-breaker fire.
+function makeCountingFactory() {
+  const s = { generation: 0, stored: new Set<string>(), hangGen0: false };
+  const factory = () => {
+    const myGen = s.generation++;
+    const runQuery = (sql: string, params?: unknown[]) => {
+      if (String(sql).trim().toLowerCase().startsWith("insert")) {
+        if (myGen === 0 && s.hangGen0) return new Promise(() => {});
+        for (let i = 0; i < (params?.length ?? 0); i += 2) s.stored.add(String(params![i]));
+      }
+      return Promise.resolve({ rows: [] as Array<{ data: unknown }> });
+    };
+    const client = { query: runQuery, release: () => {} };
+    return { connect: async () => client, query: runQuery, end: async () => {}, on: () => {} };
+  };
+  return { s, factory };
+}
+
+test("an empty flushPending() (a POST that staged nothing) does not wedge the flusher", async () => {
+  // Prod 2026-09-24: a no-write webhook's durability-barrier flush left `flushing` pinned to a
+  // settled promise; later writes never flushed and the breaker fired on the idle, stale clock.
+  const { s, factory } = makeCountingFactory();
+  await initDb({ poolFactory: factory as never, flushWatchdogMs: 100, stallBreakMs: 150, stallCheckMs: 10 });
+  db.insert("notifications", row("boot"));
+  await flushPending();
+
+  await delay(220); // idle past stallBreakMs: the progress clock is stale
+  await flushPending(); // nothing staged
+  await delay(60);
+  assert.equal(s.generation, 1, "stall-breaker did not fire on an idle, empty flush");
+
+  db.insert("notifications", row("after-empty"));
+  await flushPending();
+  assert.equal(s.stored.has("after-empty"), true, "the next write persisted on its own flush");
+  assert.equal(dbHealth().pendingWrites, 0);
+  assert.equal(s.generation, 1, "no rebuild needed");
+});
+
+test("stall-breaker log reports the real stall age and backlog, not the reconciled snapshot", async () => {
+  const { s, factory } = makeCountingFactory();
+  await initDb({
+    poolFactory: factory as never,
+    flushWatchdogMs: 200,
+    stallBreakMs: 250,
+    stallCheckMs: 20,
+    backoffMs: 5,
+  });
+  for (let i = 0; i < 5; i++) db.insert("repositories", row(`r${i}`));
+  await flushPending();
+
+  s.hangGen0 = true;
+  db.insert("notifications", row("trapped"));
+  void flushPending(); // drains `trapped` into a hung batch
+  await delay(60);
+  db.insert("notifications", row("queued")); // the one write genuinely pending
+
+  const logged: string[] = [];
+  const origError = console.error;
+  console.error = (...args: unknown[]) => void logged.push(args.map(String).join(" "));
+  try {
+    const deadline = Date.now() + 5000;
+    while (!s.stored.has("queued") && Date.now() < deadline) await delay(20);
+  } finally {
+    console.error = origError;
+  }
+
+  const line = logged.find((l) => l.includes("write-through STALLED"));
+  assert.ok(line, "breaker logged the stall");
+  const m = line!.match(/STALLED ([\d.]+)s with (\d+) write\(s\) pending \(flush in flight: (\w+)\)/);
+  assert.ok(m, `log line has the expected shape: ${line}`);
+  assert.ok(Number(m![1]) >= 0.25, `stall age measured before reconcile (got ${m![1]}s)`);
+  assert.equal(Number(m![2]), 1, "pending = the queued write, not the 7-row snapshot");
+  assert.equal(m![3], "yes", "reports the wedged in-flight flush");
+  assert.equal(s.stored.has("trapped"), true, "trapped write still recovered");
+});

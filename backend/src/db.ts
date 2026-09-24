@@ -645,6 +645,10 @@ function logFlushError(err: unknown): void {
 // authoritative in-memory state, so even writes trapped in the abandoned flush
 // come back — nothing is lost.
 function breakStall(): void {
+  // Measure before reconcileAll(): it re-stages the whole snapshot and resets the stall clock.
+  const stalledForMs = Date.now() - lastFlushProgressAt;
+  const stuckPending = pendingCount();
+  const flushInFlight = flushing !== null;
   consecutiveStallBreaks++;
   flushEpoch++; // cancel the wedged loop so it can't run concurrently with the fresh flush
   flushing = null; // release the single-flight lock so a fresh flush can run
@@ -674,11 +678,10 @@ function breakStall(): void {
   // First break of an incident: log once (the intermediate breaks stay quiet), then
   // force-recover. A transient wedge clears here on the fresh pool's first flush.
   if (consecutiveStallBreaks === 1) {
-    const stalledForMs = Date.now() - lastFlushProgressAt;
     console.error(
-      `[db] write-through STALLED ${Math.round(stalledForMs / 1000)}s with ${pendingCount()} ` +
-        `write(s) pending and NO error recorded — force-recovering (abandon wedged flush, ` +
-        `reconcile snapshot, rebuild pool, re-flush).`
+      `[db] write-through STALLED ${(stalledForMs / 1000).toFixed(1)}s with ${stuckPending} ` +
+        `write(s) pending (flush in flight: ${flushInFlight ? "yes" : "no"}) and NO error ` +
+        `recorded — force-recovering (abandon wedged flush, reconcile snapshot, rebuild pool, re-flush).`
     );
   }
   rebuildPool("stall breaker: silent write-through wedge");
@@ -1054,6 +1057,9 @@ async function connectBounded(label: string): Promise<PoolClient> {
 
 async function runFlush(): Promise<void> {
   if (flushing) return flushing;
+  // Load-bearing: with nothing staged the IIFE below finishes synchronously, so its
+  // `finally` clears `flushing` BEFORE the assignment pins it to a settled promise forever.
+  if (!pool || !hasPending()) return;
   // Cancellation token: breakStall() bumps flushEpoch to abandon a wedged loop.
   // This loop checks it after every await and exits the instant it's superseded,
   // so a stall-breaker's fresh flush is never racing a stale loop (single-flight).
