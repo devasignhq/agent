@@ -72,28 +72,28 @@ export ENVDIR=backend/deploy/gcp
   gcloud artifacts docker images list $IMAGE --include-tags --project=$P --format="value(tags,createTime)"
   ```
 
-- [ ] **P4. Decide what ships.** Cloud Run runs the newest `main`. Render last booted
-  2026-09-17, so check which backend merges it never ran:
+- [x] **P4. Decide what ships.** Done 2026-09-24: `main` at `88a44e8` (which includes #264)
+  was deployed to Render and booted at 19:25:50Z with `rowsLoadedAtBoot` 12598. Render and
+  `api:latest` now run the same backend code, so the cutover changes only the host. If more
+  backend merges land before cutover day, check what Render hasn't run yet:
   ```bash
   git log --first-parent origin/main --since="<Render bootedAt from $RENDER/api/health>" --oneline -- backend
   ```
-  Deploying those to Render first means the cutover changes only the host. Letting them ship
-  with the cutover is fine too, but then a problem afterwards could be either.
 
-- [ ] **P5. Find where each OAuth callback is registered.** Add the new callback URLs now,
-  wherever more than one is allowed:
-  - **GitHub sign-in** (`GITHUB_OAUTH_CLIENT_ID` in the env file). Find which app owns that
-    client ID. If it's an **OAuth App** (org → Developer settings → OAuth Apps), only one
-    callback is allowed, so it changes in step 3. If it's the **GitHub App**
-    `devasign-agent`, add `$API/api/auth/github/callback` as an extra Callback URL now.
-  - **Linear** (Linear → Settings → API → your OAuth application): add
-    `$API/api/auth/linear/callback` as an extra callback URL now.
+- [x] **P5. Find where each OAuth callback is registered.** Done 2026-09-24.
+  - **GitHub sign-in uses a separate OAuth App**, client ID `Ov23lircpdsFt5nH2XYe`, not the
+    `devasign-agent` GitHub App (`Iv23lieE7A1ojKw01wDx`). An OAuth App has only one callback
+    URL, so it changes in step 3. Find it under Developer settings → OAuth Apps by that client
+    ID.
+  - **Linear:** `$API/api/auth/linear/callback` was added alongside the Render one, so nothing
+    to do at cutover. The Linear **webhook** URL still changes in step 3.
 
 - [x] **P6. Prepare the verify action change.** Done:
   [devasignhq/verify-action#3](https://github.com/devasignhq/verify-action/pull/3) changes the
-  `api-url` default (and the README table) from `$RENDER` to `$API`. **Leave it unmerged until
-  step 5.** Customer workflows use `@v1`, so step 5 moves that tag. Note that `v1` currently
-  points at `fa565e1` (an untagged sync from this repo), **not** at `v1.1.2`.
+  `api-url` default (and the README table) from `$RENDER` to `$API`. It's **already merged** to
+  the action's `main`, which customers don't use: `v1` still points at `fa565e1` (an untagged
+  sync from this repo, **not** `v1.1.2`), so they still call Render. **Don't create any
+  verify-action tag or release before step 5.**
 
 - [ ] **P7. Check access.** You'll need GitHub org admin, the Stripe dashboard, Linear admin,
   both Vercel projects (sponsor and contributor) and the Render dashboard.
@@ -156,7 +156,7 @@ and stop. Render hasn't been touched.
 | Where | Field | New value |
 |---|---|---|
 | GitHub → org → GitHub Apps → `devasign-agent` → General | Webhook URL | `$API/api/webhooks/github` (the secret stays the same) |
-| The OAuth App from P5 (if it's an OAuth App) | Authorization callback URL | `$API/api/auth/github/callback` |
+| GitHub → Developer settings → OAuth Apps → client ID `Ov23lircpdsFt5nH2XYe` (see P5) | Authorization callback URL | `$API/api/auth/github/callback` |
 | Stripe → Developers → Webhooks → the existing endpoint → Update details | Endpoint URL | `$API/api/webhooks/stripe`. **Edit** the existing endpoint; a new one would get a new signing secret. |
 | Linear → your OAuth application | Webhook URL | `$API/api/webhooks/linear` |
 
@@ -174,9 +174,9 @@ now be on `devasign-api-161910310724.us-east4.run.app`, marked `HttpOnly; Secure
 SameSite=None`. Sign in on the contributor app as well.
 
 ### 5. Move the verify action (2 min)
-Merge [devasignhq/verify-action#3](https://github.com/devasignhq/verify-action/pull/3), then,
-in a checkout of `devasignhq/verify-action`, tag it `v1.2.0` (it contains the untagged
-`fa565e1` sync as well as the URL change) and move `v1`:
+[devasignhq/verify-action#3](https://github.com/devasignhq/verify-action/pull/3) is already
+merged. In a checkout of `devasignhq/verify-action`, tag `main` as `v1.2.0` (it contains the
+untagged `fa565e1` sync as well as the URL change) and move `v1`:
 ```bash
 git switch main && git pull
 git tag v1.2.0 && git push origin v1.2.0
