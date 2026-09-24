@@ -12,6 +12,7 @@ import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { classify, parseEnvText } from "./env-classify.mjs";
 
 const { values: args } = parseArgs({
   options: {
@@ -22,35 +23,6 @@ const { values: args } = parseArgs({
     apply: { type: "boolean", default: false },
   },
 });
-
-const SECRET_KEYS = new Set([
-  "DATABASE_URL",
-  "SESSION_SECRET",
-  "SESSION_SECRET_PREVIOUS",
-  "INTEGRATION_ENCRYPTION_KEY",
-  "ADMIN_TOKEN",
-  "GITHUB_APP_PRIVATE_KEY",
-  "GITHUB_APP_WEBHOOK_SECRET",
-  "GITHUB_OAUTH_CLIENT_SECRET",
-  "ANTHROPIC_API_KEY",
-  "GEMINI_API_KEY",
-  "STRIPE_SECRET_KEY",
-  "STRIPE_WEBHOOK_SECRET",
-  "RESEND_API_KEY",
-  "STELLAR_ADMIN_SECRET",
-  "ARTIFACT_S3_ACCESS_KEY_ID",
-  "ARTIFACT_S3_SECRET_ACCESS_KEY",
-  "LINEAR_API_KEY",
-  "LINEAR_OAUTH_CLIENT_SECRET",
-  "LINEAR_WEBHOOK_SIGNING_SECRET",
-  "SLACK_BOT_TOKEN",
-  "DISCORD_BOT_TOKEN",
-  "STATSIG_SECRET_KEY",
-]);
-
-// PORT is reserved by Cloud Run; *_PATH point at files that only existed on the old host.
-const SKIP = (key) =>
-  key === "PORT" || key === "WEB_CONCURRENCY" || key.startsWith("RENDER") || key.endsWith("_PATH");
 
 const outDir = path.dirname(fileURLToPath(import.meta.url));
 const envYamlPath = path.join(outDir, ".env.cloudrun.yaml");
@@ -74,15 +46,7 @@ async function fromRender(serviceId) {
 }
 
 function fromFile(file) {
-  const vars = new Map();
-  for (const line of readFileSync(file, "utf8").split(/\r?\n/)) {
-    const m = line.match(/^\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)\s*=\s*(.*)$/);
-    if (!m) continue;
-    let value = m[2].trim();
-    if (/^(["']).*\1$/.test(value)) value = value.slice(1, -1);
-    vars.set(m[1], value);
-  }
-  return vars;
+  return parseEnvText(readFileSync(file, "utf8"));
 }
 
 function run(argv, input) {
@@ -113,21 +77,13 @@ const vars = args["from-file"]
     ? await fromRender(args["render-service"])
     : (() => { throw new Error("pass --render-service srv-… or --from-file <path>"); })();
 
-const secrets = [], plain = [], skipped = [], empty = [];
-for (const [key, value] of [...vars].sort(([a], [b]) => a.localeCompare(b))) {
-  if (SKIP(key)) skipped.push(key);
-  else if (value === "") empty.push(key);
-  else if (SECRET_KEYS.has(key)) secrets.push(key);
-  else plain.push(key);
-}
+const { secrets, plain, skipped, empty, missing } = classify(vars);
 
 console.log(`Read ${vars.size} variables.`);
 console.log(`  Secret Manager (${secrets.length}): ${secrets.join(" ") || "-"}`);
 console.log(`  Plain env      (${plain.length}): ${plain.join(" ") || "-"}`);
 console.log(`  Skipped        (${skipped.length}): ${skipped.join(" ") || "-"}`);
 if (empty.length) console.log(`  Empty, ignored (${empty.length}): ${empty.join(" ")}`);
-const missing = ["DATABASE_URL", "SESSION_SECRET", "INTEGRATION_ENCRYPTION_KEY", "WEB_ORIGIN", "GITHUB_APP_NAME"]
-  .filter((k) => !secrets.includes(k) && !plain.includes(k));
 if (missing.length) console.log(`  WARNING — required in prod but absent: ${missing.join(" ")}`);
 
 if (!args.apply) {
