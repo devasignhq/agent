@@ -1,0 +1,17 @@
+node_modules
+dist
+coverage
+*.log
+
+# Secrets stay out of the image; prod reads them from Secret Manager.
+.env
+.env.*
+*.pem
+*.key
+.devasign-dev
+data
+
+**/*.test.ts
+Dockerfile
+.dockerignore
+.gcloudignore
