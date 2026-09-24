@@ -43,18 +43,19 @@ export ENVDIR=backend/deploy/gcp
 
 ## Pre-flight (the day before; nothing here affects prod)
 
-- [ ] **P1. Check this project lets a Cloud Run service be public.** An org policy may block
-  `allUsers`. Deploy Google's hello container, fetch it, delete it:
+- [x] **P1. Check this project lets a Cloud Run service be public.** Done 2026-09-24.
+  `--allow-unauthenticated` is **blocked**: the org policy rejects `allUsers` ("Setting IAM
+  policy failed"), and the service stays private (403). `--no-invoker-iam-check` **works**:
+  the service answered 200 to unauthenticated requests. So step 2 uses
+  `--no-invoker-iam-check`. To re-check later (for example if org policies change):
   ```bash
   gcloud run deploy public-check --image=us-docker.pkg.dev/cloudrun/container/hello \
-    --region=$REGION --project=$P --allow-unauthenticated --quiet
+    --region=$REGION --project=$P --no-invoker-iam-check --quiet
   curl -s -o /dev/null -w "%{http_code}\n" "$(gcloud run services describe public-check --region=$REGION --project=$P --format='value(status.url)')"   # expect 200
   gcloud run services delete public-check --region=$REGION --project=$P --quiet
   ```
-  If the deploy fails citing an organization policy on `allUsers`, repeat it with
-  `--no-invoker-iam-check` in place of `--allow-unauthenticated`. If that works, **use
-  `--no-invoker-iam-check` in step 2 as well**. If both fail, stop: the org policy needs an
-  exception first.
+  If that ever returns 403, or the deploy is refused (an org policy such as
+  `run.managed.requireInvokerIam`), stop: the org policy needs an exception first.
 
 - [ ] **P2. Add `API_ORIGIN` to the env file.** This is safe to run more than once:
   ```bash
@@ -118,12 +119,18 @@ gcloud run deploy devasign-api --project=$P --region=$REGION \
   --service-account=devasign-api@$P.iam.gserviceaccount.com \
   --min-instances=1 --max-instances=1 --no-cpu-throttling --cpu=1 --memory=2Gi \
   --timeout=3600 --concurrency=80 --execution-environment=gen2 --cpu-boost \
-  --allow-unauthenticated \
+  --no-invoker-iam-check \
   --env-vars-file=$ENVDIR/.env.cloudrun.yaml \
   --set-secrets="$SECRETS" \
   --labels=env=prod
 ```
-If P1 needed it, use `--no-invoker-iam-check` in place of `--allow-unauthenticated`.
+`--no-invoker-iam-check` makes the service public without an `allUsers` binding, which this
+project's org policy forbids (see P1). The API does its own auth: session cookies,
+webhook signatures, OIDC for verify.
+
+Also check the service is reachable without credentials:
+`curl -s -o /dev/null -w "%{http_code}\n" $API/api/health` should print `200` (a `403` means
+the invoker check is still on).
 
 **Verify before going on:**
 ```bash
