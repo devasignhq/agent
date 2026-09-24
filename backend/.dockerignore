@@ -12,6 +12,5 @@ coverage
 data
 
 **/*.test.ts
-Dockerfile
-.dockerignore
+deploy
 .gcloudignore
