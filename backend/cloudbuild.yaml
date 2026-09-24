@@ -8,7 +8,7 @@ substitutions:
 
 steps:
   - id: test
-    name: node:22-bookworm-slim
+    name: node:24-bookworm-slim
     dir: backend
     entrypoint: bash
     args: ["-c", "npm ci --no-audit --no-fund && npm test"]
