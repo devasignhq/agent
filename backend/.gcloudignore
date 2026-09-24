@@ -1,0 +1,4 @@
+# What `gcloud run deploy --source backend` uploads; mirrors .dockerignore so secrets never leave this machine.
+#!include:.dockerignore
+.git
+.gitignore
