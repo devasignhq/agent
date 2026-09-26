@@ -23,7 +23,7 @@ Options:
   --audience <aud>         OIDC audience (default devasign)
   --token <jwt>            Use this token instead of the Actions OIDC token (local runs)
   --pr <n> --sha <sha>     Override the PR number / head sha (local runs)
-  --resolve-timeout <s>    Max seconds to wait for a plan (default 180; DevAsign
+  --resolve-timeout <s>    Max seconds to wait for a plan (default 600; DevAsign
                            may shorten it and re-run this workflow when ready)
   --test-timeout <s>       Per test-file timeout in seconds (default 600)
   --plan-file <path>       Offline: run this plan JSON with no API
@@ -97,7 +97,7 @@ export async function main(argv = process.argv.slice(2)): Promise<number> {
       apiUrl,
       token,
       failOn,
-      resolveTimeoutMs: seconds(values["resolve-timeout"], 180) * 1000,
+      resolveTimeoutMs: seconds(values["resolve-timeout"], 600) * 1000,
       testTimeoutMs: seconds(values["test-timeout"], 600) * 1000,
       keep: !!values.keep,
       cwd,

@@ -44,3 +44,5 @@ jobs:
         run: npm ci --prefix verify
       - name: DevAsign verify
         uses: devasignhq/verify-action@v1
+        with:
+          resolve-timeout: "600"
