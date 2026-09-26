@@ -226,7 +226,8 @@ export const config = {
     runTimeoutMs: Number(process.env.VERIFY_RUN_TIMEOUT_MS || 60 * 60_000),
     // Advertised to the runner so it stops burning CI minutes on a slow plan; the
     // backend re-dispatches the workflow once the plan is ready. Shortens only.
-    runnerGiveUpMs: Number(process.env.VERIFY_RUNNER_GIVE_UP_MS || 120_000),
+    // 10 min: Gemini on Vertex plans in ~5-6 min, well past the old 2 min.
+    runnerGiveUpMs: Number(process.env.VERIFY_RUNNER_GIVE_UP_MS || 600_000),
     // Planner model, independent of the judge/feedback tier. Empty inherits.
     // Any id set here MUST have a row in ANTHROPIC_PRICES or cost records $0.
     plannerModel: process.env.VERIFY_PLANNER_MODEL || "claude-sonnet-5",
