@@ -11,7 +11,7 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "seed": "tsx scripts/seed.ts",
     "dev:ephemeral": "tsx scripts/ephemeral-dev.ts",
-    "test": "DATABASE_URL= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts' 'deploy/**/*.test.mjs'",
+    "test": "DATABASE_URL= LLM_PROVIDER= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts' 'deploy/**/*.test.mjs'",
     "eval:criteria": "tsx scripts/eval-criteria.ts",
     "audit": "npm audit --audit-level=high"
   },
@@ -22,6 +22,7 @@
     "@anthropic-ai/sdk": "^0.32.1",
     "@aws-sdk/client-s3": "^3.1125.0",
     "@aws-sdk/s3-request-presigner": "^3.1125.0",
+    "@google/genai": "^2.24.0",
     "@statsig/statsig-node-core": "^0.19.5",
     "@stellar/stellar-sdk": "^13.3.0",
     "cookie-parser": "^1.4.7",
