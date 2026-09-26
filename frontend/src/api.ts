@@ -455,7 +455,8 @@ export type VerifyTestRow = {
   durationMs: number;
   evidence: Array<{ artifactId: string; kind: TestEvidenceKind; attempt: number | null; expired: boolean }>;
   adopted: TestAdoption | null;
-  archived: { at: number } | null;
+  // supersededBy: the newer PR of the same repo that auto-archived this row.
+  archived: { at: number; supersededBy?: number } | null;
   repo: { id: string; name: string };
   review: { id: string; prNumber: number; prTitle: string };
   run: { id: string; sha: string; status: VerifyRunStatus; createdAt: number; checkRunUrl: string | null };

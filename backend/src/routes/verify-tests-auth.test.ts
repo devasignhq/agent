@@ -26,13 +26,20 @@ function tenant(login: string, verify?: RepoVerifyState) {
   db.insert("prReviews", { id: reviewId, repoId, prNumber: 7, prTitle: "Refunds", headSha: "a", baseSha: "b", status: "passed", verdict: null, criteria: [], taskId: null, additions: null, deletions: null, changedFiles: null, createdAt: Date.now(), updatedAt: Date.now() } as any);
   const runIds: string[] = [];
   const planIds: string[] = [];
-  const addRun = (createdAt: number, testPath: string, adopted?: { prUrl: string; prNumber: number; at: number }) => {
+  const reviewIds = [reviewId];
+  const addReview = (prNumber: number, createdAt: number) => {
+    const id = uuid();
+    db.insert("prReviews", { id, repoId, prNumber, prTitle: `PR ${prNumber}`, headSha: "a", baseSha: "b", status: "passed", verdict: null, criteria: [], taskId: null, additions: null, deletions: null, changedFiles: null, createdAt, updatedAt: createdAt } as any);
+    reviewIds.push(id);
+    return id;
+  };
+  const addRun = (createdAt: number, testPath: string, adopted?: { prUrl: string; prNumber: number; at: number }, on = { reviewId, prNumber: 7 }) => {
     const runId = uuid(), planId = uuid(), resultsId = uuid();
     db.insert("verifyPlans", { id: planId, schemaVersion: 1, runId, repoId, criteriaRevision: 1, commands: [], unverifiable: [], createdAt, tests: [
       { id: "t1", path: testPath, content: "// hidden", criterionIds: ["1"], level: "e2e", levelReason: "", origin: "generated", runner: "playwright", testSignature: "s", strategyVersion: 1, targetFiles: [], ...(adopted ? { adopted } : {}) },
     ] } as any);
     db.insert("verifyResults", { id: resultsId, schemaVersion: 1, runId, createdAt, payload: { runId, results: [{ id: "r1", testId: "t1", criterionIds: ["1"], test: "t", runner: "playwright", level: "e2e", origin: "generated", status: "pass", attempts: [{ n: 1, status: "pass", durationMs: 3, artifactIds: [] }], durationMs: 3, artifactIds: [] }] } } as any);
-    db.insert("verifyRuns", { id: runId, schemaVersion: 1, reviewId, repoId, installationId: installId, prNumber: 7, sha: "a", attempt: 1, status: "completed", criteriaRevision: 1, planTier: "pro", planId, resultsId, verdicts: [], timings: { forkedAt: createdAt }, tokenUsage: {}, artifactBytes: 0, triggeredBy: { kind: "pr_event" }, createdAt, updatedAt: createdAt } as any);
+    db.insert("verifyRuns", { id: runId, schemaVersion: 1, reviewId: on.reviewId, repoId, installationId: installId, prNumber: on.prNumber, sha: "a", attempt: 1, status: "completed", criteriaRevision: 1, planTier: "pro", planId, resultsId, verdicts: [], timings: { forkedAt: createdAt }, tokenUsage: {}, artifactBytes: 0, triggeredBy: { kind: "pr_event" }, createdAt, updatedAt: createdAt } as any);
     db.insert("verifyArtifacts", { id: uuid(), schemaVersion: 1, runId, repoId, testId: "t1", criterionIds: ["1"], kind: "video", path: "v.webm", storageKey: "k", bytes: 1, contentType: "video/webm", attempt: 1, state: "uploaded", expiresAt: Date.now() + 1e6, createdAt } as any);
     runIds.push(runId);
     planIds.push(planId);
@@ -43,12 +50,12 @@ function tenant(login: string, verify?: RepoVerifyState) {
     db.remove("verifyResults", (r) => runIds.includes(r.runId));
     db.remove("verifyPlans", (p) => planIds.includes(p.id));
     db.remove("verifyRuns", (r) => runIds.includes(r.id));
-    db.remove("prReviews", (r) => r.id === reviewId);
+    db.remove("prReviews", (r) => reviewIds.includes(r.id));
     db.remove("repositories", (r) => r.id === repoId);
     db.remove("installations", (i) => i.id === installId);
     db.remove("users", (u) => u.id === userId);
   };
-  return { userId, installId, repoId, reviewId, addRun, cleanup };
+  return { userId, installId, repoId, reviewId, addRun, addReview, cleanup };
 }
 
 const call = (userId?: string) => {
@@ -144,5 +151,40 @@ test("browserSetup lists only the caller's repos that had UI criteria checked wi
     db.remove("repositories", (r) => r.id === quietId || r.id === failingId);
     mine.cleanup();
     theirs.cleanup();
+  }
+});
+
+test("a newer PR auto-archives the older PR's tests in the same repo; a restore after it sticks until the next PR", () => {
+  const mine = tenant("rotator");
+  try {
+    mine.addRun(100, "old.spec.ts");
+    let body = call(mine.userId).body;
+    assert.equal(body.rows[0].archived, null, "a repo's only PR stays active");
+
+    const pr8 = mine.addReview(8, Date.now());
+    mine.addRun(200, "new.spec.ts", undefined, { reviewId: pr8, prNumber: 8 });
+    body = call(mine.userId).body;
+    const byPath = (p: string) => body.rows.find((r: any) => r.path === p);
+    assert.equal(byPath("new.spec.ts").archived, null);
+    assert.equal(byPath("old.spec.ts").archived.supersededBy, 8);
+    assert.deepEqual(body.counts, { ran: 1, e2e: 1, unit: 0, passed: 1, failed: 0, archived: 1 });
+
+    // A later push to the old PR does not bring it back: newness is by PR, not by run.
+    mine.addRun(300, "old.spec.ts");
+    body = call(mine.userId).body;
+    assert.equal(byPath("old.spec.ts").archived.supersededBy, 8);
+
+    assert.equal(archive(mine.userId, mine.reviewId, { paths: ["old.spec.ts"], archived: false }).statusCode, 200);
+    body = call(mine.userId).body;
+    assert.equal(byPath("old.spec.ts").archived, null, "a restore overrides the auto-archive");
+
+    const pr9 = mine.addReview(9, Date.now() + 10_000);
+    mine.addRun(400, "newest.spec.ts", undefined, { reviewId: pr9, prNumber: 9 });
+    body = call(mine.userId).body;
+    assert.equal(byPath("old.spec.ts").archived.supersededBy, 9, "an even newer PR archives it again");
+    assert.equal(byPath("new.spec.ts").archived.supersededBy, 9);
+    assert.equal(byPath("newest.spec.ts").archived, null);
+  } finally {
+    mine.cleanup();
   }
 });

@@ -3,7 +3,7 @@
 //   DATABASE_URL= node --import tsx/esm --test src/verify/test-rows.test.ts
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { bucketLevel, buildTestRows, latestRunPerReview, summarizeTestRows } from "./test-rows.js";
+import { bucketLevel, buildTestRows, latestRunPerReview, summarizeTestRows, supersededReviews } from "./test-rows.js";
 
 const NOW = 1_000_000;
 const run: any = { id: "run1", repoId: "repo1", reviewId: "rev1", sha: "abc", status: "completed", createdAt: 500, attempt: 1, report: { checkRunUrl: "https://gh/check" } };
@@ -94,4 +94,29 @@ test("latestRunPerReview keeps the newest run per review, newest first overall",
     { id: "d", reviewId: "r2", createdAt: 3, attempt: 1 },
   ];
   assert.deepEqual(latestRunPerReview(runs).map((r) => r.id), ["c", "d"]);
+});
+
+test("supersededReviews: the highest PR number per repo stays active, older PRs point at it", () => {
+  const runs: any[] = [
+    { reviewId: "a5", repoId: "r1", prNumber: 5, createdAt: 900 },
+    { reviewId: "a9", repoId: "r1", prNumber: 9, createdAt: 100 },
+    { reviewId: "a7", repoId: "r1", prNumber: 7, createdAt: 50 },
+    { reviewId: "b2", repoId: "r2", prNumber: 2, createdAt: 10 },
+  ];
+  const sup = supersededReviews(runs, (id) => (id === "a9" ? 77 : undefined));
+  assert.deepEqual([...sup].sort(), [["a5", { prNumber: 9, at: 77 }], ["a7", { prNumber: 9, at: 77 }]]);
+  assert.deepEqual(supersededReviews(runs.slice(1, 2), () => undefined).size, 0);
+  assert.deepEqual(supersededReviews([runs[0], runs[2]], () => undefined).get("a5"), { prNumber: 7, at: 50 });
+});
+
+test("a superseded PR's rows are auto-archived unless restored after the newer PR arrived", () => {
+  const superseded = { prNumber: 9, at: 300 };
+  const rows = buildTestRows(run, plan, results, artifacts, {
+    ...ctx,
+    superseded,
+    archived: [{ path: "src/cart.test.ts", at: 42 }],
+    restored: [{ path: ".devasign/tests/tax.test.ts", at: 400 }, { path: ".devasign/tests/e2e/checkout.spec.ts", at: 200 }],
+  }, NOW);
+  assert.deepEqual(rows.map((r) => r.archived), [{ at: 300, supersededBy: 9 }, { at: 42 }, null]);
+  assert.deepEqual(summarizeTestRows(rows), { ran: 0, e2e: 0, unit: 1, passed: 0, failed: 0, archived: 2 });
 });

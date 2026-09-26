@@ -52,7 +52,7 @@ import { sanitizeTabId } from "../request-context.js";
 import { track } from "../statsig.js";
 import { expensiveLimiter } from "../rate-limit.js";
 import { buildRunView } from "../verify/runs.js";
-import { buildTestRows, latestRunPerReview, summarizeTestRows } from "../verify/test-rows.js";
+import { buildTestRows, latestRunPerReview, summarizeTestRows, supersededReviews } from "../verify/test-rows.js";
 import { repoFlakeRate, repoFlakeRates } from "../verify/flake.js";
 import { adoptGeneratedTests } from "../verify/onboarding/job.js";
 import { ONBOARDING_BRANCH } from "../verify/onboarding/generate.js";
@@ -1326,6 +1326,10 @@ export function verifyTestsHandler(req: Request, res: Response) {
   const runIds = new Set(runs.map((r) => r.id));
   const planIds = new Set(runs.map((r) => r.planId));
   const resultIds = new Set(runs.map((r) => r.resultsId).filter(Boolean));
+  // Older PRs of a repo are auto-archived once a newer PR has tests; judged across every repo run, not just the capped page.
+  const newestIds = new Set(latest.map((r) => r.reviewId));
+  const arrivedAt = new Map(db.filter("prReviews", (r) => newestIds.has(r.id)).map((r) => [r.id, r.createdAt]));
+  const superseded = supersededReviews(latest, (id) => arrivedAt.get(id));
   const reviewIds = new Set(runs.map((r) => r.reviewId));
   const plans = new Map(db.filter("verifyPlans", (p) => planIds.has(p.id)).map((p) => [p.id, p]));
   const results = new Map(db.filter("verifyResults", (r) => resultIds.has(r.id)).map((r) => [r.id, r]));
@@ -1346,7 +1350,7 @@ export function verifyTestsHandler(req: Request, res: Response) {
       plan,
       run.resultsId ? results.get(run.resultsId) ?? null : null,
       artifactsByRun.get(run.id) ?? [],
-      { repoName: repoNameById.get(run.repoId) ?? "", review: { id: review.id, prNumber: review.prNumber, prTitle: review.prTitle }, archived: review.archivedTests },
+      { repoName: repoNameById.get(run.repoId) ?? "", review: { id: review.id, prNumber: review.prNumber, prTitle: review.prTitle }, archived: review.archivedTests, restored: review.restoredTests, superseded: superseded.get(review.id) ?? null },
       now
     );
   });
@@ -1367,7 +1371,8 @@ export function verifyTestsHandler(req: Request, res: Response) {
 api.get("/verify/tests", verifyTestsHandler);
 
 // Archive (or restore) tests of one PR on the Tests page. Keyed by path, so a
-// later run of the same PR keeps them archived.
+// later run of the same PR keeps them archived. Restoring also overrides the
+// auto-archive of an older PR, until a still-newer PR arrives.
 export function archiveTestsHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
@@ -1383,10 +1388,14 @@ export function archiveTestsHandler(req: Request, res: Response) {
   }
   const paths = new Set<string>(raw);
   const archived = req.body?.archived !== false;
-  const kept = (review.archivedTests ?? []).filter((a) => !paths.has(a.path));
   const now = Date.now();
-  const archivedTests = archived ? [...kept, ...[...paths].map((path) => ({ path, at: now, by: user.id }))] : kept;
-  db.update("prReviews", (r) => r.id === review.id, { archivedTests });
+  const stamp = [...paths].map((path) => ({ path, at: now, by: user.id }));
+  const keptArchived = (review.archivedTests ?? []).filter((a) => !paths.has(a.path));
+  const keptRestored = (review.restoredTests ?? []).filter((a) => !paths.has(a.path));
+  const archivedTests = archived ? [...keptArchived, ...stamp] : keptArchived;
+  // A restore is recorded too, so it outranks an auto-archive from a newer PR that already arrived.
+  const restoredTests = archived ? keptRestored : [...keptRestored, ...stamp];
+  db.update("prReviews", (r) => r.id === review.id, { archivedTests, restoredTests });
   res.json({ ok: true, archivedTests: archivedTests.map(({ path, at }) => ({ path, at })) });
 }
 api.post("/reviews/:id/verify/archive", archiveTestsHandler);

@@ -21,7 +21,8 @@ export type VerifyTestRow = {
   durationMs: number;
   evidence: Array<{ artifactId: string; kind: EvidenceKind; attempt: number | null; expired: boolean }>;
   adopted: TestAdoption | null;
-  archived: { at: number } | null;
+  // supersededBy: the newer PR of the same repo that auto-archived this row.
+  archived: { at: number; supersededBy?: number } | null;
   repo: { id: string; name: string };
   review: { id: string; prNumber: number; prTitle: string };
   run: { id: string; sha: string; status: VerifyRunStatus; createdAt: number; checkRunUrl: string | null };
@@ -36,6 +37,27 @@ export type VerifyTestsResponse = {
   truncated: boolean;
 };
 
+export type Supersession = { prNumber: number; at: number };
+
+/**
+ * Per repo, only the highest-numbered PR keeps its tests active; every older PR is
+ * superseded by it, as of when that PR arrived. `runs` is one run per review.
+ */
+export function supersededReviews(runs: VerifyRun[], arrivedAt: (reviewId: string) => number | undefined): Map<string, Supersession> {
+  const newest = new Map<string, VerifyRun>();
+  for (const r of runs) {
+    const cur = newest.get(r.repoId);
+    if (!cur || r.prNumber > cur.prNumber) newest.set(r.repoId, r);
+  }
+  const out = new Map<string, Supersession>();
+  for (const r of runs) {
+    const top = newest.get(r.repoId)!;
+    if (top.prNumber === r.prNumber) continue;
+    out.set(r.reviewId, { prNumber: top.prNumber, at: arrivedAt(top.reviewId) ?? top.createdAt });
+  }
+  return out;
+}
+
 const EVIDENCE_KINDS = new Set<string>(["video", "trace", "screenshot", "log"]);
 
 export function bucketLevel(level: TestLevel): TestCategory {
@@ -47,7 +69,13 @@ export function buildTestRows(
   plan: VerifyPlan,
   results: VerifyResults | null,
   artifacts: VerifyArtifact[],
-  ctx: { repoName: string; review: { id: string; prNumber: number; prTitle: string }; archived?: Array<{ path: string; at: number }> },
+  ctx: {
+    repoName: string;
+    review: { id: string; prNumber: number; prTitle: string };
+    archived?: Array<{ path: string; at: number }>;
+    restored?: Array<{ path: string; at: number }>;
+    superseded?: Supersession | null;
+  },
   now = Date.now()
 ): VerifyTestRow[] {
   const resultByTest = new Map((results?.payload.results ?? []).map((r) => [r.testId, r]));
@@ -59,9 +87,16 @@ export function buildTestRows(
     artifactsByTest.set(a.testId, list);
   }
   const archivedAt = new Map((ctx.archived ?? []).map((a) => [a.path, a.at]));
+  const restoredAt = new Map((ctx.restored ?? []).map((a) => [a.path, a.at]));
+  const sup = ctx.superseded ?? null;
+  const archivedFor = (path: string): VerifyTestRow["archived"] => {
+    const at = archivedAt.get(path);
+    if (at !== undefined) return { at };
+    if (!sup || (restoredAt.get(path) ?? -Infinity) >= sup.at) return null;
+    return { at: sup.at, supersededBy: sup.prNumber };
+  };
   return plan.tests.map((t) => {
     const r = resultByTest.get(t.id);
-    const at = archivedAt.get(t.path);
     return {
       key: `${run.id}:${t.id}`,
       testId: t.id,
@@ -83,7 +118,7 @@ export function buildTestRows(
           expired: a.state === "expired" || a.expiresAt <= now,
         })),
       adopted: t.adopted ?? null,
-      archived: at === undefined ? null : { at },
+      archived: archivedFor(t.path),
       repo: { id: run.repoId, name: ctx.repoName },
       review: ctx.review,
       run: {

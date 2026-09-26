@@ -796,6 +796,8 @@ export type PRReview = {
   verifyCommentSha?: string | null;
   // Tests hidden from the Tests page, by path so they stay archived across new runs.
   archivedTests?: Array<{ path: string; at: number; by: string }>;
+  // Tests restored by hand; one restored after a newer PR superseded this one stays visible.
+  restoredTests?: Array<{ path: string; at: number; by: string }>;
   // Inline review-comment threads DevAsign owns on this PR, one per review item.
   // Reconciled on every run: still-reported items are edited in place, items that
   // stopped being reported are marked fixed, new ones open a thread. Absent on
