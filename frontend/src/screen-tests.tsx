@@ -277,7 +277,7 @@ export const TestsPage = ({ isMobile }) => {
                   <button className="btn ghost sm" onClick={() => setSelected(new Set())}>Clear</button>
                 </>
               ) : (
-                <span className="mono mute" style={{ fontSize: 11 }}>Viewing archived tests. Select tests to restore them to the list.</span>
+                <span className="mono mute" style={{ fontSize: 11 }}>Viewing archived tests. A new PR archives the older PRs' tests in its repository. Select tests to restore them to the list.</span>
               )}
             </div>
           )}
@@ -328,7 +328,7 @@ const TestRow = ({ r, picked, onToggle, onOpen, onAdopted, navigate }) => (
     </span>
     <div className="tst-name">
       <span className="vln-fx-t">{testName(r.path)}</span>
-      <span className="vln-fx-l" title={r.path}>{r.path}{r.origin === "existing" ? " · existing" : ""}</span>
+      <span className="vln-fx-l" title={r.path}>{r.path}{r.origin === "existing" ? " · existing" : ""}{r.archived?.supersededBy ? ` · superseded by #${r.archived.supersededBy}` : ""}</span>
     </div>
     <span className="tst-cat" title={r.level}>{categoryLabel(r.category)}</span>
     <span className="vln-fx-repo" title={r.repo.name}>{r.repo.name}</span>
@@ -417,7 +417,11 @@ const TestDrawer = ({ row, focusArtifactId, onClose, onAdopted, onArchive, archi
             <div className="mono mute" style={{ fontSize: 11, marginTop: 4, display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
               <span className={`pill ${statusTone(row.status)}`}><i className="dot"></i> {statusLabel(row.status)}</span>
               <span>{row.level} · {row.runner}{row.origin === "existing" ? " · existing test" : " · generated"}</span>
-              {row.archived && <span className="pill mute">archived</span>}
+              {row.archived && (
+                <span className="pill mute" title={row.archived.supersededBy ? "Archived automatically when a newer PR in this repository got tests" : undefined}>
+                  {row.archived.supersededBy ? `archived · superseded by #${row.archived.supersededBy}` : "archived"}
+                </span>
+              )}
             </div>
           </div>
           <button className="modal-close" onClick={onClose} aria-label="Close"><Icon name="x" size={13} /></button>

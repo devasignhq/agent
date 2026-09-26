@@ -42,7 +42,9 @@ export function verifyRowMatters(collection: string, row: unknown, prev: unknown
   if (collection === "prReviews") {
     const r = row as PRReview;
     const p = prev as PRReview | null;
-    if (!p || JSON.stringify(p.archivedTests ?? []) === JSON.stringify(r.archivedTests ?? [])) return null;
+    if (!p) return null;
+    const same = (k: "archivedTests" | "restoredTests") => JSON.stringify(p[k] ?? []) === JSON.stringify(r[k] ?? []);
+    if (same("archivedTests") && same("restoredTests")) return null;
     return r.repoId;
   }
   return null;
