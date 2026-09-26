@@ -17,6 +17,7 @@ import {
   markAdopted,
   markArchived,
   pickEvidence,
+  pruneDismissed,
   repoOptions,
   soonestEvidenceExpiry,
   sortRows,
@@ -45,6 +46,24 @@ const ORIGIN_CHIPS = [
 const shortSha = (sha) => (sha || "").slice(0, 7);
 const when = (ts) => new Date(ts).toLocaleString("en-US", { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
 
+// Dismissed browser-banner keys (repoId:runId); blocked storage just means the banner keeps showing.
+const DISMISSED_KEY = "devasign.testsBanner.dismissed";
+const readDismissed = () => {
+  try {
+    const raw = window.localStorage.getItem(DISMISSED_KEY);
+    return new Set(raw ? JSON.parse(raw) : []);
+  } catch {
+    return new Set();
+  }
+};
+const writeDismissed = (keys) => {
+  try {
+    window.localStorage.setItem(DISMISSED_KEY, JSON.stringify(keys));
+  } catch {
+    /* ignore quota / disabled storage */
+  }
+};
+
 export const TestsPage = ({ isMobile }) => {
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -55,6 +74,7 @@ export const TestsPage = ({ isMobile }) => {
   const [open, setOpen] = React.useState(null); // { key, focusArtifactId? }
   const [selected, setSelected] = React.useState(() => new Set()); // row keys
   const [archiveBusy, setArchiveBusy] = React.useState(false);
+  const [dismissed, setDismissed] = React.useState(readDismissed);
 
   const load = React.useCallback(async (silent) => {
     if (!silent) setLoading(true);
@@ -150,7 +170,12 @@ export const TestsPage = ({ isMobile }) => {
   }
   if (!data) return null;
   const c = countRows(data.rows);
-  const banner = browserBanner(data.browserSetup);
+  const banner = browserBanner(data.browserSetup, dismissed);
+  const dismissBanner = () => {
+    const next = [...pruneDismissed(data.browserSetup, dismissed), ...banner.keys];
+    writeDismissed(next);
+    setDismissed(new Set(next));
+  };
   const filtered = filters.repo || filters.category || filters.status || filters.origin || filters.review || filters.archived || filters.q.trim();
 
   return (
@@ -168,9 +193,15 @@ export const TestsPage = ({ isMobile }) => {
             {banner.text} —{" "}
             <a href={banner.href} onClick={(e) => { e.preventDefault(); navigate(banner.href); }}>{banner.action}</a>
           </span>
+          <button className="notice-close" onClick={dismissBanner} aria-label="Dismiss" title="Dismiss until the next run flags it"><Icon name="x" size={12} /></button>
         </div>
       )}
-      {error && <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>{error}</div>}
+      {error && (
+        <div className="tu-notice page-notice" style={{ marginBottom: 12 }}>
+          <span>{error}</span>
+          <button className="notice-close" onClick={() => setError(null)} aria-label="Dismiss"><Icon name="x" size={12} /></button>
+        </div>
+      )}
 
       <div className="vln-stats tst-stats">
         <div className="vln-stat"><div className="k">tests ran</div><div className="vln-stat-row"><div className="v">{c.ran}</div><div className="d">of {data.rows.length - c.archived} planned</div></div></div>

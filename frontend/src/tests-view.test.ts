@@ -2,7 +2,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import type { BrowserSetupEntry, RunView, VerifyTestRow } from "./api.ts";
-import { EMPTY_FILTERS, browserBanner, countRows, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, soonestEvidenceExpiry, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
+import { EMPTY_FILTERS, browserBanner, countRows, pruneDismissed, filterRows, markAdopted, markArchived, pickEvidence, repoOptions, soonestEvidenceExpiry, sortRows, statusLabel, statusTone, testDetail, testName } from "./tests-view.ts";
 
 const row = (over: Partial<VerifyTestRow> & { key: string }): VerifyTestRow => ({
   testId: over.key,
@@ -199,6 +199,7 @@ test("browserBanner counts several repos and links to the most recent one", () =
   assert.equal(b.action, "set up browser tests", "mixed reasons use the setup wording");
   assert.equal(b.href, "/workflow?repo=new&setup=browser");
   assert.deepEqual(b.repos, ["acme/new", "acme/old"]);
+  assert.deepEqual(b.keys, ["new:b", "old:a"]);
 });
 
 test("browserBanner says the app did not start when every flagged repo is failing", () => {
@@ -240,4 +241,22 @@ test("browserBanner never links outside the setup panel", () => {
   assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "https://evil.test/logout" })])!.href, "/workflow?repo=r1&setup=browser");
   assert.equal(browserBanner([setupEntry({ repoId: "r1", fixUrl: "" })])!.href, "/workflow?repo=r1&setup=browser");
   assert.equal(browserBanner([setupEntry({ repoId: "r 2", fixUrl: "/workflow?repo=r%202&setup=browser" })])!.href, "/workflow?repo=r%202&setup=browser");
+});
+
+test("browserBanner stays dismissed until a new run re-flags the repo", () => {
+  const flagged = (repoId: string, runId: string, at: number) => setupEntry({ repoId, lastBrowserless: { count: 1, reason: "not_configured", runId, prNumber: 3, at } });
+  const b = browserBanner([flagged("r1", "run1", 1)])!;
+  assert.deepEqual(b.keys, ["r1:run1"]);
+  assert.equal(browserBanner([flagged("r1", "run1", 1)], new Set(b.keys)), null);
+  assert.equal(browserBanner([flagged("r1", "run2", 2)], new Set(b.keys))!.text, "UI criteria on acme/r1 were checked without a browser", "a newer run brings it back");
+
+  const partly = browserBanner([flagged("r1", "run1", 1), flagged("r2", "runB", 5)], new Set(["r1:run1"]))!;
+  assert.equal(partly.text, "UI criteria on acme/r2 were checked without a browser", "only the undismissed repo is named");
+  assert.deepEqual([partly.repos, partly.keys, partly.href], [["acme/r2"], ["r2:runB"], "/workflow?repo=r2&setup=browser"]);
+});
+
+test("pruneDismissed keeps only keys for the runs still flagged", () => {
+  const setup = [setupEntry({ repoId: "r1", lastBrowserless: { count: 1, reason: "not_configured", runId: "run2", prNumber: 3, at: 2 } })];
+  assert.deepEqual(pruneDismissed(setup, ["r1:run1", "r1:run2", "gone:x", "r1:run2"]), ["r1:run2"]);
+  assert.deepEqual(pruneDismissed(null, ["r1:run1"]), []);
 });

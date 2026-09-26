@@ -1815,6 +1815,15 @@ input[type="checkbox"]:focus-visible { outline: 1px solid var(--accent); outline
 /* The side margins above are the modal gutter this callout was written for. In
    page flow the banner has to line up with the widgets around it instead. */
 .tu-notice.page-notice { margin-left: 0; margin-right: 0; }
+.tu-notice .notice-close {
+  margin-left: auto; flex-shrink: 0;
+  width: 20px; height: 20px;
+  display: grid; place-items: center;
+  background: transparent; border: 1px solid transparent;
+  color: var(--fg-mute); cursor: pointer;
+}
+.tu-notice .notice-close:hover { color: var(--fg); border-color: var(--line-2); background: var(--bg-2); }
+.tu-notice .notice-close svg { color: inherit; margin-top: 0; }
 
 /* Shared success panel — reused by the Fund / Cancel bounty modals. */
 .wd-success { text-align: center; padding: 22px 0 14px; display: flex; flex-direction: column; align-items: center; gap: 10px; }
