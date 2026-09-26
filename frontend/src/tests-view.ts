@@ -110,7 +110,18 @@ export function markArchived(rows: VerifyTestRow[], reviewId: string, paths: str
   return rows.map((r) => (r.review.id === reviewId && set.has(r.path) ? { ...r, archived: archived ? { at } : null } : r));
 }
 
-export type BrowserBanner = { text: string; action: string; href: string; repos: string[] };
+export type BrowserBanner = { text: string; action: string; href: string; repos: string[]; keys: string[] };
+
+// A dismissal names the run that raised the flag, so the next run that re-flags the repo shows it again.
+export function bannerKey(e: BrowserSetupEntry): string {
+  return `${e.repoId}:${e.lastBrowserless?.runId ?? ""}`;
+}
+
+/** The dismissed keys that still match a current entry; the rest belong to superseded runs. */
+export function pruneDismissed(setup: BrowserSetupEntry[] | null | undefined, dismissed: Iterable<string>): string[] {
+  const live = new Set((setup ?? []).map(bannerKey));
+  return [...new Set(dismissed)].filter((k) => live.has(k));
+}
 
 // Fix links are absolute on the app's origin; the banner navigates in-app, and only to the setup panel.
 function setupPath(fixUrl: string, repoId: string): string {
@@ -131,9 +142,10 @@ function bannerCause(e: BrowserSetupEntry): BrowserlessCause {
 }
 
 /** Repos whose latest run checked UI criteria without a browser and still need setup, newest first. */
-export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): BrowserBanner | null {
+export function browserBanner(setup: BrowserSetupEntry[] | null | undefined, dismissed: ReadonlySet<string> = new Set()): BrowserBanner | null {
   const hit = (setup ?? [])
     .filter((e) => (e.status === "not_configured" || e.status === "failing" || e.status === "runner_outdated") && (e.lastBrowserless?.count ?? 0) > 0)
+    .filter((e) => !dismissed.has(bannerKey(e)))
     .sort((a, b) => b.lastBrowserless!.at - a.lastBrowserless!.at);
   if (hit.length === 0) return null;
   const repos = hit.map((e) => e.repo);
@@ -151,6 +163,7 @@ export function browserBanner(setup: BrowserSetupEntry[] | null | undefined): Br
     action: configured ? "see setup" : cause === "runner_outdated" ? "update the runner" : "set up browser tests",
     href: setupPath(hit[0].fixUrl, hit[0].repoId),
     repos,
+    keys: hit.map(bannerKey),
   };
 }
 
