@@ -96,8 +96,20 @@ export const config = {
     privateKey: loadPrivateKey(),
   },
   llm: {
+    provider: (process.env.LLM_PROVIDER === "vertex" ? "vertex" : "anthropic") as "anthropic" | "vertex",
     apiKey: process.env.ANTHROPIC_API_KEY || "",
     model: process.env.ANTHROPIC_MODEL || "claude-opus-4-7",
+  },
+  // Gemini on Vertex AI via the runtime service account (ADC); no API key.
+  // Claude model ids stored on repos/plans are mapped onto `model` in llm-vertex.ts.
+  vertex: {
+    project: process.env.VERTEX_PROJECT || process.env.GOOGLE_CLOUD_PROJECT || "",
+    location: process.env.VERTEX_LOCATION || "global",
+    model: process.env.VERTEX_MODEL || "gemini-3.8-flash",
+    priority: process.env.VERTEX_PRIORITY === "1",
+    thinking: (process.env.VERTEX_THINKING || "medium").toLowerCase(),
+    inputPerMTok: Number(process.env.VERTEX_INPUT_PER_MTOK || 1.5),
+    outputPerMTok: Number(process.env.VERTEX_OUTPUT_PER_MTOK || 7.5),
   },
   // Gemini is used as a vision/video understanding model so Opus can reason
   // over Loom / YouTube / Vimeo references the user attached to a task.
@@ -294,7 +306,10 @@ export const isDbConfigured = () => Boolean(config.databaseUrl);
 // At-rest encryption for integration tokens. When false, seal/open no-op and
 // tokens are stored in plaintext (dev/tests run this way).
 export const isEncryptionConfigured = () => Boolean(config.encryption.key);
-export const isLLMLive = () => Boolean(config.llm.apiKey);
+// Vertex needs LLM_PROVIDER=vertex explicitly: gcloud ADC on a dev laptop must
+// never turn the offline test suite into billed calls.
+export const isLLMLive = () =>
+  config.llm.provider === "vertex" ? Boolean(config.vertex.project) : Boolean(config.llm.apiKey);
 export const isGeminiLive = () => Boolean(config.gemini.apiKey);
 export const isGithubOAuthConfigured = () =>
   Boolean(config.github.oauthClientId && config.github.oauthClientSecret);

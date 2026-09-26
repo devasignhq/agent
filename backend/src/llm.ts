@@ -3,10 +3,13 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { config, isGeminiLive, isLLMLive } from "./config.js";
+import { resolveVertexModel, vertexGenerate, vertexMessage, vertexUsage } from "./llm-vertex.js";
 import { hostMatches } from "./ssrf.js";
 import { extractJSON } from "./review/parse.js";
 
-const client = isLLMLive() ? new Anthropic({ apiKey: config.llm.apiKey }) : null;
+const live = isLLMLive();
+const onVertex = live && config.llm.provider === "vertex";
+const client = live && !onVertex ? new Anthropic({ apiKey: config.llm.apiKey }) : null;
 
 // Lets a job set the default model for every complete() call it makes, without
 // threading a `model` arg through its whole call graph. Precedence: explicit
@@ -71,6 +74,9 @@ const ANTHROPIC_PRICES: Record<string, { inPerM: number; outPerM: number }> = {
 
 function priceFor(model: string): { inPerM: number; outPerM: number } {
   if (ANTHROPIC_PRICES[model]) return ANTHROPIC_PRICES[model];
+  if (model === config.vertex.model) {
+    return { inPerM: config.vertex.inputPerMTok, outPerM: config.vertex.outputPerMTok };
+  }
   if (model === config.gemini.model) {
     return { inPerM: config.gemini.inputPerMTok, outPerM: config.gemini.outputPerMTok };
   }
@@ -196,6 +202,18 @@ async function sendParams(
     : undefined;
 
   const model = opts.model || modelContext.getStore() || config.llm.model;
+  if (onVertex) {
+    const r = await vertexMessage({
+      model,
+      maxTokens: opts.maxTokens ?? 2048,
+      system: sys,
+      messages,
+      tools: tooling?.tools,
+      choice: tooling?.choice,
+    });
+    recordUsage(r.model, r.usage);
+    return r.message;
+  }
   const resp = await client!.messages.create({
     model,
     max_tokens: opts.maxTokens ?? 2048,
@@ -234,20 +252,20 @@ function textOf(resp: Anthropic.Message): string {
 }
 
 export async function completeWithMeta(opts: CompleteOpts): Promise<CompletionResult> {
-  if (!client) return { text: mockComplete(opts), stopReason: "end_turn" };
+  if (!live) return { text: mockComplete(opts), stopReason: "end_turn" };
   const resp = await sendMessages(opts);
   return { text: textOf(resp), stopReason: resp.stop_reason ?? null };
 }
 
 function rejectsTools(err: unknown): boolean {
   const e = err as { status?: number; message?: string } | null;
-  return e?.status === 400 && /tool/i.test(e?.message ?? "");
+  return e?.status === 400 && /tool|function/i.test(e?.message ?? "");
 }
 
 // Forces the model to answer by calling `tool`, so the payload is API-validated
 // JSON instead of prose to parse. A call cut at max_tokens is never accepted.
 export async function completeStructured(opts: CompleteOpts & { tool: StructuredTool }): Promise<StructuredResult> {
-  if (!client) {
+  if (!live) {
     const text = mockComplete(opts);
     let input: unknown | null = null;
     try {
@@ -329,7 +347,7 @@ export async function runLookupLoop(args: {
 export async function completeStructuredWithLookups(
   opts: CompleteOpts & { tool: StructuredTool; lookups: LookupTool[]; maxLookupTurns?: number; onLookup?: (name: string, input: unknown) => void }
 ): Promise<StructuredResult> {
-  if (!client || !opts.lookups.length || opts.images?.length) return completeStructured(opts);
+  if (!live || !opts.lookups.length || opts.images?.length) return completeStructured(opts);
   const tools = [...opts.lookups.map((l) => l.tool), opts.tool];
   try {
     return await runLookupLoop({
@@ -1169,7 +1187,7 @@ export async function summarizeVideo(input: {
 }): Promise<VideoSummary> {
   const provider = detectVideoProvider(input.url) || "other";
 
-  if (!isGeminiLive()) return mockVideoSummary(input.url, provider);
+  if (!onVertex && !isGeminiLive()) return mockVideoSummary(input.url, provider);
 
   try {
     const parts: any[] = [];
@@ -1188,37 +1206,12 @@ export async function summarizeVideo(input: {
           : "You cannot directly ingest this provider's videos. Use the URL, title and note to infer the gist conservatively, and set unreliable=true. Emit the JSON schema described in the system prompt."),
     });
 
-    const endpoint =
-      `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent`;
-    const res = await fetch(endpoint, {
-      method: "POST",
-      // The key goes in a header, never the URL: request URLs are what proxy
-      // access logs, APM spans and error trackers capture by default, and this
-      // is a long-lived credential on the org's billing account. Google accepts
-      // the same key as ?key=, but that form leaks it into every log sink.
-      headers: {
-        "Content-Type": "application/json",
-        "x-goog-api-key": config.gemini.apiKey,
-      },
-      body: JSON.stringify({
-        systemInstruction: { parts: [{ text: VIDEO_SYSTEM }] },
-        contents: [{ role: "user", parts }],
-        generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
-      }),
-    });
-    if (!res.ok) throw new Error(`gemini ${res.status}: ${await res.text().catch(() => "")}`);
-    const body = (await res.json()) as any;
-    recordUsage(config.gemini.model, {
-      inputTokens: body?.usageMetadata?.promptTokenCount,
-      outputTokens: body?.usageMetadata?.candidatesTokenCount,
-    });
-    const text: string =
-      body?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
+    const { model, text } = onVertex ? await videoViaVertex(parts) : await videoViaGeminiApi(parts);
     const parsed = safeJSON(text) as Partial<VideoSummary> | null;
     return {
       url: input.url,
       provider,
-      model: config.gemini.model,
+      model,
       summary: parsed?.summary || "",
       keyMoments: Array.isArray(parsed?.keyMoments) ? parsed!.keyMoments! : [],
       acceptanceSignals: Array.isArray(parsed?.acceptanceSignals) ? parsed!.acceptanceSignals! : [],
@@ -1228,6 +1221,47 @@ export async function summarizeVideo(input: {
     console.warn("[gemini] summarizeVideo failed:", err);
     return { ...mockVideoSummary(input.url, provider), unreliable: true };
   }
+}
+
+async function videoViaVertex(parts: any[]): Promise<{ model: string; text: string }> {
+  const { model, thinking } = resolveVertexModel(config.vertex.model);
+  const resp = await vertexGenerate(model, [{ role: "user", parts }], {
+    systemInstruction: VIDEO_SYSTEM,
+    responseMimeType: "application/json",
+    thinkingConfig: { thinkingLevel: thinking },
+  });
+  recordUsage(model, vertexUsage(resp.usageMetadata));
+  return { model, text: resp.text ?? "" };
+}
+
+async function videoViaGeminiApi(parts: any[]): Promise<{ model: string; text: string }> {
+  const endpoint =
+    `https://generativelanguage.googleapis.com/v1beta/models/${config.gemini.model}:generateContent`;
+  const res = await fetch(endpoint, {
+    method: "POST",
+    // The key goes in a header, never the URL: request URLs are what proxy
+    // access logs, APM spans and error trackers capture by default, and this
+    // is a long-lived credential on the org's billing account. Google accepts
+    // the same key as ?key=, but that form leaks it into every log sink.
+    headers: {
+      "Content-Type": "application/json",
+      "x-goog-api-key": config.gemini.apiKey,
+    },
+    body: JSON.stringify({
+      systemInstruction: { parts: [{ text: VIDEO_SYSTEM }] },
+      contents: [{ role: "user", parts }],
+      generationConfig: { responseMimeType: "application/json", temperature: 0.2 },
+    }),
+  });
+  if (!res.ok) throw new Error(`gemini ${res.status}: ${await res.text().catch(() => "")}`);
+  const body = (await res.json()) as any;
+  recordUsage(config.gemini.model, {
+    inputTokens: body?.usageMetadata?.promptTokenCount,
+    outputTokens: body?.usageMetadata?.candidatesTokenCount,
+  });
+  const text: string =
+    body?.candidates?.[0]?.content?.parts?.map((p: any) => p.text || "").join("") || "";
+  return { model: config.gemini.model, text };
 }
 
 function mockVideoSummary(url: string, provider: VideoProvider): VideoSummary {
@@ -1265,7 +1299,7 @@ export async function summarizeLinearFile(input: {
   const isImage = input.mediaType.startsWith("image/");
   if (!isPdf && !isImage) return null;
 
-  if (!client) {
+  if (!live) {
     return `[mock] Attached ${isPdf ? "PDF" : "image"} at ${input.url}. Real file understanding requires ANTHROPIC_API_KEY.`;
   }
 
@@ -1273,29 +1307,21 @@ export async function summarizeLinearFile(input: {
     const fileBlock = isPdf
       ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: input.base64 } }
       : { type: "image", source: { type: "base64", media_type: input.mediaType, data: input.base64 } };
-    const resp = await client.messages.create({
-      model: config.llm.model,
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "user",
-          content: [
-            fileBlock,
-            {
-              type: "text",
-              text:
-                "This file is attached to a Linear ticket. In 3–6 sentences, summarise what it specifies or shows, " +
-                "focusing on concrete, checkable requirements or acceptance signals a code reviewer would need.",
-            },
-          ] as any,
-        },
-      ],
-    });
-    const text = resp.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    return text.trim() || null;
+    const resp = await sendParams({ model: config.llm.model, maxTokens: 1024 }, [
+      {
+        role: "user",
+        content: [
+          fileBlock,
+          {
+            type: "text",
+            text:
+              "This file is attached to a Linear ticket. In 3–6 sentences, summarise what it specifies or shows, " +
+              "focusing on concrete, checkable requirements or acceptance signals a code reviewer would need.",
+          },
+        ] as any,
+      },
+    ]);
+    return textOf(resp).trim() || null;
   } catch (err) {
     console.warn("[llm] summarizeLinearFile failed:", input.url, err);
     return null;
@@ -1319,35 +1345,26 @@ export async function extractGuidanceFromPdf(input: {
   base64: string;
   title?: string;
 }): Promise<string | null> {
-  if (!client) {
+  if (!live) {
     return (
       `[mock] Guidance distilled from PDF${input.title ? ` "${input.title}"` : ""}. ` +
       "Real extraction requires ANTHROPIC_API_KEY.\n- Follow the conventions described in the attached document."
     );
   }
   try {
-    const resp = await client.messages.create({
-      model: config.llm.model,
-      max_tokens: 1024,
-      system: GUIDANCE_EXTRACT_SYSTEM,
-      messages: [
-        {
-          role: "user",
-          content: [
-            { type: "document", source: { type: "base64", media_type: "application/pdf", data: input.base64 } },
-            {
-              type: "text",
-              text: `Distil this document${input.title ? ` ("${input.title}")` : ""} into review guidelines per the system instruction.`,
-            },
-          ] as any,
-        },
-      ],
-    });
-    const text = resp.content
-      .filter((b): b is Anthropic.TextBlock => b.type === "text")
-      .map((b) => b.text)
-      .join("\n");
-    return text.trim() || null;
+    const resp = await sendParams({ model: config.llm.model, maxTokens: 1024, system: GUIDANCE_EXTRACT_SYSTEM }, [
+      {
+        role: "user",
+        content: [
+          { type: "document", source: { type: "base64", media_type: "application/pdf", data: input.base64 } },
+          {
+            type: "text",
+            text: `Distil this document${input.title ? ` ("${input.title}")` : ""} into review guidelines per the system instruction.`,
+          },
+        ] as any,
+      },
+    ]);
+    return textOf(resp).trim() || null;
   } catch (err) {
     console.warn("[llm] extractGuidanceFromPdf failed:", err);
     return null;

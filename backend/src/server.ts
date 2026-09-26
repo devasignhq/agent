@@ -297,7 +297,7 @@ await initStatsig();
 const port = config.port;
 const server = app.listen(port, () => {
   console.log(`DevAsign API listening on http://localhost:${port}`);
-  console.log(`  · LLM:        ${isLLMLive() ? "live (Anthropic)" : "mock"}`);
+  console.log(`  · LLM:        ${isLLMLive() ? (config.llm.provider === "vertex" ? `live (Vertex ${config.vertex.model}${config.vertex.priority ? ", priority" : ""})` : "live (Anthropic)") : "mock"}`);
   console.log(`  · GitHub App: ${isGithubAppConfigured() ? "configured" : "missing (outbound App credentials unset)"}`);
   console.log(`  · Webhook:    ${isGithubWebhookConfigured() ? "signature verified (HMAC)" : "UNVERIFIED — no secret (dev only)"}`);
   console.log(`  · Slack:      ${isSlackEnvConfigured() ? `env fallback → ${config.integrations.slackBotChannel}` : "per-user only"}`);
