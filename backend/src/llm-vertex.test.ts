@@ -20,10 +20,19 @@ const reply = (content: Content, finishReason = "STOP", usageMetadata = {}): Gen
   ({ candidates: [{ content, finishReason }], usageMetadata }) as GenerateContentResponse;
 
 test("Claude tier ids map onto the Vertex model as thinking levels", () => {
-  assert.deepEqual(resolveVertexModel("claude-haiku-4-5"), { model: config.vertex.model, thinking: ThinkingLevel.LOW });
-  assert.deepEqual(resolveVertexModel("claude-sonnet-5"), { model: config.vertex.model, thinking: ThinkingLevel.MEDIUM });
-  assert.deepEqual(resolveVertexModel("claude-opus-4-7"), { model: config.vertex.model, thinking: ThinkingLevel.HIGH });
-  assert.deepEqual(resolveVertexModel("gemini-2.5-pro"), { model: "gemini-2.5-pro", thinking: ThinkingLevel.HIGH });
+  assert.deepEqual(resolveVertexModel("claude-haiku-4-5", "high"), { model: config.vertex.model, thinking: ThinkingLevel.LOW });
+  assert.deepEqual(resolveVertexModel("claude-sonnet-5", "high"), { model: config.vertex.model, thinking: ThinkingLevel.MEDIUM });
+  assert.deepEqual(resolveVertexModel("claude-opus-4-7", "high"), { model: config.vertex.model, thinking: ThinkingLevel.HIGH });
+  assert.deepEqual(resolveVertexModel("gemini-2.5-pro", "high"), { model: "gemini-2.5-pro", thinking: ThinkingLevel.HIGH });
+});
+
+test("the thinking cap defaults to medium and never raises a lower tier", () => {
+  assert.equal(config.vertex.thinking, "medium");
+  assert.equal(resolveVertexModel("claude-opus-4-8").thinking, ThinkingLevel.MEDIUM);
+  assert.equal(resolveVertexModel("claude-haiku-4-5").thinking, ThinkingLevel.LOW);
+  assert.equal(resolveVertexModel(config.vertex.model).thinking, ThinkingLevel.MEDIUM);
+  assert.equal(resolveVertexModel("claude-opus-4-8", "low").thinking, ThinkingLevel.LOW);
+  assert.equal(resolveVertexModel("claude-opus-4-8", "bogus").thinking, ThinkingLevel.MEDIUM);
 });
 
 test("output budget adds thinking headroom and caps at the model max", () => {

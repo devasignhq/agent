@@ -17,16 +17,25 @@ export type VertexTool = { name: string; description: string; inputSchema: Recor
 export type VertexToolChoice = { type: "any" } | { type: "tool"; name: string };
 export type VertexUsage = { inputTokens: number; outputTokens: number; cacheReadTokens: number; cacheCreationTokens: number };
 
+const LEVELS = [ThinkingLevel.LOW, ThinkingLevel.MEDIUM, ThinkingLevel.HIGH];
+const LEVEL_BY_NAME: Record<string, ThinkingLevel> = { low: ThinkingLevel.LOW, medium: ThinkingLevel.MEDIUM, high: ThinkingLevel.HIGH };
+
 // Plan tiers are stored as Claude ids (repositories.defaultModel, billing plans),
-// so the tier survives as a thinking level on the one Gemini model.
-export function resolveVertexModel(requested: string): { model: string; thinking: ThinkingLevel } {
-  if (!requested.startsWith("claude-")) return { model: requested, thinking: ThinkingLevel.HIGH };
-  const thinking = /haiku/.test(requested)
-    ? ThinkingLevel.LOW
-    : /sonnet/.test(requested)
-      ? ThinkingLevel.MEDIUM
-      : ThinkingLevel.HIGH;
-  return { model: config.vertex.model, thinking };
+// so the tier survives as a thinking level, capped at VERTEX_THINKING.
+export function resolveVertexModel(
+  requested: string,
+  cap: string = config.vertex.thinking
+): { model: string; thinking: ThinkingLevel } {
+  const max = LEVEL_BY_NAME[cap] ?? ThinkingLevel.MEDIUM;
+  const tier = !requested.startsWith("claude-")
+    ? ThinkingLevel.HIGH
+    : /haiku/.test(requested)
+      ? ThinkingLevel.LOW
+      : /sonnet/.test(requested)
+        ? ThinkingLevel.MEDIUM
+        : ThinkingLevel.HIGH;
+  const thinking = LEVELS[Math.min(LEVELS.indexOf(tier), LEVELS.indexOf(max))];
+  return { model: requested.startsWith("claude-") ? config.vertex.model : requested, thinking };
 }
 
 // Gemini counts thinking against maxOutputTokens (a 64-token probe spent 60 on

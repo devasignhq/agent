@@ -107,6 +107,7 @@ export const config = {
     location: process.env.VERTEX_LOCATION || "global",
     model: process.env.VERTEX_MODEL || "gemini-3.8-flash",
     priority: process.env.VERTEX_PRIORITY === "1",
+    thinking: (process.env.VERTEX_THINKING || "medium").toLowerCase(),
     inputPerMTok: Number(process.env.VERTEX_INPUT_PER_MTOK || 1.5),
     outputPerMTok: Number(process.env.VERTEX_OUTPUT_PER_MTOK || 7.5),
   },
