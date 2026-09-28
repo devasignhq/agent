@@ -503,10 +503,17 @@ function sessionStrings(v: unknown, add: (s: string) => void, depth = 0): void {
 
 // `json`: the text is JSON lines (a trace), so a Cookie line is never cut short, only its values.
 export function redact(text: string, opts: RedactOptions): string {
+  return redactor(opts)(text);
+}
+
+// Collects the secrets once, for a caller scrubbing line after line with the same options.
+export function redactor(opts: RedactOptions): (text: string) => string {
   const env = opts.env ?? process.env;
   const swaps = new Map<string, string>();
   const secret = (v: unknown) => {
     if (typeof v !== "string" || v.length < MIN_SECRET) return;
+    // A PEM key or pretty JSON is printed a line at a time, often behind a prefix (node:test's "# ").
+    if (/[\r\n]/.test(v)) for (const line of v.split(/\r?\n/)) secret(line.trim());
     // A lone surrogate in a session value makes encodeURIComponent throw; this scrub runs
     // inside a stream handler, where a throw is an uncaught exception that ends the run.
     let encoded: string | null = null;
@@ -536,16 +543,16 @@ export function redact(text: string, opts: RedactOptions): string {
       for (const store of Array.isArray((db as { stores?: unknown })?.stores) ? (db as { stores: unknown[] }).stores : []) sessionStrings((store as { records?: unknown })?.records, secret);
     }
   }
-  let out = text;
-  if (swaps.size) {
-    const needles = [...swaps.keys()].sort((a, b) => b.length - a.length).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
-    out = out.replace(new RegExp(needles.join("|"), "g"), (m) => swaps.get(m) ?? REDACTED);
-  }
-  out = out
-    .replace(HEADER_ENTRY_JSON, `$1"${REDACTED}"`)
-    .replace(HEADER_FIELD_JSON, `$1"${REDACTED}"`)
-    .replace(STORAGE_ARRAY_JSON, (list) => list.replace(VALUE_JSON, `$1"${REDACTED}"`));
-  return opts.json ? out : out.replace(HEADER_LINE, `$1${REDACTED}`);
+  const needles = swaps.size
+    ? new RegExp([...swaps.keys()].sort((a, b) => b.length - a.length).map((n) => n.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join("|"), "g")
+    : null;
+  return (text) => {
+    const out = (needles ? text.replace(needles, (m) => swaps.get(m) ?? REDACTED) : text)
+      .replace(HEADER_ENTRY_JSON, `$1"${REDACTED}"`)
+      .replace(HEADER_FIELD_JSON, `$1"${REDACTED}"`)
+      .replace(STORAGE_ARRAY_JSON, (list) => list.replace(VALUE_JSON, `$1"${REDACTED}"`));
+    return opts.json ? out : out.replace(HEADER_LINE, `$1${REDACTED}`);
+  };
 }
 
 export function redactFile(file: string, opts: RedactOptions): void {

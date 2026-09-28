@@ -89,3 +89,16 @@ test("onLine gets whole lines tagged with their stream, even when a line arrives
   assert.deepEqual(lines.filter(([s]) => s === "out").map(([, l]) => l), ["Set-Cookie: sid=s3cr3t-value", "next line", "tail without newline"]);
   assert.deepEqual(lines.filter(([s]) => s === "err"), [["err", "oops"]]);
 });
+
+test("baseEnv replaces the inherited environment; env layers on top and CI is still set", async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), "dv-exec-env-"));
+  process.env.DV_EXEC_PARENT_ONLY = "parent-only";
+  try {
+    const src = "console.log(JSON.stringify({ parent: process.env.DV_EXEC_PARENT_ONLY ?? null, base: process.env.DV_EXEC_BASE ?? null, extra: process.env.DV_EXEC_EXTRA ?? null, ci: process.env.CI ?? null }))";
+    const seen = async (o: { baseEnv?: NodeJS.ProcessEnv; env?: NodeJS.ProcessEnv }) => JSON.parse((await runCommand({ cmd: process.execPath, args: ["-e", src], cwd: root, timeoutMs: 10_000, ...o })).stdout);
+    assert.deepEqual(await seen({}), { parent: "parent-only", base: null, extra: null, ci: "true" });
+    assert.deepEqual(await seen({ baseEnv: { PATH: process.env.PATH, DV_EXEC_BASE: "b" }, env: { DV_EXEC_EXTRA: "e" } }), { parent: null, base: "b", extra: "e", ci: "true" });
+  } finally {
+    delete process.env.DV_EXEC_PARENT_ONLY;
+  }
+});

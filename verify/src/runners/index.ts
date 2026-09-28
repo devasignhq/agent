@@ -3,6 +3,7 @@
 import { createRequire } from "node:module";
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { redactFile, redactor, type RedactOptions } from "../boot.js";
 import { aggregateAttempts, classifyAttempt } from "../classify.js";
 import { packageDirOf } from "../detect.js";
 import { runCommand } from "../exec.js";
@@ -50,8 +51,15 @@ export async function runFileTests(args: {
   timeoutMs: number;
   artifacts: LocalArtifact[];
   fileOf?: (t: PlanTest) => string;
+  // The environment a test starts from; unset, ours.
+  baseEnv?: (t: PlanTest) => NodeJS.ProcessEnv | undefined;
+  // Names that environment left out; a failure whose output mentions one says so.
+  withheld?: (t: PlanTest) => readonly string[];
+  redaction?: RedactOptions;
 }): Promise<RunnerResult[]> {
   const results: RunnerResult[] = [];
+  const redaction = args.redaction ?? {};
+  const scrub = redactor(redaction);
   for (const t of args.tests) {
     const max = Math.max(1, args.maxAttempts(t));
     const attempts: RunnerAttempt[] = [];
@@ -65,13 +73,18 @@ export async function runFileTests(args: {
     for (let n = 1; n <= max; n++) {
       const { cmd, args: argv } = commandForFile(t.runner, file, binRoots);
       const logFile = path.join(args.ws.artifactsDir, "logs", `${t.id}-${n}.log`);
-      const r = await runCommand({ cmd, args: argv, cwd: args.ws.root, timeoutMs: args.timeoutMs, logFile, onLine: (l) => console.log(`  ${l}`) });
-      const c = classifyAttempt(t.runner, r);
+      const r = await runCommand({ cmd, args: argv, cwd: args.ws.root, baseEnv: args.baseEnv?.(t), timeoutMs: args.timeoutMs, logFile, onLine: (l) => console.log(`  ${scrub(l)}`) });
+      redactFile(logFile, redaction);
+      // Scrubbed before the error is picked out and cut to size, so no cut splits a secret from its match.
+      const output = scrub(r.output);
+      const c = classifyAttempt(t.runner, { ...r, output });
+      const denied = c.status === "pass" ? [] : (args.withheld?.(t) ?? []).filter((name) => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`).test(output));
+      const error = denied.length ? `${c.error ?? "failed"} (withheld from generated tests: ${denied.join(", ")}; list under verify.env to pass through)` : c.error;
       const ref = `log:${t.id}:${n}`;
       args.artifacts.push({ clientRef: ref, kind: "log", path: logFile, displayPath: args.ws.relative(logFile), contentType: "text/plain", testId: t.id, criterionIds: t.criterionIds, attempt: n });
-      attempts.push({ n, status: c.status, durationMs: r.durationMs, error: c.error, artifactIds: [] });
+      attempts.push({ n, status: c.status, durationMs: r.durationMs, error, artifactIds: [] });
       attemptRefs.push([ref]);
-      log.info(`attempt ${n}/${max}: ${c.status}${c.error ? ` — ${c.error}` : ""}`);
+      log.info(`attempt ${n}/${max}: ${c.status}${error ? ` — ${error}` : ""}`);
       if (c.status === "pass" && n === 1) break;
       if (c.status === "pass" && n > 1) break; // pass after a failure: flaky, stop here
       if (c.status === "error" && max > 1 && n === 1 && /could not start|ENOENT|Cannot find module|Cannot find package|Failed to (?:load url|resolve import)/.test(c.error || "")) break; // infra, retrying won't help
