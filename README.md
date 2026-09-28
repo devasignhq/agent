@@ -21,9 +21,11 @@ This repo holds three apps that share one backend, plus the two packages that
 run verification in your CI:
 
 - [`backend/`](backend) — Node + Express API: GitHub OAuth + GitHub App,
-  webhook receiver, in-memory job queue, review worker, Anthropic + Gemini LLM
-  clients, Stellar/Soroban escrow, Stripe billing, and a Postgres-backed store
-  (Neon). Implements the spine described in [`design.md`](design.md).
+  webhook receiver, in-memory job queue, review worker, LLM client (Claude on
+  Anthropic, or Gemini on Vertex AI), Stellar/Soroban escrow, Stripe billing,
+  and a Postgres-backed store (Neon). Implements the spine described in
+  [`design.md`](design.md). Ships as a container to Google Cloud Run (see
+  **Deployment** below).
 - [`frontend/`](frontend) — the **maintainer** dashboard (Vite + React + TS).
   Terminal/CLI dark theme, Geist + Geist Mono, orange accent `#ff7a3d`.
 - [`contributor/`](contributor) — the standalone **contributor** app (Vite +
@@ -32,7 +34,6 @@ run verification in your CI:
   runs the generated tests on your runner and uploads evidence.
 - [`verify-action/`](verify-action) — the composite GitHub Action wrapping that
   CLI (`devasignhq/verify-action@v1`).
-- [`motion/`](motion) — the product video, rendered from code with Remotion.
 
 The two frontends are separate apps with separate accounts (a maintainer
 account and a contributor account are distinct even for the same GitHub
@@ -61,11 +62,13 @@ What works out of the box:
 - `GET  /api/bounties`, `POST /api/bounties`, and the funding / apply / submit /
   payout lifecycle (see **Bounties** below)
 - `GET  /api/security/overview`, `POST /api/security/scan` (see **Security** below)
-- `GET  /api/reviews/:id/verify`, `POST /api/reviews/:id/verify/adopt`,
-  `GET/POST /api/repositories/:id/verify/setup[-pr]` (see **Verification** below)
+- `GET  /api/reviews/:id/verify`, `POST /api/reviews/:id/verify/{adopt,archive}`,
+  `GET  /api/verify/tests`, `GET/POST /api/repositories/:id/verify/setup[-pr]`,
+  `POST /api/repositories/:id/verify/{boot-check,recheck}` (see **Verification** below)
 - `POST /v1/runs/resolve`, `POST /v1/runs/:id/results`, `POST /v1/runs/:id/artifacts`,
-  `GET /v1/runs/:id` — the **runner API**, mounted at `/v1` and authenticated by
-  GitHub OIDC rather than a session cookie
+  `GET /v1/runs/:id`, `POST /v1/probes/:id/{result,artifacts}` — the **runner
+  API**, mounted at `/v1` and authenticated by GitHub OIDC rather than a session
+  cookie
 - `GET  /api/me`, `GET /api/integrations`, `GET /api/billing/subscription`,
   `GET /api/notifications/stream` (SSE), …
 
@@ -75,6 +78,13 @@ output → log) still runs end-to-end. Drop in a key to flip to live Claude. Vid
 understanding (Loom / screen recordings) runs on Gemini when `GEMINI_API_KEY` is
 set, and is skipped otherwise.
 
+Set `LLM_PROVIDER=vertex` to route **every** LLM call (reviews, structured
+output, the repo-lookup tool loop, PDFs/images, video) to Gemini on Vertex AI
+instead (`VERTEX_MODEL`, default `gemini-3.8-flash`). It authenticates with the
+runtime service account, or `gcloud auth application-default login` locally;
+`VERTEX_THINKING` caps the thinking level (default `medium`) and
+`VERTEX_PRIORITY=1` opts into Priority PayGo. Anthropic stays the default.
+
 ### Frontend (maintainer dashboard)
 
 ```bash
@@ -83,19 +93,29 @@ npm install
 npm run dev                # http://localhost:3001, proxies /api → 8787
 ```
 
-Screens:
+Screens, as grouped in the sidebar:
 
-- Auth (GitHub OAuth gate)
-- Onboarding (GitHub install → integrations → IDE/CLI → wallet)
-- Agents (PR queue + review log timeline + end-goal panel + multimodal composer,
-  plus the per-criterion verification panel and its browser recordings)
-- Bounties (list + drawer + create/fund modal + applications inbox + invoice PDF)
-- Security (repo scans, findings by severity, one-click issue → bounty)
-- Workflow (per-repo review models and stage toggles)
-- Wallet (Stellar balance + payout address)
-- Settings (Account, Installation, Review Models per repo, Usage, Plans,
-  Security, Integrations)
+- Auth (GitHub OAuth gate) and Onboarding (plan → configure repositories →
+  connect workspace; the integrations step is Pro/Max only)
+- **Workspace**
+  - Agents — PR queue, review log timeline, end-goal panel, multimodal
+    composer, and the per-criterion verification panel with its recordings
+  - Tests — every test from each PR's newest verify run: filter by repo,
+    end-to-end/unit, status and generated/existing; evidence with a deletion
+    countdown; adopt, archive (older PRs' tests auto-archive), and dismissible
+    browser-setup warnings
+  - Workflow — per-repo review models, stage toggles, and the verification
+    boot config (the command and URL CI boots for browser tests)
+  - Bounties — list, drawer, create/fund modal, applications inbox, invoice
+    PDF; shown only when bounties are switched on under Account
+- **Security** — Reports (scans, findings by severity, one-click issue →
+  bounty, CSV/PDF export) and Configuration (gate, rulings/precedents, policy)
+- **Settings** — Repository (GitHub installs), Integrations (Linear, Slack,
+  Discord), Billing (plan, usage, invoices)
+- Help & Resources, and Account (profile, feature switches, deletion)
 - ⌘K command center and a Tweaks panel (accent / density / sidebar / mono font)
+
+Old `/settings/:section` URLs redirect to the page each section became.
 
 ### Contributor app
 
@@ -135,11 +155,13 @@ Stellar config lives under `STELLAR_*` in `backend/.env.example`
 The agent scans a repository for vulnerabilities and tracks findings over time
 (`backend/src/security/`). Findings are **fingerprinted** so they survive
 re-scans, ranked into four severity tiers, and confidence caps severity
-(unconfirmed findings can't exceed medium). A `devasign/security` Check Run
-reports the gate, precedents/policy let a repo suppress or accept classes of
-findings, and a maintainer can turn any finding into a GitHub issue — and from
-there a funded bounty — in one click. Findings can be exported (CSV/PDF) on paid
-plans.
+(unconfirmed findings can't exceed medium). A finding surfaces only after it
+passes a mechanical evidence check and an independent verifier whose code
+citations are checked; anything else stays hidden as `unverified`. A
+`devasign/security` Check Run reports the gate, precedents/policy let a repo
+suppress or accept classes of findings, and a maintainer can turn any finding
+into a GitHub issue — and from there a funded bounty — in one click. Findings
+can be exported (CSV/PDF) on paid plans.
 
 ## Verification
 
@@ -204,11 +226,44 @@ Deliberate properties:
 
 Getting set up is one click: DevAsign detects your stack and opens an onboarding
 PR on branch `devasign/enable-verification` adding
-`.github/workflows/devasign-verify.yml` and a `verify:` block in `.devasign.yml`
-(`install` / `build` / `start` / `url` / `ready` / `seed`, plus `services`,
-`login` and `env` for end-to-end runs). `devasign-verify doctor` diagnoses a
-setup locally, and any generated test can be **adopted** into your own suite
-from the PR in one click.
+`.github/workflows/devasign-verify.yml` and a `verify:` block in `.devasign.yml`:
+
+```yaml
+verify:
+  e2e: auto                 # auto | always | never
+  install: npm ci
+  servers:                  # up to 4, started in order before `start`
+    - name: backend
+      start: npm --prefix backend run dev
+      url: http://localhost:8787
+      ready: /api/health
+  start: npm --prefix frontend run dev -- --port 3001 --strictPort
+  url: http://localhost:3001  # the app the browser opens
+  ready: /
+  timeout: 180              # seconds each managed-boot step may take
+  login:
+    script: node scripts/login.mjs  # writes a Playwright storageState
+    check: /api/me          # must answer 2xx with that session
+  services: [postgres]      # postgres | mysql | redis
+  env: [DATABASE_URL]       # secret names the job must provide (scrubbed from logs)
+```
+
+Browser (end-to-end) tests need `start` + `url`; `servers` or a `login.script`
+switch the runner to **managed boot** (CLI ≥ 1.6), which starts every process,
+checks the signed-in session with the app's `Origin`, scrubs secrets and session
+values from uploaded logs and traces, and stops everything on the way out.
+Generated browser tests start signed in; your own tests never do.
+
+Boot config is **inferred** from your packages (root or nested, reading the
+app's own dev-server port), and the Workflow page's setup drawer shows what
+inference settled and asks for the rest, committing your answers to the setup
+PR. The setup PR's own CI then **proves** the proposed config — boots it, loads
+the page, signs in — and DevAsign reports back on the PR ("Came up at … in 41s
+— signed in"). An already-onboarded repo can re-prove its config at any time
+with a boot check against the default branch.
+
+`devasign-verify doctor` diagnoses a setup locally, and any generated test can
+be **adopted** into your own suite from the PR in one click.
 
 ## The review pipeline
 
@@ -218,7 +273,11 @@ Per [`design.md`](design.md), the worker drains a job per PR and runs, in order:
    summarize any videos via Gemini.
 2. **Holistic** — retrieve the whole-repo index (when built) for cross-file context.
 3. **Criteria / End goal** — synthesize acceptance criteria, seeded from a
-   linked bounty (locked at funding) or Linear ticket, refined by video.
+   linked bounty (locked at funding) or Linear ticket, refined by video. The
+   review can read files **outside the diff** (a read-only `read_repo_file`
+   tool pinned to the PR head, plus `git check-ignore` facts for ignore-rule
+   criteria); a criterion it still can't check is `unverifiable`, and when
+   only those remain the review is a neutral comment rather than a block.
 4. **New-commit intent review** — on re-review, judge new commits against their
    own commit-message intent and the incremental delta.
 5. **Defect review** — a correctness pass ("is this code right?") independent of
@@ -242,13 +301,14 @@ re-open passed criteria), not just add criteria.
 | GitHub App install + JWT + installation tokens | ✅ signing, token caching, REST helper |
 | Webhook receiver (HMAC) | ✅ verifies sha256; routes `installation`, `installation_repositories`, `pull_request`, `issue_comment` |
 | Review pipeline | ✅ ingest → holistic → criteria → new-commit → defect → output → log |
-| LLM (Claude) | ✅ live when key set, deterministic mock otherwise |
-| Video understanding (Gemini) | ✅ live when `GEMINI_API_KEY` set, skipped otherwise |
+| LLM (Claude / Gemini on Vertex) | ✅ Claude when key set, Gemini on Vertex with `LLM_PROVIDER=vertex`, deterministic mock otherwise |
+| Video understanding (Gemini) | ✅ live when `GEMINI_API_KEY` set (or via Vertex), skipped otherwise |
 | Job queue | ✅ in-memory (stand-in for Cloud Tasks); one worker drains it |
 | Persistence | ✅ Postgres (Neon); in-memory snapshot at boot, resilient write-through on mutation |
 | Bounties + Stellar/Soroban escrow | ✅ non-custodial (Freighter-signed create/release, admin-signed release/refund); contract deploy is environment config |
-| Security audit | ✅ fingerprinted findings, severity tiers, precedents/policy, issue → bounty |
-| Verification (tests in your CI) | ✅ OIDC-authenticated runner API, `@devasign/verify` CLI + `verify-action`, own Check Run, signed-URL artifacts, retention sweep |
+| Security audit | ✅ fingerprinted findings, severity tiers, verifier gate, precedents/policy, issue → bounty |
+| Verification (tests in your CI) | ✅ OIDC-authenticated runner API, `@devasign/verify` CLI + `verify-action`, managed multi-process/signed-in boot, boot inference + CI-proven setup, own Check Run, signed-URL artifacts, retention sweep |
+| Deployment | ✅ Docker image → Google Cloud Run via Cloud Build (Node 24) |
 | Integrations | ✅ Slack & Discord broadcast; Linear OAuth + ingestion + webhooks |
 | Billing (Stripe) | ✅ live when `STRIPE_SECRET_KEY` set: checkout, portal, plan changes, credits |
 | Notifications | ✅ per-user SSE stream + live row-change fan-out |
@@ -260,7 +320,9 @@ Keys are grouped in [`backend/.env.example`](backend/.env.example); both
 frontends only need `VITE_API_BASE`. Notable groups:
 
 - **GitHub** — `GITHUB_OAUTH_*`, `GITHUB_APP_*` (id, name, webhook secret, private key)
-- **LLM** — `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `GEMINI_API_KEY` / `GEMINI_MODEL`
+- **LLM** — `ANTHROPIC_API_KEY` / `ANTHROPIC_MODEL`, `GEMINI_API_KEY` / `GEMINI_MODEL`,
+  and `LLM_PROVIDER` + `VERTEX_*` (project, location, model, thinking, priority,
+  per-MTok prices) for Gemini on Vertex AI
 - **Data & sessions** — `DATABASE_URL`, `SESSION_SECRET`, `INTEGRATION_ENCRYPTION_KEY`
 - **Origins** — `WEB_ORIGIN` (maintainer app), `CONTRIBUTOR_ORIGIN` (contributor app)
 - **Stellar** — `STELLAR_*` (network, RPC/Horizon, escrow contract, USDC, admin key)
@@ -270,6 +332,19 @@ frontends only need `VITE_API_BASE`. Notable groups:
   `VERIFY_RUN_TIMEOUT_MS`, and `ARTIFACT_S3_*` for the private recordings bucket
   (Cloudflare R2 or any S3-compatible store; unset = verify without recordings)
 - **Ops** — `RESEND_API_KEY` / `EMAIL_FROM`, `STATSIG_*`
+
+## Deployment
+
+The API runs on **Google Cloud Run**. [`backend/Dockerfile`](backend/Dockerfile)
+builds a Node 24 image and [`backend/cloudbuild.yaml`](backend/cloudbuild.yaml)
+is the Cloud Build pipeline that tests, builds, pushes and deploys it on every
+merge to `main` that touches `backend/` (the deploy step is switched by the
+trigger's `_DEPLOY` substitution). The maintainer and contributor apps deploy
+separately (Vercel); point `WEB_ORIGIN` and `CONTRIBUTOR_ORIGIN` at them
+exactly. The runbook for the
+Render → Cloud Run move, including env import
+([`backend/deploy/gcp/import-render-env.mjs`](backend/deploy/gcp)) and rollback,
+is [`backend/deploy/gcp/CUTOVER.md`](backend/deploy/gcp/CUTOVER.md).
 
 ## End-to-end smoke test
 
