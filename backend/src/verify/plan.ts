@@ -41,7 +41,7 @@ import { withDomEnvironment } from "./dom-env.js";
 import { inferSetupFromTree, isFrontendPath, isTestPath } from "./detect.js";
 import { flakeRowsForCriterion, flakeRow, isQuarantined, isRetired, latestStrategyVersion, testSignature } from "./flake.js";
 import { rerenderReport } from "./report.js";
-import { criteriaForRun, forgetRunnerPoll, runnerGaveUp, RUNNER_GONE_MS, updateRun } from "./runs.js";
+import { criteriaForRun, forgetRunnerPoll, runnerDispatchPayload, runnerGaveUp, RUNNER_GONE_MS, updateRun } from "./runs.js";
 import { BOOT_KEYS, hasBootConfig, parseDevasignVerify } from "./yml.js";
 import { patchRepoVerify, setupFixUrl } from "./repo-state.js";
 
@@ -897,7 +897,7 @@ async function gatherContext(run: VerifyRun, repo: Repository, install: Installa
 
 async function retriggerRunner(run: VerifyRun, repo: Repository, install: Installation, deps: PlannerDeps): Promise<void> {
   try {
-    await (deps.dispatch ?? defaultDispatch)(install, repo, { pr: run.prNumber, sha: run.sha, runId: run.id, reviewId: run.reviewId });
+    await (deps.dispatch ?? defaultDispatch)(install, repo, runnerDispatchPayload(run));
     forgetRunnerPoll(repo.id, run.prNumber, run.sha);
     db.insert("reviewLogs", { id: uuid(), reviewId: run.reviewId, kind: "verify", at: Date.now(), action: "Runner re-triggered: the plan was not ready when CI asked", meta: { runId: run.id } });
   } catch (err) {

@@ -136,7 +136,7 @@ export type ResolveRequest = {
   giveUp?: boolean;
   capabilities?: RunnerCapability[];
   // Echoed from the dispatch's client_payload; it is what proves this run is the one
-  // GitHub started for that boot re-check.
+  // GitHub started for that dispatch — a boot re-check or a re-dispatched verify run.
   probe?: { id: string; nonce: string };
 };
 

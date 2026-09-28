@@ -11,7 +11,7 @@ import { buildCommands, enforcePlanPolicy, hasUntriedRung, makeTestFileValidator
 import { buildImportAllowList, importTarget, resolvesInRepo, unresolvedRelativeImports } from "./imports.js";
 import type { StructuredResult } from "../llm.js";
 import { recordFlakeOutcome, testSignature } from "./flake.js";
-import { createVerifyRun, snapshotCriteriaRevision } from "./runs.js";
+import { createVerifyRun, dispatchNonceHash, noteRunnerGone, snapshotCriteriaRevision } from "./runs.js";
 import type { Criterion } from "../types.js";
 import type { DetectedSetup, PlanTest } from "./contract.js";
 import { ADOPT_DIR } from "./onboarding/job.js";
@@ -110,6 +110,26 @@ test("a cited existing test that is not in the tree is rejected; the criterion i
     const log = db.find("reviewLogs", (l) => l.reviewId === s.review.id && l.kind === "verify");
     assert.match(String(log?.detail), /src\/nope\.test\.ts \(missing_existing\)/);
     assert.equal(plan.unverifiable.length, 0);
+  } finally {
+    s.cleanup();
+  }
+});
+
+test("a plan landing after the runner gave up re-dispatches CI with a token only that dispatch carries", async () => {
+  const s = seed([crit("1")]);
+  const { deps: d } = deps({ responses: [{ tests: [gen("1", "unit")] }] });
+  const sent: Array<Record<string, unknown>> = [];
+  d.dispatch = async (_i, _r, payload) => void sent.push(payload);
+  noteRunnerGone(s.repo.id, s.review.prNumber, s.review.headSha);
+  try {
+    assert.equal((await runVerifyPlan(s.run.id, d))?.status, "awaiting_runner");
+    assert.equal(sent.length, 1, "the job that gave up is replaced by a dispatched one");
+    const token = sent[0].probe as { id: string; nonce: string };
+    assert.deepEqual([sent[0].pr, sent[0].sha, sent[0].runId, token.id], [7, "abc1234", s.run.id, s.run.id]);
+    // The dispatched job's token names no PR; this nonce is what lets it, and only it, claim the run.
+    const row = db.find("verifyRuns", (r) => r.id === s.run.id)!;
+    assert.equal(row.dispatch?.nonceHash, dispatchNonceHash(token.nonce));
+    assert.ok(!JSON.stringify(row).includes(token.nonce), "the row other jobs can read keeps only a hash");
   } finally {
     s.cleanup();
   }

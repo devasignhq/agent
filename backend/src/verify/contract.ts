@@ -132,14 +132,15 @@ export type ResolveRequest = {
   event?: ResolveEvent;
   attempt?: number;
   setup?: DetectedSetup;
+  // Informational: the Actions run that claims a verify run is read from the signed token.
   actions?: { runId: string; jobUrl?: string; runnerOs?: string };
   cliVersion?: string;
   // Final poll before the runner stops waiting, so a plan landing after it can re-dispatch CI.
   giveUp?: boolean;
   // What this runner can do beyond the base contract; absent on CLIs older than 1.6.
   capabilities?: RunnerCapability[];
-  // Echoed straight back from the dispatch's client_payload: it is what proves this run is
-  // the one GitHub started for that boot re-check, and nothing else in the payload can.
+  // Echoed straight back from the dispatch's client_payload: it proves this run is the one GitHub
+  // started for that dispatch (id: a boot re-check's probe, or a re-dispatched verify run).
   probe?: { id: string; nonce: string };
 };
 

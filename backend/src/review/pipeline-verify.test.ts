@@ -125,7 +125,9 @@ test("fork after criteria, plan in parallel, Verify check run at the join; resul
     assert.equal(checks[1].output.title, "Setup pending");
     assert.equal(db.find("prReviews", (r) => r.id === review.id)?.verifyCommentId, undefined);
 
-    // Runner reports: first test passes, second fails on every attempt.
+    // Runner reports: first test passes, second fails on every attempt. Only the job whose
+    // resolve claimed the run may post its results; that is Actions run 1 here.
+    db.update("verifyRuns", (r) => r.id === run.id, { runnerMeta: { actionsRunId: "1", runAttempt: "1" } });
     const [first, second] = plan.tests;
     const req: any = {
       params: { runId: run.id },
