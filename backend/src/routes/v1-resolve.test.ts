@@ -227,6 +227,29 @@ test("the claim a resolve records is the signed token's, never the body's", asyn
   assert.deepEqual([named.statusCode, named.body.error], [403, "actions_run_mismatch"], "the run the body named cannot report for it");
 });
 
+test("a re-run of the PR's own job re-claims its run, and the attempt it replaced can no longer post", async () => {
+  const seed = seedReadyRun(undefined);
+  const first = fakeRes();
+  await resolveHandler(req(seed.repo, seed.prNumber), first);
+  assert.equal(first.body.status, "ready");
+  // A GitHub re-run replays the same event: the run id and the ref naming the PR stay, only the attempt moves.
+  const again = fakeRes();
+  await resolveHandler(req(seed.repo, seed.prNumber, {}, { run_attempt: "2" }), again);
+  assert.equal(again.body.status, "ready", JSON.stringify(again.body));
+  assert.deepEqual([runRow(seed.runId).runnerMeta!.actionsRunId, runRow(seed.runId).runnerMeta!.runAttempt], ["900", "2"]);
+
+  const results = { runId: seed.runId, sha: SHA, planId: seed.planId, cliVersion: "1.9.1", results: [] };
+  const staleSign = fakeRes();
+  await artifactsHandler(onRun(seed.runId, req(seed.repo, seed.prNumber), { files: [] }), staleSign);
+  assert.deepEqual([staleSign.statusCode, staleSign.body.error], [403, "actions_run_mismatch"]);
+  const stale = fakeRes();
+  await resultsHandler(onRun(seed.runId, req(seed.repo, seed.prNumber), results), stale);
+  assert.deepEqual([stale.statusCode, stale.body.error], [403, "actions_run_mismatch"]);
+  const current = fakeRes();
+  await resultsHandler(onRun(seed.runId, req(seed.repo, seed.prNumber, {}, { run_attempt: "2" }), results), current);
+  assert.deepEqual([current.statusCode, current.body.status], [200, "judging"]);
+});
+
 test("a token whose ref names no PR is refused every run the App did not dispatch it for", async () => {
   // Such a job could be any PR's dispatch — and it runs that PR's install scripts before the CLI —
   // or a hand-started workflow. `pr` and `sha` are public; only the nonce is not.
