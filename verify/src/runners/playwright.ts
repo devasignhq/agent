@@ -259,6 +259,8 @@ export async function runPlaywright(args: {
   configName: string;
   booted?: { baseUrl: string; storageState?: string } | null;
   scrub?: (text: string) => string;
+  // What Playwright, and so every spec, its webServer and globalSetup, starts from; unset, ours.
+  baseEnv?: NodeJS.ProcessEnv;
 }): Promise<{ results: RunnerResult[]; output: string; code: number | null }> {
   const { ws } = args;
   const outputDir = path.join(ws.artifactsDir, "pw", args.configName.replace(/\.config\.ts$/, ""));
@@ -279,7 +281,7 @@ export async function runPlaywright(args: {
   const files = args.tests.map((t) => path.resolve(ws.root, t.path));
   const scrub = args.scrub ?? ((t: string) => t);
   log.group(`playwright ${args.configName}: ${files.length} file(s)`);
-  const r = await runCommand({ cmd: cli.cmd, args: [...cli.args, "test", "--config", cfgPath, ...files], cwd: ws.root, timeoutMs: args.timeoutMs, logFile: path.join(ws.artifactsDir, "logs", `${args.configName}.log`), onLine: (l, stream) => {
+  const r = await runCommand({ cmd: cli.cmd, args: [...cli.args, "test", "--config", cfgPath, ...files], cwd: ws.root, baseEnv: args.baseEnv, timeoutMs: args.timeoutMs, logFile: path.join(ws.artifactsDir, "logs", `${args.configName}.log`), onLine: (l, stream) => {
       const shown = consoleLine(l, stream, !!webServer);
       if (shown !== null) console.log(`  ${scrub(shown)}`);
     } });

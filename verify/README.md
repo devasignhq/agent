@@ -14,6 +14,18 @@ Guarantees:
 - Never edits `package.json`, lockfiles, or `playwright.config.*`; generates `.devasign/playwright.config.ts` that extends yours with `video: 'on'`, `trace: 'on'`, `screenshot: 'on'`.
 - A failing generated test is retried twice; pass-after-retry is `flaky`, never `fail`. Your own tests are never retried by us.
 - Setup problems (no start command, missing secret names, wrong runtime) are uploaded as a structured diagnosis, and the process exits 0.
+- Every test's output is scrubbed of secrets (the rules under **Logs** below) before it reaches the job log, an uploaded log, or a result's error message.
+
+## What generated tests can see
+
+DevAsign writes generated tests from your repository's content, so they start with a narrower environment than the job's. Your own tests, and everything a managed boot starts, keep the whole environment.
+
+- **Never passed:** the runner's own credentials and control files: every `ACTIONS_*` variable (including the OIDC token request pair `ACTIONS_ID_TOKEN_REQUEST_URL`/`ACTIONS_ID_TOKEN_REQUEST_TOKEN`), `GITHUB_TOKEN`, `GH_TOKEN`, `DEVASIGN_TOKEN`, `GITHUB_ENV`, `GITHUB_PATH`, `GITHUB_OUTPUT`, `GITHUB_STATE` and `GITHUB_STEP_SUMMARY`. Listing one under `env` does not change this.
+- **Passed only when `verify.env` names them:** variables whose names contain `SECRET`, `TOKEN`, `KEY`, `PASS`, `PWD`, `CRED`, `PRIVATE`, `AUTH`, `COOKIE`, `SESSION`, `DSN` or `DATABASE_URL`, and values carrying a credential: a URL with a username or password, or a `password=`, `token=` or `key=` style entry in a query or connection string. The job log lists the names it withheld, and their values are scrubbed from every log like the others.
+- **Passed as they are:** everything else, and connection URLs to one loopback host (`localhost`, `127.x`, `::1`) or none (a socket, a `file:` path), which is how a job reaches its service containers. Any other host fails closed, including a host list, a `?host=` parameter, or a bare name: a container job that reaches its services as `postgres:5432` lists the variable under `env`.
+- **Browser tests:** when Playwright starts the app (`start`/`url` only, or a `webServer` in your config), the app inherits Playwright's environment, so generated browser tests lose only the runner's credentials. Under a managed boot the runner starts the app, and generated browser tests get the narrowed environment.
+
+This keeps secrets out of a generated test's environment variables; it is not a sandbox. A test runs as the job's user on the job's machine.
 
 ## Booting the app for browser tests
 

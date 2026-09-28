@@ -22,6 +22,8 @@ export async function runCommand(opts: {
   cmd: string;
   args: string[];
   cwd: string;
+  // What the child starts from instead of our own environment; `env` is layered on top.
+  baseEnv?: NodeJS.ProcessEnv;
   env?: NodeJS.ProcessEnv;
   timeoutMs: number;
   logFile?: string;
@@ -46,7 +48,7 @@ export async function runCommand(opts: {
     };
     // Node's test runner marks its own children via NODE_TEST_CONTEXT; a test
     // process spawned from inside one (our integration suite) must not inherit it.
-    const env: NodeJS.ProcessEnv = { ...process.env, ...(opts.env || {}), CI: "true", FORCE_COLOR: "0" };
+    const env: NodeJS.ProcessEnv = { ...(opts.baseEnv ?? process.env), ...(opts.env || {}), CI: "true", FORCE_COLOR: "0" };
     for (const k of Object.keys(env)) if (k.startsWith("NODE_TEST_")) delete env[k];
     // Own process group: a test runner reached through a wrapper (npx, npm exec)
     // spawns grandchildren, and killing only the direct child leaves them running.

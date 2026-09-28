@@ -13,7 +13,8 @@ import type { TokenSource } from "./oidc.js";
 import { diskKey, onDiskPath, retargetRenamed, writeModuleTypeShims } from "./module-type.js";
 import { runFileTests } from "./runners/index.js";
 import { ensureBrowsers, runPlaywright } from "./runners/playwright.js";
-import { CLI_COMMIT, CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
+import { CLI_COMMIT, CLI_VERSION, type DoctorDiagnosis, type FailOn, type LocalArtifact, type PlanTest, type ResolveResponse, type RunnerPlan, type RunnerResult, type RunnerResults } from "./types.js";
+import { generatedTestEnv, withoutRunnerCredentials } from "./test-env.js";
 import { redactTrace } from "./trace-redact.js";
 import { Workspace } from "./workspace.js";
 import { mergeBootConfig, needsManagedBoot } from "./yml.js";
@@ -112,14 +113,25 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
   const runnable = plan.tests.filter((t) => !(t.origin === "existing" && !existsSync(path.resolve(ws.root, t.path))));
   const pw = runnable.filter((t) => t.runner === "playwright");
   const others = runnable.filter((t) => t.runner !== "playwright");
+  const managed = needsManagedBoot(opts.yml) && plan.managedBoot !== false;
+  const generatedIn = (tests: PlanTest[]) => tests.some((t) => t.origin === "generated");
+  // The repository's own tests keep the whole job environment. Without a managed boot, Playwright
+  // starts the app the generated specs drive, so the app's secrets stay in what Playwright inherits.
+  const genEnv = generatedTestEnv(process.env, opts.yml?.env);
+  const browserEnv = managed ? genEnv.env : withoutRunnerCredentials(process.env);
+  // Whatever looks secret enough to withhold is also scrubbed from every log, whoever printed it.
+  const secretNames = [...(opts.yml?.env ?? []), ...genEnv.withheld];
+  if (genEnv.withheld.length && (generatedIn(others) || (managed && generatedIn(pw)))) {
+    const except = !managed && generatedIn(pw) ? " (browser tests excepted: Playwright starts the app they drive)" : "";
+    log.info(`withheld from generated tests${except}: ${genEnv.withheld.join(", ")} — list a name under verify.env in .devasign.yml to pass it through`);
+  }
 
-  results.push(...(await runFileTests({ tests: others, ws, fileOf: (t) => disk.get(t.id) ?? t.path, maxAttempts: (t) => (t.origin === "generated" ? 1 + plan.retries.generated : 1), timeoutMs: opts.testTimeoutMs, artifacts })));
+  results.push(...(await runFileTests({ tests: others, ws, fileOf: (t) => disk.get(t.id) ?? t.path, maxAttempts: (t) => (t.origin === "generated" ? 1 + plan.retries.generated : 1), timeoutMs: opts.testTimeoutMs, artifacts, baseEnv: (t) => (t.origin === "generated" ? genEnv.env : undefined), withheld: (t) => (t.origin === "generated" ? genEnv.withheld : []), redaction: { envNames: secretNames } })));
   doctor = diagnoseMissingDependencies(results, ws.root);
   if (doctor) log.warn(`setup needs attention: ${doctor.message}`);
 
   if (pw.length) {
     const repoCfg = opts.setup?.frameworks.find((f) => f.name === "playwright")?.configPath ?? null;
-    const managed = needsManagedBoot(opts.yml) && plan.managedBoot !== false;
     const errorAll = (message: string) => {
       for (const t of pw) results.push({ id: `r-${t.id}`, testId: t.id, criterionIds: t.criterionIds, test: t.path, runner: "playwright", level: t.level, origin: t.origin, status: "error", attempts: [], durationMs: 0, error: message, artifactIds: [] });
     };
@@ -137,7 +149,7 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
       const generated = pw.filter((t) => t.origin === "generated");
       const existing = pw.filter((t) => t.origin === "existing");
       let state: StorageState | null = null;
-      const scrub = (text: string) => redact(text, { envNames: opts.yml?.env, state });
+      const scrub = (text: string) => redact(text, { envNames: secretNames, state });
       const logFiles: string[] = [];
       let boot: Awaited<ReturnType<typeof bootManaged>> | null = null;
       try {
@@ -165,7 +177,7 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
         if (!managed || booted) {
           let combinedOutput = "";
           const runs = [
-            { tests: generated, retries: plan.retries.generated, configName: "playwright.config.ts" },
+            { tests: generated, retries: plan.retries.generated, configName: "playwright.config.ts", baseEnv: browserEnv },
             { tests: existing, retries: plan.retries.existing, configName: "playwright.existing.config.ts" },
           ];
           for (const r of runs.filter((x) => x.tests.length)) {
@@ -181,8 +193,8 @@ export async function executePlan(plan: RunnerPlan, ws: Workspace, opts: { yml: 
         if (boot?.handle) await boot.handle.stop();
         if (managed) cleanupAuth(ws);
         // Every log that leaves this job is scrubbed of secrets and the session first, and so is a signed-in trace.
-        for (const f of logFiles) redactFile(f, { envNames: opts.yml?.env, state });
-        if (state) for (const f of new Set(artifacts.filter((a) => a.kind === "trace").map((a) => a.path))) redactTrace(f, { envNames: opts.yml?.env, state });
+        for (const f of logFiles) redactFile(f, { envNames: secretNames, state });
+        if (state) for (const f of new Set(artifacts.filter((a) => a.kind === "trace").map((a) => a.path))) redactTrace(f, { envNames: secretNames, state });
       }
     }
   }

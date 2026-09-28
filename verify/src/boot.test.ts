@@ -9,7 +9,7 @@ import net from "node:net";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { authStatePath, bootManaged, bootSpec, checkSession, cleanupAuth, cookieHeaderFor, redact, redactFile, runLogin, startApp, type BootSpec, type StorageState } from "./boot.js";
+import { authStatePath, bootManaged, bootSpec, checkSession, cleanupAuth, cookieHeaderFor, redact, redactFile, redactor, runLogin, startApp, type BootSpec, type StorageState } from "./boot.js";
 
 const node = JSON.stringify(process.execPath);
 
@@ -332,6 +332,25 @@ test("redact removes secret env values, cookie headers and storage-state values,
   assert.match(out, /Set-Cookie: \[redacted\]/);
   assert.match(out, /sent sid=\[redacted\] and t=\[redacted\]/);
   assert.equal(redact("no custom-value here", { env, state: null }), "no custom-value here", "an unnamed, unsecret-looking var is left alone");
+});
+
+test("a redactor built once scrubs every line it is handed exactly as redact does", () => {
+  const env = { API_TOKEN: "tok-123456789" };
+  const scrub = redactor({ env });
+  const lines = ["a tok-123456789 b", "Authorization: Bearer x", "tok-123456789 then tok-123456789"];
+  for (const l of [...lines, ...lines]) assert.equal(scrub(l), redact(l, { env }));
+  assert.equal(scrub("tok-123456789 then tok-123456789"), "[redacted] then [redacted]", "a reused pattern never resumes mid-string");
+});
+
+test("a multi-line secret is redacted line by line, behind a prefix or split across calls", () => {
+  const key = "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\nBKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj\n-----END PRIVATE KEY-----";
+  const env = { APP_PRIVATE_KEY: key };
+  const printed = key.split("\n").map((l) => `# ${l}`).join("\n");
+  const out = redact(printed, { env });
+  for (const line of key.split("\n")) assert.ok(!out.includes(line), `"${line}" survived:\n${out}`);
+  const scrub = redactor({ env });
+  assert.equal(scrub("# BKcwggSjAgEAAoIBAQC7VJTUt9Us8cKj"), "# [redacted]", "the job log sees one line at a time");
+  assert.equal(redact(`whole ${key} value`, { env }), "whole [redacted] value");
 });
 
 test("a session value that cannot be URL-encoded is still redacted, and never throws", () => {
