@@ -7,7 +7,7 @@ import assert from "node:assert/strict";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { afterFeedbackRunSettled, applyActions, CONFIDENCE_THRESHOLD, enqueueVerifyFeedbackIfEligible, isBotLogin, normalizeActions, runVerifyFeedback } from "./feedback.js";
-import { createVerifyRun, diffCriteria, snapshotCriteriaRevision, updateRun } from "./runs.js";
+import { createVerifyRun, diffCriteria, dispatchNonceHash, snapshotCriteriaRevision, updateRun } from "./runs.js";
 import { runVerifyJudge } from "./judge.js";
 import type { Criterion } from "../types.js";
 import type { MaintainerComment } from "../queue.js";
@@ -67,6 +67,9 @@ test("DoD 14: a reword + an add land as revision 2, re-plan only the affected cr
     assert.match(s.calls.replies[0], /added \d+: The total is formatted as currency/);
     assert.match(s.calls.replies[0], /Re-running verification for 2 criteria/);
     const newRun = db.find("verifyRuns", (r) => r.id === out.runId)!;
+    const token = (s.calls.dispatches[0] as any).probe;
+    assert.equal(token.id, newRun.id, "the dispatch carries the token its job must echo to claim the new run");
+    assert.equal(newRun.dispatch?.nonceHash, dispatchNonceHash(token.nonce));
     assert.equal(newRun.triggeredBy.kind, "comment");
     assert.equal(newRun.inheritFromRunId, s.run.id);
     assert.equal(newRun.criteriaRevision, 2);

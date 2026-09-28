@@ -154,9 +154,10 @@ test("a run that could not have probed anyway is not recorded as an outdated run
 
 // ---- the two probe endpoints ------------------------------------------------
 
+// As offerBootProbe writes it: claimed by the job it was offered to (claimsFor's run 900, attempt 1).
 function seedProbe(repo: Repository, over: Partial<BootProbe> = {}): BootProbe {
   return db.insert("bootProbes", {
-    id: uuid(), schemaVersion: 1, repoId: repo.id, prNumber: PR, sha: SHA, attempt: 1,
+    id: uuid(), schemaVersion: 1, repoId: repo.id, kind: "setup_pr", prNumber: PR, actionsRunId: "900", sha: SHA, attempt: 1,
     status: "offered", offeredAt: Date.now(), uploadedBytes: 0, uploadedCount: 0, ...over,
   });
 }
@@ -211,6 +212,26 @@ test("the probe guard rejects another repo's probe, a wrong sha, a reported prob
     assert.equal(res.body.error, error, label);
   }
   assert.equal(db.filter("verifyArtifacts", (a) => a.owner === "probe" && a.repoId === repo.id).length, 0, "nothing was signed");
+});
+
+test("a setup PR probe is the offered job's alone: another job on the same PR neither signs nor reports on it", async () => {
+  const repo = seedRepo();
+  const offered = await resolve(repo);
+  const probeId = offered.body.probe.probeId;
+  for (const [label, claims] of [["another run on the setup PR", { run_id: "901" }], ["a re-run of the offered job", { run_attempt: "2" }]] as const) {
+    const signed = fakeRes();
+    await probeArtifactsHandler(probeReq(repo, probeId, signBody(1_024), claims), signed);
+    assert.deepEqual([signed.statusCode, signed.body.error], [403, "actions_run_mismatch"], label);
+    const told = fakeRes();
+    await makeProbeResultHandler({ settle: async () => {} })(probeReq(repo, probeId, report(), claims), told);
+    assert.deepEqual([told.statusCode, told.body.error], [403, "actions_run_mismatch"], label);
+  }
+  assert.equal(db.filter("verifyArtifacts", (a) => a.runId === probeId).length, 0, "nothing was signed against it");
+  assert.equal(db.find("bootProbes", (p) => p.id === probeId)!.status, "offered", "and it is still the offered job's to report");
+
+  const ok = fakeRes();
+  await makeProbeResultHandler({ settle: async () => {} })(probeReq(repo, probeId, report()), ok);
+  assert.deepEqual(ok.body, { ok: true }, "the job it was offered to still reports");
 });
 
 test("the upload cap accumulates on the probe row, so splitting the request cannot beat it", async () => {

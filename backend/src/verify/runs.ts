@@ -1,5 +1,6 @@
 // Row helpers for verify runs: creation, lookup, and the read model that both
 // GET /v1/runs/{id} and the app render.
+import { createHash, randomBytes } from "node:crypto";
 import { v4 as uuid } from "uuid";
 import { db } from "../db.js";
 import { config } from "../config.js";
@@ -181,6 +182,22 @@ export function hasRunnerEvidence(repo: Pick<Repository, "id" | "verify">): bool
 
 export function updateRun(id: string, patch: Partial<VerifyRun>): VerifyRun | null {
   return db.update("verifyRuns", (r) => r.id === id, { ...patch, updatedAt: Date.now() });
+}
+
+// How long a dispatched job may claim its run — and so how long a nonce a CI log leaked stays redeemable.
+export const DISPATCH_EXPIRE_MS = 2 * 60 * 60_000;
+
+export const dispatchNonceHash = (nonce: string): string => createHash("sha256").update(nonce).digest("hex");
+
+/**
+ * The client_payload that re-triggers CI for a run. A dispatched job's token names no PR, so
+ * the nonce, which only that job's event file carries, is what lets it claim this run.
+ */
+export function runnerDispatchPayload(run: Pick<VerifyRun, "id" | "prNumber" | "sha" | "reviewId">): Record<string, unknown> {
+  const nonce = randomBytes(24).toString("base64url");
+  updateRun(run.id, { dispatch: { at: Date.now(), nonceHash: dispatchNonceHash(nonce) } });
+  // Under `probe` because that is the key @devasign/verify 1.8+ echoes back from client_payload.
+  return { pr: run.prNumber, sha: run.sha, runId: run.id, reviewId: run.reviewId, probe: { id: run.id, nonce } };
 }
 
 /** Newest run for a review (optionally pinned to a sha), by attempt then creation. */

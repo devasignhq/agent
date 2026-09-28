@@ -116,14 +116,14 @@ test("two artifact files sharing a clientRef are rejected, not fatal", async () 
     head: async () => null,
     remove: async () => {},
   };
-  db.insert("verifyRuns", { id: runId, schemaVersion: 1, reviewId: uuid(), repoId, installationId: uuid(), prNumber: 3, sha: "abc", attempt: 1, status: "running", criteriaRevision: 1, planTier: "pro", verdicts: [], timings: { forkedAt: Date.now() }, tokenUsage: {}, artifactBytes: 0, triggeredBy: { kind: "pr_event" }, createdAt: Date.now(), updatedAt: Date.now() } as any);
+  db.insert("verifyRuns", { id: runId, schemaVersion: 1, reviewId: uuid(), repoId, installationId: uuid(), prNumber: 3, sha: "abc", attempt: 1, status: "running", criteriaRevision: 1, planTier: "pro", verdicts: [], timings: { forkedAt: Date.now() }, tokenUsage: {}, artifactBytes: 0, triggeredBy: { kind: "pr_event" }, runnerMeta: { actionsRunId: "900", runAttempt: "1" }, createdAt: Date.now(), updatedAt: Date.now() } as any);
   setArtifactStorageForTests(fake);
   try {
     const res = fakeRes();
     const file = (clientRef: string, path: string) => ({ clientRef, kind: "log", path, bytes: 10, contentType: "text/plain" });
     await artifactsHandler(
       {
-        runner: { repo: { id: repoId }, plan: "pro" },
+        runner: { repo: { id: repoId }, claims: { run_id: "900", run_attempt: "1" }, plan: "pro" },
         params: { runId },
         body: { files: [file("a", "one.log"), file("a", "two.log"), file("b", "three.log")] },
       } as any,

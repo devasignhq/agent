@@ -1363,6 +1363,9 @@ export type VerifyRun = {
     e2eWithheld?: "runner_outdated" | "managed_boot_off";
   };
   doctor?: DoctorDiagnosis | null;
+  // The App's latest repository_dispatch for this run. Only the nonce's hash is kept: this row
+  // is served to every runner in the repo, and the nonce is what lets the dispatched job claim it.
+  dispatch?: { at: number; nonceHash: string };
   triggeredBy: { kind: "pr_event" | "comment" | "rerun" | "dispatch"; commentId?: number };
   // A feedback re-run plans only the affected criteria; the rest inherit this run's verdicts.
   inheritFromRunId?: string | null;

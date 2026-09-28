@@ -13,8 +13,8 @@ export type RunContext = {
   runAttempt: number;
   runnerOs: string;
   jobUrl?: string;
-  // The boot re-check this run was dispatched for, when it was. Opaque here: the API
-  // matches it against the row it minted.
+  // The App's token from the dispatch that started this run: a boot re-check's or a verify
+  // re-run's. Opaque here, and echoed either way: the API matches it against the row it minted.
   probe?: { id: string; nonce: string };
 };
 

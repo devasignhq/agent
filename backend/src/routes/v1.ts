@@ -11,7 +11,7 @@ import { installationsForUser, userInInstall } from "../github/installations.js"
 import { effectiveWorkflow } from "../review/workflow.js";
 import { enqueueVerifyJudge } from "../queue.js";
 import { runnerLimiter } from "../rate-limit.js";
-import type { BootProbe, Installation, Repository, VerifyArtifact, VerifyArtifactKind } from "../types.js";
+import type { BootProbe, Installation, Repository, VerifyArtifact, VerifyArtifactKind, VerifyRun } from "../types.js";
 import { prNumberFromRef, verifyActionsToken, type ActionsClaims, type OidcResult } from "../verify/oidc.js";
 import { artifactKey, artifactStorage, retentionExpiresAt, UPLOAD_LIMITS } from "../verify/storage.js";
 import { localArtifactPath, localStoreEnabled, verifyLocalSignature } from "../verify/storage-local.js";
@@ -24,6 +24,8 @@ import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 import {
   buildRunView,
+  DISPATCH_EXPIRE_MS,
+  dispatchNonceHash,
   e2eGate,
   latestRunForReview,
   forgetRunnerPoll,
@@ -219,9 +221,38 @@ const sameSecret = (a: string, b: string): boolean => {
   return x.length === y.length && x.length > 0 && timingSafeEqual(x, y);
 };
 
+/** The Actions job attempt a verified token speaks for. The request body never gets a say. */
+export function actionsRunOf(runner: RunnerIdentity): { actionsRunId: string; attempt: number } {
+  return { actionsRunId: String(runner.claims.run_id), attempt: Number(runner.claims.run_attempt) || 1 };
+}
+
 /** The run that is already this probe's, if one has claimed it. */
 export function claimedBy(probe: BootProbe, runner: RunnerIdentity): boolean {
-  return probe.actionsRunId === String(runner.claims.run_id) && probe.attempt === (Number(runner.claims.run_attempt) || 1);
+  const me = actionsRunOf(runner);
+  return probe.actionsRunId === me.actionsRunId && probe.attempt === me.attempt;
+}
+
+/** Whether this token's job is the one whose resolve claimed the run, as claimedBy is for a probe. */
+export function runClaimedBy(run: VerifyRun, runner: RunnerIdentity): boolean {
+  const me = actionsRunOf(runner);
+  const meta = run.runnerMeta;
+  return meta?.actionsRunId != null && String(meta.actionsRunId) === me.actionsRunId && (Number(meta.runAttempt) || 1) === me.attempt;
+}
+
+const DISPATCH_UNVERIFIED =
+  "a job whose token names no pull request may only resolve the one DevAsign dispatched it for, by echoing that dispatch's client_payload.probe (@devasign/verify 1.8 or later)";
+
+/**
+ * The run the App re-dispatched this job for. The token names no PR and `pr`/`sha` are public,
+ * so, as with a re-check, only the nonce from the job's own client_payload ties it to one run.
+ */
+export function dispatchedRunFor(runner: RunnerIdentity, body: ResolveRequest): VerifyRun | null {
+  const token = body.probe;
+  if (runner.claims.event_name !== "repository_dispatch" || !token) return null;
+  const run = db.find("verifyRuns", (r) => r.id === token.id && r.repoId === runner.repo.id);
+  if (!run?.dispatch || run.prNumber !== body.pr || run.sha.toLowerCase() !== body.sha.toLowerCase()) return null;
+  if (Date.now() - run.dispatch.at > DISPATCH_EXPIRE_MS) return null;
+  return sameSecret(run.dispatch.nonceHash, dispatchNonceHash(token.nonce)) ? run : null;
 }
 
 // `pr` and `sha` are both public, so the nonce in the App's own dispatch is the only thing
@@ -286,8 +317,7 @@ export function offerBootProbe(runner: RunnerIdentity, body: ResolveRequest): Bo
   }
 
   const prNumber = ob.prNumber;
-  const attempt = Number(runner.claims.run_attempt) || 1;
-  const actionsRunId = String(runner.claims.run_id);
+  const { actionsRunId, attempt } = actionsRunOf(runner);
   const uploadLimits = { ...PROBE_UPLOAD_LIMITS };
   const capable = () => patchRepoVerify(runner.repo.id, (cur) => ({ ...cur, onboarding: { ...cur.onboarding, probeUnavailable: null } }));
 
@@ -333,14 +363,19 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
   if (!body) return fail(res, 400, "invalid_body", { detail: "sha (hex) and pr (positive int) are required" });
   const refPr = prNumberFromRef(runner.claims.ref);
   if (refPr != null && refPr !== body.pr) return fail(res, 403, "pr_mismatch");
+  const onboardingPr = runner.repo.verify?.onboarding?.prNumber;
+  const isOnboardingPr = onboardingPr != null && onboardingPr === body.pr;
+  // Bound to no PR by its ref, such a token could otherwise claim any PR's run. The onboarding
+  // PR is exempt: it has no runs, and a re-check proves its dispatch in offerBootProbe.
+  const dispatched = refPr == null && !isOnboardingPr ? dispatchedRunFor(runner, body) : null;
+  if (refPr == null && !isOnboardingPr && !dispatched) return fail(res, 403, "dispatch_unverified", { detail: DISPATCH_UNVERIFIED });
   // Must stay after rememberSetup: the onboarding PR's run is often the first
   // runner contact, and that write is what clears the repo's "setup pending" state.
   rememberSetup(runner.repo, body.setup);
 
   // DevAsign never reviews its own onboarding PR, so no plan will ever exist for it.
   // Instead that run is where the proposed boot config gets tried (offerBootProbe).
-  const onboardingPr = runner.repo.verify?.onboarding?.prNumber;
-  if (onboardingPr != null && onboardingPr === body.pr) {
+  if (isOnboardingPr) {
     const probe = offerBootProbe(runner, body);
     const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "onboarding_pr", ...(probe ? { probe } : {}) };
     return void res.json(out);
@@ -359,6 +394,11 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
     return void res.status(202).json(out);
   }
   const run = latestRunForReview(review.id, body.sha);
+  // A newer run took the commit over after the App dispatched this job, which is not that run's runner.
+  if (dispatched && run?.id !== dispatched.id) {
+    const out: ResolveResponse = { ok: true, status: "empty", runId: null, reason: "superseded" };
+    return void res.json(out);
+  }
   if (!run) {
     const superseded = review.headSha.toLowerCase() !== body.sha.toLowerCase();
     if (!superseded) {
@@ -398,15 +438,17 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
       forgetRunnerPoll(runner.repo.id, body.pr, body.sha);
       const now = Date.now();
       const e2eWithheld = e2eGate(plan, body.capabilities) ?? undefined;
+      const { actionsRunId, attempt } = actionsRunOf(runner);
       updateRun(run.id, {
         status: "running",
         timings: { ...run.timings, resolvedAt: run.timings.resolvedAt ?? now },
         runnerMeta: {
           ...(run.runnerMeta || {}),
-          actionsRunId: body.actions?.runId ?? runner.claims.run_id,
-          runAttempt: runner.claims.run_attempt,
+          // The claim runForRunner holds results and artifacts to: signed, so never the body's say-so.
+          actionsRunId,
+          runAttempt: String(attempt),
           runnerOs: body.actions?.runnerOs,
-          jobUrl: body.actions?.jobUrl,
+          jobUrl: `https://github.com/${runner.claims.repository}/actions/runs/${actionsRunId}`,
           cliVersion: body.cliVersion,
           capabilities: body.capabilities,
           e2eWithheld,
@@ -424,10 +466,18 @@ export async function resolveHandler(req: RunnerRequest, res: Response): Promise
   }
 }
 
+const RUN_CLAIMED_ELSEWHERE = "only the GitHub Actions job that resolved this run may post to it";
+
 function runForRunner(req: RunnerRequest, res: Response) {
+  const runner = req.runner!;
   const run = db.find("verifyRuns", (r) => r.id === String(req.params.runId));
-  if (!run || run.repoId !== req.runner!.repo.id) {
+  if (!run || run.repoId !== runner.repo.id) {
     fail(res, 404, "run_not_found");
+    return null;
+  }
+  // Any job in the repo can mint a token, and run ids and head shas are on the PR for anyone to read.
+  if (!runClaimedBy(run, runner)) {
+    fail(res, 403, "actions_run_mismatch", { detail: RUN_CLAIMED_ELSEWHERE });
     return null;
   }
   return run;
@@ -604,10 +654,15 @@ export function probeForRunner(req: RunnerRequest, res: Response, sha?: string):
     return null;
   }
   // A re-check carries the onboarding PR's number but ran on the default branch, so the ref's
-  // PR says nothing about it: what has to match is the dispatched run that claimed the row.
-  const refOk = probe.kind === "recheck" ? runnerMayRecheck(runner) && claimedBy(probe, runner) : prNumberFromRef(runner.claims.ref) === probe.prNumber;
+  // PR says nothing about it: only a run the App dispatched can hold one.
+  const refOk = probe.kind === "recheck" ? runnerMayRecheck(runner) : prNumberFromRef(runner.claims.ref) === probe.prNumber;
   if (!refOk) {
     fail(res, 403, "pr_mismatch");
+    return null;
+  }
+  // Either kind belongs to the one job it was offered to, as a verify run does (runForRunner).
+  if (!claimedBy(probe, runner)) {
+    fail(res, 403, "actions_run_mismatch", { detail: "only the GitHub Actions job this probe was offered to may post to it" });
     return null;
   }
   if (sha !== undefined && sha.toLowerCase() !== probe.sha.toLowerCase()) {

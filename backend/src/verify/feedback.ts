@@ -16,7 +16,7 @@ import { enqueueVerifyFeedback, type MaintainerComment } from "../queue.js";
 import type { Criterion, Installation, PRCommentAction, PRCommentActionKind, Repository, VerifyRun } from "../types.js";
 import { runVerifyPlan } from "./plan.js";
 import { rerenderReport, runDeepLink } from "./report.js";
-import { createVerifyRun, latestRunForReview, snapshotCriteriaRevision, updateRun } from "./runs.js";
+import { createVerifyRun, latestRunForReview, runnerDispatchPayload, snapshotCriteriaRevision, updateRun } from "./runs.js";
 
 export const CONFIDENCE_THRESHOLD = 0.6;
 export const DISPATCH_EVENT = "devasign-verify";
@@ -240,7 +240,7 @@ export async function runVerifyFeedback(reviewId: string, comment: MaintainerCom
   const fresh = db.find("verifyRuns", (r) => r.id === run.id);
   if (fresh?.status === "awaiting_runner" && install) {
     try {
-      await (deps.dispatch ?? defaultDispatch)(install, repo, { pr: review.prNumber, sha: review.headSha, runId: run.id, reviewId: review.id });
+      await (deps.dispatch ?? defaultDispatch)(install, repo, runnerDispatchPayload(run));
       db.insert("reviewLogs", { id: uuid(), reviewId: review.id, kind: "verify", at: Date.now(), action: "Runner re-triggered via repository_dispatch", meta: { runId: run.id } });
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
