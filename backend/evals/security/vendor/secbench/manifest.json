@@ -1,0 +1,116 @@
+{
+  "version": 1,
+  "trees": { "vulnerable": "app-vulnerable", "fixed": "app-fixed" },
+  "note": "The only record of which cases are real. Fixture code carries no hints.",
+  "cases": [
+    {
+      "id": "R1",
+      "kind": "real",
+      "title": "Invoice lookup is authenticated but not tenant-scoped",
+      "path": "src/routes/invoices.ts",
+      "symbol": "invoicesRouter",
+      "classAliases": ["idor", "missing-authz", "broken-access-control", "tenant-isolation", "missing-tenant-scope"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "verified", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "R2",
+      "kind": "real",
+      "title": "Invoice search builds SQL by string concatenation",
+      "path": "src/routes/search.ts",
+      "symbol": "searchRouter",
+      "classAliases": ["sql-injection", "injection", "sqli"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "verified", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "R3",
+      "kind": "real",
+      "title": "Download path joins a request parameter with no containment check",
+      "path": "src/routes/files.ts",
+      "symbol": "filesRouter",
+      "classAliases": ["path-traversal", "directory-traversal", "lfi", "arbitrary-file-read"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "verified", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "R4",
+      "kind": "real",
+      "title": "Billing webhook applies events without verifying the signature",
+      "path": "src/routes/webhooks.ts",
+      "symbol": "webhooksRouter",
+      "classAliases": ["unverified-webhook", "missing-signature-verification", "missing-authn", "webhook-forgery"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "verified", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "R5",
+      "kind": "real",
+      "title": "Report fetch takes its target URL from the request body",
+      "path": "src/routes/reports.ts",
+      "symbol": "reportsRouter",
+      "classAliases": ["ssrf", "server-side-request-forgery"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "verified", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "D1",
+      "kind": "decoy",
+      "title": "Admin routes carry no inline role check; requireAdmin is mounted in app.ts",
+      "path": "src/routes/admin.ts",
+      "symbol": "adminRouter",
+      "classAliases": ["missing-authz", "missing-admin-check", "privilege-escalation", "broken-access-control"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "not_reproduced", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "D2",
+      "kind": "decoy",
+      "title": "Order handler reads an id from the URL; the repository is bound to the tenant",
+      "path": "src/routes/orders.ts",
+      "symbol": "ordersRouter",
+      "classAliases": ["idor", "missing-authz", "tenant-isolation", "missing-tenant-scope"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "not_reproduced", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "D3",
+      "kind": "decoy",
+      "title": "Concatenated SQL in a developer script the service never imports",
+      "path": "scripts/seed-dev.ts",
+      "classAliases": ["sql-injection", "injection", "sqli"],
+      "proof": "reachability",
+      "entry": "src/server.ts",
+      "expected": { "vulnerable": "untestable:not_reachable", "fixed": "untestable:not_reachable" }
+    },
+    {
+      "id": "D4",
+      "kind": "decoy",
+      "title": "Thumbnail route joins a path parameter behind a router-level validator",
+      "path": "src/routes/thumbnails.ts",
+      "symbol": "thumbnailsRouter",
+      "classAliases": ["path-traversal", "directory-traversal", "lfi"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "not_reproduced", "fixed": "not_reproduced" }
+    },
+    {
+      "id": "D5",
+      "kind": "decoy",
+      "title": "Placeholder secret in a committed sample config",
+      "path": "test/fixtures/sample-config.json",
+      "classAliases": ["hardcoded-secret", "committed-secret", "secrets-in-source"],
+      "proof": "none",
+      "expected": { "vulnerable": "not_verified", "fixed": "not_verified" }
+    },
+    {
+      "id": "D6",
+      "kind": "decoy",
+      "title": "Partner sync handler shows no verification; middleware checks the signature",
+      "path": "src/routes/partners.ts",
+      "symbol": "partnersRouter",
+      "classAliases": ["unverified-webhook", "missing-signature-verification", "missing-authn", "webhook-forgery"],
+      "proof": "runtime",
+      "expected": { "vulnerable": "not_reproduced", "fixed": "not_reproduced" }
+    }
+  ]
+}

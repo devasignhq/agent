@@ -12,5 +12,6 @@ coverage
 data
 
 **/*.test.ts
+evals
 deploy
 .gcloudignore

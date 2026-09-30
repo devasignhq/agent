@@ -1,0 +1,8 @@
+{
+  "name": "secbench-app",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "Billing service used as the security audit benchmark's subject.",
+  "dependencies": { "express": "^4.22.2" }
+}
