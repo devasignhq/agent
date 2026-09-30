@@ -1,0 +1,6 @@
+{
+  "_comment": "Placeholder values for local runs. Replace before deploying.",
+  "webhookSecret": "replace-me-placeholder-value",
+  "reportHost": "reports.example.com",
+  "pageSize": 25
+}

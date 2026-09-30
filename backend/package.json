@@ -11,8 +11,10 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "seed": "tsx scripts/seed.ts",
     "dev:ephemeral": "tsx scripts/ephemeral-dev.ts",
-    "test": "DATABASE_URL= LLM_PROVIDER= VERTEX_THINKING= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts' 'deploy/**/*.test.mjs'",
+    "test": "DATABASE_URL= LLM_PROVIDER= VERTEX_THINKING= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test 'src/**/*.test.ts' 'deploy/**/*.test.mjs' 'evals/**/*.test.ts'",
+    "test:secbench": "DATABASE_URL= ANTHROPIC_API_KEY= GEMINI_API_KEY= STATSIG_SECRET_KEY= node --import tsx/esm --test evals/security/vendor/secbench/truth.test.ts",
     "eval:criteria": "tsx scripts/eval-criteria.ts",
+    "eval:security": "tsx scripts/eval-security.ts",
     "audit": "npm audit --audit-level=high"
   },
   "engines": {

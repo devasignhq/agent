@@ -446,7 +446,7 @@ export function buildFileSummaryUserMessage(path: string, content: string): stri
   return `Path: ${path}\n\n${wrapUntrusted("FILE_CONTENT", content)}`;
 }
 
-async function summariseFile(path: string, content: string): Promise<
+export async function summariseFile(path: string, content: string): Promise<
   { summary: string; exports: string[]; imports: string[]; securityFlags: string[] } | null
 > {
   const userText = buildFileSummaryUserMessage(path, content);

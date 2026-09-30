@@ -28,6 +28,8 @@ review:
     - "**/*.tsbuildinfo"
     - "**/*.generated.*"
     - "**/__snapshots__/**"
+    # deliberately vulnerable benchmark fixture — see backend/evals/security/README.md
+    - "backend/evals/security/vendor/**"
     # lockfiles are deliberately NOT ignored — review-dependencies needs them
   agents:
     disable: [] # e.g. [review-frontend]

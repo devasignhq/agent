@@ -374,6 +374,42 @@ export type SecurityVerification = {
   engine: string;
 };
 
+// Whether an executed test (or a deterministic rule) has proven a finding real.
+// With the proof gate on, only "verified" is presented; see security/proof.ts.
+export type SecurityProofStatus =
+  | "untested"
+  | "testing"
+  | "verified"
+  | "not_reproduced"
+  | "inconclusive"
+  | "untestable";
+export type SecurityProofReason =
+  | "stale"
+  | "control_failed"
+  | "test_errored"
+  | "flaky"
+  | "single_attempt"
+  | "not_reachable"
+  | "deployment_dependent"
+  | "nondeterministic"
+  | "no_test_written"
+  | "unsupported_runner";
+export type SecurityProof = {
+  status: SecurityProofStatus;
+  method: "test" | "rule";
+  reason?: SecurityProofReason;
+  detail?: string;
+  blobSha?: string;  // file blob the proof ran against; stale once detectedSha moves
+  testedSha?: string; // commit the proof ran at
+  paths?: string[];
+  runId?: string;
+  testPath?: string;
+  attempts?: { control: number; probe: number };
+  engine: string;
+  updatedAt: number;
+};
+export type FindingPresentation = "main" | "kept" | "untested" | "suppressed" | "resolved";
+
 // Why a human suppressed a finding. "False positive" and "accept risk" are one
 // button each in the UI, but a maintainer clicks them for very different
 // reasons, and only some of those reasons are a lesson the agent can learn.
@@ -422,6 +458,7 @@ export type SecurityFinding = {
   confidence: SecurityConfidence; // verifier-owned: "confirmed" only when verification.status is
   scannerConfidence?: SecurityConfidence; // the scanner's self-report, kept for the record
   verification?: SecurityVerification;
+  proof?: SecurityProof;
   title: string;             // one line, specific
   concern: string;           // what it is and why it's exploitable
   evidence?: string;         // quoted file:line evidence the model actually read
