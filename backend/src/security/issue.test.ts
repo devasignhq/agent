@@ -101,3 +101,42 @@ test("issue body omits optional sections cleanly when the finding lacks them", (
   assert.match(body, /api\/routes\/payouts\.ts/);
   assert.match(body, /### What's wrong/);
 });
+
+test("under the proof gate the Verification section states the proof, never the AI review", () => {
+  const confirmed = {
+    status: "confirmed" as const,
+    evidence: [{ path: "api/app.ts", line: 40, quote: 'app.use("/v1", router)' }],
+    verifiedAt: 1,
+    model: "m",
+    engine: "verify-v1",
+  };
+  const proven = findingIssueBody(
+    finding({
+      verification: confirmed,
+      detectedSha: "blob1",
+      proof: {
+        status: "verified",
+        method: "test",
+        blobSha: "blob1",
+        testedSha: "0123456789abcdef",
+        testPath: ".devasign/tests/payouts.proof.test.ts",
+        engine: "proof-v1",
+        updatedAt: 1,
+      },
+    }),
+    { proofGate: true }
+  );
+  assert.match(proven, /### Verification\nReproduced by an executed test at `0123456789ab`/);
+  assert.match(proven, /Test: `\.devasign\/tests\/payouts\.proof\.test\.ts`/);
+  assert.doesNotMatch(proven, /Independently verified/);
+
+  const untested = findingIssueBody(finding({ verification: confirmed }), { proofGate: true });
+  assert.doesNotMatch(untested, /### Verification/);
+});
+
+test("under the proof gate createFindingIssue refuses an untested finding before touching GitHub", async () => {
+  await assert.rejects(
+    createFindingIssue({ repo: {} as any, install: {} as any, finding: finding(), actorLogin: "x", proofGate: true }),
+    (e: unknown) => e instanceof IssueCreationError && e.code === "untested"
+  );
+});

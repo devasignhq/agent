@@ -12,6 +12,7 @@
 import type { SecurityFinding } from "./api.ts";
 import { guardFormula, toCsv } from "./bounty-csv.ts";
 import { displayId, STATE_LABEL } from "./security-findings.ts";
+import { proofTag } from "./security-proof.ts";
 import { citationLabel } from "./security-triage.ts";
 
 // Resolves a repo's default branch from the overview (the export modules never
@@ -85,6 +86,18 @@ export function verificationText(f: SecurityFinding): string {
   return `unverifiable${v.detail ? ` — ${v.detail}` : ""}`;
 }
 
+// What an executed test proved, for a reader handing this to a coding agent.
+export function proofText(f: SecurityFinding): string {
+  // Empty without a proof record, so nothing changes while the proof gate is off.
+  if (!f.proof) return "";
+  const tag = proofTag(f.proof);
+  const parts = [tag.detail ? `${tag.label} — ${tag.detail}` : tag.label];
+  const p = f.proof;
+  if (p?.testedSha) parts.push(`tested at ${p.testedSha.slice(0, 12)}`);
+  if (p?.testPath) parts.push(`test: ${p.testPath}`);
+  return parts.join("\n");
+}
+
 // Same screen-word rule as the transactions CSV: export the label the page
 // shows, but fall back to the raw wire value rather than "" if a state is
 // added to the backend before this map learns it.
@@ -115,6 +128,7 @@ export const FINDINGS_CSV_HEADERS = [
   "Concern",
   "Evidence",
   "Verified Evidence",
+  "Proof",
   "Dataflow",
   "Exploit Narrative",
   "Blast Radius",
@@ -167,6 +181,7 @@ export const findingsCsvRows = (
     text(f.concern),
     text(f.evidence),
     text(verificationText(f)),
+    text(proofText(f)),
     text(dataflowText(f)),
     text(exploitText(f)),
     text(f.blastRadius),
@@ -214,6 +229,7 @@ export function findingDetailBlocks(f: SecurityFinding): DetailBlock[] {
     ["Concern", f.concern],
     ["Evidence", f.evidence],
     ["Verification", verificationText(f)],
+    ["Proof", proofText(f)],
     ["Dataflow", dataflowText(f)],
     ["Exploit narrative", exploitText(f)],
     ["Blast radius", f.blastRadius],

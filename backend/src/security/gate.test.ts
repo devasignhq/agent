@@ -194,3 +194,39 @@ test("gateOutput: a private-repo finding with no line number renders the path al
   assert.match(out.summary, /\(`api\/payouts\.ts`\)/);
   assert.doesNotMatch(out.summary, /undefined/);
 });
+
+test("gateOutput: under the proof gate a pass says how many findings are awaiting a test", () => {
+  reset();
+  const gate = computeGate({
+    findings: [finding(), finding({ id: "f2", severity: "high" })],
+    openReviews: [],
+    policy: DEFAULT_SECURITY_POLICY,
+    proofGate: true,
+  });
+  const out = gateOutput(repoFx(true), gate);
+  assert.equal(out.title, "Security gate passed");
+  assert.equal(
+    out.summary,
+    "All required security gate rules pass.\n\n2 findings are awaiting a test and aren't enforced yet.\n\n" +
+      `Details: ${config.webOrigin}/security/config?tab=gate`
+  );
+});
+
+test("gateOutput: under the proof gate a private repo's blocked summary lists proven findings only", () => {
+  reset();
+  const proven = seedFinding({
+    proof: { status: "verified", method: "test", blobSha: "s", engine: "proof-v1", updatedAt: 1 },
+  });
+  const untested = seedFinding({ id: "f2", title: "Untested claim", path: "api/other.ts" });
+  const gate = computeGate({
+    findings: [proven, untested],
+    openReviews: [],
+    policy: DEFAULT_SECURITY_POLICY,
+    proofGate: true,
+  });
+  const out = gateOutput(repoFx(true), gate);
+  assert.equal(out.title, "Security gate blocked");
+  assert.match(out.summary, /Unparameterised payout query/);
+  assert.doesNotMatch(out.summary, /Untested claim/);
+  assert.match(out.summary, /1 finding is awaiting a test and isn't enforced yet\./);
+});

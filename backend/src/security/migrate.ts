@@ -12,6 +12,7 @@ import { db } from "../db.js";
 import type { SecurityFinding } from "../types.js";
 import { classifySurfaceFor, fingerprintFinding } from "./fingerprint.js";
 import { capSeverityByConfidence } from "./severity.js";
+import { untestedProof } from "./proof.js";
 
 export function backfillLegacyVulnerabilities(): number {
   const existing = new Set(db.table("securityFindings").map((f) => f.fingerprint));
@@ -63,4 +64,15 @@ export function backfillLegacyVulnerabilities(): number {
     console.log(`[security] migrated ${migrated} legacy vulnerabilities into securityFindings`);
   }
   return migrated;
+}
+
+// Idempotent boot stamp so every stored finding carries its proof tag in the
+// database (`data->'proof'->>'status'`); later boots find nothing to do.
+export function backfillProofRecords(now = Date.now()): number {
+  const missing = db.table("securityFindings").filter((f) => !f.proof);
+  for (const f of missing) {
+    db.update("securityFindings", (x) => x.id === f.id, { proof: untestedProof(now) });
+  }
+  if (missing.length) console.log(`[security] tagged ${missing.length} findings as untested`);
+  return missing.length;
 }

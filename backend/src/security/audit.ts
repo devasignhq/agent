@@ -30,6 +30,7 @@ import { effectiveSecurityPolicy, isActiveState } from "./policy.js";
 import { reconcileFile, type DetectedFinding, type ReconcileCtx } from "./reconcile.js";
 import { anchorHolds, matchPrecedent, renderPrecedentBlock, selectPrecedents } from "./precedent.js";
 import { publishGateForRepo } from "./gate.js";
+import { proofGateFor } from "./proof-gate.js";
 
 const CONCURRENCY = 4;
 const MAX_FILES_PER_RUN = 500;
@@ -496,6 +497,7 @@ export async function runSecurityAudit(payload: SecurityAuditJobPayload): Promis
           duration_ms: Date.now() - t0,
           est_cost_usd: costUsd,
           model: AUDIT_MODEL,
+          proof_gate: proofGateFor(repo),
         });
       }
     });

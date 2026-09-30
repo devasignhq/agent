@@ -11,12 +11,14 @@ import type {
   SecuritySeverity,
   SeverityGateAction,
 } from "../types.js";
+import { isProven } from "./proof.js";
 
 export const DEFAULT_SECURITY_POLICY: RepoSecurityPolicy = {
   version: 1,
   triggers: { onMerge: true, onPrPush: true, nightly: false, advisories: false },
   engines: { api: true, frontend: true, infra: true, secrets: true, deps: true },
   gates: { critical: "block", high: "warn", medium: "track", low: "track" },
+  proof: { publicOptIn: false },
 };
 
 // States that count as "unresolved" for gating and dashboards. fix_ready still
@@ -37,6 +39,15 @@ export function isActiveState(s: SecurityFindingState): boolean {
   return ACTIVE_STATES.includes(s);
 }
 
+// Under the proof gate a test outranks the LLM verifier, so a proven row it held back still gates.
+export function gatesUnderProof(f: SecurityFinding): boolean {
+  return (GATING_STATES.includes(f.state) || f.state === "unverified") && isProven(f);
+}
+
+function awaitsProof(f: SecurityFinding): boolean {
+  return (isActiveState(f.state) || f.state === "unverified") && !isProven(f);
+}
+
 // Merge defaults under whatever partial policy the row carries, so rows written
 // before a field existed keep loading and new fields pick up their defaults.
 export function effectiveSecurityPolicy(repo: Repository | undefined): RepoSecurityPolicy {
@@ -47,13 +58,18 @@ export function effectiveSecurityPolicy(repo: Repository | undefined): RepoSecur
     triggers: { ...DEFAULT_SECURITY_POLICY.triggers, ...(p.triggers ?? {}) },
     engines: { ...DEFAULT_SECURITY_POLICY.engines, ...(p.engines ?? {}) },
     gates: { ...DEFAULT_SECURITY_POLICY.gates, ...(p.gates ?? {}) },
+    proof: { ...DEFAULT_SECURITY_POLICY.proof, ...(p.proof ?? {}) },
   };
 }
 
 // Coerce a client-submitted policy body into a well-formed policy. Unknown keys
 // are dropped; missing ones fall back to defaults. Critical stays at least
 // "warn" — a policy that silently *tracks* criticals would make the page lie.
-export function normalizeSecurityPolicy(body: unknown): RepoSecurityPolicy {
+// `proof` falls back to `prev` instead, so a client that predates it can't clear an opt-in.
+export function normalizeSecurityPolicy(
+  body: unknown,
+  prev: RepoSecurityPolicy = DEFAULT_SECURITY_POLICY
+): RepoSecurityPolicy {
   const b = (body && typeof body === "object" ? body : {}) as Record<string, any>;
   const bool = (v: unknown, dflt: boolean) => (typeof v === "boolean" ? v : dflt);
   const gate = (v: unknown, dflt: SeverityGateAction): SeverityGateAction =>
@@ -84,6 +100,10 @@ export function normalizeSecurityPolicy(body: unknown): RepoSecurityPolicy {
       medium: gate(g.medium, d.gates.medium),
       low: gate(g.low, d.gates.low),
     },
+    proof:
+      typeof b.proof?.publicOptIn === "boolean"
+        ? { ...(prev.proof ?? d.proof), publicOptIn: b.proof.publicOptIn }
+        : { ...d.proof, ...(prev.proof ?? {}) },
   };
 }
 
@@ -115,15 +135,18 @@ export function computeGate(args: {
   findings: SecurityFinding[];        // this repo's findings
   openReviews: PRReview[];            // open-PR reviews (latest per PR)
   policy: RepoSecurityPolicy;
+  proofGate?: boolean;                // only test-proven findings enforce
 }): GateResult {
-  const { findings, openReviews, policy } = args;
+  const { findings, openReviews, policy, proofGate = false } = args;
   const rules: GateRule[] = [];
   const blockingIds = new Set<string>();
 
   const blockSevs = SEV_LIST.filter((s) => policy.gates[s] === "block");
   const warnSevs = SEV_LIST.filter((s) => policy.gates[s] === "warn");
 
-  const gating = findings.filter((f) => GATING_STATES.includes(f.state));
+  const gating = proofGate
+    ? findings.filter(gatesUnderProof)
+    : findings.filter((f) => GATING_STATES.includes(f.state));
 
   // R1 — per block-gated severity, unresolved findings on the default branch.
   for (const sev of blockSevs) {
@@ -143,11 +166,12 @@ export function computeGate(args: {
   const introduced = openReviews.flatMap((r) =>
     (r.securityFindings ?? []).filter((f) => blockSevs.includes(f.severity))
   );
+  // PR-diff findings are untested LLM claims, so under the proof gate they only warn.
   rules.push({
     id: "no-introduced-blocking",
     label: "No open PR introduces a block-gated finding",
     pass: introduced.length === 0,
-    required: true,
+    required: !proofGate,
     count: introduced.length,
   });
 
@@ -160,6 +184,17 @@ export function computeGate(args: {
       pass: hits.length === 0,
       required: false,
       count: hits.length,
+    });
+  }
+
+  if (proofGate) {
+    const awaiting = findings.filter(awaitsProof).length;
+    rules.push({
+      id: "awaiting-proof",
+      label: "Findings awaiting a test (not enforced yet)",
+      pass: awaiting === 0,
+      required: false,
+      count: awaiting,
     });
   }
 

@@ -10,6 +10,7 @@ import { fingerprintFinding } from "./fingerprint.js";
 import { isActiveState } from "./policy.js";
 import type { AgentFinding } from "./agent.js";
 import { describeVerdict } from "./verify.js";
+import { refreshProof, untestedProof } from "./proof.js";
 
 // A detection the audit annotated with its verifier verdict and, when a
 // maintainer ruling authorises auto-suppressing it, that ruling
@@ -121,6 +122,7 @@ export function reconcileFile(args: {
         confidence: d.confidence,
         ...(d.scannerConfidence ? { scannerConfidence: d.scannerConfidence } : {}),
         verification: v,
+        proof: untestedProof(ctx.now),
         title: d.title,
         concern: d.concern,
         ...(d.evidence ? { evidence: d.evidence } : {}),
@@ -172,10 +174,12 @@ export function reconcileFile(args: {
     }
 
     // Re-detection of a known finding.
+    const proof = refreshProof(prior.proof, ctx.sha, ctx.now);
     const base: Partial<SecurityFinding> = {
       lastSeenAt: ctx.now,
       detectedSha: ctx.sha,
       verification: v,
+      ...(proof !== prior.proof ? { proof } : {}),
       ...(d.scannerConfidence ? { scannerConfidence: d.scannerConfidence } : {}),
     };
     if (HUMAN_VERDICT.includes(prior.state)) {

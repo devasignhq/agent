@@ -41,7 +41,7 @@ import { startTopologyRefresh } from "./review/cross-repo/job.js";
 import { startBountyKeeper } from "./bounties/keeper.js";
 import { startBountyLiveSignals } from "./bounties/live.js";
 import { startSecurityLiveSignals } from "./security/live.js";
-import { backfillLegacyVulnerabilities } from "./security/migrate.js";
+import { backfillLegacyVulnerabilities, backfillProofRecords } from "./security/migrate.js";
 import { effectiveSecurityPolicy } from "./security/policy.js";
 import { sweepStaleSecurityScans } from "./security/stale-scans.js";
 import type { SecurityScanRun } from "./types.js";
@@ -344,6 +344,7 @@ startVerifyLiveSignals();
 // One-shot, idempotent: legacy index-embedded vulnerabilities → the
 // first-class securityFindings collection (see security/migrate.ts).
 backfillLegacyVulnerabilities();
+backfillProofRecords();
 backfillRepoIndex();
 startNightlySecuritySweep();
 startStaleScanReaper();
