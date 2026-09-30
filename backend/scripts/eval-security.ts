@@ -130,7 +130,7 @@ async function auditTree(tree: BenchTree): Promise<{ score: RunScore; costUsd: n
         if (m.ok) valid.push(m.finding);
         else {
           const held = applyVerdict(d, holdVerification(m.reason, m.detail, Date.now()));
-          detections.push(toDetection(held));
+          detections.push(toDetection(held, entry.path));
         }
       }
       if (!valid.length) return;
@@ -143,7 +143,7 @@ async function auditTree(tree: BenchTree): Promise<{ score: RunScore; costUsd: n
         console.log(`[eval]   ! verify failed ${entry.path}`);
         return;
       }
-      valid.forEach((d, i) => detections.push(toDetection(applyVerdict(d, verdicts[i]))));
+      valid.forEach((d, i) => detections.push(toDetection(applyVerdict(d, verdicts[i]), entry.path)));
     });
     return Number((currentUsage()?.costUsd ?? 0).toFixed(4));
   });
@@ -151,9 +151,12 @@ async function auditTree(tree: BenchTree): Promise<{ score: RunScore; costUsd: n
   return { score: scoreRun({ tree, cases, detections, scanFailedPaths }), costUsd, bundles };
 }
 
-function toDetection(f: ReturnType<typeof applyVerdict>): BenchDetection {
+// AgentFinding carries no path — runSecurityAudit supplies it from the index
+// entry, so the eval must too, or every detection scores as unmatched noise.
+function toDetection(f: ReturnType<typeof applyVerdict>, path: string): BenchDetection {
+  if (!path) throw new Error("toDetection called without a path — detections would all score as noise");
   return {
-    path: f.path ?? "",
+    path,
     class: f.class,
     ...(f.symbol ? { symbol: f.symbol } : {}),
     title: f.title,

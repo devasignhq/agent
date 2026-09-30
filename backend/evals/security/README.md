@@ -90,9 +90,41 @@ LLM_PROVIDER=vertex VERTEX_PROJECT=<prod project> VERTEX_THINKING=medium \
 
 ## Baseline
 
-**Not yet recorded.** Attempted 2026-09-28 and blocked on credentials, not code:
-the `backend/.env` Anthropic key returns `401 authentication_error`, and the local
-Vertex ADC token needs reauth (`invalid_grant / invalid_rapt` — run
-`gcloud auth application-default login`). Both runs correctly reported 25
-`scan_failed` files rather than a false all-clear. Re-run the command above once
-either credential works, and record the numbers here with the date and model.
+**2026-09-30 · Gemini 3.8 Flash on Vertex, medium thinking (prod's configuration) ·
+3 runs per tree · ~$0.68 per pass.**
+
+| tree | real bugs surfaced | decoys surfaced | noise | scan failures |
+|---|---|---|---|---|
+| vulnerable, 3 runs | **5/5, 5/5, 5/5** | 0/6 every run | 2–4 | 0 |
+| fixed, 3 runs | 0/5, 0/5, **1/5** | 0/6 every run | 2–4 | 0 |
+
+Per-case surfacing rate across all 6 runs: R1–R4 3/6 (exactly the three vulnerable
+runs), R5 4/6, every decoy **0/6**.
+
+**Read this honestly: on this fixture the current pipeline did well.** No decoy was
+ever surfaced. D1 — authorization applied where the router is mounted, the case
+this whole project was motivated by — was *refuted* by the verifier in every run,
+with the right reason. That is the failure mode we expected to catch, and the
+verifier handled it.
+
+Two things the run did show:
+
+1. **One reproducible false positive.** R5 (SSRF) surfaced against the *fixed*
+   tree in 1 of 3 runs — a confirmed finding about code that already has the
+   control. That is the exact class of report this work exists to suppress.
+2. **The pipeline is not deterministic.** Identical inputs, different verdicts
+   between runs. A finding's fate currently depends partly on which run you got,
+   which is itself an argument for deciding it with an executed test rather than
+   a second opinion.
+
+Consistent non-case findings (counted as noise here, but real): `db/billing.ts`
+lacks idempotency on credit application — confirmed in all 6 runs — and the webhook
+signature check has no replay protection, correctly held as `unverifiable`. Both are
+genuine gaps in the fixture that the manifest does not track.
+
+**What this does not tell us.** The benchmark did not reproduce the false-positive
+rate seen in production, so whatever drives that is not yet in the fixture —
+plausibly scale (real repos exceed the 8-file evidence bundle), framework-driven
+wiring, or config-based controls. The production aggregates (see the plan's SQL)
+are currently the only evidence about which mode actually dominates, and the
+fixture should grow toward whatever they show.
