@@ -195,6 +195,28 @@ test("a held-back row can be dismissed under the proof gate, and not without it"
   assert.equal(res.body.finding.presentation, "suppressed");
 });
 
+// Prompted by our own verifier on PR #279: the overview's gate-off shape was
+// asserted, but the PATCH response's was not — and PATCH is what every triage
+// consumer reads back.
+test("proof mode off: a successful PATCH returns the stored row, with no proof keys", () => {
+  delete process.env.SECURITY_PROOF_MODE;
+  const { userId, ready, rows } = seed();
+  const res = fakeRes();
+  securityFindingPatchHandler(
+    reqFor(userId, { id: ready.id, findingId: rows.untested.id }, { action: "accept" }),
+    res
+  );
+  assert.equal(res.statusCode, 200);
+  assert.equal(res.body.finding.state, "accepted");
+  assert.equal("presentation" in res.body.finding, false);
+  assert.equal("proof" in res.body.finding, false);
+  // Byte-for-byte the row the db holds — no view wrapper in the way.
+  assert.deepEqual(
+    res.body.finding,
+    db.find("securityFindings", (f) => f.id === rows.untested.id)
+  );
+});
+
 test("an untested row can't become an issue under the proof gate; a kept row returns its existing issue", async () => {
   process.env.SECURITY_PROOF_MODE = "on";
   const { userId, ready, rows } = seed();
