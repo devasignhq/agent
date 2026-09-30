@@ -274,3 +274,45 @@ test("an unannotated detection is unaffected by the suppression path", () => {
   assert.equal(out.introduced, 1);
   assert.deepEqual(out.appliedPrecedentIds, []);
 });
+
+const VERIFIED_PROOF = {
+  status: "verified" as const,
+  method: "test" as const,
+  blobSha: "sha1",
+  testedSha: "c0ffee",
+  runId: "run-1",
+  detail: "expected 403, got 200",
+  engine: "proof-v1",
+  updatedAt: 400_000,
+};
+
+test("new rows are born tagged untested, whatever the LLM verifier said", () => {
+  for (const verification of [CONFIRMED, REFUTED]) {
+    const out = reconcileFile({ existing: [], detected: [detected({ verification })], ctx: ctx() });
+    assert.deepEqual(out.insert[0].proof, { status: "untested", method: "test", engine: "proof-v1", updatedAt: 1_000_000 });
+  }
+});
+
+test("a re-detection on a changed blob marks the proof stale but keeps the run pointers", () => {
+  const out = reconcileFile({ existing: [stored({ proof: VERIFIED_PROOF })], detected: [detected()], ctx: ctx() });
+  const patch = out.update[0].patch;
+  assert.equal(patch.proof?.status, "untested");
+  assert.equal(patch.proof?.reason, "stale");
+  assert.equal(patch.proof?.runId, "run-1");
+  assert.equal(patch.proof?.detail, undefined);
+  assert.equal(patch.state, undefined);
+});
+
+test("a re-detection on the same blob leaves the proof alone", () => {
+  const out = reconcileFile({
+    existing: [stored({ proof: VERIFIED_PROOF })],
+    detected: [detected()],
+    ctx: ctx({ sha: "sha1" }),
+  });
+  assert.equal("proof" in out.update[0].patch, false);
+});
+
+test("a re-detected legacy row without a proof gets tagged untested", () => {
+  const out = reconcileFile({ existing: [stored()], detected: [detected()], ctx: ctx() });
+  assert.equal(out.update[0].patch.proof?.status, "untested");
+});

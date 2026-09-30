@@ -8,8 +8,9 @@ import { db } from "../db.js";
 import { gh, installationPermissions } from "../github/app.js";
 import type { Installation, Repository, SecurityFinding } from "../types.js";
 import { contradictPrecedent } from "./precedent-store.js";
+import { effectiveProof, presentationOf } from "./proof.js";
 
-export type IssueCreationErrorCode = "missing_issues_permission" | "github_error" | "unverified";
+export type IssueCreationErrorCode = "missing_issues_permission" | "github_error" | "unverified" | "untested";
 
 export class IssueCreationError extends Error {
   code: IssueCreationErrorCode;
@@ -22,7 +23,7 @@ export class IssueCreationError extends Error {
 // Issue body: the finding contract rendered for a contributor who has never
 // seen the Security page — everything needed to reproduce and fix, plus the
 // deep link back for the sponsor.
-export function findingIssueBody(finding: SecurityFinding): string {
+export function findingIssueBody(finding: SecurityFinding, opts: { proofGate?: boolean } = {}): string {
   const lines: string[] = [];
   const loc = `\`${finding.path}${finding.line ? `:${finding.line}` : ""}\``;
   lines.push(
@@ -43,7 +44,20 @@ export function findingIssueBody(finding: SecurityFinding): string {
     lines.push(finding.evidence);
     lines.push("```");
   }
-  if (finding.verification?.status === "confirmed" && finding.verification.evidence.length) {
+  const proof = effectiveProof(finding);
+  if (opts.proofGate) {
+    if (proof.status === "verified") {
+      lines.push("");
+      lines.push("### Verification");
+      lines.push(
+        proof.method === "rule"
+          ? "Verified by a deterministic rule check against the repository."
+          : `Reproduced by an executed test${proof.testedSha ? ` at \`${proof.testedSha.slice(0, 12)}\`` : ""}: ` +
+              "the legitimate request worked and the protection check failed on every attempt."
+      );
+      if (proof.testPath) lines.push(`Test: \`${proof.testPath}\``);
+    }
+  } else if (finding.verification?.status === "confirmed" && finding.verification.evidence.length) {
     lines.push("");
     lines.push("### Verification");
     lines.push("Independently verified against the repository. Cited evidence:");
@@ -90,8 +104,13 @@ export async function createFindingIssue(args: {
   install: Installation;
   finding: SecurityFinding;
   actorLogin: string;
+  proofGate?: boolean;
 }): Promise<{ issueNumber: number; issueUrl: string }> {
-  if (args.finding.state === "unverified") {
+  if (args.proofGate) {
+    if (presentationOf(args.finding) === "untested") {
+      throw new IssueCreationError("untested", "This finding hasn't been proven by a test yet, so it can't be filed as an issue.");
+    }
+  } else if (args.finding.state === "unverified") {
     throw new IssueCreationError("unverified", "This finding was held back by the verifier and can't be filed as an issue.");
   }
   const { repo, install, finding, actorLogin } = args;
@@ -108,7 +127,7 @@ export async function createFindingIssue(args: {
         method: "POST",
         body: JSON.stringify({
           title: `[Security] ${finding.title}`,
-          body: findingIssueBody(finding),
+          body: findingIssueBody(finding, { proofGate: args.proofGate }),
           labels: ["security"],
         }),
         headers: { "Content-Type": "application/json" },

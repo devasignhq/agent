@@ -101,6 +101,8 @@ export {
 };
 import { ACTIVE_STATES as SECURITY_ACTIVE_STATES } from "../security/policy.js";
 import { publishGateForPR } from "../security/gate.js";
+import { proofGateFor } from "../security/proof-gate.js";
+import { isProven } from "../security/proof.js";
 import { resolveBountyForPR } from "../bounties/prlink.js";
 import { recordBountyEvent } from "../bounties/service.js";
 import { crossRepoBlocked, modelForPlan, planForUser, privateRepoBlocked } from "../billing/plans.js";
@@ -796,12 +798,13 @@ export async function runReviewJob(reviewId: string): Promise<void> {
     // dev with no install) pays nothing.
     const touchedEntries = holistic.entries.slice(0, holistic.touchedCount);
     const dependentEntries = holistic.entries.slice(holistic.touchedCount);
+    const proofGate = proofGateFor(repo);
     const activeFindingsIn = (entries: RepoIndexEntry[]): SecurityFinding[] => {
       if (!entries.length) return [];
       const paths = new Set(entries.map((e) => e.path));
-      return db.filter(
-        "securityFindings",
-        (f) => f.repoId === repo.id && paths.has(f.path) && SECURITY_ACTIVE_STATES.includes(f.state)
+      return presentablePreexisting(
+        db.filter("securityFindings", (f) => f.repoId === repo.id && paths.has(f.path)),
+        proofGate
       );
     };
     const dependentVulns = collectPreexistingVulns(activeFindingsIn(dependentEntries));
@@ -4800,6 +4803,13 @@ export type PreexistingVulnLike = {
 // (not introduced by this PR), so they surface as context and never gate the
 // merge. Deduped by path+concern and capped so a vuln-heavy file can't flood
 // the review. Exported for testing alongside the review pipeline.
+// Stored audit findings a PR may mention. Under the proof gate only proven ones,
+// which also keeps untested rows out of the (paid) re-verify.
+export function presentablePreexisting(findings: SecurityFinding[], proofGate: boolean): SecurityFinding[] {
+  if (!proofGate) return findings.filter((f) => SECURITY_ACTIVE_STATES.includes(f.state));
+  return findings.filter((f) => (SECURITY_ACTIVE_STATES.includes(f.state) || f.state === "unverified") && isProven(f));
+}
+
 export function collectPreexistingVulns(vulns: PreexistingVulnLike[]): HolisticFinding[] {
   const out: HolisticFinding[] = [];
   const seen = new Set<string>();

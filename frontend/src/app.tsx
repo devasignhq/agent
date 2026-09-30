@@ -186,7 +186,9 @@ function usePageBadges({ enabled, current, userId, notifications }) {
       const ov = await api.securityOverview();
       // A locked plan can read its findings but can't act on them — badging
       // them would nag about a feature the account doesn't have.
-      setFindings(ov.locked ? [] : ov.findings || []);
+      // Under the proof gate an untested finding is not something to nag about.
+      const rows = ov.locked ? [] : ov.findings || [];
+      setFindings(rows.filter((f) => f.presentation !== "untested"));
     } catch (err) {
       if (!(err && err.status === 401)) console.warn("[page-badges] security poll failed:", err);
     }

@@ -599,6 +599,13 @@ export type RepoSecurityPolicy = {
     deps: boolean;
   };
   gates: Record<SecuritySeverity, SeverityGateAction>;
+  // Public repos run proof tests only after an explicit opt-in: a failing proof
+  // in a public CI log would disclose the unfixed hole.
+  proof: {
+    publicOptIn: boolean;
+    publicOptInBy?: string | null;
+    publicOptInAt?: number | null;
+  };
 };
 
 // Snapshot of security findings the review pipeline attributed to a PR's head,

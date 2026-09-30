@@ -20,6 +20,7 @@ import type {
 import { enqueueGuidanceIngest, enqueueIndex, enqueueMaintainerFeedback, enqueueReview, enqueueSecurityAudit } from "../queue.js";
 import { effectiveSecurityPolicy, normalizeSecurityPolicy } from "../security/policy.js";
 import { computeGateForRepo, publishGateForRepo } from "../security/gate.js";
+import { findingView, proofGateFor, proofReadiness } from "../security/proof-gate.js";
 import { createFindingIssue, IssueCreationError } from "../security/issue.js";
 import { RULING_CODES, codeFitsAction, precedentFromRuling } from "../security/precedent.js";
 import { contradictPrecedent, corpusForInstallations, revokePrecedent } from "../security/precedent-store.js";
@@ -706,7 +707,8 @@ function scanSummary(s: SecurityScanRun) {
 }
 
 // Session-scoped aggregate across every repo the user's installations own.
-api.get("/security/overview", (req, res) => {
+// Exported (like securityScanBatchHandler) so the proof-gate payload is testable.
+export function securityOverviewHandler(req: Request, res: Response) {
   const user = getSessionUser(req);
   if (!user) return void res.status(401).json({ error: "not_signed_in" });
   const installs = installationsForUser(user.id);
@@ -714,6 +716,7 @@ api.get("/security/overview", (req, res) => {
   const repos = db.filter("repositories", (r) => installIds.has(r.installationId));
   const repoIds = new Set(repos.map((r) => r.id));
   const repoNameById = new Map(repos.map((r) => [r.id, `${r.owner}/${r.name}`]));
+  const proofGateById = new Map(repos.map((r) => [r.id, proofGateFor(r)]));
 
   const findings = db
     .filter("securityFindings", (f) => repoIds.has(f.repoId))
@@ -735,13 +738,16 @@ api.get("/security/overview", (req, res) => {
     const repoName = repoNameById.get(f.repoId) ?? "";
     const bounty =
       f.issueNumber != null ? bountyByKey.get(`${repoName}#${f.issueNumber}`) ?? null : null;
-    return {
-      ...f,
-      repo: repoName,
-      bounty: bounty
-        ? { id: bounty.id, code: bounty.code, status: bounty.status, amountUsdc: bounty.amountUsdc }
-        : null,
-    };
+    return findingView(
+      {
+        ...f,
+        repo: repoName,
+        bounty: bounty
+          ? { id: bounty.id, code: bounty.code, status: bounty.status, amountUsdc: bounty.amountUsdc }
+          : null,
+      },
+      proofGateById.get(f.repoId) === true
+    );
   });
 
   // Last 12 scans per repo (completed or not — a queued/running row is what
@@ -783,13 +789,18 @@ api.get("/security/overview", (req, res) => {
           .filter("securityScans", (s) => s.repoId === repo.id)
           .sort((a, b) => b.startedAt - a.startedAt)
           .map(scanSummary)[0] ?? null,
+      ...(proofGateById.get(repo.id)
+        ? { proofGate: true, private: repo.private, proofReadiness: proofReadiness(repo) }
+        : {}),
     };
   });
 
   // `locked` rides the overview (like `advancedLocked` on the workflow GET) so
   // the page can paywall itself without a second request.
   res.json({ repos: repoViews, scans, findings: findingViews, locked: securityLocked(user) });
-});
+}
+
+api.get("/security/overview", securityOverviewHandler);
 
 // Full scan run including the terminal log (the merge-gate view's console).
 api.get("/repositories/:id/security/scans/:scanId", (req, res) => {
@@ -890,7 +901,7 @@ api.post("/security/scan", expensiveLimiter, securityScanBatchHandler);
 // One-click GitHub issue from a finding. Idempotent — an existing issue is
 // returned, never duplicated. The created issue is the handoff to the Bounties
 // flow ("issue first, then bounty").
-api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimiter, async (req, res) => {
+export async function securityFindingIssueHandler(req: Request, res: Response) {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
@@ -910,20 +921,24 @@ api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimite
       install,
       finding,
       actorLogin: ctx.user.githubLogin,
+      proofGate: proofGateFor(ctx.repo),
     });
     res.json({ ok: true, ...created });
   } catch (err) {
     if (err instanceof IssueCreationError) {
-      const status = err.code === "missing_issues_permission" ? 403 : err.code === "unverified" ? 409 : 502;
+      const status =
+        err.code === "missing_issues_permission" ? 403 : err.code === "unverified" || err.code === "untested" ? 409 : 502;
       return void res.status(status).json({ error: err.code, message: err.message });
     }
     res.status(502).json({ error: "github_error", message: String(err).slice(0, 200) });
   }
-});
+}
+
+api.post("/repositories/:id/security/findings/:findingId/issue", expensiveLimiter, securityFindingIssueHandler);
 
 // Finding triage actions. Every transition appends an activity event with the
 // acting user's login; gate-affecting transitions republish the check-run.
-api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
+export function securityFindingPatchHandler(req: Request, res: Response) {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
@@ -946,7 +961,9 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
     [...(finding.activity ?? []), { at: now, kind, detail, actor: ctx.user.githubLogin }].slice(-50);
 
   // Held-back rows are not findings yet: no triage until the verifier confirms.
-  if (finding.state === "unverified") return void res.status(409).json({ error: "unverified" });
+  // Under the proof gate they sit with every other untested row, which may be dismissed.
+  const proofGate = proofGateFor(ctx.repo);
+  if (finding.state === "unverified" && !proofGate) return void res.status(409).json({ error: "unverified" });
   const TERMINAL = new Set(["resolved", "accepted", "false_positive"]);
   let patch: Partial<SecurityFinding> | null = null;
 
@@ -1036,8 +1053,10 @@ api.patch("/repositories/:id/security/findings/:findingId", (req, res) => {
   const updated = db.update("securityFindings", (f) => f.id === finding.id, patch);
   // State changes can alter the blocking set — republish best-effort.
   void publishGateForRepo(ctx.repo).catch(() => {});
-  res.json({ ok: true, finding: updated, precedent });
-});
+  res.json({ ok: true, finding: updated ? findingView(updated, proofGate) : updated, precedent });
+}
+
+api.patch("/repositories/:id/security/findings/:findingId", securityFindingPatchHandler);
 
 // Every ruling on the installations this user belongs to, newest first — the
 // same set the audit honours, so a co-maintainer sees (and can withdraw) what
@@ -1104,7 +1123,15 @@ api.put("/repositories/:id/security/policy", (req, res) => {
   const ctx = ownedRepo(req, res);
   if (!ctx) return;
   if (securityLocked(ctx.user)) return void res.status(403).json(UPGRADE_SECURITY);
-  const policy = normalizeSecurityPolicy(req.body?.policy ?? req.body);
+  const prev = effectiveSecurityPolicy(ctx.repo);
+  const next = normalizeSecurityPolicy(req.body?.policy ?? req.body, prev);
+  const policy =
+    next.proof.publicOptIn === prev.proof.publicOptIn
+      ? next
+      : {
+          ...next,
+          proof: { publicOptIn: next.proof.publicOptIn, publicOptInBy: ctx.user.githubLogin, publicOptInAt: Date.now() },
+        };
   db.update("repositories", (r) => r.id === ctx.repo.id, { securityPolicy: policy });
   // Gate rules may have changed meaning — republish across open PRs.
   const fresh = db.find("repositories", (r) => r.id === ctx.repo.id);

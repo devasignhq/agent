@@ -76,6 +76,8 @@ export function track(
 export const GATES = {
   /** Draft acceptance criteria when a bounty is created (bounties/criteria-job.ts). */
   bountyCriteriaDrafting: "bounty_criteria_drafting",
+  /** Present and gate only test-proven security findings (security/proof-gate.ts). */
+  securityProof: "security_proof_gate",
 } as const;
 
 /**

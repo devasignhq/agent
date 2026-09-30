@@ -15,6 +15,7 @@ import { config } from "../config.js";
 import { gh } from "../github/app.js";
 import type { Installation, PRReview, Repository } from "../types.js";
 import { computeGate, effectiveSecurityPolicy, type GateResult } from "./policy.js";
+import { proofGateFor } from "./proof-gate.js";
 
 export const GATE_CHECK_NAME = "devasign/security";
 
@@ -37,7 +38,16 @@ export function computeGateForRepo(repo: Repository, openReviews: PRReview[]): G
     findings: db.filter("securityFindings", (f) => f.repoId === repo.id),
     openReviews,
     policy: effectiveSecurityPolicy(repo),
+    proofGate: proofGateFor(repo),
   });
+}
+
+function awaitingProofLine(gate: GateResult): string {
+  const n = gate.rules.find((r) => r.id === "awaiting-proof")?.count ?? 0;
+  if (!n) return "";
+  return n === 1
+    ? "1 finding is awaiting a test and isn't enforced yet."
+    : `${n} findings are awaiting a test and aren't enforced yet.`;
 }
 
 // Check-run output on a PUBLIC repo is world-readable, so rendering the path,
@@ -55,16 +65,19 @@ export function gateOutput(
   repo: Repository,
   gate: GateResult
 ): { title: string; summary: string } {
+  const awaiting = awaitingProofLine(gate);
   if (gate.verdict === "pass") {
     return {
       title: "Security gate passed",
       summary:
         "All required security gate rules pass.\n\n" +
+        (awaiting ? `${awaiting}\n\n` : "") +
         `Details: ${config.webOrigin}/security/config?tab=gate`,
     };
   }
   const failedRules = gate.rules.filter((r) => r.required && !r.pass);
-  const counts = failedRules.map((r) => `✗ ${r.label} — ${r.count} found`).join("\n");
+  const counts =
+    failedRules.map((r) => `✗ ${r.label} — ${r.count} found`).join("\n") + (awaiting ? `\n\n${awaiting}` : "");
   const link = `\n\nReview and resolve on the Security page: ${config.webOrigin}/security/config?tab=gate`;
 
   if (!repo.private) {
@@ -153,6 +166,7 @@ export async function publishGateForPR(args: {
     findings: db.filter("securityFindings", (f) => f.repoId === repo.id),
     openReviews: [review],
     policy,
+    proofGate: proofGateFor(repo),
   });
   try {
     await postCheckRun(install, repo, review.headSha, gate);

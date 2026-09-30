@@ -140,3 +140,73 @@ test("computeGate: a PR introducing only a medium passes R2 under the default po
   });
   assert.equal(gate.verdict, "pass");
 });
+
+const PROVEN = { status: "verified" as const, method: "test" as const, blobSha: "s", engine: "proof-v1", updatedAt: 1 };
+
+test("proof gate: an unproven critical never gates, a proven one fails R1", () => {
+  const off = computeGate({ findings: [finding()], openReviews: [], policy: DEFAULT_SECURITY_POLICY, proofGate: true });
+  assert.equal(off.verdict, "pass");
+  const on = computeGate({
+    findings: [finding({ proof: PROVEN })],
+    openReviews: [],
+    policy: DEFAULT_SECURITY_POLICY,
+    proofGate: true,
+  });
+  assert.equal(on.verdict, "fail");
+  assert.deepEqual(on.blockingFindingIds, ["f1"]);
+});
+
+test("proof gate: a stale proof, or an untested issue/bounty row, never gates", () => {
+  for (const f of [
+    finding({ proof: { ...PROVEN, blobSha: "older" } }),
+    finding({ state: "issue_created", issueNumber: 3 }),
+    finding({ state: "bounty", issueNumber: 3, bountyId: "b" }),
+  ]) {
+    const gate = computeGate({ findings: [f], openReviews: [], policy: DEFAULT_SECURITY_POLICY, proofGate: true });
+    assert.equal(gate.verdict, "pass", f.state);
+  }
+});
+
+test("proof gate: a proven row the LLM verifier held back still gates", () => {
+  const gate = computeGate({
+    findings: [finding({ state: "unverified", proof: PROVEN })],
+    openReviews: [],
+    policy: DEFAULT_SECURITY_POLICY,
+    proofGate: true,
+  });
+  assert.equal(gate.verdict, "fail");
+});
+
+test("proof gate: PR-introduced criticals only warn, and untested findings are counted as awaiting", () => {
+  const gate = computeGate({
+    findings: [finding(), finding({ id: "f2", severity: "high" })],
+    openReviews: [review({ securityFindings: [{ concern: "c", severity: "critical" }] })],
+    policy: DEFAULT_SECURITY_POLICY,
+    proofGate: true,
+  });
+  assert.equal(gate.verdict, "pass");
+  const r2 = gate.rules.find((r) => r.id === "no-introduced-blocking");
+  assert.ok(r2 && !r2.pass && !r2.required);
+  const awaiting = gate.rules.find((r) => r.id === "awaiting-proof");
+  assert.ok(awaiting && awaiting.count === 2 && !awaiting.required);
+  const warnHigh = gate.rules.find((r) => r.id === "warn-high");
+  assert.ok(warnHigh && warnHigh.pass && warnHigh.count === 0);
+});
+
+test("proof gate off: the gate is exactly what it was", () => {
+  const args = { findings: [finding()], openReviews: [], policy: DEFAULT_SECURITY_POLICY };
+  assert.deepEqual(computeGate({ ...args, proofGate: false }), computeGate(args));
+  assert.equal(computeGate(args).rules.some((r) => r.id === "awaiting-proof"), false);
+});
+
+test("public-repo opt-in defaults off, coerces junk, and survives a client that omits it", () => {
+  assert.deepEqual(DEFAULT_SECURITY_POLICY.proof, { publicOptIn: false });
+  assert.deepEqual(effectiveSecurityPolicy({ securityPolicy: { version: 1 } } as unknown as Repository).proof, {
+    publicOptIn: false,
+  });
+  const prev = { ...DEFAULT_SECURITY_POLICY, proof: { publicOptIn: true, publicOptInBy: "ada", publicOptInAt: 9 } };
+  assert.deepEqual(normalizeSecurityPolicy({ triggers: {} }, prev).proof, prev.proof);
+  assert.deepEqual(normalizeSecurityPolicy({ proof: { publicOptIn: "yes" } }, prev).proof, prev.proof);
+  assert.equal(normalizeSecurityPolicy({ proof: { publicOptIn: false } }, prev).proof.publicOptIn, false);
+  assert.equal(normalizeSecurityPolicy({ proof: { publicOptIn: true } }).proof.publicOptIn, true);
+});

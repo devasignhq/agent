@@ -788,6 +788,44 @@ export type VisibleFindingState =
 export type HiddenFindingState = "unverified";
 export type SecurityFindingState = VisibleFindingState | HiddenFindingState;
 
+// Whether an executed test (or a deterministic rule) proved the finding real.
+// Only a "verified" proof is presented under the proof gate; see security-proof.ts.
+export type SecurityProofStatus =
+  | "untested"
+  | "testing"
+  | "verified"
+  | "not_reproduced"
+  | "inconclusive"
+  | "untestable";
+export type SecurityProofReason =
+  | "stale"
+  | "control_failed"
+  | "test_errored"
+  | "flaky"
+  | "single_attempt"
+  | "not_reachable"
+  | "deployment_dependent"
+  | "nondeterministic"
+  | "no_test_written"
+  | "unsupported_runner";
+export type SecurityProof = {
+  status: SecurityProofStatus;
+  method: "test" | "rule";
+  reason?: SecurityProofReason;
+  detail?: string;
+  blobSha?: string;
+  testedSha?: string;
+  paths?: string[];
+  runId?: string;
+  testPath?: string;
+  attempts?: { control: number; probe: number };
+  engine: string;
+  updatedAt: number;
+};
+// Where the server says this finding belongs. Absent when the proof gate is off,
+// which is what keeps the page rendering exactly as it did before.
+export type FindingPresentation = "main" | "kept" | "untested" | "suppressed" | "resolved";
+
 export type SecurityCitation = { path: string; line?: number; quote: string };
 export type SecurityVerification = {
   status: "confirmed" | "refuted" | "unverifiable";
@@ -822,6 +860,8 @@ export type SecurityFinding = {
   confidence: SecurityConfidence;
   scannerConfidence?: SecurityConfidence;
   verification?: SecurityVerification;
+  proof?: SecurityProof;
+  presentation?: FindingPresentation;
   title: string;
   concern: string;
   evidence?: string;
@@ -893,6 +933,8 @@ export type RepoSecurityPolicy = {
   triggers: { onMerge: boolean; onPrPush: boolean; nightly: boolean; advisories: boolean };
   engines: { api: boolean; frontend: boolean; infra: boolean; secrets: boolean; deps: boolean };
   gates: Record<SecuritySeverity, SeverityGateAction>;
+  // Public repos run proof tests only after an explicit opt-in.
+  proof?: { publicOptIn: boolean; publicOptInBy?: string | null; publicOptInAt?: number | null };
 };
 
 export type GateRule = {
@@ -914,6 +956,10 @@ export type SecurityRepoView = {
   policy: RepoSecurityPolicy;
   gate: GateResult;
   latestScan: SecurityScanSummary | null;
+  // Present only while the proof gate is on for this repo.
+  proofGate?: boolean;
+  private?: boolean;
+  proofReadiness?: "ready" | "needs_setup" | "needs_opt_in";
 };
 
 // Result of a bulk re-scan. `skipped` carries the repos that already had a run

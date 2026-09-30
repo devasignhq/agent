@@ -268,6 +268,7 @@ for (const [path, flags] of [
   ["package-lock.json", []],
   ["api/middleware/error.ts", []],
   ["infra/s3.tf", []],
+  ["api/routes/refunds.ts", ["handles-auth"]],
 ]) {
   db.insert("repoIndex", {
     id: `ephemeral-idx-${path.replace(/[^a-z0-9]/gi, "-")}`,
@@ -581,6 +582,194 @@ seedScan({
   ].map((line, i) => ({ at: now - 2 * HOUR + i * 4000, line })),
 });
 console.log("[ephemeral] seeded security findings + scan runs for ephemeral-repo-1");
+
+// ── proof gate (SECURITY_PROOF_MODE=on) ──────────────────────────────────────
+// Two more repos so the page can be seen in every state the gate produces:
+// one onboarded + private (tests can run) and one onboarded + public that has
+// not opted in. ephemeral-repo-1 stays public and un-onboarded → needs_setup.
+if ((process.env.SECURITY_PROOF_MODE || "").toLowerCase() === "on") {
+  const proofRepo = (id, name, extra) =>
+    db.insert("repositories", {
+      id,
+      installationId: "ephemeral-install-1",
+      owner: "ephemeral-tester",
+      name,
+      defaultBranch: "main",
+      defaultModel: "",
+      modelOverrides: {},
+      reviewsEnabled: true,
+      indexState: "ready",
+      indexedAt: now - HOUR,
+      indexedCommit: "1d4e9ab",
+      indexedFileCount: 31,
+      verify: { onboarding: { state: "verified" }, detected: null },
+      ...extra,
+    });
+  proofRepo("ephemeral-repo-proof", "billing-api", { private: true });
+  proofRepo("ephemeral-repo-public", "docs-site", { private: false });
+
+  for (const [repoId, path] of [
+    ["ephemeral-repo-proof", "api/routes/invoices.ts"],
+    ["ephemeral-repo-proof", "api/routes/search.ts"],
+    ["ephemeral-repo-proof", "api/routes/files.ts"],
+    ["ephemeral-repo-proof", "api/routes/admin.ts"],
+    ["ephemeral-repo-proof", "api/webhooks/billing.ts"],
+    ["ephemeral-repo-public", "src/pages/search.ts"],
+  ]) {
+    db.insert("repoIndex", {
+      id: `ephemeral-idx-${repoId}-${path.replace(/[^a-z0-9]/gi, "-")}`,
+      repoId,
+      path,
+      sha: "blob-current",
+      size: 1536,
+      language: "ts",
+      summary: `Seeded index entry for ${path}.`,
+      exports: [],
+      imports: [],
+      securityFlags: ["handles-auth"],
+      securityScannedSha: "blob-current",
+      securityEngine: "audit-v2",
+      indexedAt: now - HOUR,
+      model: "mock",
+    });
+  }
+
+  const proofFinding = (over) => {
+    const row = {
+      id: `ephemeral-proof-${Math.random().toString(36).slice(2, 8)}`,
+      fingerprint: Math.random().toString(16).slice(2, 18),
+      repoId: "ephemeral-repo-proof",
+      path: "api/routes/invoices.ts",
+      class: "missing-authz",
+      surface: "api",
+      severity: "high",
+      confidence: "needs_human",
+      title: "finding",
+      concern: "seeded",
+      state: "open",
+      firstDetectedAt: now - 20 * HOUR,
+      lastSeenAt: now - HOUR,
+      detectedSha: "blob-current",
+      model: "mock",
+      activity: [{ at: now - 20 * HOUR, kind: "detected", detail: "Detected by security audit", actor: "audit-agent" }],
+      ...over,
+    };
+    db.insert("securityFindings", row);
+    return row;
+  };
+  const proofOf = (over) => ({
+    method: "test",
+    blobSha: "blob-current",
+    testedSha: "1d4e9ab77c21",
+    testPath: ".devasign/tests/security/invoices.proof.test.ts",
+    engine: "proof-v1",
+    updatedAt: now - HOUR,
+    ...over,
+  });
+
+  // Proven: the only kind the page presents at full severity.
+  proofFinding({
+    state: "new",
+    severity: "critical",
+    confidence: "confirmed",
+    line: 42,
+    symbol: "invoicesRouter",
+    class: "idor",
+    cwe: "CWE-639",
+    title: "Invoice lookup returns another tenant's invoice",
+    concern: "The handler reads :invoiceId straight from the URL and never scopes the query to the caller's tenant.",
+    evidence: "const invoice = findInvoice(db, req.params.invoiceId);",
+    invariant: "An invoice is only readable by the tenant that owns it.",
+    remediation: "Use findInvoiceForTenant(db, id, req.user.tenantId).",
+    exploitNarrative: ["Sign in as tenant A", "GET /invoices/<tenant B id>", "Tenant B's invoice is returned"],
+    proof: proofOf({ status: "verified", attempts: { control: 1, probe: 3 } }),
+  });
+  proofFinding({
+    state: "open",
+    severity: "critical",
+    confidence: "confirmed",
+    line: 17,
+    symbol: "searchRouter",
+    class: "sql-injection",
+    path: "api/routes/search.ts",
+    title: "Invoice search concatenates the query into SQL",
+    concern: "The q parameter is interpolated into the statement, so a crafted value escapes the tenant filter.",
+    proof: proofOf({ status: "verified", testPath: ".devasign/tests/security/search.proof.test.ts" }),
+  });
+  // Verified by rule rather than by a test.
+  proofFinding({
+    state: "open",
+    severity: "high",
+    confidence: "confirmed",
+    path: "api/webhooks/billing.ts",
+    line: 9,
+    class: "hardcoded-secret",
+    title: "Signing secret committed in the webhook handler",
+    concern: "A live signing secret is present in source.",
+    proof: proofOf({ status: "verified", method: "rule", testPath: undefined }),
+  });
+  // Every untested shape the ledger has to explain.
+  proofFinding({ title: "Refund route may skip the ownership check", path: "api/routes/files.ts", proof: proofOf({ status: "untested", reason: "no_test_written", testPath: undefined }) });
+  proofFinding({ title: "Admin route appears to lack a role check", path: "api/routes/admin.ts", symbol: "adminRouter", proof: proofOf({ status: "not_reproduced" }) });
+  proofFinding({ title: "Export path may allow traversal", path: "api/routes/files.ts", proof: proofOf({ status: "inconclusive", reason: "control_failed" }) });
+  proofFinding({ title: "Token comparison may not be constant-time", path: "api/webhooks/billing.ts", proof: proofOf({ status: "inconclusive", reason: "flaky" }) });
+  proofFinding({ title: "Bucket policy depends on deployment", path: "api/routes/admin.ts", proof: proofOf({ status: "untestable", reason: "deployment_dependent" }) });
+  // Proven once, then the file changed: stale, so it drops out of the list.
+  proofFinding({
+    state: "open",
+    severity: "critical",
+    title: "Payout endpoint missing idempotency",
+    path: "api/routes/search.ts",
+    detectedSha: "blob-newer",
+    proof: proofOf({ status: "verified", blobSha: "blob-older" }),
+  });
+  // Already acted on but never proven: keeps its place, badged, and stops gating.
+  proofFinding({
+    state: "issue_created",
+    severity: "critical",
+    title: "Session cookie set without SameSite",
+    path: "api/routes/admin.ts",
+    issueNumber: 41,
+    issueUrl: "https://github.com/ephemeral-tester/billing-api/issues/41",
+    proof: proofOf({ status: "untested", reason: "no_test_written", testPath: undefined }),
+  });
+  // A public repo that has not opted in: nothing can be proven there yet.
+  proofFinding({
+    repoId: "ephemeral-repo-public",
+    path: "src/pages/search.ts",
+    severity: "high",
+    title: "Search page renders unescaped query text",
+    class: "xss",
+    surface: "frontend",
+    proof: proofOf({ status: "untested", reason: "no_test_written", testPath: undefined }),
+  });
+
+  for (const repoId of ["ephemeral-repo-proof", "ephemeral-repo-public"]) {
+    db.insert("securityScans", {
+      id: `ephemeral-scan-${repoId}`,
+      repoId,
+      trigger: "merge",
+      full: false,
+      prNumber: 512,
+      prTitle: "Add invoice search",
+      mergeSha: "1d4e9ab",
+      prAuthor: "ephemeral-tester",
+      status: "completed",
+      startedAt: now - 2 * HOUR,
+      finishedAt: now - 2 * HOUR + 41_000,
+      filesScanned: 6,
+      cacheHits: 25,
+      introduced: repoId === "ephemeral-repo-proof" ? 11 : 1,
+      introducedBySeverity: repoId === "ephemeral-repo-proof" ? { critical: 4, high: 5, medium: 2 } : { high: 1 },
+      resolved: 0,
+      stillOpen: repoId === "ephemeral-repo-proof" ? 11 : 1,
+      heldBack: 0,
+      costUsd: 0.12,
+      log: [{ at: now - 2 * HOUR, line: "$ devasign security-audit --trigger merge" }],
+    });
+  }
+  console.log("[ephemeral] proof gate ON — seeded billing-api (private, onboarded) + docs-site (public, no opt-in)");
+}
 
 // ── Agent page seed ─────────────────────────────────────────────────────────
 // One review per badge state so the queue, the detail pane and the composer

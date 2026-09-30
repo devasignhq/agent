@@ -77,6 +77,14 @@ import {
   type RulingDraft,
 } from "./security-triage.ts";
 import { exportFilename, findingFileUrl, findingsCsv } from "./security-export.ts";
+import {
+  needsUntestedBadge,
+  partitionFindings,
+  proofGateOn,
+  proofTag,
+  readinessBanners,
+  untestedSummary,
+} from "./security-proof.ts";
 import { downloadTextFile } from "./download.ts";
 
 // ─── tiny shared pieces ───────────────────────────────────────────────────────
@@ -403,11 +411,19 @@ export const SecurityPage = ({
               onOpen={(id) => navigate(`/security/findings/${id}`)}
               onManage={() => navigate(configPath("rulings"))}
             />
-            <HeldBackSection
-              findings={overview.findings}
-              repoFilter={repoFilter}
-              onOpen={(id) => navigate(`/security/findings/${id}`)}
-            />
+            {proofGateOn(overview.repos) ? (
+              <UntestedSection
+                findings={partitionFindings(overview.findings, true).untested}
+                repoFilter={repoFilter}
+                onOpen={(id) => navigate(`/security/findings/${id}`)}
+              />
+            ) : (
+              <HeldBackSection
+                findings={overview.findings}
+                repoFilter={repoFilter}
+                onOpen={(id) => navigate(`/security/findings/${id}`)}
+              />
+            )}
           </>
         ))}
       {view === "config" && tab === "rulings" &&
@@ -828,19 +844,20 @@ const Dashboard = ({
   const [pdfBusy, setPdfBusy] = React.useState(false);
   const [exportErr, setExportErr] = React.useState<string | null>(null);
 
-  const scopedFindings = overview.findings.filter(
-    (f) => repoFilter === "all" || f.repoId === repoFilter
-  );
+  // Under the proof gate the untested rows leave the pool entirely, so every
+  // count, chip, tile and chart below is about proven work only.
+  const gateOn = proofGateOn(overview.repos);
+  const pool = partitionFindings(overview.findings, gateOn).pool;
+  const scopedFindings = pool.filter((f) => repoFilter === "all" || f.repoId === repoFilter);
   const scopedScans = overview.scans.filter(
     (s) => repoFilter === "all" || s.repoId === repoFilter
   );
   const stats = computeStats(scopedFindings, scopedScans, now);
-  const counts = chipCounts(overview.findings, repoFilter, query);
-  const shown = sortFindings(
-    filterFindings(overview.findings, { chip, repoId: repoFilter, query })
-  );
+  const counts = chipCounts(pool, repoFilter, query);
+  const shown = sortFindings(filterFindings(pool, { chip, repoId: repoFilter, query }));
   const series = mergeDeltaSeries(overview.scans, repoFilter, 12);
-  const surfaces = surfaceBreakdown(overview.findings, repoFilter);
+  const surfaces = surfaceBreakdown(pool, repoFilter);
+  const banners = gateOn ? readinessBanners(overview.repos, overview.findings, repoFilter) : [];
   const repoName = (repoId: string) =>
     overview.findings.find((f) => f.repoId === repoId)?.repo ??
     overview.repos.find((r) => r.id === repoId)?.name ??
@@ -971,11 +988,19 @@ const Dashboard = ({
             )}
           </div>
           <div className="flex items-center gap-2">
-            {latest.introduced > 0 && (
-              <span className="vln-sev critical">
-                <i /> {latest.introduced} introduced
-              </span>
-            )}
+            {latest.introduced > 0 &&
+              (gateOn ? (
+                <span
+                  className="vln-tag plain"
+                  title="Detected by the scan. A finding is only presented once a test proves it."
+                >
+                  {latest.introduced} detected
+                </span>
+              ) : (
+                <span className="vln-sev critical">
+                  <i /> {latest.introduced} introduced
+                </span>
+              ))}
             {latest.heldBack > 0 && (
               <span className="vln-tag plain" title="Detections the verifier could not confirm — hidden, never gating">
                 {latest.heldBack} held back
@@ -989,6 +1014,21 @@ const Dashboard = ({
           </div>
         </div>
       )}
+
+      {banners.map((b) => (
+        <div key={`${b.repoId}-${b.kind}`} className="tu-notice page-notice" style={{ marginBottom: 12 }}>
+          <span>{b.message}</span>
+          {b.href ? (
+            <a className="vln-back" href={b.href} style={{ marginLeft: 8 }}>
+              {b.actionLabel} <Icon name="chevron-r" size={11} />
+            </a>
+          ) : (
+            <a className="vln-back" href="/security/config?tab=policy" style={{ marginLeft: 8 }}>
+              {b.actionLabel} <Icon name="chevron-r" size={11} />
+            </a>
+          )}
+        </div>
+      ))}
 
       <div className="vln-stats">
         <div className="vln-stat">
@@ -1033,8 +1073,14 @@ const Dashboard = ({
       <div className="vln-mid">
         <div className="vln-pnl">
           <div className="vln-pnl-head">
-            <h3 className="vln-pnl-t">Introduced vs resolved · last {series.length || 0} scans</h3>
+            {/* Scan counters count DETECTIONS, which under the proof gate is not
+                what the page presents — so the heading says so rather than
+                implying these bars are findings anyone should act on. */}
+            <h3 className="vln-pnl-t">
+              {gateOn ? "Detected" : "Introduced"} vs resolved · last {series.length || 0} scans
+            </h3>
             <div className="vln-pnl-s">
+              {gateOn && "before testing · "}
               {repoFilter === "all"
                 ? "all repositories"
                 : `${overview.repos.find((r) => r.id === repoFilter)?.owner}/${overview.repos.find((r) => r.id === repoFilter)?.name}`}
@@ -1290,7 +1336,12 @@ const Dashboard = ({
               <span className="vln-fx-id">{displayId(f)}</span>
               <span style={{ minWidth: 0 }}>
                 <span className="vln-fx-t">
-                  {f.title} <ConfTag conf={f.confidence} />
+                  {f.title} {f.presentation == null && <ConfTag conf={f.confidence} />}
+                  {needsUntestedBadge(f) && (
+                    <span className="vln-tag plain" title="No test has proven this yet — it does not gate a merge">
+                      untested
+                    </span>
+                  )}
                 </span>
                 <span className="vln-fx-l">
                   <u>{f.path}</u>
@@ -1404,8 +1455,9 @@ const FindingDetail = ({
   }
   const f = finding;
   const now = Date.now();
-  const sla = slaLabel(f, now);
-  const similar = similarFindings(f, all);
+  // An untested finding has no measured blast radius, so it gets no countdown.
+  const sla = finding.presentation === "untested" ? { text: "—", breached: false } : slaLabel(f, now);
+  const similar = similarFindings(f, all).filter((s) => s.presentation !== "untested");
   const repo = repos.find((r) => r.id === f.repoId);
 
   const act = async (label: string, fn: () => Promise<void>) => {
@@ -1451,15 +1503,33 @@ const FindingDetail = ({
   };
 
   const terminal = f.state === "resolved" || f.state === "accepted" || f.state === "false_positive";
-  const held = f.state === "unverified";
+  // Under the proof gate an untested row may still be dismissed, so it is not
+  // read-only the way a verifier-held row was.
+  const gateOn = f.presentation != null;
+  const untested = gateOn ? f.presentation === "untested" : false;
+  const held = gateOn ? false : f.state === "unverified";
+  const proof = gateOn ? proofTag(f.proof) : null;
 
   return (
     <div className="page vln-page vln-dt">
       <div className="vln-dt-head">
         <div className="flex items-center gap-2" style={{ flexWrap: "wrap" }}>
-          <SevPill sev={f.severity} />
-          <ConfTag conf={f.confidence} />
-          {f.verification?.status === "confirmed" && (
+          {untested ? <span className="vln-tag plain">{f.severity} (unproven)</span> : <SevPill sev={f.severity} />}
+          {!gateOn && <ConfTag conf={f.confidence} />}
+          {proof && (
+            <span
+              className={proof.tone === "ok" ? "vln-tag ok" : "vln-tag plain"}
+              title={proof.detail ?? "Reproduced by an executed test against this repository"}
+            >
+              {proof.label}
+            </span>
+          )}
+          {needsUntestedBadge(f) && (
+            <span className="vln-tag plain" title="Someone already acted on this, but no test has proven it — it does not gate a merge">
+              untested
+            </span>
+          )}
+          {!gateOn && f.verification?.status === "confirmed" && (
             <span className="vln-tag ok" title="An independent verifier confirmed this against the repository with cited evidence">
               verified
             </span>
@@ -1563,10 +1633,33 @@ const FindingDetail = ({
                 <pre className="vln-code">{f.evidence}</pre>
               </div>
             )}
+            {gateOn && f.proof && (
+              <div className="vln-block">
+                <div className="vln-h">
+                  Proof <span>{proof?.label}</span>
+                </div>
+                <div style={{ fontSize: 12 }}>
+                  {f.proof.status === "verified"
+                    ? f.proof.method === "rule"
+                      ? "A deterministic rule check confirmed this against the repository."
+                      : "An executed test reproduced this: the legitimate request worked, and the protection check failed on every attempt."
+                    : proof?.detail
+                      ? `Not proven — ${proof.detail}.`
+                      : "Not proven by a test yet."}
+                </div>
+                {(f.proof.testedSha || f.proof.testPath) && (
+                  <div className="mono mute" style={{ fontSize: 11, marginTop: 4 }}>
+                    {f.proof.testedSha ? `tested at ${f.proof.testedSha.slice(0, 12)}` : ""}
+                    {f.proof.testedSha && f.proof.testPath ? " · " : ""}
+                    {f.proof.testPath ?? ""}
+                  </div>
+                )}
+              </div>
+            )}
             {f.verification && (
               <div className="vln-block">
                 <div className="vln-h">
-                  Verification <span>{f.verification.status}</span>
+                  {gateOn ? "AI review" : "Verification"} <span>{f.verification.status}</span>
                 </div>
                 {f.verification.status === "confirmed" ? (
                   f.verification.evidence.map((c, i) => (
@@ -1694,8 +1787,15 @@ const FindingDetail = ({
         </div>
       ) : (
       <div className="vln-dt-foot">
-        {/* Issue / bounty flow: one-click issue first; bounties ride the issue. */}
-        {f.issueUrl ? (
+        {/* Issue / bounty flow: one-click issue first; bounties ride the issue.
+            An untested finding cannot be filed — there is nothing proven to hand
+            a contributor — but it can still be dismissed below. */}
+        {untested ? (
+          <span className="mono mute" style={{ fontSize: 11 }}>
+            {proof?.detail ? `untested — ${proof.detail}.` : "untested."} It does not gate a merge, and can't become
+            an issue until a test proves it.
+          </span>
+        ) : f.issueUrl ? (
           <a className="btn" href={f.issueUrl} target="_blank" rel="noreferrer">
             <Icon name="github" size={13} /> Issue #{f.issueNumber} <Icon name="external" size={10} />
           </a>
@@ -1985,6 +2085,61 @@ const SuppressedSection = ({
           <button className="btn ghost sm" onClick={onManage}>
             Manage rulings
           </button>
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Everything the proof gate holds back, with the reason in plain words. Rows are
+// openable (the detail view offers dismissal) but carry no severity colour: an
+// untested claim has no measured blast radius.
+const UntestedSection = ({
+  findings,
+  repoFilter,
+  onOpen,
+}: {
+  findings: SecurityFinding[];
+  repoFilter: string;
+  onOpen: (id: string) => void;
+}) => {
+  const [open, setOpen] = React.useState(false);
+  const scoped = repoFilter === "all" ? findings : findings.filter((f) => f.repoId === repoFilter);
+  if (scoped.length === 0) return null;
+  const summary = untestedSummary(scoped);
+
+  return (
+    <div className="vln-suppressed">
+      <button className="vln-suppressed-head" onClick={() => setOpen((v) => !v)}>
+        <Icon name={open ? "chevron-d" : "chevron-r"} size={12} />
+        Untested ({summary.total})
+        <span className="mono mute" style={{ fontSize: 11, marginLeft: 8 }}>
+          not proven by a test yet — never gates a merge
+        </span>
+      </button>
+      {open && (
+        <div className="vln-suppressed-list">
+          {summary.byLabel.length > 1 && (
+            <div className="vln-suppressed-why mono mute" style={{ marginBottom: 6 }}>
+              {summary.byLabel.map((b) => `${b.count} ${b.label}`).join(" · ")}
+            </div>
+          )}
+          {scoped.map((f) => {
+            const tag = proofTag(f.proof);
+            return (
+              <div key={f.id} className="vln-suppressed-row">
+                <button className="vln-suppressed-title" onClick={() => onOpen(f.id)}>
+                  <span className="vln-tag plain">{tag.label}</span>
+                  <span className="mono">
+                    {f.path}
+                    {f.line ? `:${f.line}` : ""}
+                  </span>
+                  <span>{f.title}</span>
+                </button>
+                <div className="vln-suppressed-why mono mute">↳ {tag.detail ?? verdictLine(f)}</div>
+              </div>
+            );
+          })}
         </div>
       )}
     </div>
@@ -2403,8 +2558,43 @@ const PolicyRepoEditor = ({
     { k: "deps", icon: "git", n: "Dependencies", d: "manifests · lockfiles" },
   ];
 
+  // A failing proof test in a public repo's CI log would disclose the unfixed
+  // hole, so the maintainer opts in per repo.
+  const showProofOptIn = repo.proofGate === true && repo.private === false;
+
   return (
     <div className="vln-pol">
+      {showProofOptIn && (
+        <div className="vln-pnl">
+          <div className="vln-pnl-head">
+            <h3 className="vln-pnl-t">Security tests {locked && <ProLock />}</h3>
+            <div className="vln-pnl-s">{repo.owner}/{repo.name} · public</div>
+          </div>
+          <div>
+            <div className={`vln-eng ${policy.proof?.publicOptIn ? "" : "off"}`}>
+              <span className="ico">
+                <Icon name="lock" size={13} />
+              </span>
+              <div>
+                <div className="vln-eng-n">run security tests on this public repo</div>
+                <div className="vln-eng-d">
+                  proof tests run in this repo's CI; keep off if a failing test's output would disclose an unfixed issue
+                </div>
+              </div>
+              <Toggle
+                on={policy.proof?.publicOptIn === true}
+                disabled={locked}
+                onClick={() =>
+                  edit((p) => ({
+                    ...p,
+                    proof: { ...(p.proof ?? { publicOptIn: false }), publicOptIn: !p.proof?.publicOptIn },
+                  }))
+                }
+              />
+            </div>
+          </div>
+        </div>
+      )}
       <div className="vln-pnl">
         <div className="vln-pnl-head">
           <h3 className="vln-pnl-t">Triggers {locked && <ProLock />}</h3>
