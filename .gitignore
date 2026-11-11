@@ -1,5 +1,6 @@
 # Dependencies
-node_modules/
+# No trailing slash: a symlinked node_modules (worktree setup) is a file, not a dir
+node_modules
 .pnp
 .pnp.js
 
