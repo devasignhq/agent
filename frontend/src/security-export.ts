@@ -213,8 +213,41 @@ export function exportFilename(
   nowMs: number,
   repoSlug: string | null
 ): string {
-  const stem = `devasign-security-findings${repoSlug ? `-${repoSlug}` : ""}-${iso(nowMs).slice(0, 10)}`;
-  return `${stem.replace(/[^A-Za-z0-9._-]+/g, "-")}.${ext}`;
+  return safeFilename(
+    `devasign-security-findings${repoSlug ? `-${repoSlug}` : ""}-${iso(nowMs).slice(0, 10)}`,
+    ext
+  );
+}
+
+const safeFilename = (stem: string, ext: string) =>
+  `${stem.replace(/[^A-Za-z0-9._-]+/g, "-")}.${ext}`;
+
+// devasign-security-finding-VLN-AB12CD-YYYY-MM-DD.pdf, for a one-finding export.
+export const findingExportFilename = (f: SecurityFinding, nowMs: number): string =>
+  safeFilename(`devasign-security-finding-${displayId(f)}-${iso(nowMs).slice(0, 10)}`, "pdf");
+
+// ─── per-repo rollup ─────────────────────────────────────────────────────────
+
+export type RepoSeverityRow = {
+  repo: string;
+  critical: number;
+  high: number;
+  medium: number;
+  low: number;
+  total: number;
+};
+
+// Severity counts per repo for a multi-repo report, busiest repo first.
+export function repoSeveritySummary(findings: SecurityFinding[]): RepoSeverityRow[] {
+  const rows = new Map<string, RepoSeverityRow>();
+  for (const f of findings) {
+    const repo = f.repo || "—";
+    const row = rows.get(repo) ?? { repo, critical: 0, high: 0, medium: 0, low: 0, total: 0 };
+    if (f.severity in row) row[f.severity] += 1;
+    row.total += 1;
+    rows.set(repo, row);
+  }
+  return [...rows.values()].sort((a, b) => b.total - a.total || a.repo.localeCompare(b.repo));
 }
 
 // ─── PDF sections ────────────────────────────────────────────────────────────
