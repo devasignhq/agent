@@ -12,12 +12,14 @@ import {
   exploitText,
   exportFilename,
   findingDetailBlocks,
+  findingExportFilename,
   findingFileUrl,
   findingLocationLine,
   findingMetaLine,
   findingsCsv,
   findingsCsvRows,
   originLabel,
+  repoSeveritySummary,
   verificationText,
 } from "./security-export.ts";
 
@@ -216,4 +218,27 @@ test("exportFilename: date stem, optional repo slug, hostile characters", () => 
     exportFilename("csv", NOW, "we?ird/na me"),
     "devasign-security-findings-we-ird-na-me-1970-04-11.csv"
   );
+});
+
+test("findingExportFilename: display id and UTC date", () => {
+  assert.equal(
+    findingExportFilename(finding({ fingerprint: "ab12cdef" }), NOW),
+    "devasign-security-finding-VLN-AB12CD-1970-04-11.pdf"
+  );
+});
+
+test("repoSeveritySummary: per-severity counts, busiest repo first, ties by name", () => {
+  const rows = repoSeveritySummary([
+    finding({ repo: "acme/web", severity: "low" }),
+    finding({ repo: "acme/pay", severity: "critical" }),
+    finding({ repo: "acme/pay", severity: "high" }),
+    finding({ repo: "acme/pay", severity: "high" }),
+    finding({ repo: "acme/api", severity: "medium" }),
+  ]);
+  assert.deepEqual(rows, [
+    { repo: "acme/pay", critical: 1, high: 2, medium: 0, low: 0, total: 3 },
+    { repo: "acme/api", critical: 0, high: 0, medium: 1, low: 0, total: 1 },
+    { repo: "acme/web", critical: 0, high: 0, medium: 0, low: 1, total: 1 },
+  ]);
+  assert.deepEqual(repoSeveritySummary([]), []);
 });

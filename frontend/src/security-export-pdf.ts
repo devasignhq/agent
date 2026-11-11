@@ -20,6 +20,7 @@ import {
   findingLocationLine,
   findingMetaLine,
   originLabel,
+  repoSeveritySummary,
   type RepoBranchLookup,
 } from "./security-export.ts";
 
@@ -61,12 +62,17 @@ const COLS = {
   repo: { x: 478, w: PAGE_W - M - 478 },
 };
 
+// "report" is the list export (summary table, plus a per-repo rollup when it
+// spans repos); "single" is one finding's detail on its own.
+export type FindingsPdfOptions = { scopeLabel: string; mode?: "report" | "single" };
+
 export async function downloadFindingsPdf(
   findings: SecurityFinding[],
   branchOf: RepoBranchLookup,
   filename: string,
-  scopeLabel: string
+  { scopeLabel, mode = "report" }: FindingsPdfOptions
 ): Promise<void> {
+  const single = mode === "single";
   const fonts = await loadFonts();
 
   const doc = new jsPDF({ unit: "pt", format: "letter", compress: true });
@@ -110,7 +116,7 @@ export async function downloadFindingsPdf(
 
   // ── header ──
   setStyle(16, { bold: true });
-  doc.text("Security findings", M, y + 12);
+  doc.text(single ? "Security finding" : "Security findings", M, y + 12);
   // Logo lockup in the top-right corner, bottom-aligned with the title's
   // baseline. drawPath replays it at the invoice's position/scale; the
   // translate moves that rendering here.
@@ -125,11 +131,8 @@ export async function downloadFindingsPdf(
   y += 30;
   setStyle(8, { color: MUTED });
   const stamp = new Date().toISOString().slice(0, 10);
-  doc.text(
-    `${scopeLabel} · ${findings.length} finding${findings.length === 1 ? "" : "s"} · exported ${stamp} (UTC)`,
-    M,
-    y
-  );
+  const count = single ? "" : ` · ${findings.length} finding${findings.length === 1 ? "" : "s"}`;
+  doc.text(`${scopeLabel}${count} · exported ${stamp} (UTC)`, M, y);
   // Website reference at the far right, sharing the meta line's baseline.
   // textWithLink has no align option, so right-align by measured width.
   const site = "devasign.com";
@@ -137,6 +140,38 @@ export async function downloadFindingsPdf(
     url: "https://devasign.com",
   });
   y += 20;
+
+  // ── per-repo rollup, only when the report spans repos ──
+  const byRepo = single ? [] : repoSeveritySummary(findings);
+  if (byRepo.length > 1) {
+    const sevCols = ["critical", "high", "medium", "low"] as const;
+    const numX = (i: number) => PAGE_W - M - (sevCols.length - i) * 52;
+    const repoW = numX(0) - M - 8;
+    const repoHead = () => {
+      setStyle(6.5, { bold: true, color: MUTED });
+      doc.text("BY REPOSITORY", M, y + 8);
+      sevCols.forEach((sev, i) => doc.text(sev.toUpperCase(), numX(i), y + 8));
+      doc.text("TOTAL", PAGE_W - M, y + 8, { align: "right" });
+      y += 12;
+      rule();
+      y += 4;
+    };
+    repoHead();
+    for (const row of byRepo) {
+      ensure(13, repoHead);
+      setStyle(7.5);
+      doc.text(fit(row.repo, repoW), M, y + 8);
+      sevCols.forEach((sev, i) => {
+        const n = row[sev];
+        setStyle(7.5, { bold: n > 0, color: n > 0 ? SEV_COLOR[sev] : MUTED });
+        doc.text(String(n), numX(i), y + 8);
+      });
+      setStyle(7.5, { bold: true });
+      doc.text(String(row.total), PAGE_W - M, y + 8, { align: "right" });
+      y += 13;
+    }
+    y += 16;
+  }
 
   // ── summary table (the on-page columns) ──
   const tableHead = () => {
@@ -151,10 +186,9 @@ export async function downloadFindingsPdf(
     rule();
     y += 4;
   };
-  tableHead();
-
   const ROW_H = 13;
-  for (const f of findings) {
+  if (!single) tableHead();
+  for (const f of single ? [] : findings) {
     ensure(ROW_H, tableHead);
     setStyle(7.5, { bold: true, color: SEV_COLOR[f.severity] ?? INK });
     doc.text(f.severity, COLS.severity.x, y + 8);
@@ -175,8 +209,10 @@ export async function downloadFindingsPdf(
     // Never start a finding it can't at least open: heading + meta + a couple
     // of body lines.
     ensure(72);
-    y += 14;
-    rule();
+    if (!single) {
+      y += 14;
+      rule();
+    }
     y += 14;
 
     setStyle(10.5, { bold: true });
@@ -224,8 +260,8 @@ export async function downloadFindingsPdf(
   }
 
   doc.setProperties({
-    title: "DevAsign security findings",
-    subject: `Security findings export: ${scopeLabel}`,
+    title: single ? "DevAsign security finding" : "DevAsign security findings",
+    subject: `Security ${single ? "finding" : "findings"} export: ${scopeLabel}`,
     creator: "DevAsign",
   });
   doc.save(filename);

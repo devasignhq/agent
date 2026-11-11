@@ -76,7 +76,8 @@ import {
   type RulingAction,
   type RulingDraft,
 } from "./security-triage.ts";
-import { exportFilename, findingFileUrl, findingsCsv } from "./security-export.ts";
+import { exportFilename, findingExportFilename, findingFileUrl, findingsCsv } from "./security-export.ts";
+import type { FindingsPdfOptions } from "./security-export-pdf.ts";
 import {
   needsUntestedBadge,
   partitionFindings,
@@ -119,6 +120,36 @@ const StateTag = ({ f }: { f: SecurityFinding }) => {
 };
 
 const short = (sha?: string | null) => (sha ? sha.slice(0, 7) : "");
+
+// ─── PDF export ───────────────────────────────────────────────────────────────
+
+// Dynamic import keeps jsPDF and the fonts out of the main bundle for everyone
+// who never exports (same split as the invoice PDF).
+const usePdfExport = () => {
+  const [busy, setBusy] = React.useState(false);
+  const [err, setErr] = React.useState<string | null>(null);
+  const run = async (
+    findings: SecurityFinding[],
+    branchOf: (repoId: string) => string | undefined,
+    filename: string,
+    opts: FindingsPdfOptions
+  ) => {
+    if (findings.length === 0 || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const { downloadFindingsPdf } = await import("./security-export-pdf.ts");
+      await downloadFindingsPdf(findings, branchOf, filename, opts);
+    } catch {
+      setErr("Couldn't build the PDF. Check your connection and try again.");
+    } finally {
+      setBusy(false);
+    }
+  };
+  return { busy, err, run };
+};
+
+const LOCKED_EXPORT_TITLE = "Exports are a Pro/Max feature";
 
 // ─── plan lock ────────────────────────────────────────────────────────────────
 //
@@ -841,8 +872,7 @@ const Dashboard = ({
   // repo switch silently narrows the export and an id resurfaces as selected
   // if the filter brings its row back.
   const [selected, setSelected] = React.useState<Set<string>>(new Set());
-  const [pdfBusy, setPdfBusy] = React.useState(false);
-  const [exportErr, setExportErr] = React.useState<string | null>(null);
+  const pdf = usePdfExport();
 
   // Under the proof gate the untested rows leave the pool entirely, so every
   // count, chip, tile and chart below is about proven work only.
@@ -911,25 +941,12 @@ const Dashboard = ({
     );
   };
 
-  const exportPdf = async () => {
-    if (selectedShown.length === 0 || overview.locked || pdfBusy) return;
-    setPdfBusy(true);
-    setExportErr(null);
-    try {
-      // Dynamic import keeps jsPDF and the fonts out of the main bundle for
-      // everyone who never exports (same split as the invoice PDF).
-      const { downloadFindingsPdf } = await import("./security-export-pdf.ts");
-      await downloadFindingsPdf(
-        selectedShown,
-        branchOf,
-        exportFilename("pdf", Date.now(), repoSlug),
-        repoSlug ?? "all repositories"
-      );
-    } catch {
-      setExportErr("Couldn't build the PDF. Check your connection and try again.");
-    } finally {
-      setPdfBusy(false);
-    }
+  // With nothing ticked this exports the whole visible list (repo dropdown,
+  // chip and search applied); with a selection, only the ticked rows.
+  const scopeLabel = repoSlug ?? "all repositories";
+  const exportPdf = (rows: SecurityFinding[]) => {
+    if (overview.locked) return;
+    void pdf.run(rows, branchOf, exportFilename("pdf", Date.now(), repoSlug), { scopeLabel });
   };
 
   const latest = [...scopedScans].sort((a, b) => b.startedAt - a.startedAt)[0] ?? null;
@@ -1251,7 +1268,7 @@ const Dashboard = ({
             </div>
             {selectedShown.length > 0 ? (
               <div className="vln-export-bar">
-                {exportErr && <span className="vln-export-err">{exportErr}</span>}
+                {pdf.err && <span className="vln-export-err">{pdf.err}</span>}
                 <span>
                   <b>{selectedShown.length}</b> selected
                 </span>
@@ -1262,7 +1279,7 @@ const Dashboard = ({
                   onClick={exportCsv}
                   title={
                     overview.locked
-                      ? "Exports are a Pro/Max feature"
+                      ? LOCKED_EXPORT_TITLE
                       : "Download the selected findings as CSV"
                   }
                 >
@@ -1270,23 +1287,39 @@ const Dashboard = ({
                 </button>
                 <button
                   className="btn sm"
-                  disabled={overview.locked || pdfBusy}
-                  onClick={() => void exportPdf()}
+                  disabled={overview.locked || pdf.busy}
+                  onClick={() => exportPdf(selectedShown)}
                   title={
                     overview.locked
-                      ? "Exports are a Pro/Max feature"
+                      ? LOCKED_EXPORT_TITLE
                       : "Download the selected findings as a PDF report"
                   }
                 >
-                  <Icon name="download" size={12} /> {pdfBusy ? "Preparing…" : "PDF"}
+                  <Icon name="download" size={12} /> {pdf.busy ? "Preparing…" : "PDF"}
                 </button>
                 <button className="btn ghost sm" onClick={() => setSelected(new Set())}>
                   Clear
                 </button>
               </div>
             ) : (
-              <div className="vln-pnl-s">
-                showing {shown.length} finding{shown.length === 1 ? "" : "s"}
+              <div className="vln-export-bar vln-report-bar">
+                {pdf.err && <span className="vln-export-err">{pdf.err}</span>}
+                <span className="vln-pnl-s">
+                  showing {shown.length} finding{shown.length === 1 ? "" : "s"}
+                </span>
+                {overview.locked && <ProLock />}
+                <button
+                  className="btn sm"
+                  disabled={overview.locked || pdf.busy || shown.length === 0}
+                  onClick={() => exportPdf(shown)}
+                  title={
+                    overview.locked
+                      ? LOCKED_EXPORT_TITLE
+                      : `Download all ${shown.length} shown finding${shown.length === 1 ? "" : "s"} in ${scopeLabel} as a PDF report`
+                  }
+                >
+                  <Icon name="download" size={12} /> {pdf.busy ? "Preparing…" : "Export report"}
+                </button>
               </div>
             )}
           </div>
@@ -1426,6 +1459,7 @@ const FindingDetail = ({
   const [err, setErr] = React.useState<string | null>(null);
   const [confirm, setConfirm] = React.useState<"false_positive" | "accept" | null>(null);
   const [copied, setCopied] = React.useState(false);
+  const pdf = usePdfExport();
 
   React.useEffect(() => {
     setTab("Overview");
@@ -1539,6 +1573,22 @@ const FindingDetail = ({
           <span className="vln-tag plain">{displayId(f)}</span>
           <StateTag f={f} />
           <div style={{ flex: 1 }} />
+          {locked && <ProLock />}
+          <button
+            className="btn sm"
+            disabled={locked || pdf.busy}
+            onClick={() =>
+              void pdf.run(
+                [f],
+                (repoId) => repos.find((r) => r.id === repoId)?.defaultBranch,
+                findingExportFilename(f, Date.now()),
+                { scopeLabel: [displayId(f), f.repo].filter(Boolean).join(" · "), mode: "single" }
+              )
+            }
+            title={locked ? LOCKED_EXPORT_TITLE : "Download this finding as a PDF report"}
+          >
+            <Icon name="download" size={12} /> {pdf.busy ? "Preparing…" : "Export PDF"}
+          </button>
           <button className="vln-back" onClick={onBack}>
             <Icon name="chevron-r" size={11} /> back to findings <span className="mute">esc</span>
           </button>
@@ -1555,7 +1605,7 @@ const FindingDetail = ({
         ))}
       </div>
 
-      {err && <div className="tu-notice" style={{ margin: "12px 0 0" }}>{err}</div>}
+      {(err || pdf.err) && <div className="tu-notice" style={{ margin: "12px 0 0" }}>{err ?? pdf.err}</div>}
 
       <div className="vln-dt-body">
         <div className="kv-grid vln-kv">

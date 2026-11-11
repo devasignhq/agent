@@ -6320,6 +6320,8 @@ pre.vln-code, .vln-code {
   .vln-fx-row > .vln-fx-o,
   .vln-fx-row > .vln-fx-repo,
   .vln-fx-row > .vln-fx-a { display: none; }
+  /* The whole-report export needs no row selection, so it stays on mobile. */
+  .vln-export-bar.vln-report-bar { display: flex; }
   .vln-fx-row > :nth-child(4) { grid-area: title; }
   .vln-fx-row > .vln-tag:last-child { grid-area: state; }
   /* Search stays — it's the only way to reach a row once the columns collapse
